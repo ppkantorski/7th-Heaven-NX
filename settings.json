@@ -1,0 +1,37 @@
+{
+ "Ninostyle Battle.iro": {
+  "enabled": true,
+  "options": {
+   "Cloud": 1,
+   "Barret": 1,
+   "Tifa": 1,
+   "Aerith": 1,
+   "Red XIII": 1,
+   "Yuffie": 1,
+   "Cait Sith": 1,
+   "Vincent": 1,
+   "Cid": 1,
+   "Sephiroth": 1,
+   "Jessie Mod": 0,
+   "Other": 0,
+   "busterizer": 0
+  }
+ },
+ "Ninostyle Chibi.iro": {
+  "enabled": true,
+  "options": {
+   "fb": 0,
+   "lazaro": 0,
+   "efryt fb": 0,
+   "alt tifa": 0,
+   "Dynamic Weapons": 0,
+   "buggy": 3,
+   "chocobo": 2,
+   "highwind": 1,
+   "submarine": 1,
+   "tiny_bronco": 1,
+   "cargo_ship": 1,
+   "gelnika": 1
+  }
+ }
+}
