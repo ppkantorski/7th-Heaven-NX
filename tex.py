@@ -226,6 +226,112 @@ def _dither_to_palette(rgba, w, h, palette):
     return out
 
 
+def _resample_raw(pixels, w, h, bytespp, nw, nh):
+    """Nearest-neighbour resample of raw per-pixel blocks (palette indices
+    OR truecolor bytes -- whatever `bytespp` already is). Unlike
+    _resample_rgba, this does not decode/re-encode colour: it copies each
+    source pixel's bytes verbatim to its new position, so a paletted
+    texture stays paletted against the SAME palette and a truecolor
+    texture keeps its exact channel layout. Safe for any bytespp."""
+    out = bytearray(nw * nh * bytespp)
+    for y in range(nh):
+        sy = y * h // nh
+        srow = sy * w * bytespp
+        drow = y * nw * bytespp
+        for x in range(nw):
+            sx = srow + (x * w // nw) * bytespp
+            dx = drow + x * bytespp
+            out[dx:dx + bytespp] = pixels[sx:sx + bytespp]
+    return bytes(out)
+
+
+def _cap_size(w, h, max_dim):
+    """
+    New (width, height) for a texture capped at `max_dim`.
+
+    Two rules, both of which the first version of this function broke:
+
+    UNIFORM. Both axes are divided by the SAME factor. `min(w, cap)` per axis
+    is not a downscale, it is an anamorphic squash: a 1024x512 sheet came out
+    512x512, i.e. horizontally compressed 2:1 while its height was untouched.
+    FF7 .p files store texture coordinates as normalised floats (see FFNx's
+    `struct texcoords { float u; float v; }`), so nothing goes out of range --
+    the art just renders wrong, and worst on the polygons with the least
+    texture area to spare, which is exactly where a stray-looking smear shows
+    up on a small model.
+
+    POWER OF TWO. The factor is a power of two, so a nearest-neighbour
+    resample lands on exact source pixels and is a clean 2x/4x decimation
+    rather than an irregular one that drops rows unevenly. It also keeps
+    power-of-two sources power-of-two, which non-uniform capping did not
+    (1024x768 -> 512x512 turned a legal 4:3 sheet into a square one).
+
+    Returns (w, h) unchanged when nothing needs to happen.
+    """
+    if w <= max_dim and h <= max_dim:
+        return w, h
+    # Scale both axes by the SAME ratio, so the longer one lands exactly on
+    # `max_dim`. For a power-of-two cap and a power-of-two source this is bit
+    # for bit what the old halving loop produced (1024 -> 512 -> 256), so no
+    # existing build moves; what it adds is caps that are not powers of two.
+    # `Cap at 768px` used to quietly give 512, because halving cannot reach
+    # 768 -- the number in the menu has to be the number on the texture.
+    #
+    # The cost is that a non-power-of-two ratio makes the nearest-neighbour
+    # resample drop rows unevenly rather than decimate cleanly. That is a real
+    # trade and it is the one the setting is asking for; the power-of-two
+    # values are still there for anyone who wants the clean decimation.
+    longest = max(w, h)
+    return (max(1, w * max_dim // longest),
+            max(1, h * max_dim // longest))
+
+
+def cap_dimensions(data, max_dim):
+    """
+    Downscale a TEX file so neither dimension exceeds `max_dim`, preserving
+    its exact original format: paletted stays paletted (same palette,
+    resampled indices), truecolor stays truecolor (same bit depth,
+    resampled channels). No quantization and no header layout changes beyond
+    the fields that DESCRIBE the new pixel block.
+
+    Aspect ratio is preserved -- see _cap_size for why that is not optional.
+
+    The pitch field (0x44) is rewritten when, and only when, the source
+    carries a nonzero one. Every vanilla field TEX on hand has pitch=0 at
+    every size (all 32x32 in char.lgp), so the field module plainly does not
+    need it, and a zero is passed through untouched to stay byte-compatible
+    with vanilla. But a mod tool that DOES fill it in has written
+    `width * bytes_per_pixel`, and leaving that stale after halving the width
+    describes a row stride twice the real one: any consumer that honours it
+    reads the image sheared. Rewriting a nonzero pitch keeps the header
+    self-consistent whichever way the loader goes.
+
+    Returns (new_bytes, note) or (None, reason) -- reason is 'not a TEX'
+    or 'already within cap' when nothing changes.
+    """
+    t = parse(data)
+    if t is None:
+        return None, 'not a TEX'
+    w, h, bypp = t['width'], t['height'], t['bytes_per_pixel']
+    nw, nh = _cap_size(w, h, max_dim)
+    if (nw, nh) == (w, h):
+        return None, 'already within cap'
+    new_pixels = _resample_raw(t['pixels'], w, h, bypp, nw, nh)
+    hdr = bytearray(data[:HEADER_LEN])
+    struct.pack_into('<I', hdr, O_WIDTH, nw)
+    struct.pack_into('<I', hdr, O_HEIGHT, nh)
+    pitch = _u32(data, O_PITCH)
+    if pitch:
+        struct.pack_into('<I', hdr, O_PITCH, nw * bypp)
+    out = bytes(hdr) + t['palette'] + new_pixels
+    kind = 'paletted' if t['palette_flag'] else f'{bypp * 8}-bit truecolor'
+    note = (f'{w}x{h} -> {nw}x{nh} ({kind}, aspect preserved) '
+            f'{len(data):,} -> {len(out):,} bytes')
+    if pitch:
+        note += f'; pitch {pitch} -> {nw * bypp}'
+    return out, note
+
+
 def convert_for_battle(data, vanilla_data=None, cap=256):
     """
     Convert a truecolor mod TEX for the battle module, which renders enemy
@@ -257,13 +363,62 @@ def convert_for_battle(data, vanilla_data=None, cap=256):
     # the v4 build). Mirroring vanilla 16-color / multi-palette layouts
     # produced BLACK models in every build that tried it (v4, v7),
     # regardless of pixel content, so vanilla palette structure is
-    # deliberately ignored.
+    # deliberately ignored. (Dimensions are a separate question from
+    # palette layout -- see below -- and this paragraph is only about
+    # the latter.)
     w, h, bypp = t['width'], t['height'], t['bytes_per_pixel']
-    nw, nh = min(w, cap), min(h, cap)
+
+    # Target dimensions. `vanilla_data` names the actual slot this texture
+    # is replacing (e.g. LGP entry "oxae"), and its aspect ratio -- not
+    # the mod's own source art -- is what the game's UV mapping for that
+    # slot was built against. Prefer it when available: cap vanilla's own
+    # (w, h) uniformly (see _cap_size docstring on why per-axis min() is
+    # an anamorphic squash, not a downscale), then upscale that by
+    # doubling in lockstep as long as the result still fits under `cap`
+    # AND is actually resolvable from the source (no upscaling past what
+    # the mod's own art provides). This matches the mod's own aspect in
+    # the overwhelming majority of cases (a straight upscale preserves
+    # proportions by construction) while remaining correct even when a
+    # mod ships a differently-shaped replacement for one slot -- e.g.
+    # Avalanche Arisen's "raac" is a 512x512 square replacing a 128x256
+    # portrait vanilla texture; without this, the square source's own
+    # aspect would still be used and the result would render stretched.
+    van_t = parse(vanilla_data) if vanilla_data else None
+    if van_t and van_t['width'] and van_t['height']:
+        nw, nh = _cap_size(van_t['width'], van_t['height'], cap)
+        # Scale up by the largest WHOLE factor that still fits the cap and is
+        # still resolvable from the source. This used to double, which meant a
+        # 256px vanilla tile could only ever reach 256, 512 or 1024 -- so
+        # `Cap at 768px` silently produced 512 and the setting looked broken.
+        # An integer factor keeps the aspect exact (both axes scale by the
+        # same whole number) and is identical to doubling whenever the cap IS
+        # a power of two, so no existing build changes.
+        if nw > 0 and nh > 0:
+            k = min(cap // nw, cap // nh, w // nw, h // nh)
+            if k > 1:
+                nw *= k
+                nh *= k
+    else:
+        nw, nh = _cap_size(w, h, cap)
     rgba = _resample_rgba(t['pixels'], w, h, bypp, nw, nh)
     palette, mapping = _median_cut(rgba, 255)
     idx = bytearray(0 if p[3] < 128 else mapping[p] + 1 for p in rgba)
-    entries = [(0, 0, 0, 0)] + palette
+    # The reserved transparent entry gets the average of the opaque colours
+    # that BORDER transparency, not black. Once the palette is expanded to
+    # RGBA the GPU cannot tell index 0 apart, so it bilinear-filters straight
+    # through it; with black there it draws a dark line along every boundary
+    # in the atlas, which is what the seams down faces and shoulders were.
+    # Alpha stays 0, transparency is still decided by the colour-key flag and
+    # the index, and not one index byte below changes. See tex.debleed().
+    clear = (0, 0, 0)
+    _pal_bytes = bytearray()
+    for r, g, b, a in palette:
+        _pal_bytes += bytes((b, g, r, a))
+    edge = _boundary_colour(idx, nw, nh, b'\x00\x00\x00\x00' + bytes(_pal_bytes),
+                            len(palette) + 1, 0)
+    if edge is not None:
+        clear = edge
+    entries = [(clear[0], clear[1], clear[2], 0)] + palette
     entries += [(0, 0, 0, 255)] * (256 - len(entries))
     pal_bytes = bytearray()
     for r, g, b, a in entries:
@@ -274,3 +429,136 @@ def convert_for_battle(data, vanilla_data=None, cap=256):
             f'({len(palette) + 1}/256 colors) '
             f'{len(data):,} -> {len(out):,} bytes')
     return out, note
+
+
+# ==========================================================================
+# COLOUR-KEY DE-FRINGING
+# ==========================================================================
+def _boundary_colour(px, w, h, palette, n_colors, pal_index=0):
+    """
+    Average of the opaque texels that orthogonally touch a transparent one.
+
+    That set is exactly the set of colours bilinear filtering will mix with
+    palette entry 0 along a boundary, so their mean is the single value that
+    makes the mixing invisible. Returns None when the texture has no such
+    boundary, i.e. nothing to fix.
+    """
+    base = pal_index * n_colors * 4
+    tot_r = tot_g = tot_b = cnt = 0
+    for y in range(h):
+        row = y * w
+        for x in range(w):
+            if px[row + x]:
+                continue
+            for nx, ny in ((x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)):
+                if not (0 <= nx < w and 0 <= ny < h):
+                    continue
+                i = px[ny * w + nx]
+                if not i:
+                    continue
+                o = base + i * 4
+                if o + 3 >= len(palette):
+                    continue
+                tot_b += palette[o]
+                tot_g += palette[o + 1]
+                tot_r += palette[o + 2]
+                cnt += 1
+    if not cnt:
+        return None
+    return (tot_r // cnt, tot_g // cnt, tot_b // cnt)
+
+
+def debleed(data):
+    """
+    Kill the black fringe at colour-key edges, WITHOUT touching a pixel.
+
+    THE PROBLEM. FF7 character textures are atlases whose sub-regions are
+    separated by transparent gutters, and the transparent palette entry is
+    black. Measured on the vanilla archive:
+
+        694 char.lgp TEX files, all paletted
+        626 with colorkey=1, and in every one palette entry 0 is RGB(0,0,0)
+        458 of 624 (73%) have a transparent texel touching an opaque one
+
+    Once the palette is expanded to RGBA the GPU has no idea index 0 is
+    special. It bilinear-filters, and along every one of those boundaries it
+    interpolates toward black. A face whose halves sit either side of a gutter
+    gets a thin dark line down the middle; a shoulder gets a vertical one.
+    Point sampling on the original hardware never showed it; an upscaled
+    model under a filtering renderer shows it clearly, because the fringe is
+    one texel wide and the texel is now large.
+
+    THE FIX. Give entry 0 the average colour of the opaque texels that border
+    transparency, and leave its alpha at 0. Filtering then blends toward the
+    art's own edge colour instead of black.
+
+    WHY IT CANNOT COMPROMISE THE IMAGE. Transparency here is decided by the
+    colorkey FLAG plus the index, not by the colour -- the same archive
+    carries 68 textures with colorkey=0 whose entry 0 is opaque white and
+    draws normally. So entry 0's RGB is read only when it is being blended
+    toward, never when it is being drawn. This function enforces that rather
+    than claiming it: it refuses unless colorkey is set, and it rewrites
+    nothing but palette entry 0. Every index byte, every other palette entry,
+    and the whole header come out identical, which `check_indices_unchanged`
+    below verifies byte for byte.
+
+    Returns (new_bytes, note) or (None, reason).
+    """
+    t = parse(data)
+    if t is None:
+        return None, 'not a TEX'
+    if not t['palette_flag']:
+        return None, 'not paletted'
+    if not _u32(data, O_COLORKEY):
+        # entry 0 is a real, drawable colour here -- changing it WOULD change
+        # the image, which is the one case this must never touch
+        return None, 'no colour key'
+    n_colors = t['colors_per_palette']
+    n_pal = max(1, t['num_palettes'])
+    if not n_colors:
+        return None, 'no palette'
+    px = t['pixels']
+    w, h = t['width'], t['height']
+    if 0 not in px:
+        return None, 'no transparent texels'
+
+    pal = bytearray(t['palette'])
+    changed = []
+    for p in range(n_pal):
+        rgb = _boundary_colour(px, w, h, pal, n_colors, p)
+        if rgb is None:
+            continue
+        o = p * n_colors * 4
+        if o + 3 >= len(pal):
+            continue
+        if pal[o + 3]:            # entry 0 is opaque in this palette; leave it
+            continue
+        if (pal[o + 2], pal[o + 1], pal[o]) == rgb:
+            continue
+        pal[o] = rgb[2]           # B
+        pal[o + 1] = rgb[1]       # G
+        pal[o + 2] = rgb[0]       # R
+        changed.append(p)         # alpha at pal[o + 3] is untouched
+    if not changed:
+        return None, 'nothing to debleed'
+    out = (bytes(data[:HEADER_LEN]) + bytes(pal)
+           + bytes(data[HEADER_LEN + len(pal):]))
+    return out, ('%d palette(s) de-fringed' % len(changed))
+
+
+def check_indices_unchanged(before, after):
+    """
+    True when `after` differs from `before` in palette bytes only.
+
+    `debleed`'s whole claim is that it cannot alter the image. This is that
+    claim as an assertion: same header, same pixel indices, same length.
+    """
+    if len(before) != len(after):
+        return False
+    if before[:HEADER_LEN] != after[:HEADER_LEN]:
+        return False
+    t = parse(before)
+    if t is None:
+        return False
+    pal_end = HEADER_LEN + t['palette_size'] * 4
+    return before[pal_end:] == after[pal_end:]
