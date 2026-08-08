@@ -54,7 +54,11 @@ def _walk(W, hook):
     if imm & (1 << 25):
         imm -= 1 << 26
     va, seen = hook + imm * 4, [hook]
-    for _ in range(80):
+    # 400, not 80. A cave's PHYSICAL length is its word count plus one chain
+    # link per padding hole it had to use, and `ff7nx_moviebars` is 76 words
+    # spread over ~50 two-word holes -- 127 steps. The old bound turned a
+    # perfectly healthy cave into a RuntimeError.
+    for _ in range(400):
         x = W(va)
         seen.append(va)
         if (x & 0xFC000000) == 0x14000000:
@@ -68,6 +72,29 @@ def _walk(W, hook):
             continue
         va += 4
     raise RuntimeError('cave chain from +%#x did not terminate' % hook)
+
+
+def _walk_via_module(t, hook):
+    """
+    Ask the owning module to walk a cave that `_walk` cannot.
+
+    `_walk` stops at the `b` back to the game, which is right for every cave
+    written before this one -- their return branch is their last word.
+    `ff7nx_moviebars` deliberately puts its shared quad-issue subroutine AFTER
+    the return, reached by `bl`, so that its only `b` is the return and its own
+    revert can use the same chain rule as everything else. The consequence is
+    that `_walk` counts 72 of 127 words and, more to the point, the COLLISION
+    CHECK never sees the tail. That is the one thing this script exists for, so
+    it asks the module rather than growing a second heuristic.
+    """
+    if hook != 0x10E0A4C:
+        return None
+    try:
+        import ff7nx_moviebars as MB
+    except Exception:                                          # noqa: BLE001
+        return None
+    got = MB.walk_physical(t)
+    return ([hook] + list(got)) if got else None
 
 
 # hook sites that carry a cave: (module, leg, va)
@@ -87,6 +114,7 @@ CAVES = [
     ('framing',    'tile cull right2',          0xA05E8C),
     ('framing',    'parallax right (l4b)',      0xA08D40),
     ('moviealign', 'movie quad +16',            0x10DE8F0),
+    ('moviebars',  'FMV margin bars',           0x10E0A4C),
     ('camclamp',   'scripted camera clamp',     0x9F874C),
     # RETIRED -- see ff7nx_movieclip.enabled(). Hooked here means the scissor
     # is narrowing the whole frame during an FMV, which freezes stale field
@@ -96,8 +124,8 @@ CAVES = [
 
 # caves whose ABSENCE is correct: {hook: why}
 CAVES_WANT_ABSENT = {
-    0x1133FE8: 'RETIRED -- the scissor ate the margin clear; '
-               'ff7nx_moviecull replaces it',
+    0x1133FE8: 'RETIRED -- it scissored the presentation blit, which froze '
+               'stale field art in the margins; ff7nx_moviebars replaces it',
 }
 
 # single-word legs: (module, leg, va, {word: meaning}, wanted)
@@ -136,7 +164,14 @@ MOVIECULL_SITES = {0x9EC43C: 'cull left', 0x9EC49C: 'cull right'}
 
 
 def _moviecull_row(t, va):
-    """(text, wanted) for a modelcull site that ff7nx_moviecull has caved."""
+    """
+    (text, wanted) for a modelcull site that ff7nx_moviecull has caved.
+
+    RETIRED. The cull is an early-out on a model's ORIGIN, so it removes whole
+    models and cannot slice one -- FINDINGS-91 §9 is the hardware result that
+    retired it. A caved site is now a thing to look at, not a healthy module,
+    so `wanted` is the plain 16:9 word `ff7nx_modelcull` writes.
+    """
     try:
         import ff7nx_moviecull as MC
     except Exception:
@@ -145,10 +180,9 @@ def _moviecull_row(t, va):
         return None
     pl, wl, pr, wr = MC.bounds_in_module(t)
     play, wide = (pl, wl) if va == MC.LEFT_SITE else (pr, wr)
-    txt = 'CAVE: %s while a movie plays, else %s' % (play, wide)
-    want_play = MC.STOCK_LEFT if va == MC.LEFT_SITE else MC.STOCK_RIGHT
-    want_wide = MC.WIDE_LEFT if va == MC.LEFT_SITE else MC.WIDE_RIGHT
-    return txt, 'CAVE: %s while a movie plays, else %s' % (want_play, want_wide)
+    txt = ('CAVE: %s while a movie plays, else %s  (RETIRED -- proven null)'
+           % (play, wide))
+    return txt, '97  (16:9)' if va == MC.LEFT_SITE else '457 (16:9)'
 
 
 def main(argv=None):
@@ -194,7 +228,7 @@ def main(argv=None):
     own = collections.defaultdict(list)
     live = 0
     for mod, leg, hook in CAVES:
-        ws = _walk(W, hook)
+        ws = _walk_via_module(t, hook) or _walk(W, hook)
         if ws is None:
             note = 'not hooked'
             if leg.startswith('[0xCFF208]'):

@@ -836,21 +836,24 @@ def run_build(mods, enabled, settings_by_mod, log, progress,
     # and note _build_flevel has ALREADY rewritten section 9 to match, so if
     # this pass cannot run the SD tree is inconsistent and says so.
     produced += build.apply_field_bg(SDOUT_DIR, DUMP, log, produced)
-    # LAST module pass. Clears the field frame so the 16:9 margins are black
-    # instead of the previous frame's dominant colour -- the tan/yellow wash.
-    # See build.apply_bg_clear; measured NOT installed and 0 callers on the
-    # stock module, i.e. this has never shipped.
-    produced += build.apply_bg_clear(SDOUT_DIR, DUMP, log, produced)
-    # The 16:9 field frame: no painted letterbox, the full 480-unit window,
-    # the background and its sprites centred in it, and the model cull widened
-    # to the wider frame. Nine words, all immediates, no cave -- but it still
-    # goes after everything above because it edits exefs/main. Gated on the
-    # 16:9 setting; at 4:3 it is a no-op by design. FINDINGS-88.
+    # REMOVED: apply_bg_clear ("Black 16:9 margins") and apply_movie_clip
+    # ("Clip models to the movie"). Both are retired on hardware results --
+    # bg_clear changed nothing because the flat margin colour is not the clear
+    # colour (ff7nx_marginart/ff7nx_marginpal fixed it at the source), and the
+    # movie clip scissored the presentation blit and froze stale field art in
+    # the margins. FINDINGS-92 §6. The modules stay on disk as derivations;
+    # nothing calls them.
+    #
+    # LAST module pass, and it is now the only one that touches exefs/main
+    # after ff7nx_ws: the 16:9 field frame -- no painted letterbox, the full
+    # 480-unit window, the background and its sprites centred in it, the model
+    # cull widened to the wider frame, the movie quad aligned to it, the FMV
+    # margin bars, and the scripted-camera clamp. It goes last because it edits
+    # exefs/main and because ff7nx_cave's allocator re-checks that its padding
+    # holes are still zero IN THE MODULE IT IS HANDED, so it has to see
+    # whatever every earlier cave actually took. Gated on the 16:9 setting; at
+    # 4:3 it is a no-op by design. FINDINGS-88, FINDINGS-92.
     produced += build.apply_field_frame(SDOUT_DIR, DUMP, log, produced)
-    # TRULY last module pass: a cave, and the cave allocator re-checks that
-    # its padding holes are still zero in the module it is handed -- so it has
-    # to see whatever every earlier cave actually took. HANDOFF-80 §5.0.
-    produced += build.apply_movie_clip(SDOUT_DIR, DUMP, log, produced)
     # The custom PIXEL shader sets (background scaler, FXAA). These touch no
     # module at all, so they can go anywhere -- but they must go BEFORE
     # prune_stale, because that is what deletes them again when the setting
@@ -1309,18 +1312,14 @@ def launch_ui():
     m30_var = tk.BooleanVar(value=bool(global_saved.get('movie_30fps', False)))
     a360_var = tk.BooleanVar(value=bool(global_saved.get('analog_360', False)))
     norun_var = tk.BooleanVar(value=bool(global_saved.get('no_autorun', False)))
-    # DEFAULT ON. `gfx_drv_clear` has ZERO callers in the stock module
-    # (measured with ff7nx_bgclear --show), so the 16:9 margins keep whatever
-    # the frame buffer last held -- the field's dominant colour. That is the
-    # tan/yellow wash. See build.apply_bg_clear.
-    bgclr_var = tk.BooleanVar(value=bool(global_saved.get('bg_clear', False)))
-    # DEFAULT ON, and it is the only module patch that is. The cave measures
-    # the render target and skips when it is already 4:3, so on a 4:3 build it
-    # cannot write a pixel. See build.apply_movie_clip / ff7nx_movieclip.py §4.
-    mclip_var = tk.BooleanVar(value=bool(global_saved.get('movie_clip', False)))
-    # The 16:9 field frame. Defaults ON, like the movie clip, because with
-    # widescreen off it cannot write a word -- ff7nx_letterbox.enabled() and
-    # ff7nx_modelcull.enabled() both fall through to ff7nx_ws.enabled().
+    # REMOVED: bgclr_var ('bg_clear', "Black 16:9 margins") and mclip_var
+    # ('movie_clip', "Clip models to the movie"). Both retired -- FINDINGS-92
+    # §6. A stale key left in settings.json by an older build is ignored: the
+    # environment variables are no longer written and nothing reads them.
+    #
+    # The 16:9 field frame. Defaults ON because with widescreen off it cannot
+    # write a word -- ff7nx_letterbox.enabled() and ff7nx_modelcull.enabled()
+    # both fall through to ff7nx_ws.enabled().
     frame_var = tk.BooleanVar(value=bool(global_saved.get('field_frame', True)))
     nocheat_var = tk.BooleanVar(value=bool(global_saved.get('no_cheats', False)))
 
@@ -1505,50 +1504,41 @@ def launch_ui():
              'move the field without the movie and the cut looks worse than '
              'it did before. FFNx’s numbers (enable_uncrop, '
              'ff7_field_center).\n\n'
+             'It also paints the FMV’s own 4:3 margins. FF7 keeps videos at '
+             '4:3, so in a 16:9 frame there is black to the left and right of '
+             'the picture and a thin band above and below it — and a field '
+             'model standing near the edge used to be drawn straight over it, '
+             'sword and legs hanging outside the video. Four opaque black '
+             'quads go down last, over the finished frame, so the overhang '
+             'passes UNDER them the way a real letterbox works. Nothing is '
+             'clipped and no model disappears. Only while a video is actually '
+             'playing. See FINDINGS-92.\n\n'
              'NOT on this switch: the model cull box. It is 4:3-sized and '
              'gets widened to the 16:9 frame whenever 16:9 is on, with or '
              'without this box ticked. That one is a plain bug — NPCs '
              'switched off while still inside the picture — and there is '
              'no setting in which you would want it back.\n\n'
-             'Seven words plus a twelve-word cave in dead padding, '
-             'byte-exactly reversible. Only does anything with '
+             'Seven words, an eighteen-word cave for the movie quad and a '
+             'seventy-six-word one for the margin bars, all in dead alignment '
+             'padding and byte-exactly reversible. Only does anything with '
              '“16:9 widescreen” selected above — at 4:3 the letterbox is '
-             'the framing the game was authored in. See FINDINGS-88.', True),
-            ('check', 'Clip models to the movie — RETIRED, leave OFF',
-             mclip_var, None,
-             'RETIRED. This narrowed the GL scissor to the central 4:3 while '
-             'a movie played. It did stop models being drawn in the margin — '
-             'and it also clipped the frame CLEAR and the letterbox fill, '
-             'because a scissor is frame state and not a per-draw filter. So '
-             'the last field frame before the FMV stayed frozen in the left '
-             'and right margins for the whole video.\n\n'
-             'Measured on hardware, both ways:\n'
-             '    ON   models clipped (right), margins show STALE field art\n'
-             '    OFF  margins black (right), models drawn over the movie\n\n'
-             'Neither is shippable, and no band arithmetic fixes it. The job '
-             'is done instead by ff7nx_moviecull, which gates the FIELD MODEL '
-             'CULL on the same is_playing flag — field_do_draw_3d_model '
-             'decides draw/do-not-draw and touches no render state, so it '
-             'cannot reach the clear.\n\n'
-             'Switching this on will bring the stale margins back. It is kept '
-             'only for an A/B. See FINDINGS-91 §1.', True),
-            ('check', 'Black 16:9 margins', bgclr_var, None,
-             'The port clears the whole render target to the field\u2019s own '
-             'background colour every frame. Inside 4:3 the art covers it; '
-             'outside, it IS the margin \u2014 which is why the margin reads '
-             'as the field\u2019s dominant colour: sandy yellow in Sector 6, '
-             'tan in Wall Market, green in the slums.\n\n'
-             'This makes gfx_drv_setbg store black instead of the colour it '
-             'was handed, so the margin is black wherever the mod ships no '
-             'wide art. Two words, no code cave.\n\n'
-             'MEASURED ON HARDWARE AND IT DID NOT HELP: the Sector 6 margins '
-             'are unchanged with this on, so the flat colour is not the clear '
-             'colour. Off by default for that reason.\n\n'
-             'Turn it off if a field looked better with the colour \u2014 and '
-             'note a branch scan reports \u201czero callers\u201d for the '
-             'clear, which is a false negative: it is a gfx-driver table '
-             'entry called through a function pointer, like gfx_drv_flip.',
-             True),
+             'the framing the game was authored in, and there are no margins '
+             'to paint. See FINDINGS-88 and FINDINGS-92.', True),
+            # REMOVED, both retired on hardware results -- FINDINGS-92 §6.
+            #
+            # "Clip models to the movie" narrowed the GL scissor to the central
+            # 4:3 while a movie played. It could not work: the scissor it
+            # narrowed also caught the PRESENTATION BLIT, so the back buffer's
+            # margins were never written and froze the last field frame drawn
+            # before the FMV. That job is now done by ff7nx_moviebars, which
+            # paints the four margins as opaque black quads in the flip path --
+            # last, over the finished frame -- so overhang goes UNDER the black
+            # instead of being clipped, and no frame state changes at all.
+            #
+            # "Black 16:9 margins" made gfx_drv_setbg store black instead of
+            # the colour it was handed. Measured on hardware and it changed
+            # nothing, because the flat margin colour is not the clear colour.
+            # ff7nx_marginart / ff7nx_marginpal fixed that at the source.
         ]),
         ('Shaders', [
             ('combo', 'Background scaler', scaler_var,
@@ -1997,8 +1987,6 @@ def launch_ui():
                                  'movie_30fps': bool(m30_var.get()),
                                  'analog_360': bool(a360_var.get()),
                                  'no_autorun': bool(norun_var.get()),
-                                 'bg_clear': bool(bgclr_var.get()),
-                                 'movie_clip': bool(mclip_var.get()),
                                  'field_frame': bool(frame_var.get()),
                                  'no_cheats': bool(nocheat_var.get()),
                                  'limiter_fps': current_limiter_fps(),
@@ -2041,8 +2029,6 @@ def launch_ui():
     m30_var.trace_add('write', save_settings_now)
     a360_var.trace_add('write', save_settings_now)
     norun_var.trace_add('write', save_settings_now)
-    bgclr_var.trace_add('write', save_settings_now)
-    mclip_var.trace_add('write', save_settings_now)
     frame_var.trace_add('write', save_settings_now)
     nocheat_var.trace_add('write', save_settings_now)
     lim_var.trace_add('write', save_settings_now)
@@ -2741,12 +2727,10 @@ def launch_ui():
             _global_setting('margin_black', 0))
         os.environ[build.ff7nx_marginart.MARGIN_ART_ENV] = str(
             current_field_bg_margin_art())
-        os.environ[build.BG_CLEAR_ENV] = '1' if bgclr_var.get() else '0'
-        # RETIRED (FINDINGS-91 §1). A saved `movie_clip: true` from before
-        # the retirement would otherwise override the module's own default
-        # and put the stale margins straight back -- which is exactly what
-        # happened on the first build after the retirement landed.
-        os.environ[build.MOVIE_CLIP_ENV] = '1' if mclip_var.get() else '0'
+        # SEVENTH_NX_BG_CLEAR and SEVENTH_NX_MOVIE_CLIP are no longer written
+        # here. Both features are retired (FINDINGS-92 §6) and the GUI writing
+        # a variable on every save is precisely how a retired module comes back
+        # from the dead -- FINDINGS-91 §6. build.py refuses both regardless.
         os.environ[build.movie_convert.QUALITY_ENV] = current_movie_quality()
         os.environ[build.movie_convert.FIT_ENV] = current_movie_fit()
         os.environ[build.movie_convert.COLOUR_ENV] = current_movie_colour()
@@ -2905,19 +2889,19 @@ def main():
         if build.ff7nx_marginart.MARGIN_ART_ENV not in os.environ:
             os.environ[build.ff7nx_marginart.MARGIN_ART_ENV] = str(
                 saved.get('__global__', {}).get('margin_art', 0))
-        if build.BG_CLEAR_ENV not in os.environ:
-            os.environ[build.BG_CLEAR_ENV] = str(
-                saved.get('__global__', {}).get('bg_clear', 1))
-        if build.MOVIE_CLIP_ENV not in os.environ:
-            # RETIRED: default 0, not 1. The old default resurrected the
-            # scissor for every user who had never touched the checkbox.
-            os.environ[build.MOVIE_CLIP_ENV] = str(
-                int(bool(saved.get('__global__', {}).get('movie_clip', 0))))
-            _ff = str(int(bool(saved.get('__global__', {})
-                               .get('field_frame', 1))))
-            os.environ.setdefault(build.FIELD_FRAME_ENV, _ff)
-            os.environ.setdefault(build.MOVIE_ALIGN_ENV, _ff)
-            # the cull follows 16:9, not this setting -- left unset
+        # bg_clear / movie_clip: retired, no longer defaulted from settings.
+        #
+        # The field-frame defaults used to be nested INSIDE the movie_clip
+        # branch, so they were only ever applied when SEVENTH_NX_MOVIE_CLIP
+        # happened to be unset. Un-nested here; `setdefault` means an explicit
+        # environment override still wins.
+        _ff = str(int(bool(saved.get('__global__', {})
+                           .get('field_frame', 1))))
+        os.environ.setdefault(build.FIELD_FRAME_ENV, _ff)
+        os.environ.setdefault(build.MOVIE_ALIGN_ENV, _ff)
+        # SEVENTH_NX_MODEL_CULL and SEVENTH_NX_MOVIE_BARS are deliberately left
+        # unset: the cull follows 16:9 rather than this checkbox, and the FMV
+        # margin bars follow MOVIE_ALIGN_ENV, which is set just above.
         if build.field_bg_repack.MAX_TOTAL_PAGES_ENV not in os.environ:
             os.environ[build.field_bg_repack.MAX_TOTAL_PAGES_ENV] = str(
                 saved.get('__global__', {}).get(

@@ -37,6 +37,7 @@ import ff7nx_letterbox
 import ff7nx_modelcull
 import ff7nx_moviealign
 import ff7nx_moviecull
+import ff7nx_moviebars
 import ff7nx_camclamp
 import ff7nx_uncrop
 import ff7nx_marginblack
@@ -5598,6 +5599,21 @@ BG_CLEAR_ENV = 'SEVENTH_NX_BG_CLEAR'
 
 def bg_clear_enabled(env=None):
     """
+    RETIRED. Always False unless SEVENTH_NX_BG_CLEAR=force.
+
+    FINDINGS-92 §6. Measured on hardware twice and it changed nothing, because
+    the flat margin colour is not the clear colour -- `ff7nx_marginart` and
+    `ff7nx_marginpal` fixed that at the source, which is why the margins have
+    been correct since. The GUI checkbox is gone and this pass is no longer
+    called from the pipeline.
+
+    Refused HERE and not by flipping a default, and the word is deliberately
+    'force' rather than '1', because FINDINGS-91 §6 is the whole reason: the
+    settings save path writes every key on every build, so any '1'-shaped
+    default is one stale settings.json away from coming back.
+
+    ---- the original note, kept because the derivation is correct ----
+
     OFF by default, on the module's own instructions.
 
     `ff7nx_bgcolor.py` wrote the decision tree before any of this shipped:
@@ -5616,7 +5632,7 @@ def bg_clear_enabled(env=None):
     """
     raw = (env if env is not None
            else os.environ.get(BG_CLEAR_ENV, '0')).strip().lower()
-    return raw not in ('0', 'off', 'no', 'none', 'false')
+    return raw == 'force'
 
 
 def apply_bg_clear(sdout, dump, log=lambda *_: None, produced=()):
@@ -5739,18 +5755,34 @@ def apply_field_frame(sdout, dump, log=lambda *_: None, produced=()):
         assert at import that every replacement word's immediate is the number
         in the patch's own name, and `--verify` prints it.
 
-    Runs with the other module passes, before `apply_movie_clip`. Both take
-    padding holes, and the allocator re-checks that its holes are still zero
-    IN THE MODULE IT IS HANDED, so whichever runs second sees what the first
-    took. Order between them does not matter; only that they are sequential.
+    THE LAST MODULE PASS, and since FINDINGS-92 the only one that touches
+    exefs/main after ff7nx_ws -- `apply_bg_clear` and `apply_movie_clip` are
+    both retired and neither is called any more. Every cave here takes padding
+    holes, and `ff7nx_cave`'s allocator re-checks that its holes are still zero
+    IN THE MODULE IT IS HANDED, so each pass below sees what the ones before it
+    took. Only the moviebars/moviealign order is load-bearing; see below.
     """
     want_frame = ff7nx_letterbox.enabled()
     want_cull = ff7nx_modelcull.enabled()
     want_movie = ff7nx_moviealign.enabled()
-    want_mcull = want_cull and ff7nx_moviecull.enabled()
+    # RETIRED on a hardware result. `ff7nx_moviecull` was installed, gated
+    # correctly and executing, and models were still drawn in all four
+    # margins during an FMV -- FINDINGS-91 §9. The cull is an early-out on a
+    # model's ORIGIN with ~50 units of slack; it removes whole models and
+    # cannot slice one, so no pair of bounds could ever have done this job.
+    # `ff7nx_moviebars` replaces it.
+    #
+    # Refused HERE rather than by flipping the module's default, because that
+    # is the mistake FINDINGS-91 §6 wrote up: the GUI writes the environment
+    # variable on every save, so a module default is not a gate. The word is
+    # deliberately 'force' and not '1', so no checkbox and no settings.json
+    # can produce it.
+    want_mcull = str(os.environ.get(ff7nx_moviecull.MOVIECULL_ENV,
+                                    '')).strip().lower() == 'force'
+    want_bars = ff7nx_moviebars.enabled()
     want_clamp = ff7nx_camclamp.enabled()
     if not (want_frame or want_cull or want_movie or want_mcull
-            or want_clamp):
+            or want_bars or want_clamp):
         # SAY SO. `ff7nx_ws.apply_module` learned this the expensive way and
         # wrote it down: "Silence here cost a whole build." A pass that is
         # gated OFF and prints nothing is indistinguishable in the log from a
@@ -5766,6 +5798,7 @@ def apply_field_frame(sdout, dump, log=lambda *_: None, produced=()):
         for name, env, want in (
                 ('frame height', FIELD_FRAME_ENV, want_frame),
                 ('movie align', MOVIE_ALIGN_ENV, want_movie),
+                ('movie bars', ff7nx_moviebars.MOVIEBARS_ENV, want_bars),
                 ('model cull', MODEL_CULL_ENV, want_cull)):
             log(f'  {name:14s} {"on" if want else "off"}   '
                 f'({env}={os.environ.get(env, "<unset, follows 16:9>")!r})')
@@ -5814,11 +5847,27 @@ def apply_field_frame(sdout, dump, log=lambda *_: None, produced=()):
         rc |= ff7nx_modelcull.apply(dest, log=log)
     if want_movie:
         rc |= ff7nx_moviealign.apply(dest, log=log)
+    if want_bars:
+        # AFTER ff7nx_moviealign, always. The bars are placed against the
+        # movie quad, and moviealign is what decides whether that quad sits at
+        # game y 0 or y 16. ff7nx_moviebars READS +0x10DE8F0 to find out, so
+        # running it first would place the top and bottom bars 24 px away from
+        # the picture they are supposed to meet.
+        rc |= ff7nx_moviebars.apply(dest, log=log)
+    else:
+        log('  movie margin bars: OFF -- models will draw over the black '
+            'margins during an FMV. '
+            f'({ff7nx_moviebars.MOVIEBARS_ENV}='
+            f'{os.environ.get(ff7nx_moviebars.MOVIEBARS_ENV, "<unset>")!r})')
     if want_mcull:
         # AFTER ff7nx_modelcull, always: the cave's not-playing branch is the
         # displaced word, so running it first would bake 40/400 into both
         # arms. ff7nx_moviecull refuses in that case rather than writing a
         # cave that does nothing, but the ordering is the real guarantee.
+        log('  movie model cull: RETIRED, forced on by '
+            f'{ff7nx_moviecull.MOVIECULL_ENV}=force. It is a proven null '
+            'result -- see FINDINGS-91 §9 -- and it costs 22 words of padding '
+            'for nothing.')
         rc |= ff7nx_moviecull.apply(dest, log=log)
     if want_clamp:
         rc |= ff7nx_camclamp.apply(dest, log=log)
@@ -5883,13 +5932,17 @@ def apply_movie_clip(sdout, dump, log=lambda *_: None, produced=()):
     # `SEVENTH_NX_MOVIE_CLIP=force` still applies it, for an A/B and nothing
     # else. The word is deliberately not '1', so no checkbox can produce it.
     # ------------------------------------------------------------------
+    # No longer called from the pipeline either -- 7th_heaven_nx.py dropped it
+    # with the checkbox. Kept callable only so `=force` can still stage an A/B.
     if os.environ.get(MOVIE_CLIP_ENV, '').strip().lower() != 'force':
         if ff7nx_movieclip.enabled():
             log('movie 4:3 clip: RETIRED, not applied')
-            log('  The scissor clipped the frame CLEAR as well as the models, '
-                'so the margins kept the last field frame drawn before the '
-                'FMV instead of going black. ff7nx_moviecull does the same '
-                'job through the model cull, which cannot reach the clear.')
+            log('  The scissor it narrowed also caught the PRESENTATION BLIT, '
+                'so the back buffer\'s margins were never written and froze '
+                'the last field frame drawn before the FMV. ff7nx_moviebars '
+                'does the job instead, by PAINTING the four margins in the '
+                'flip path -- last, over the finished frame -- so overhang '
+                'goes under the black and no frame state changes.')
             log('  (SEVENTH_NX_MOVIE_CLIP=force overrides this for an A/B.)')
         return []
     log('! movie 4:3 clip: FORCED ON. This is the retired scissor patch and '

@@ -234,8 +234,6 @@
   "movie_30fps": true,
   "analog_360": true,
   "no_autorun": true,
-  "bg_clear": false,
-  "movie_clip": true,
   "field_frame": true,
   "no_cheats": true,
   "limiter_fps": 66,
