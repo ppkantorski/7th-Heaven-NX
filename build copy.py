@@ -26,38 +26,15 @@ import p as pfile
 import tex
 import battle_stage_bg
 import ff7nx_widescreen
-import ff7nx_ws
-import ff7nx_shaders
-import ff7nx_fieldbuf
 import ff7nx_fieldbg
-import ff7nx_movieclip
-import ff7nx_letterbox
-import ff7nx_modelcull
-import ff7nx_moviealign
-import ff7nx_moviecull
-import ff7nx_camclamp
-import ff7nx_uncrop
-import ff7nx_marginblack
-import ff7nx_marginpage
-import ff7nx_marginpal
-import ff7nx_palkey
-import field_bg_dense
-import ff7nx_bgclear
-import ff7nx_bgcolor
-import ff7nx_marginart
 import field_bg_native
 import field_bg_repack
-import field_bg_compact
 
 # Largest DECOMPRESSED field file this build wrote. apply_field_bg
 # needs it: the game decompresses a field into a fixed 2,000,000-byte
 # buffer (see ff7nx_fieldbg section E) and a repacked field overflows
 # it. Set by _build_flevel, read by apply_field_bg.
 FIELD_BG_MAX_RAW = 0
-# The largest a field may decompress to before `ff7nx_fieldbg.field_buffer_bytes`
-# (next power of two at or above 125% of it) doubles the loader's buffer past
-# the proven 2,097,152. MEASURED: exactly one field of 711 crossed it.
-FIELD_BG_RAW_CAP = 2097152 * 4 // 5
 import dds_decode
 from PIL import Image
 
@@ -612,10 +589,6 @@ class Plan:
         self.battle_bg_native_names = set()  # battle.lgp lownames synthesized
                                               # from Avalanche Arisen's DDS
                                               # tiles -- see BATTLE_BG_TEX_CAP
-        self.widescreen = None       # (config.toml, movie_config.toml, mod)
-                                     # -- FFNx's per-field widescreen table,
-                                     # baked into flevel.lgp section 8 by
-                                     # _build_flevel. See ff7nx_ws.py.
 
     def total_portable(self):
         return (sum(len(v) for v in self.archive_files.values())
@@ -673,27 +646,6 @@ def build_plan(mods, settings_by_mod, catalogs, log=lambda *_: None,
             allowed = {f.lower().replace(chr(92), '/').rstrip('/') + '/'
                        for f in folders} or None
             plan.field_dds_sources.append((mod.path, allowed))
-
-    # FFNx's per-field widescreen table. `CONFIG/widescreen/config.toml` is
-    # NOT metadata: it is the half of the feature that decides which fields
-    # can be widened at all, and Cosmos Limit Break's copy takes coverage
-    # from 341 of 711 fields (the gate alone) to 647. It used to be
-    # discarded here as an FFNx-only file. See ff7nx_ws.py.
-    #
-    # Collected in mod order with LATER WINNING, the same rule as every
-    # other asset, and only when 16:9 is actually switched on -- with the
-    # feature off nothing reads it and walking every mod cache for it is
-    # wasted I/O.
-    if ff7nx_ws.wants_bake():
-        cfg, mov, alts, root = ff7nx_ws.find_config(
-            [getattr(m, 'cache', None) for m in mods])
-        if cfg:
-            plan.widescreen = (cfg, mov, os.path.basename(root or ''))
-            log(f'  widescreen config: {os.path.relpath(cfg, root)}'
-                f'   (from {os.path.basename(root or "?")})')
-            for a in alts:
-                log(f'    (also present, not used: '
-                    f'{os.path.relpath(a, root)})')
 
     # FFNx HEXT exe-patch files: mods ship these under a `hext/` folder (or
     # as .hext). They aren't archive data -- they patch the x86 ff7 exe the
@@ -1600,7 +1552,6 @@ def load_catalogs(workingdir, log=lambda *_: None):
 
 TEXCONV_CACHE = os.path.join(HERE, 'cache', '_texconv')
 TEXCAP_CACHE = os.path.join(HERE, 'cache', '_texcap')
-DEBLEED_CACHE = os.path.join(HERE, 'cache', '_debleed')
 
 # Field/world texture dimension cap, in pixels. Off (None) by default --
 # the field/world modules are documented above as fine with full-size
@@ -1612,14 +1563,6 @@ DEBLEED_CACHE = os.path.join(HERE, 'cache', '_debleed')
 # turning it on is a deliberate, visible trade of texture fidelity for
 # headroom. 0 or unset disables it -- exact current behaviour.
 FIELD_TEX_CAP_ENV = 'SEVENTH_NX_FIELD_TEX_CAP'
-
-# Colour-key de-fringing for field/world model textures. ON by default: it is
-# the one texture change in this file that provably cannot alter the image --
-# it rewrites palette entry 0 and nothing else, and every index byte is checked
-# to be identical afterwards. See tex.debleed() for the measurement that
-# motivates it (73% of vanilla char.lgp textures have a filtering boundary
-# against a black transparent entry). Set to 1 to turn it off for A/B.
-NO_DEBLEED_ENV = 'SEVENTH_NX_NO_DEBLEED'
 
 # Battle background texture cap -- same idea as FIELD_TEX_CAP_ENV above, but
 # scoped to ONLY the tiles this tool itself synthesizes from Avalanche
@@ -1662,225 +1605,6 @@ BATTLE_BG_TEX_CAP_ENV = 'SEVENTH_NX_BATTLE_BG_TEX_CAP'
 #
 # Unset/0 disables it, matching FIELD_TEX_CAP_ENV, so a build with nothing
 # set behaves exactly as it did before this existed.
-def _log_page_cost_report(page_cost, px, log, ng_retry=0,
-                          ng_over=None, ng_margin=0):
-    """
-    What every field will ask the driver for at this page size.
-
-    HANDOFF-52 3.4 item 4. The build already parses all 709 sections, so this
-    costs nothing and answers the question the reboot-and-look loop was
-    answering slowly: which fields are the expensive ones, and how close is
-    the worst of them to the ~18 MB where black bars appeared.
-
-    The ceiling is deliberately NOT enforced -- failure was measured
-    non-monotonic in the budget (black at 18 MB, clean at 14), so no number
-    here is a law. It is reported so the page size can be chosen against real
-    fields rather than against the arithmetic in a handoff.
-    """
-    if not page_cost:
-        return
-    MB = 1048576.0
-    page_cost.sort(key=lambda r: -r[2])
-    worst_name, worst_pages, worst_bytes = page_cost[0][:3]
-    total = sum(r[2] for r in page_cost)
-    log('')
-    log(f'  field background cost at {px}x{px} '
-        f'({field_bg_repack._page_bytes(px, 2) / MB:.2f} MB per truecolor '
-        f'page, {field_bg_repack._page_bytes(256, 1) / MB:.2f} MB per '
-        f'vanilla paletted one):')
-    log(f'      heaviest field  {worst_name} -- {worst_pages} page(s), '
-        f'{worst_bytes / MB:.2f} MB')
-    log(f'      mean {total / len(page_cost) / MB:.2f} MB across '
-        f'{len(page_cost)} field(s)')
-
-    # PAGE COUNT, reported because bytes are not what breaks.
-    # field_load_textures makes one texture per present page and abandons the
-    # loop on the first failure, so this line is the one to read.
-    by_pages = sorted(page_cost, key=lambda r: -r[1])
-    # GREW relative to what this field STARTED with, per field. That is the
-    # only comparison that means anything -- a field the mod already ships
-    # with 12 pages has not grown by still having 12.
-    over = [r for r in page_cost if r[3] is not None and r[1] > r[3]]
-    log(f'      pages per field: max {by_pages[0][1]} ({by_pages[0][0]}), '
-        f'mean {sum(r[1] for r in page_cost) / len(page_cost):.1f}')
-    if over:
-        over.sort(key=lambda r: r[3] - r[1])
-        names = ', '.join('%s (%d->%d)' % (n, b, k)
-                          for n, k, _c, b in over[:8])
-        log(f'      {len(over)} field(s) GREW their page count: {names}'
-            + (' ...' if len(over) > 8 else ''))
-        log(f'      Every page is a texture, and field_load_textures '
-            f'(x86 0x640292) abandons the whole loop on the first one it '
-            f'cannot allocate -- every page after it draws nothing, which is '
-            f'what scattered black squares are. Lower '
-            f'{field_bg_repack.MAX_TOTAL_PAGES_ENV} (currently '
-            f'{field_bg_repack.max_total_pages() or "unlimited"}).')
-    # WHAT THE NO-GROWTH LOOP ACTUALLY DID, as a number rather than a promise.
-    # The loop was missing entirely in the build that grew 123 fields while
-    # the SAFETY line below asserted it could not.
-    if ng_retry:
-        log(f'      no-growth: {ng_retry} field(s) had the dense repack '
-            f'RE-RUN at a lower truecolor ceiling because they still held '
-            f'more pages than they started with after compaction. That is '
-            f'the loop working -- it costs colour depth in those fields and '
-            f'buys back the textures the loader has to allocate.')
-    if ng_margin:
-        log(f'      no-growth: {ng_margin} field(s) hold more pages than the '
-            f'MOD ships because ff7nx_marginpage added a palette-pure margin '
-            f'page to them. That page is not optional -- it is what stops the '
-            f'margin being drawn through a foreign colour table -- and it is '
-            f'NOT charged to the repack. MEASURED: charging it cost 285 '
-            f'field(s) their promotion and did not remove the page anyway.')
-    if ng_over:
-        names = ', '.join('%s (%d->%d)' % (n, b, k) for n, b, k in ng_over[:8])
-        log(f'      ! no-growth: {len(ng_over)} field(s) are STILL over their '
-            f'starting page count with the repack fully disabled, so the '
-            f'growth is not this pass\'s -- it is ff7nx_marginpage\'s extra '
-            f'page. {names}' + (' ...' if len(ng_over) > 8 else ''))
-    for label, ceiling in (('over 18 MB (black bars were MEASURED here)', 18.0),
-                           ('over 14 MB (clean on hardware at this size)',
-                            14.0),
-                           ('over 6 MB', 6.0)):
-        over = [r for r in page_cost if r[2] / MB > ceiling]
-        if over:
-            names = ', '.join('%s (%.1f MB)' % (n, b / MB)
-                              for n, _p, b, _bf in over[:8])
-            log(f'      {len(over)} field(s) {label}: {names}'
-                + (' ...' if len(over) > 8 else ''))
-            break
-    else:
-        log(f'      no field exceeds 6 MB -- the whole archive is comfortably '
-            f'inside everything ever measured')
-    log(f'      SAFETY: {field_bg_repack.safety_note()}')
-    _log_render_target_match(px, log)
-    _log_uniformity(px, log)
-
-
-def _log_uniformity(px, log):
-    """
-    Whether this page size can produce a UNIFORM picture at all.
-
-    It usually cannot, and the reason is structural rather than budgetary.
-    A truecolor page has no index channel, so 0x0000 has to mean transparent
-    (x86 0x6470E0) -- which means a cell carrying a COLOUR KEY can never be
-    promoted, and the paletted page holding it stays 256x256 forever. The
-    depth-1 page size is deliberately not patched (the loader's #0x10000 is
-    shared with the depth-1 read count), so it cannot follow.
-
-    MEASURED over all 709 fields of a real flevel:
-
-        281 (40%)  have no fx-page tiles
-         32 ( 5%)  have no colour-key pixels
-         32 ( 5%)  have NEITHER -- the only fields that could ever be
-                   100% truecolor
-
-    So at any page size above 256, 95% of fields are GUARANTEED to mix a
-    px-sized truecolor page with a 256px paletted one, and that mismatch is a
-    resolution difference, which is visible. At exactly 256 the two are the
-    same size and differ only in colour depth, which is not.
-
-    No budget, ceiling or promotion mode changes this. It is the reason a
-    bigger page size trades uniformity for sharpness rather than simply
-    buying quality.
-    """
-    if px <= field_bg_native.VANILLA_PX:
-        log('      uniform: promoted and unpromoted pages are both '
-            f'{px}x{px} here, so they differ only in COLOUR DEPTH, not '
-            'resolution. This is the only page size that can look uniform '
-            '-- see the note below.')
-        return
-    if field_bg_repack.replace_only():
-        log(f'      WORST-LOOKING COMBINATION: replace-only qualifies only '
-            f'13% of pages (437 of 3,315, measured), so this build puts '
-            f'{px}px pages beside 256px ones at a ratio of about 1 to 7. '
-            f'Replace-only is the safest setting for MEMORY and the worst '
-            f'for APPEARANCE at any size above 256 -- the two goals point in '
-            f'opposite directions here.')
-    log(f'      NOT UNIFORM: 95% of fields (677 of 709, measured) carry '
-        f'colour-key pixels, and a truecolor page cannot hold a colour key '
-        f'-- 0x0000 has to mean transparent. Those pages stay 256x256 '
-        f'PALETTED forever, so at {px}px they sit next to {px // 256}x '
-        f'sharper neighbours in the same picture.')
-    log(f'      Only 32 of 709 fields could ever be 100% truecolor. If a '
-        f'uniform look matters more than sharpness, 256px is the only size '
-        f'that delivers it; no budget or ceiling changes this.')
-
-
-def _log_render_target_match(px, log):
-    """
-    Does the field RENDER TARGET match the page size?
-
-    These are two independent settings that come out of ONE pool, and getting
-    them out of step is expensive in exactly the way that produces black
-    squares. A background tile is 16 texels covering 32 game units, so a page
-    of `px` gives cells of `px/16` texels and needs a target of
-    `px/16 / 32 * 853` pixels across before any of that detail can appear:
-
-        128px pages -> 1x (428x240)      3.13 MB
-        256px pages -> 1x (428x240)      3.13 MB
-        512px pages -> 2x (854x480)     12.51 MB
-        768px pages -> 3x (1280x720)    28.12 MB
-        1024px pages -> would need 4x, which does not exist
-
-    THIS IS A QUALITY REPORT, NOT A MEMORY ONE. Do not read a mismatch here
-    as a cause of dropped textures.
-
-    RENDER-TARGET MEMORY IS A DEAD THEORY, KILLED TWICE ON HARDWARE:
-    HANDOFF-52 1.2 predicted that dropping 3x -> 1x would fix the bands and
-    it did not, and it was re-tested for the black squares with the same
-    result -- the squares do not care what the field render resolution is.
-    HANDOFF-52 6 lists "the bands are the render-target memory" as a
-    correction to an earlier wrong claim, and it was then re-derived a second
-    time from a pool argument, which is why this warning is written here in
-    the code rather than left in a document.
-
-    So the only advice this function gives is to RAISE THE PAGE SIZE to match
-    the target already chosen. It never suggests lowering the render
-    resolution -- that is not a solution, it is a regression, and it does not
-    address the symptom anyway.
-    """
-    MB = 1048576.0
-    targets = {1: (428, 240), 2: (854, 480), 3: (1280, 720)}
-    try:
-        import ff7nx_fieldbuf
-        have = ff7nx_fieldbuf.env_scale()
-    except Exception:                                          # noqa: BLE001
-        return
-    if have not in targets:
-        return
-    need_w = (px / 16.0) / 32.0 * 853.333
-    want = next((k for k in sorted(targets)
-                 if targets[k][0] >= need_w - 1), None)
-    hw, hh = targets[have]
-    log(f'      render target {have}x ({hw}x{hh}, '
-        f'{hw * hh * 4 * 8 / MB:.2f} MB for 8 buffers)')
-    if want is None:
-        log(f'      {px}px pages would need a target wider than 3x to be '
-            f'resolved at all; some of that detail can never appear.')
-    elif have > want:
-        bigger = [k for k in sorted(targets) if k == have]
-        # what page size would this target actually resolve?
-        matched_px = None
-        for cand in (1024, 768, 512, 256, 128):
-            if (cand / 16.0) / 32.0 * 853.333 <= targets[have][0] + 1:
-                matched_px = cand
-                break
-        log(f'      the {have}x target can resolve pages up to '
-            f'{matched_px}px; at {px}px it is upscaling {px}px of detail to '
-            f'fill it. RAISING the page size is what uses the target you '
-            f'already have -- lowering the render resolution is not '
-            f'suggested and does not affect dropped textures (hardware, '
-            f'twice).')
-        del bigger
-    elif have < want:
-        ww, wh = targets[want]
-        log(f'      the target is smaller than {px}px pages can fill; {want}x '
-            f'({ww}x{wh}) is what resolves them fully. Some of that detail '
-            f'cannot reach the screen.')
-    else:
-        log(f'      matched: {px}px pages are exactly resolved at {have}x')
-
-
 FIELD_BG_CAP_ENV = 'SEVENTH_NX_FIELD_BG_CAP'
 
 # SUPERSEDED, 2026-08-01. The paragraph above is still an accurate
@@ -2170,26 +1894,11 @@ def _convert_battle_textures(name, mod_files, van, log, folder_of=None,
         if is_battle_bg and bg_cap is None:
             bg_cap = _battle_bg_tex_cap()
         cap = bg_cap if is_battle_bg else 256
-        # Version tag invalidates caches from older converter POLICIES.
-        # The cap is in the key too, but the cap alone is not enough and that
-        # cost a whole build: someone selected 768, the doubling bug produced
-        # 512, and the result was cached under `-cap768`. Fixing the bug did
-        # not change the key, so the next build reused the wrong-sized
-        # conversion and battle.lgp came out byte-identical -- the setting
-        # looked broken twice for two completely different reasons.
-        #
-        # BUMP THIS whenever the pixels convert_for_battle() produces change
-        # for an input it has already seen. Changing the cap is a different
-        # question from changing what a cap MEANS.
-        #   v3  black 16-color headers
-        #   v4  16-color quantization mud
-        #   v5  1x256 paletted for everything
-        #   v6  upscale by a whole factor, not by doubling, so a cap that is
-        #       not a power of two is actually reachable
-        #   v7  the reserved transparent entry carries the boundary colour
-        #       instead of black, so filtering stops drawing a dark line
-        #       along every atlas seam
-        cache_key = ('TEXCONV-V7-' + _sig(src) + f'-cap{cap}'
+        # Version tag invalidates caches from older converter policies
+        # (v3: black 16-color headers; v4: 16-color quantization mud).
+        # Cap is part of the key so switching the battle background cap
+        # setting doesn't reuse a stale conversion at the old size.
+        cache_key = ('TEXCONV-V5-' + _sig(src) + f'-cap{cap}'
                      + ('-' + _sig(van_path) if van_path else ''))
         cached = os.path.join(TEXCONV_CACHE,
                               f'{name}.{low}.{hashlib.sha1(cache_key.encode()).hexdigest()[:16]}')
@@ -2259,82 +1968,6 @@ def _field_bg_cap():
     except ValueError:
         return None
     return val if 0 < val < BG_MAX_PAGES else None
-
-
-def _bg_compact_only(archive, payloads, log):
-    """
-    Fit the archive to the console without touching how it looks.
-
-    No promotion, no colour change, no resolution change, no palette
-    decision -- cells are relocated between pages of the same depth, size and
-    blend group with their bytes copied verbatim, and pages nothing points at
-    any more stop being textures. Every field checks its own output and is
-    handed back untouched if anything is off (field_bg_compact.self_check).
-
-    This is what "Field background page size: Off" now does, because Off used
-    to mean "leave the mod's page counts exactly as they are" and the mod's
-    page counts are the problem. See the note at the head of
-    _bg_field_backgrounds.
-    """
-    global FIELD_BG_MAX_RAW
-    n_fields = n_saved = n_moved = n_merged = 0
-    rejected = []
-    over = []
-    for name in sorted(archive.index):
-        entry = archive.index[name]
-        if not archive.is_field(entry):
-            continue
-        blob = payloads.get(name)
-        if blob is not None:
-            if not _is_lzs_wrapped(blob):
-                continue
-            raw = lgp.lzs_decompress(blob[4:])
-        else:
-            raw = archive.decompressed(entry)
-        try:
-            parts = lgp.split_sections(raw)
-        except Exception:                                      # noqa: BLE001
-            continue
-        try:
-            new9, cst = field_bg_compact.compact_section9(parts[8])
-        except Exception as exc:                                # noqa: BLE001
-            log(f'  ! field background: {name} not compacted -- {exc}')
-            continue
-        if cst.rejected:
-            rejected.append((name, cst.rejected))
-        if cst.pages_after and cst.pages_after > 12:
-            over.append((name, cst.pages_after))
-        if not cst.saved:
-            continue
-        n_fields += 1
-        n_saved += cst.saved
-        n_moved += cst.cells_moved
-        n_merged += cst.cells_merged
-        parts[8] = new9
-        new_raw = lgp.join_sections(parts)
-        if len(new_raw) > FIELD_BG_MAX_RAW:
-            FIELD_BG_MAX_RAW = len(new_raw)
-        payloads[name] = _encode_field_cached(archive, new_raw)
-    log(f'  field background: NOT promoted (page size Off) -- colours, '
-        f'resolution and palettes are exactly as the mods left them.')
-    log(f'      FITTED: {n_saved} texture(s) freed across {n_fields} field(s)'
-        f' -- {n_moved:,} cell(s) relocated, {n_merged:,} merged as '
-        f'byte-identical.')
-    log(f'      Every present page is one texture and field_load_textures '
-        f'(x86 0x640292) abandons the loop on the first it cannot serve. '
-        f'MEASURED on this mod: 169 field(s) arrive holding MORE pages than '
-        f'vanilla (worst 15 against 12) before anything here runs, which is '
-        f'what the black squares are.')
-    if over:
-        log(f'      {len(over)} field(s) STILL above 12 pages after fitting:')
-        for nm, k in sorted(over, key=lambda r: -r[1])[:10]:
-            log(f'          {nm:<12} {k} page(s)')
-    if rejected:
-        log(f'      ! {len(rejected)} field(s) failed the self-check and were '
-            f'left exactly as they came in:')
-        for nm, why in rejected[:8]:
-            log(f'          {nm:<12} {why}')
-    return n_fields, 0, 0
 
 
 def _bg_texture_pages(sec9):
@@ -2429,53 +2062,6 @@ def _cap_field_backgrounds(chunks, log, max_pages):
     return kept
 
 
-# PAGE COUNT PER FIELD AS THE MOD SHIPS IT -- the only correct no-growth
-# baseline, and neither of the two obvious candidates is it.
-#
-#   vanilla flevel          WRONG, too strict. Cosmos ships its own section 9
-#                           for 683 fields and its page counts are ITS OWN:
-#                           MEASURED off the mod's chunk.9 -- fship_2 15 pages
-#                           against vanilla's 12, church 4 against 3, chrin_3b
-#                           5 against 4. Those pages are not ours to remove and
-#                           chasing them strips truecolor for nothing.
-#   `parts[8]` in the loop  WRONG, too lax. `ff7nx_marginart` and
-#                           `ff7nx_marginpage` have already run by then, and
-#                           marginpage adds ~1 page per field -- so the loop
-#                           compares 8 against 8 and marginpage's page is free
-#                           by definition. MEASURED: this is why the first
-#                           restored loop logged `266 field(s) RE-RUN` and 0
-#                           GREW while mds5_1 stayed at 8 against the mod's 7,
-#                           byte-identical to the build before it.
-#
-# So snapshot it in `_build_flevel`, after the mod's chunks are in and before
-# our own passes touch anything.
-_PAGES_BEFORE_MARGIN = {}
-
-
-def _snapshot_page_counts(archive, payloads):
-    """{field: live page count} as the archive stands right now."""
-    out = {}
-    for name in archive.index:
-        entry = archive.index[name]
-        if not archive.is_field(entry):
-            continue
-        blob = payloads.get(name)
-        try:
-            if blob is not None:
-                if not _is_lzs_wrapped(blob):
-                    continue
-                raw = lgp.lzs_decompress(blob[4:])
-            else:
-                raw = archive.decompressed(entry)
-            sec9 = lgp.split_sections(raw)[8]
-            pages, _s, _e = field_bg_native.parse_texture_block(
-                sec9, field_bg_native.VANILLA_PX)
-        except Exception:                                      # noqa: BLE001
-            continue
-        out[name] = sum(1 for p in pages if p is not None)
-    return out
-
-
 def _convert_field_backgrounds(archive, payloads, log, dds_sources=()):
     """
     Rewrite section 9 of EVERY field so the file agrees with a module patched
@@ -2496,103 +2082,16 @@ def _convert_field_backgrounds(archive, payloads, log, dds_sources=()):
     Returns (n_fields, n_pages, bytes_added).
     """
     px = ff7nx_fieldbg.page_px()
-    # PAGE SIZE "OFF" MEANS DO NOT PROMOTE. IT DOES NOT MEAN DO NOTHING.
-    #
-    # MEASURED against Cosmos Limit Break's own `chunk.9` sections -- the ones
-    # this build splices in and the console actually loads -- compared with
-    # the stock archive:
-    #
-    #     the mod as shipped        169 field(s) hold MORE pages than vanilla
-    #                               does, worst fship_2 at 15 against 12
-    #     after compaction alone     41 field(s), worst 13
-    #                               224 textures freed, nothing promoted
-    #
-    # Every ceiling in this tree was calibrated against VANILLA flevel.lgp
-    # while the console loads the MOD's. `field_load_textures` (x86 0x640292)
-    # abandons the loop on the first texture it cannot serve, so a field that
-    # arrives asking for 15 when the port was provisioned for 12 drops the
-    # rest of its picture -- with promotion switched off, at page size Off,
-    # before any of this code has had an opinion. That is what the black
-    # squares were, and it is why removing the memory cap made things worse:
-    # the cap had been accidentally holding down a page count the INPUT data
-    # was inflating.
-    #
-    # So Off still compacts. It changes no colour, no resolution and no
-    # palette -- it only stops asking the console for textures it was never
-    # built to serve.
-    if px == ff7nx_fieldbg.OFF_PAGE_PX:
-        if not field_bg_compact.enabled():
-            return 0, 0, 0
-        return _bg_compact_only(archive, payloads, log)
-    # NOT `px == VANILLA_PX` any more. 256 used to mean "off" and returned
-    # here, which is why "256px truecolor" -- the cheapest promotion there is,
-    # 0.38 MB a page against vanilla paletted's 0.31 -- had never been tried:
-    # the setting existed but this line threw it away. Off is its own value
-    # now (see ff7nx_fieldbg.OFF_PAGE_PX) and 256 falls through to the repack.
+    if px == field_bg_native.VANILLA_PX:
+        return 0, 0, 0
 
-    # ------------------------------------------------------------------
-    # SAY THE GROWTH MODE OUT LOUD, FIRST, BEFORE ANY OTHER NUMBER.
-    #
-    # It was printed only as a SAFETY footnote 40 lines below a wall of
-    # per-page statistics, and two consecutive hardware builds were run
-    # believing it had been changed when it had not. The mode is the single
-    # setting that decides whether the loader is asked for more textures
-    # than the stock game asks for, so it goes at the top where a glance at
-    # the log answers "did my change take effect".
-    # ------------------------------------------------------------------
-    _mode = ('NO GROWTH' if field_bg_repack.no_growth()
-             else 'REPLACE ONLY' if field_bg_repack.replace_only() else 'OFF')
-    log('  field background: PAGE GROWTH = %s' % _mode)
-    if _mode == 'OFF':
-        log('      ! OFF means every page the mod covers is promoted and the '
-            'page count GROWS. field_load_textures (x86 0x640292) abandons '
-            'the whole loop on the first page it cannot allocate and every')
-        log('        page after it draws nothing -- that is what the '
-            'scattered black squares are. If you are chasing black squares, '
-            'this is the setting: Field background -> Page growth -> '
-            '"No growth".')
-    # THE BUDGET IS CALIBRATED FOR 512px PAGES AND NOTHING ELSE.
-    #
-    # budget_bytes()'s own evidence -- "fields with 1 truecolor page were
-    # clean, fields with 3-4 were black", "a 512px truecolor page costs
-    # 1.5 MB" -- was all taken at 512px. At 256px a truecolor page is
-    # 0.38 MB, four times cheaper, so a 4 MB cap that admitted ~2 pages at
-    # 512 is being applied to pages that cost a quarter as much. It excludes
-    # art for a reason that does not hold at this page size.
-    #
-    # budget_bytes() also records that the failure is NOT MONOTONIC in the
-    # budget (18 MB black, 14 MB clean; lowering to 4.0 made margins worse),
-    # which means no value of it can be argued to be safe. It is a guess
-    # wearing a number.
-    # `budget_bytes()` returns UNLIMITED == 1<<60 for "no budget", not 0, so
-    # a truthiness test fires on Unlimited and prints 1099511627776.0 MB.
-    # Compare against the sentinel.
-    _bud = field_bg_repack.budget_bytes()
-    if _bud >= field_bg_repack.UNLIMITED:
-        _bud = 0
-    if _bud and px != 512:
-        log('      ! the %.1f MB per-field budget was MEASURED at 512px '
-            'pages, where a truecolor page costs 1.50 MB. These are %dpx '
-            'pages at %.2f MB.' % (_bud / 1048576.0, px,
-                                   (px * px * 2 + px * px * 4) / 1048576.0))
-        log('        The calibration does not transfer, and it is excluding '
-            'art to respect a ceiling measured somewhere else. Set the field '
-            'background memory budget to Unlimited unless you are '
-            'deliberately reproducing a 512px result.')
-
-    dense = {'fields': 0, 'cells': 0, 'pages': 0, 'pages_before': 0,
-             'from_art': 0, 'from_art_borrow': 0, 'from_vanilla': 0,
-             'refused': [], 'toobig': []}
     art = None
     if dds_sources:
         art = field_bg_repack.ArtProvider(dds_sources, px, log)
         if art:
             log(f'  field background: {len(art.slots):,} upscaled page image(s)'
                 f' across {len(art.fields()):,} field(s) available'
-                + (f'; {art.ambiguous} slot(s) had SEVERAL dumps of the '
-                   f'same page ({art.ambiguous_base} took the base state, '
-                   f'{art.ambiguous_arbitrary} had no base dump and took '
-                   f'the first by name)'
+                + (f'; {art.ambiguous} slot(s) ambiguous and skipped'
                    if art.ambiguous else ''))
         else:
             log('  field background: no upscaled art found in the enabled '
@@ -2604,36 +2103,13 @@ def _convert_field_backgrounds(archive, payloads, log, dds_sources=()):
             'conversion runs in pure Python and this will take a very long '
             'time. `pip3 install numpy` and rebuild.')
 
-    # THE MARGIN PAGE SPLIT, as a hook the repack calls between promotion and
-    # compaction. It used to be its own pass ahead of this whole function; it
-    # renamed pages before promotion could look the mod's art up by page name,
-    # which left 78% of margin tiles 8-bit against 43% of interior ones.
-
-
     nf = npg = grew = 0
     up_fields = up_pages = up_cells = up_new = 0
     up_exact = up_borrowed = up_single = up_transparent = 0
     up_fx = up_art = 0
-    up_capped = up_dropped = up_wrongpal = 0
-    cmp_fields = cmp_saved = cmp_merged = cmp_moved = 0
-    cmp_rejected = []
-    # NO-GROWTH, ENFORCED RATHER THAN ASSERTED.
-    #
-    # `field_bg_repack` is no longer called, and the ceiling loop that made
-    # "no growth" true lived inside it. Its DESCRIPTION STRING
-    # (field_bg_repack.py:867) was still being printed, so the log claimed
-    # "the loader is never asked for more textures than this archive already
-    # asked for" four lines under "123 field(s) GREW their page count". Both
-    # cannot be true. These count what the restored loop actually does.
-    ng_retry = 0                      # dense repacks re-run at a lower ceiling
-    ng_over = []                      # (field, before, after) still over at 0
-    ng_margin = 0                     # fields the MARGIN passes grew, reported
-                                      # but not charged to the repack
+    up_capped = up_dropped = 0
     no_cover = no_fit = 0
     skipped = []
-    skipped_all_or_nothing = []       # (field, pages it would have promoted)
-    page_cost = []                    # (field, live pages, bytes) for the
-                                      # per-field ceiling report below
     for name in sorted(archive.index):
         entry = archive.index[name]
         if not archive.is_field(entry):
@@ -2659,180 +2135,20 @@ def _convert_field_backgrounds(archive, payloads, log, dds_sources=()):
             continue
         # Repack AFTER the rescale, so the pre-existing truecolor pages are
         # already at `px` and parse_texture_block agrees with itself.
-        # ---- PROMOTE, THEN PAY FOR IT
-        #
-        # The promotion ADDS a page rather than replacing one, because the
-        # original paletted page has to stay alive for every tile that could
-        # not move (colour-key cells, fx-page tiles). What it leaves behind is
-        # a set of pages that are mostly EMPTY -- and every present page is a
-        # texture whether it holds 256 cells or 6.
-        #
-        # So the leftovers get packed back down. Cells are relocated by the
-        # same two u32s the promotion already rewrites, between pages of the
-        # same depth, size and blend group, with the bytes copied verbatim.
-        # NOTE: the promote-then-compact pass this paragraph described is
-        # gone. The dense repack below replaces every original page, so there
-        # are no leftovers to pack down and no ceiling to walk.
-        # ---- DENSE REPACK, CAPPED AT THE DENSITY HARDWARE SURVIVES
-        #
-        # MEASURED with the real .iro over 110 fields: the promotion that runs
-        # on this console never puts more than THREE truecolor pages in one
-        # field (mean 1.41). Both frozen builds averaged 4.7 with every page
-        # truecolor -- at a LOWER total page count -- so the truecolor count is
-        # the one quantity that separates them. Vanilla ships 26 truecolor
-        # pages across 400 fields; this path is a rarity in the stock game.
-        #
-        # So: pack the most-drawn cells densely into at most three truecolor
-        # pages and leave the rest where they are. The pages left behind
-        # already carry Cosmos art -- `ff7nx_marginart` writes 335,457 cells of
-        # it into them -- so nothing reverts to vanilla pixels and the
-        # widescreen alignment holds. The difference is colour depth, not art.
-        st = cst = None
-        _pre9 = new9
-
-        # WHAT THIS FIELD ASKED FOR BEFORE THIS BUILD TOUCHED IT.
-        #
-        # THE BASELINE HAS TO COME FROM THE ARCHIVE, NOT FROM `parts`.
-        #
-        # `parts` is the section as the EARLIER passes left it, and
-        # `ff7nx_marginpage` has already added ~1 page per field by the time
-        # we get here. Measuring no-growth against that makes marginpage's
-        # page free by definition: the loop compares 8 against 8, stops, and
-        # the field still asks the loader for one more texture than the mod
-        # shipped.
-        #
-        # MEASURED, and this is why the first restored loop changed nothing
-        # where it mattered: with `parts[8]` as the baseline the log printed
-        # `no-growth: 266 field(s) RE-RUN` and zero GREW, while mds5_1 stayed
-        # at 8 pages against the mod's 7 and mds5_3 at 8 against 6 -- byte
-        # for byte the same as the build before it, in exactly the fields
-        # that were crashing.
-        #
-        # `archive` still holds the mod's own field; `payloads` holds ours.
-        # So decode the archive entry when we have replaced it.
-        # THE BASELINE IS THE SECTION AS THE MARGIN PASSES LEFT IT, and that
-        # is a deliberate retreat from enforcing the mod's own count.
-        #
-        # MEASURED, both ways, on hardware:
-        #
-        #   baseline = parts[8]   (post-marginpage)
-        #       266 field(s) re-run, 637 field(s) promoted, 325,512 cells,
-        #       mds5_1 at 8 pages against the mod's 7.   NO CRASH.
-        #   baseline = the mod's own count
-        #       1,196 field(s) re-run, 352 field(s) promoted, 163,980 cells,
-        #       and 197 field(s) STILL over anyway because marginpage's page
-        #       is not this pass's to give back.
-        #
-        # The strict baseline cost 285 fields their promotion -- almost half
-        # the archive dropped to 8-bit -- to chase a page the loop cannot
-        # reach. And the thing it was meant to prevent turned out not to be
-        # the problem: the build that crashed and the build that did not had
-        # IDENTICAL page counts in the fields that crashed, so page count is
-        # not the mechanism.
-        #
-        # `ff7nx_marginpage`'s extra page is not optional -- it is what stops
-        # the margin being drawn through a foreign colour table -- and the mod
-        # itself ships fields at up to 15 pages that the console runs. So the
-        # rule this pass is held to is the honest one: DO NOT GROW WHAT THE
-        # MARGIN PASSES HANDED YOU. The mod-relative number is still
-        # snapshotted and still reported, it is just no longer enforced.
-        try:
-            _b, _bs, _be = field_bg_native.parse_texture_block(
-                parts[8], field_bg_native.VANILLA_PX)
-            before = sum(1 for p in _b if p is not None)
-        except Exception:                                      # noqa: BLE001
-            before = None
-        before_mod = _PAGES_BEFORE_MARGIN.get(name)
-
-        # ---- DENSE REPACK + COMPACT, UNDER A REAL NO-GROWTH CEILING
-        #
-        # The repack is ADDITIVE: the originals stay for every cell that did
-        # not promote, and `ff7nx_marginpage` has already added ~1 page per
-        # field upstream. Compaction pays some of that back but not all of it,
-        # and the build that crashed grew 123 fields while the log asserted it
-        # could not -- mds5_1 7->8, mds5_3 6->8, church 3->5, the whole Sector
-        # 5 corridor.
-        #
-        # So: measure after compaction and, if the field still holds more
-        # pages than it started with, re-run the repack at a lower truecolor
-        # ceiling until it does not. Down to zero, which is the paletted
-        # section plus compaction -- still Cosmos art, because `marginart`
-        # wrote 335,457 cells of it into the paletted pages.
-        #
-        # HANDOFF-78 2.9: the LAST no-growth retry loop walked coverage from
-        # 71% to 12% because the margin page split ran INSIDE it and its pages
-        # counted on every pass. This loop re-runs ONE pass, always from the
-        # same `_pre9`, so nothing accumulates across iterations.
-        _af = _pf = None
+        st = None
         if art is not None and name.lower() in art.fields():
-            _af, _pf = art.open(name), art.palettes
-        _try9, dst, cst, _dense_ok = _pre9, None, None, False
-        try:
-            for _tc in range(field_bg_dense.MAX_TRUECOLOR_PAGES, -1, -1):
-                try:
-                    _try9, dst = field_bg_dense.dense_repack(
-                        parts[3], _pre9, name, _af, _pf, px, max_tc=_tc)
-                except Exception as exc:                       # noqa: BLE001
-                    log(f'  ! field background: {name} not repacked -- {exc}')
-                    _try9, dst = _pre9, None
-                _dense_ok = (dst is not None and not dst.refused
-                             and dst.cells > 0)
-                if _dense_ok and (len(raw) - len(parts[8]) + len(_try9)
-                                  > FIELD_BG_RAW_CAP):
-                    # One field over 1,677,721 bytes re-patches the loader's
-                    # decompression buffer from the proven 2,097,152 to an
-                    # untested 4,194,304 for the WHOLE GAME. Not worth one
-                    # field.
-                    _try9, _dense_ok = _pre9, False
-                cst = None
-                if field_bg_compact.enabled():
-                    try:
-                        _try9, cst = field_bg_compact.compact_section9(
-                            _try9, src_px=px)
-                    except Exception as exc:                   # noqa: BLE001
-                        log(f'  ! field background: {name} not compacted '
-                            f'-- {exc}')
-                        cst = None
-                if before is None or not field_bg_repack.no_growth():
-                    break
-                try:
-                    _lp, _lx, _ly = field_bg_native.parse_texture_block(
-                        _try9, px)
-                    _live = sum(1 for p in _lp if p is not None)
-                except Exception:                              # noqa: BLE001
-                    break
-                if _live <= before:
-                    break
-                if _tc == 0:
-                    # Nothing left to give: the growth is not this pass's.
-                    # Name it rather than assert it did not happen.
-                    ng_over.append((name, before, _live))
-                    break
-                ng_retry += 1
-        finally:
-            if _af is not None:
+            try:
+                new9, st = field_bg_repack.repack_section9(
+                    new9, name, art.open(name), px, src_px=px,
+                    pals_for=art.palettes)
+            except Exception as exc:                           # noqa: BLE001
+                log(f'  ! field background: {name} not repacked -- {exc}')
+                st = None
+            finally:
                 art.close()
-        new9 = _try9
-        if _dense_ok:
-            dense['fields'] += 1
-            dense['cells'] += dst.cells
-            dense['pages'] += dst.pages
-            dense['pages_before'] += dst.pages_before
-            dense['from_art'] += dst.from_art
-            dense['from_art_borrow'] += dst.from_art_borrow
-            dense['from_vanilla'] += dst.from_vanilla
-        if cst is not None and getattr(cst, 'rejected', None):
-            cmp_rejected.append((name, cst.rejected))
-        if cst is not None and cst.saved:
-            cmp_fields += 1
-            cmp_saved += cst.saved
-            cmp_merged += cst.cells_merged
-            cmp_moved += cst.cells_moved
         if st is not None:
             no_cover += st.pages_uncovered
             no_fit += st.pages_nofit
-            if st.pages_allornothing:
-                skipped_all_or_nothing.append((name, st.pages_allornothing))
             if st:
                 up_fields += 1
                 up_pages += st.pages_upgraded
@@ -2845,35 +2161,8 @@ def _convert_field_backgrounds(archive, payloads, log, dds_sources=()):
                 up_art += st.cells_art_transparent
                 up_new += st.new_pages
                 up_capped += st.pages_capped
-                up_wrongpal += getattr(st, 'cells_wrong_palette', 0)
                 up_dropped += st.pages_dropped
-        # What this field will actually ask the driver for, computed from the
-        # section as it now stands. Cheap -- the block is already parsed and
-        # in cache -- and it turns "reboot and look for black squares" into a
-        # build-log line.
-        try:
-            _pages, _s, _e = field_bg_native.parse_texture_block(new9, px)
-            live = [p for p in _pages if p is not None]
-            # BEFORE: the MOD's own page count, computed above from the
-            # archive entry rather than from `parts` -- see the comment at
-            # the top of this loop. Recomputing it here from `parts[8]` was
-            # what made the GREW list disagree with reality: it counted
-            # marginpage's page as part of the baseline.
-            page_cost.append((
-                name, len(live),
-                sum(field_bg_repack._page_bytes(
-                    field_bg_native.VANILLA_PX if p.depth == 1 else px,
-                    p.depth) for p in live),
-                before))
-        except Exception:                                      # noqa: BLE001
-            pass
-        # `_dense_ok` HAS TO BE IN THIS TEST. The old promotion reported
-        # through `st`/`cst`; with those gone the guard skipped every field
-        # and wrote no payload at all -- the repack ran, logged 709 fields,
-        # and none of it reached the archive.
-        if before_mod is not None and before is not None and before > before_mod:
-            ng_margin += 1
-        if not k and not st and not (cst and cst.saved) and not _dense_ok:
+        if not k and not st:
             continue
         parts[8] = new9
         new_raw = lgp.join_sections(parts)
@@ -2883,44 +2172,10 @@ def _convert_field_backgrounds(archive, payloads, log, dds_sources=()):
         nf += 1
         npg += k
         grew += len(new9) - len(parts[8]) + (len(new_raw) - len(raw))
-    if dense['fields']:
-        log('  field background DENSE REPACK (capped at %d truecolor page(s) '
-            'per field, the density measured on hardware): %s cell(s) packed '
-            'onto %d page(s) across %d field(s) -- %.2f pages per field '
-            'against %.2f before. %s exact from the mod, %s borrowed, %s from '
-            'the paletted page. Everything not promoted keeps the Cosmos art '
-            'the margin pass already wrote into it.'
-            % (field_bg_dense.MAX_TRUECOLOR_PAGES, f"{dense['cells']:,}",
-               dense['pages'], dense['fields'],
-               dense['pages'] / max(dense['fields'], 1),
-               dense['pages_before'] / max(dense['fields'], 1),
-               f"{dense['from_art']:,}", f"{dense['from_art_borrow']:,}",
-               f"{dense['from_vanilla']:,}"))
     if up_fields:
         log(f'  field background: UPSCALED {up_pages} page(s) in {up_fields} '
             f'field(s) -> {up_new} truecolor page(s), {up_cells:,} cell(s) '
             f'at {px}x{px}')
-        # COVERAGE, STATED AS A FRACTION.
-        #
-        # "184 pages in 113 fields" reads like a result. Against the 692
-        # fields the mod actually ships art for it is 16%, and the other 84%
-        # of the game draws vanilla pages -- which on a console looks like
-        # the mod is not installed. That went unnoticed for a whole build
-        # because the two numbers were never printed next to each other.
-        _avail = len(art.fields()) if art else 0
-        if _avail:
-            _pct = 100.0 * up_fields / _avail
-            log(f'      COVERAGE: {up_fields} of {_avail} field(s) the mod '
-                f'ships art for got any of it ({_pct:.0f}%)')
-            if _pct < 60.0:
-                log('      ! most of the game is still drawing VANILLA pages. '
-                    'If the centre of the screen looks unmodded while the '
-                    '16:9 side regions look upscaled, this line is why --')
-                log('        Settings -> Field background: choose the '
-                    '"Uniform - 256px" preset (page growth "No growth"). '
-                    'Replace-only promotes only pages where EVERY tile can '
-                    'move, which the mod\'s added wide pages always satisfy '
-                    'and vanilla centre pages almost never do.')
         log(f'      {up_single} page(s) the mod dumped as a single image -- '
             'the engine only ever makes one texture for those, so every tile '
             'on them is exact')
@@ -2936,59 +2191,10 @@ def _convert_field_backgrounds(archive, payloads, log, dds_sources=()):
             f'{up_borrowed:,} of {up_cells:,} cell(s) '
             f'({100.0 * up_borrowed / max(up_cells, 1):.1f}%) took a '
             'neighbouring palette')
-        if up_wrongpal:
-            log(f'      {up_wrongpal:,} cell(s) kept their paletted page -- '
-                f'the mod ships no image for their OWN palette, and at slot '
-                f'0x0F and up the engine makes one texture per palette, so '
-                f'borrowing a neighbour\'s would draw them in the wrong '
-                f'COLOURS. They still draw, in their own colours, at the '
-                f'same size -- they just do not get the colour-depth '
-                f'upgrade. MEASURED before this rule: 20.9% of promoted '
-                f'cells were the wrong colour, which is what "upscaled and '
-                f'stock textures side by side" actually was. Set '
-                f'{field_bg_repack.BORROW_ENV}=nearest for the old '
-                f'behaviour.')
-    if cmp_fields:
-        log(f'      COMPACTED: {cmp_saved} page(s) freed across {cmp_fields} '
-            f'field(s) by packing the leftovers back down -- {cmp_moved:,} '
-            f'cell(s) relocated, {cmp_merged:,} merged as byte-identical. '
-            f'Every present page is a texture whether it holds 256 cells or '
-            f'6, and after promotion the originals are mostly empty. The '
-            f'cells move by the same two u32s the promotion rewrites, '
-            f'between pages of the same depth, size and blend group, bytes '
-            f'copied verbatim -- so this frees textures without changing a '
-            f'pixel. Verify with verify_compact.py; turn it off with '
-            f'{field_bg_compact.COMPACT_ENV}=0.')
-    if cmp_rejected:
-        log(f'      ! {len(cmp_rejected)} field(s) FAILED the compaction '
-            f'self-check and were left exactly as they came in. This is a '
-            f'bug in field_bg_compact, not a setting -- please report it '
-            f'with this list:')
-        for nm, why in cmp_rejected[:12]:
-            log(f'          {nm:<12} {why}')
-        if len(cmp_rejected) > 12:
-            log(f'          ... and {len(cmp_rejected) - 12} more')
-    elif not field_bg_compact.enabled():
-        log(f'      compaction is OFF ({field_bg_compact.COMPACT_ENV}=0). '
-            f'That is the pass that pays for the promoted pages out of the '
-            f'originals; without it the page count grows by about 2 per '
-            f'field and that is what black squares are.')
     if up_dropped or up_capped:
         log(f'      {up_dropped} original page(s) freed -- nothing points at '
             f'them any more, so they no longer cost a texture')
-        if up_capped and field_bg_repack.budget_bytes() >= \
-                field_bg_repack.UNLIMITED:
-            # MISATTRIBUTION, fixed. With the budget Unlimited nothing can be
-            # capped BY the budget, but this line still claimed it was and
-            # quoted the 1<<60 sentinel as "1099511627776.0 MB". What actually
-            # held these back is no-growth's ceiling loop: a field that still
-            # holds more pages than it started with after compaction is
-            # repacked at a lower ceiling until it does not.
-            log(f'      {up_capped} page(s) left paletted by the NO-GROWTH '
-                f'ceiling -- their field still held more pages than vanilla '
-                f'after compaction, so it was repacked lower until it did '
-                f'not. The budget is Unlimited and capped nothing.')
-        elif up_capped:
+        if up_capped:
             mb = field_bg_repack.budget_bytes() / 1048576.0
             log(f'      {up_capped} page(s) left paletted to stay inside the '
                 f'{mb:.1f} MB per-field texture budget. Every present page '
@@ -3000,21 +2206,6 @@ def _convert_field_backgrounds(archive, payloads, log, dds_sources=()):
                 f'fields with 1 truecolor page were clean, fields with 3-4 '
                 f'were black. Tune with '
                 f'{field_bg_repack.BUDGET_ENV}=<megabytes>.')
-    if skipped_all_or_nothing:
-        worst = sorted(skipped_all_or_nothing,
-                       key=lambda r: -r[1])[:12]
-        log(f'      {len(skipped_all_or_nothing)} field(s) kept their vanilla '
-            f'background because not ALL of their pages fitted -- '
-            f'all-or-nothing is on, so a field is never left half truecolor '
-            f'and half paletted:')
-        for nm, n in worst:
-            log(f'          {nm:<12} {n} page(s) would have been promoted')
-        if len(skipped_all_or_nothing) > len(worst):
-            log(f'          ... and {len(skipped_all_or_nothing) - len(worst)}'
-                f' more')
-        log(f'      Raise or remove the budget ({field_bg_repack.BUDGET_ENV}'
-            f'=0 for unlimited), drop to a smaller page size, or set '
-            f'{field_bg_repack.PARTIAL_ENV}=1 to promote what fits.')
     thr = field_bg_repack.black_cell_threshold()
     if thr > 0:
         log(f'      cells at least {thr * 100:.0f}% opaque black kept their '
@@ -3030,7 +2221,6 @@ def _convert_field_backgrounds(archive, payloads, log, dds_sources=()):
             'ships no image for any palette they use'
             + (f'; {no_fit} more for want of a free truecolor slot'
                if no_fit else ''))
-    _log_page_cost_report(page_cost, px, log, ng_retry, ng_over, ng_margin)
     if nf:
         log(f'  field background: {npg} truecolor page(s) in {nf} field(s) '
             f'rescaled to {px}x{px}')
@@ -3079,106 +2269,6 @@ def _encode_field_cached(archive, raw):
             os.replace(tmp, path)
         except OSError:
             pass
-    return out
-
-
-def _debleed_textures(name, mod_files, van, log):
-    """
-    Recolour the transparent palette entry of every colour-keyed texture in
-    a model archive, vanilla or mod, so bilinear filtering stops drawing
-    black lines along the gutters of the atlas.
-
-    Runs for EVERY model archive, not just the field ones. The seam is a
-    property of FF7's texture format, not of any particular module, and it is
-    just as visible on an enemy as on an NPC. Measured on the vanilla
-    archives this project ships:
-
-        char.lgp    695 TEX, 458 de-fringe
-        battle.lgp  787 TEX, 322 colour-keyed, 319 de-fringe
-
-    For battle.lgp this also covers what `convert_for_battle` cannot: that
-    function refuses anything already paletted, so it only ever fixed the
-    truecolor mod textures it converts itself -- every vanilla enemy skin
-    kept its black entry and its seams.
-
-    Applied to the MOD's files and, where an entry is untouched by the mod,
-    left alone -- vanilla entries are only rewritten if the mod does not
-    replace them, which is handled by the caller merging this into
-    `mod_files`. Anything the fix cannot prove safe is skipped: no colour
-    key, no transparent texels, not paletted, not a TEX.
-
-    Every rewrite is verified with tex.check_indices_unchanged before it is
-    accepted, so a bug here cannot silently alter artwork -- it can only fail
-    to help.
-    """
-    if os.environ.get(NO_DEBLEED_ENV, '').strip().lower() in (
-            '1', 'true', 'yes', 'on'):
-        return mod_files
-    os.makedirs(DEBLEED_CACHE, exist_ok=True)
-    out = dict(mod_files)
-    done = refused = from_van = 0
-
-    # Every .tex in the archive, not just the ones the mod replaces. The seam
-    # is in FF7's own atlas layout, so a vanilla NPC the mod leaves alone has
-    # it too -- and most of the characters you notice it on are exactly the
-    # ones nobody bothered to remake. A vanilla entry that de-fringes is added
-    # to the overlay so it actually reaches the archive; one that does not is
-    # left out entirely, so untouched entries are still reused byte for byte.
-    todo = [(low, src, mod) for low, (src, mod) in mod_files.items()]
-    todo += [(low, path, None) for low, path in (van or {}).items()
-             if low not in mod_files]
-
-    for low, src, mod in todo:
-        # Detected by CONTENT, not by name. battle.lgp's textures have no
-        # extension at all -- they are called "aa", "da" and so on -- so an
-        # `endswith('.tex')` filter silently skipped the entire archive, which
-        # is exactly the half of this that enemies live in. tex.parse() is
-        # strict enough to be the test: it checks the version word AND that
-        # the file length matches the header's own dimensions exactly, which
-        # is what stops a .p model (also version 1) being mistaken for one.
-        try:
-            with open(src, 'rb') as f:
-                head = f.read(4)
-                if len(head) < 4 or head != b'\x01\x00\x00\x00':
-                    continue
-                data = head + f.read()
-        except OSError:
-            continue
-        key = 'DEBLEED-V1-' + ('van-' if mod is None else 'mod-') + _sig(src)
-        cached = os.path.join(
-            DEBLEED_CACHE,
-            '%s.%s.%s' % (name, low,
-                          hashlib.sha1(key.encode()).hexdigest()[:16]))
-        if os.path.exists(cached):
-            out[low] = (cached, mod)
-            done += 1
-            continue
-        try:
-            new, _note = tex.debleed(data)
-        except Exception:
-            continue
-        if new is None:
-            continue
-        if not tex.check_indices_unchanged(data, new):
-            refused += 1
-            continue
-        tmp = cached + '.tmp'
-        with open(tmp, 'wb') as f:
-            f.write(new)
-        os.replace(tmp, cached)
-        out[low] = (cached, mod)
-        done += 1
-        if mod is None:
-            from_van += 1
-    if done:
-        log('  %s: %d texture(s) de-fringed (%d of them vanilla entries the '
-            'mod does not replace) -- the transparent palette entry now '
-            'carries the colour of the art beside it instead of black, so '
-            'filtering stops drawing a dark line along every atlas seam '
-            '(set %s=1 to disable)' % (name, done, from_van, NO_DEBLEED_ENV))
-    if refused:
-        log('  ! %s: %d de-fringe(s) REFUSED -- the rewrite would have changed '
-            'pixel indices, so the original was kept' % (name, refused))
     return out
 
 
@@ -3623,10 +2713,6 @@ def _build_model_archive(name, archive_path, mod_files, romfs, pack_lgp,
         if cap:
             mod_files = _cap_field_textures(name, mod_files, log, cap)
 
-    # Every model archive, and AFTER both the battle conversion and the field
-    # cap so neither can undo it. Idempotent on anything already de-fringed.
-    mod_files = _debleed_textures(name, mod_files, van, log)
-
     # Does this mod actually change the archive? Track new entries and whether
     # any replacement differs from vanilla. If nothing changes, we skip the
     # whole archive rather than writing a needless copy of vanilla.
@@ -3774,87 +2860,8 @@ def _build_inplace_archive(name, archive_path, mod_files, romfs, log,
     return dest
 
 
-WIDESCREEN_CACHE = os.path.join(HERE, 'cache', '_widescreen')
-
-
-def _bake_widescreen_ranges(archive, payloads, widescreen, log):
-    """
-    Write FFNx's per-field camera ranges into flevel.lgp's own section 8.
-
-    `field_clip_with_camera_range_float` (FFNx background.cpp:417) reads the
-    range out of `field_triggers_header` and then REPLACES it with the one
-    `config.toml` supplies. There is no runtime object to replace it with
-    here, and building one would mean a 711-entry lookup table in a module
-    with about 31 KB of usable cave space. Writing the config's numbers into
-    the field data instead makes `field_triggers_header->camera_range`
-    simply correct at load, and costs no cave space and no lookup.
-
-    Runs LAST, after both mod replacement paths and after the background
-    conversion, so it is the final word on section 8 and cannot be
-    overwritten by a pass that rebuilt the field for another reason. It
-    edits only the four `int16` at +0x0C of section 8's body; the section
-    length does not change, so nothing else in the field moves.
-
-    Only fields whose range the config actually CHANGES are re-encoded --
-    on Cosmos Limit Break that is 41 of 711, because the config's main lever
-    is the explicit `mode` key rather than the range (README-45 §8.2).
-
-    Returns the stats dict, or None if nothing was configured.
-    """
-    if not widescreen:
-        return None
-    cfg_path, mov_path, mod_name = widescreen
-    config, movie_config = ff7nx_ws.load(cfg_path, mov_path)
-    if not config:
-        log(f'  ! widescreen: {cfg_path} parsed to nothing; camera ranges '
-            f'left alone')
-        return None
-
-    clamp = ff7nx_ws.wants_clamp()
-    stats = ff7nx_ws.apply_to_flevel(
-        archive, payloads, config, movie_config,
-        encode=lambda raw: _encode_field_cached(archive, raw),
-        clamp=clamp,
-        # NOT next to build.py. `_archive_fingerprint` hashes every .py in
-        # this folder, so a build that writes a .py here changes its own
-        # cache key and every subsequent build rebuilds flevel.lgp from
-        # scratch -- 130 MB and several minutes, forever.
-        table_path=os.path.join(WIDESCREEN_CACHE, 'widescreen_fields.py'),
-        log=log)
-
-    log(f'  widescreen: {stats.get("total", 0)} field(s), '
-        f'{stats.get("wide", 0)} would be wide '
-        f'({100.0 * stats.get("wide", 0) / max(1, stats.get("total", 1)):.1f}%'
-        f'), {stats.get("gated_in", 0)} of them without the config at all')
-    by_mode = stats.get('by_mode') or {}
-    if by_mode:
-        log('    modes: ' + ', '.join(f'{k} {v}'
-                                      for k, v in sorted(by_mode.items())))
-    log(f'    camera ranges written: {stats.get("written", 0)}'
-        f' (config {stats.get("from_config", 0)}'
-        + (f', clamp {stats.get("from_clamp", 0)}' if clamp else '')
-        + ')')
-
-    # Say what the config asks for that a range edit cannot express, rather
-    # than approximating it. h_offset/v_offset shift the camera POINT before
-    # the clamp; moving the range moves the bounds, which is a different
-    # thing, and pretending otherwise would put the camera slightly wrong on
-    # every field that uses them.
-    gap = ff7nx_ws.config_report(config)
-    if gap['point_shift']:
-        log(f'    note: {len(gap["point_shift"])} field(s) also ask for '
-            f'h_offset/v_offset/reset_vertical_pos. Those shift the camera '
-            f'point, not its bounds, so they are NOT baked -- they need the '
-            f'framing stage.')
-    if gap['unknown_keys']:
-        log(f'    note: config keys FFNx does not read: '
-            f'{", ".join(gap["unknown_keys"])}')
-
-    return stats
-
-
 def _build_flevel(archive_path, chunks, field_files, romfs, log,
-                  dds_sources=(), widescreen=None):
+                  dds_sources=()):
     """
     Patch flevel.lgp. Three replacement shapes, decided per entry by
     comparing the mod file with how the VANILLA entry is stored:
@@ -3990,128 +2997,8 @@ def _build_flevel(archive_path, chunks, field_files, romfs, log,
     # docstring. Must come after both replacement paths have decided their
     # payloads, or a mod's section 9 would be converted and then overwritten
     # with an unconverted one.
-    # BEFORE the repack, and that ordering is the whole correctness argument.
-    #
-    # Cosmos names its art `<field>_<page>_<palette>.dds` against the VANILLA
-    # page numbering. `_convert_field_backgrounds` renumbers and COMPACTS -- a
-    # real build logs "661 page(s) freed across 317 field(s), 279,534 cell(s)
-    # relocated". MEASURED after that pass:
-    #
-    #     mds6_2  dump slots [0,1,2,3,4]  ->  built slots [2,3,4,26,27,28]
-    #             pages with identical content: NONE
-    #
-    # So writing Cosmos's page-0 art into the BUILT archive's slot 0 lands it
-    # on cells that now hold something else. It renders as garbage -- bright
-    # yellow blocks where the quantiser matched a light palette entry. And
-    # `bwhlin` kept 4 of its 6 pages, so it looked perfect, which is exactly
-    # how the error survived being tested on one field.
-    #
-    # Running first, the page numbering still matches the mod's, and the
-    # repack promotes and compacts on top of correct data. A page it later
-    # promotes to truecolor takes the DDS at full depth anyway.
-    _PAGES_BEFORE_MARGIN.clear()
-    _PAGES_BEFORE_MARGIN.update(_snapshot_page_counts(archive, payloads))
-    # SAY IT OUT LOUD. The first version of the no-growth loop used `parts[8]`
-    # as its baseline and was a silent no-op in the fields being tested -- the
-    # log said `266 field(s) RE-RUN` and `0 GREW` while mds5_1 stayed one page
-    # over what the mod ships. There is no way to tell those two states apart
-    # from the log, so print the baseline itself.
-    log('  field background: no-growth baseline snapshotted for %d field(s) '
-        'BEFORE the margin passes (the mod\'s own page count -- not vanilla, '
-        'which is too strict, and not the post-marginpage section, which is '
-        'too lax)' % len(_PAGES_BEFORE_MARGIN))
-    if dds_sources and ff7nx_marginart.enabled():
-        _art = field_bg_repack.ArtProvider(
-            dds_sources, ff7nx_fieldbg.page_px(), log)
-        if _art:
-            _ma_scope = ff7nx_marginart.scope()
-            log('  margin art scope: %s' % (
-                'MARGIN + INTERIOR -- Cosmos art replaces vanilla inside the '
-                '4:3 picture too, on layer 1' if _ma_scope == 'all'
-                else 'MARGIN ONLY -- the 4:3 picture is not touched'))
-            ma_stats = ff7nx_marginart.apply_to_flevel(
-                archive, payloads, ff7nx_marginart.provider_source(_art),
-                encode=lambda raw: _encode_field_cached(archive, raw), log=log,
-                scope=_ma_scope)
-            ma_line = ff7nx_marginart.summarise(ma_stats)
-            if ma_line:
-                log('  ' + ma_line)
-            # Reported separately from the fill because it is a separate
-            # decision with its own failure mode: the fill can write every
-            # cell it is asked to and STILL produce a flat block if the
-            # palette it quantised against cannot hold the art. HANDOFF-81.
-            mpal_line = ff7nx_marginpal.summarise(ma_stats.get('pal'))
-            if mpal_line:
-                log('  ' + mpal_line)
-
-            # AFTER the fill and BEFORE the repack, and both halves of that
-            # matter.
-            #
-            # AFTER, because Cosmos names its art `<field>_<page>_<pal>.dds`
-            # against the page the cell is on NOW. Move the cell first and the
-            # lookup misses -- measured: the split ran, the pages came out
-            # palette-pure, and every moved cell stayed flat filler.
-            #
-            # BEFORE, because the repack renumbers and compacts, and a page
-            # this pass created has to be visible to that accounting like any
-            # other.
-            mp_stats = ff7nx_marginpage.apply_to_flevel(
-                archive, payloads,
-                encode=lambda raw: _encode_field_cached(archive, raw), log=log)
-            mp_line = ff7nx_marginpage.summarise(mp_stats)
-            if mp_line:
-                log('  ' + mp_line)
-            # (the note below is kept for the record)
-            # THE MARGIN PAGE SPLIT WAS BRIEFLY REMOVED.
-            #
-            # It existed for one reason: a depth-1 page is drawn through ONE
-            # palette, so a margin sharing a page with tiles of another
-            # palette came out through the wrong colour table -- the Sector 6
-            # yellow. The dense repack bakes every cell with the palette it
-            # names, so there is no page left that can be drawn through a
-            # foreign table and nothing for the split to fix. Removing it also
-            # removes the page growth it cost and the compaction freeze that
-            # protected it.
-            # AFTER the split, so it sees the palette page each margin tile
-            # finally names.
-            #
-            # The console DRAWS palette index 0 instead of discarding it.
-            # PROVED on hardware 2026-08-05: the first version of this pass
-            # wrote BLACK at index 0 and the same build both removed the
-            # Sector 6 yellow (mds6_2/mds6_3 store PURE YELLOW there) and put
-            # black speckles across Wall Market's interior. One change, both
-            # effects -- so the key is drawn, and black is merely less wrong
-            # than yellow. The pass now DE-FRINGES: entry 0 takes the mean
-            # colour of the art beside the index-0 pixels, the same treatment
-            # `_debleed_textures` already gives char.lgp and battle.lgp.
-            pk_stats = ff7nx_palkey.apply_to_flevel(
-                archive, payloads,
-                encode=lambda raw: _encode_field_cached(archive, raw), log=log)
-            pk_line = ff7nx_palkey.summarise(pk_stats)
-            if pk_line:
-                log('  ' + pk_line)
-
     if ff7nx_fieldbg.enabled():
         _convert_field_backgrounds(archive, payloads, log, dds_sources)
-
-    # AFTER the background conversion, and that ordering is not cosmetic: the
-    # repack builds one truecolor texture per (page, cell, PALETTE) actually
-    # referenced, so a palette page introduced before it runs would be one the
-    # mod has no image for, the nearest would be borrowed for it, and the
-    # filler would come back in its original colour. See ff7nx_marginblack.py,
-    # ORDERING. HANDOFF-65 §4.
-    mb_stats = ff7nx_marginblack.apply_to_flevel(
-        archive, payloads, encode=lambda raw: _encode_field_cached(archive, raw),
-        log=log)
-    mb_line = ff7nx_marginblack.summarise(mb_stats)
-    if mb_line:
-        log('  ' + mb_line)
-
-    # AFTER that, so the camera range is the last thing written into section
-    # 8 and cannot be reverted by a field the background pass rebuilt. The
-    # two passes touch different sections (8 vs 9) and both go through the
-    # content-keyed encode cache, so ordering costs nothing but correctness.
-    ws_stats = _bake_widescreen_ranges(archive, payloads, widescreen, log)
 
     try:
         archive.replace(payloads)
@@ -4125,26 +3012,6 @@ def _build_flevel(archive_path, chunks, field_files, romfs, log,
         os.remove(dest)
         log('  ! flevel: tables did not survive rebuild; rejected')
         return None
-
-    # Read the camera ranges back OUT of the file that was just written and
-    # compare them with the plan. This is the check that makes the whole
-    # data half falsifiable without a console: the numbers in the archive
-    # either are the config's or they are not. It is not fatal -- a wrong
-    # camera range is a framing bug, not a crash -- but it must be loud,
-    # because the failure mode it catches is silent on hardware.
-    if ws_stats and ws_stats.get('plan'):
-        ok, problems = ff7nx_ws.verify_flevel(
-            dest, ws_stats['before'], ws_stats['plan'])
-        if ok:
-            log(f'  widescreen: verified -- all '
-                f'{len(ws_stats["plan"])} camera range(s) are in the '
-                f'rebuilt archive and nothing else moved')
-        else:
-            log(f'  ! widescreen: VERIFY FAILED ({len(problems)} problem(s))'
-                f' -- the archive is still valid, its camera ranges are not')
-            for p in problems[:10]:
-                log(f'      {p}')
-
     out_size = os.path.getsize(dest)
     log(f'  wrote flevel.lgp ({out_size:,} bytes, '
         f'{out_size / van_size:.2f}x vanilla)')
@@ -4163,7 +3030,6 @@ ANALOG_360_ENV = 'SEVENTH_NX_ANALOG_360'
 NO_AUTORUN_ENV = 'SEVENTH_NX_NO_AUTORUN'
 NO_CHEATS_ENV = 'SEVENTH_NX_NO_CHEATS'
 LIMITER_FPS_ENV = 'SEVENTH_NX_LIMITER_FPS'
-SMOOTH_SCRIPTED_ENV = 'SEVENTH_NX_SMOOTH_SCRIPTED'
 
 
 def movie_30fps():
@@ -4190,25 +3056,6 @@ def no_cheats():
         '1', 'true', 'yes', 'on')
 
 
-def smooth_scripted():
-    """
-    Smooth scripted/cutscene field movement -- PART OF THE 60 FPS SET, ON.
-
-    This is not an option any more. It is not a separate feature either: the
-    60 FPS set makes the field loop run twice as often, and scripted movement
-    still advances once per PAIR of frames, so without this it visibly steps.
-    Fixing that is part of the same job as making the field run at 60, so it
-    ships with it.
-
-    `SEVENTH_NX_SMOOTH_SCRIPTED=0` still turns it off. That exists to bisect, not to configure -- if a
-    scene ever misbehaves, this is the first thing to switch off to find out
-    whether it is implicated, and the answer is one build away instead of one
-    code change away. Anything other than an explicit off value leaves it on.
-    """
-    return os.environ.get(SMOOTH_SCRIPTED_ENV, '').strip().lower() not in (
-        '0', 'false', 'no', 'off')
-
-
 def limiter_fps():
     """
     What the busy-wait frame limiters should aim for, or 0 to leave them at 60.
@@ -4228,27 +3075,6 @@ def movie_quality():
     v = os.environ.get(movie_convert.QUALITY_ENV, '').strip().lower()
     return v if v in movie_convert.QUALITY_CRF \
         else movie_convert.QUALITY_DEFAULT
-
-
-def movie_fit():
-    """
-    How converted FMVs are sized.
-
-    'fit' resamples on the PC, with Lanczos, to the size the console really
-    draws (movies.device_footprint -- 1440x1008 for the 1280x896 shape).
-    'native' keeps whatever the mod ships, which is what every build before
-    MOVIECONV-V2 did and is kept so the two can be A/B'd.
-    """
-    v = os.environ.get(movie_convert.FIT_ENV, '').strip().lower()
-    return v if v in dict(movie_convert.FIT_CHOICES) \
-        else movie_convert.FIT_DEFAULT
-
-
-def movie_colour():
-    """BT.709 normalisation on ('bt709') or off ('off')."""
-    v = os.environ.get(movie_convert.COLOUR_ENV, '').strip().lower()
-    return v if v in dict(movie_convert.COLOUR_CHOICES) \
-        else movie_convert.COLOUR_DEFAULT
 
 
 def _movie_cache_dir(sdout_root):
@@ -4304,8 +3130,6 @@ def _emplace_movies(plan, romfs, sdout, dump, log, progress, produced):
     if not plan.movies and not movie_30fps():
         return
     quality = movie_quality()
-    fit = movie_fit()
-    colour = movie_colour()
     normalise = movie_30fps()
     if not movie_convert.have_ffmpeg():
         log(f'! {len(plan.movies)} movie(s) skipped: ffmpeg/ffprobe not found '
@@ -4391,22 +3215,10 @@ def _emplace_movies(plan, romfs, sdout, dump, log, progress, produced):
             'field clock is stock)'
             % (len(work), movie_convert.VANILLA_MOVIE_FPS))
     log('        quality: %s, crf %d' % (label, movie_convert.crf_for(quality)))
-    log('        sizing: %s   colour: %s'
-        % (dict(movie_convert.FIT_CHOICES)[fit],
-           dict(movie_convert.COLOUR_CHOICES)[colour]))
-    if fit == 'fit':
-        log('        the console draws a movie into at most %dx%d device '
-            'pixels (measured, see movies.py); anything larger is minified '
-            'by a single bilinear tap in video_p.glsl, so it is resampled '
-            'here with Lanczos instead'
-            % (movie_convert.TARGET_W, movie_convert.TARGET_H))
     if len(vanilla_dirs) > 1:
         log('        directories: %s' % ', '.join(vanilla_dirs))
 
     done = failed = cached = copied = 0
-    resized = recoloured = 0
-    oversize_left = []       # (stem, w, h) when fit is off but should not be
-    undersize = []           # (stem, w, h) -- the shader has to magnify these
     spent = 0.0
     # OFF used to mean "whatever rate the mod ships", which made the
     # checkbox useless as a control: Cosmos FMV ships 30 fps, so unticking
@@ -4431,23 +3243,14 @@ def _emplace_movies(plan, romfs, sdout, dump, log, progress, produced):
             # `vanilla is not None` is in there because a silent mod file
             # borrows the original's soundtrack, so whether one was available
             # changes what comes out.
-            # CONVERTER_VERSION is in here, not just the settings. A
-            # 768px texture fix once silently did nothing because its key
-            # carried the cap but not the code that applied it, so an
-            # unchanged input with unchanged settings kept serving the old
-            # output. Any change to what convert() emits bumps that string.
             key = movie_convert.source_key(
-                src, '%s|%s|%d|%s|%s|%d|%d|%s|%s|%s'
-                % (movie_convert.CONVERTER_VERSION,
-                   quality,
-                   movie_convert.crf_for(quality),
-                   movie_convert.TARGET_PROFILE,
-                   movie_convert.TARGET_PRESET,
-                   movie_convert.TARGET_ARATE,
-                   vanilla is not None,
-                   target_fps,
-                   fit,
-                   colour))
+                src, '%s|%d|%s|%s|%d|%d|%s' % (quality,
+                                               movie_convert.crf_for(quality),
+                                               movie_convert.TARGET_PROFILE,
+                                               movie_convert.TARGET_PRESET,
+                                               movie_convert.TARGET_ARATE,
+                                               vanilla is not None,
+                                               target_fps))
             tag = stem if reldir == movie_convert.MOVIE_DIR else \
                 '%s.%s' % (reldir.replace('/', '_'), stem)
             cached_file = os.path.join(cache, f'{tag}.{key}.mp4')
@@ -4479,8 +3282,8 @@ def _emplace_movies(plan, romfs, sdout, dump, log, progress, produced):
             # which under normalisation means already at the target rate.
             at_rate = (not target_fps
                        or abs(info['fps'] - target_fps) < 0.01)
-            if movie_convert.already_target(info, fit=fit, colour=colour) \
-                    and info['has_audio'] and at_rate:
+            if movie_convert.already_target(info) and info['has_audio'] \
+                    and at_rate:
                 shutil.copyfile(src, cached_file)
                 _link_or_copy(cached_file, dest)
                 copied += 1
@@ -4498,7 +3301,7 @@ def _emplace_movies(plan, romfs, sdout, dump, log, progress, produced):
             t0 = time.time()
             r = movie_convert.convert(src, cached_file, vanilla=vanilla,
                                       quality=quality, target_fps=target_fps,
-                                      fit=fit, colour=colour, log=log)
+                                      log=log)
             took = time.time() - t0
             spent += took
             _link_or_copy(cached_file, dest)
@@ -4514,19 +3317,6 @@ def _emplace_movies(plan, romfs, sdout, dump, log, progress, produced):
                 extra += ' (frame-doubled)'
             shown = stem if reldir == movie_convert.MOVIE_DIR else \
                 '%s/%s' % (reldir.rsplit('/', 2)[-2], stem)
-            if r['fit_reason'] == 'fit':
-                resized += 1
-                extra += ' (%dx%d -> %dx%d, lanczos)' % (
-                    r['src']['width'], r['src']['height'],
-                    r['out']['width'], r['out']['height'])
-            elif r['src']['width'] < r['drawn'][0] * 0.98:
-                undersize.append((stem, r['src']['width'],
-                                  r['src']['height']))
-            if r['colour_converted']:
-                recoloured += 1
-            if fit != 'fit' and r['src']['width'] > r['drawn'][0] * 1.02:
-                oversize_left.append((stem, r['src']['width'],
-                                      r['src']['height']))
             log('  ok %-12s %s -> h264 %s fps, crf %d%s  [%.1fs]'
                 % (shown, movie_convert.describe_source(r['src']),
                    r['fps'], r['crf'], extra, took))
@@ -4544,27 +3334,10 @@ def _emplace_movies(plan, romfs, sdout, dump, log, progress, produced):
                 os.remove(stale)
 
     # Resolution, reported every build so "is it being downscaled?" is
-    # answerable from the log rather than from ffprobe -- and so is the
-    # question behind it, which is not "what size is the file" but "what
-    # size does the console DRAW it". describe_drawn() answers the second.
-    if resized:
-        log('        %d movie(s) resampled to the drawn size with Lanczos '
-            '(instead of being bilinear-minified on the console)' % resized)
-    if recoloured:
-        log('        %d movie(s) converted to BT.709 limited, which is what '
-            'romfs/shaders/video_p.glsl hardcodes' % recoloured)
-    for stem, w, h in oversize_left[:6]:
-        log('        ! %s is %dx%d, larger than the %dx%d the console draws '
-            '-- with sizing set to "native" the GPU minifies it with one '
-            'bilinear tap' % (stem, w, h,
-                              movie_convert.TARGET_W, movie_convert.TARGET_H))
-    if undersize:
-        s0, w0, h0 = undersize[0]
-        log('        note: %d movie(s) are SMALLER than the console draws '
-            '(e.g. %s at %dx%d). Nothing here can add detail they do not '
-            'have -- install custom_shaders/hd_video/video_p.glsl, which '
-            'reconstructs magnified movies.'
-            % (len(undersize), s0, w0, h0))
+    # answerable from the log rather than from ffprobe. Nothing here scales:
+    # the only -vf is `scale=trunc(iw/2)*2:trunc(ih/2)*2`, which forces even
+    # dimensions for yuv420p and is a no-op on anything already even. What a
+    # mod ships is what gets encoded.
     if plan.opening_dims:
         w, h = plan.opening_dims
         van_dims = None
@@ -4574,19 +3347,14 @@ def _emplace_movies(plan, romfs, sdout, dump, log, progress, produced):
                 vi = movie_convert.probe(vo)
                 if vi:
                     van_dims = (vi['width'], vi['height'])
-        drawn = movie_convert.device_footprint(w, h)
         if van_dims and van_dims != (w, h):
             log('movie size: opening built at %dx%d, the port\'s own is '
-                '%dx%d' % (w, h, van_dims[0], van_dims[1]))
+                '%dx%d -- kept at the mod\'s resolution, nothing downscales'
+                % (w, h, van_dims[0], van_dims[1]))
         elif van_dims:
             log('movie size: opening %dx%d, same as the port\'s own' % (w, h))
         else:
             log('movie size: opening %dx%d' % (w, h))
-        log('            the console draws it at %dx%d device pixels %s'
-            % (drawn[0], drawn[1],
-               '(1:1)' if abs(w - drawn[0]) <= 2 else
-               ('(magnified %.2fx)' % (drawn[0] / float(w)) if w < drawn[0]
-                else '(MINIFIED %.2fx)' % (w / float(drawn[0])))))
 
     parts = [f'{done} converted' + (f' in {spent:.0f}s' if spent else '')]
     if cached:
@@ -4966,32 +3734,6 @@ def _stat_sig(path):
         return None
 
 
-def _ws_fingerprint(widescreen):
-    """
-    The widescreen config as a cache key component.
-
-    `plan.widescreen` is a path pair, not a mod file, so it is invisible to
-    the `files` half of `_archive_fingerprint`. Without this, switching from
-    a mod that ships a config to one that does not would reuse the flevel
-    built against the first -- 41 fields with the wrong camera range and no
-    line in the log to say why.
-
-    Size+mtime, the same trade the rest of the fingerprint makes.
-    """
-    if not widescreen:
-        return ''
-    out = []
-    for path in widescreen[:2]:
-        if not path:
-            continue
-        try:
-            st = os.stat(path)
-            out.append(f'{path}:{st.st_size}:{int(st.st_mtime)}')
-        except OSError:
-            out.append(f'{path}:missing')
-    return '|'.join(out)
-
-
 def _archive_fingerprint(name, archive_path, files, extra):
     """
     Everything that can change what an archive build produces.
@@ -5207,12 +3949,7 @@ def apply_plan(plan, archive_paths, sdout, log=lambda *_: None,
                 'flevel.lgp', archive_paths['flevel.lgp'],
                 dict(flevel_fields),
                 (sorted((k, sorted(v)) for k, v in plan.chunks.items()),
-                 sorted(plan.field_dds_sources or ()),
-                 # the widescreen config decides 41 fields' camera ranges,
-                 # and it lives outside `flevel_fields`, so it has to be in
-                 # the key by hand or swapping mods would reuse a stale
-                 # archive built against the previous one
-                 _ws_fingerprint(plan.widescreen)))
+                 sorted(plan.field_dds_sources or ())))
             hit, payload = _archive_cache_ok('flevel.lgp', fdest, ffp, log)
             if hit:
                 produced.append(fdest)
@@ -5230,8 +3967,7 @@ def apply_plan(plan, archive_paths, sdout, log=lambda *_: None,
                 log('building flevel.lgp ...')
                 dest = _build_flevel(archive_paths['flevel.lgp'], plan.chunks,
                                      flevel_fields, romfs, log,
-                                     plan.field_dds_sources,
-                                     plan.widescreen)
+                                     plan.field_dds_sources)
                 if dest:
                     _archive_cache_store('flevel.lgp', dest, ffp,
                                          str(FIELD_BG_MAX_RAW))
@@ -5537,22 +4273,11 @@ def apply_field_bg(sdout, dump, log=lambda *_: None, produced=()):
     """
     if not ff7nx_fieldbg.enabled():
         return []
-    px = ff7nx_fieldbg.page_px()
-    if not ff7nx_fieldbg.patches_module(px, FIELD_BG_MAX_RAW):
-        # 256px on a build whose biggest field still fits the stock
-        # 2,000,000 byte buffer. Every word this pass would write already
-        # holds the value it wants, so there is nothing to do -- and, more
-        # usefully, nothing to REQUIRE: this is the one field-background
-        # setting that ships as a flevel.lgp alone, with no game dump.
-        log('')
-        log(f'{px}x{px} field background pages need no module patch '
-            f'(the stock words already say {px}); flevel.lgp carries this '
-            f'setting on its own.')
-        return []
     if dump is None or not dump.nso:
         log('! field background: needs exefs/main from a full game dump; '
             'skipped')
         return []
+    px = ff7nx_fieldbg.page_px()
     dest = os.path.join(sdout, 'atmosphere', 'contents', TITLE_ID, 'exefs',
                         'main')
     fresh = {os.path.normpath(os.path.abspath(p)) for p in produced}
@@ -5588,374 +4313,6 @@ def apply_field_bg(sdout, dump, log=lambda *_: None, produced=()):
             'before using this SD tree.')
         return []
     os.replace(tmp, dest)
-    return [dest] if not built else []
-
-
-BG_CLEAR_ENV = 'SEVENTH_NX_BG_CLEAR'
-
-
-def bg_clear_enabled(env=None):
-    """
-    OFF by default, on the module's own instructions.
-
-    `ff7nx_bgcolor.py` wrote the decision tree before any of this shipped:
-
-        * Margins turn black.      Confirmed, the margin was the clear colour.
-        * Margins are unchanged.   Then the flat colour is NOT the clear
-                                   colour, and THIS PATCH SHOULD BE REVERTED.
-
-    MEASURED on hardware, 2026-08-05: applied, verified in the log
-    (`2 word(s) verified and applied`), and the Sector 6 margins are
-    unchanged. So the second branch is the one we are on. The patch is kept
-    and wired -- it is correct code and costs one build to retry -- but it is
-    off unless asked for.
-
-    settings.json `bg_clear: 1` / the GUI checkbox turns it on.
-    """
-    raw = (env if env is not None
-           else os.environ.get(BG_CLEAR_ENV, '0')).strip().lower()
-    return raw not in ('0', 'off', 'no', 'none', 'false')
-
-
-def apply_bg_clear(sdout, dump, log=lambda *_: None, produced=()):
-    """
-    Make the FRAME CLEAR COLOUR black, so the 16:9 margins are black instead
-    of the field's own background colour.
-
-    RETRACTION, AND IT IS MINE. An earlier version of this pass shipped
-    `ff7nx_bgclear`, whose header says `gfx_drv_clear` has "zero callers" and
-    is dead code. I measured that ("callers of the clear thunk in this image:
-    0"), reported it, and wired the patch in. It is a FALSE NEGATIVE, and
-    `ff7nx_bgcolor.py` -- sitting in the same directory -- had already written
-    down why:
-
-        gfx_drv_clear_all / gfx_drv_clear are entries 143/144 of the port's
-        gfx-driver table (gfx_drv_table.txt, dump_gfx_table.py). They are
-        FUNCTION POINTERS installed into FF7's `struct gfx_driver` and called
-        indirectly from the main loop. A B/BL scan is blind to them by
-        construction -- it reports zero callers for gfx_drv_flip too.
-
-    So the clear was never dead. It runs every frame, and it clears to the
-    colour `gfx_drv_setbg` stored -- the field's own background colour.
-    Inside 4:3 the art covers it; outside, it IS the margin. That is why the
-    margin "reads as the field's dominant palette colour": it literally is
-    one. Adding a second call to the same clear, with the same colour, was
-    always going to change nothing, and on hardware it changed nothing.
-
-    The patch that does the job is two words in `gfx_drv_setbg`, storing XZR
-    instead of the colour it was handed. Disassembled in `ff7nx_bgcolor.py`;
-    same instruction, same addressing mode, no cave, no displaced instruction.
-
-    LAST of the module passes, after the field-background page size.
-    """
-    if not bg_clear_enabled():
-        return []
-    dest = os.path.join(sdout, 'atmosphere', 'contents', TITLE_ID, 'exefs',
-                        'main')
-    fresh = {os.path.normpath(os.path.abspath(p)) for p in produced}
-    built = os.path.normpath(os.path.abspath(dest)) in fresh
-    src = dest if built else dump.nso
-    log('')
-    log('forcing the frame clear colour to BLACK (16:9 margins) ...')
-    if not built and not os.path.exists(src):
-        log('! black margins: no module to patch')
-        return []
-    log(f'  base main   {src}'
-        + ('   (previous patch output)' if built else '   (from dump)'))
-    tmp = dest + '.bgcolor-tmp'
-    try:
-        ok = ff7nx_bgcolor.apply(src, tmp, log)
-    except Exception as exc:                                   # noqa: BLE001
-        log(f'! black margins: {type(exc).__name__}: {exc}')
-        ok = False
-    if not ok:
-        if os.path.exists(tmp):
-            os.remove(tmp)
-        log('! black margins: NOT applied -- the rest of the build is still '
-            'valid, the 16:9 margins just keep the field background colour.')
-        return []
-    os.replace(tmp, dest)
-    log(f'  wrote {dest}')
-    return [dest] if not built else []
-
-
-FIELD_FRAME_ENV = ff7nx_letterbox.LETTERBOX_ENV
-MODEL_CULL_ENV = ff7nx_modelcull.MODELCULL_ENV
-MOVIE_ALIGN_ENV = ff7nx_moviealign.MOVIEALIGN_ENV
-
-
-def _ws_on():
-    try:
-        return ff7nx_ws.enabled()
-    except Exception:                                          # noqa: BLE001
-        return False
-
-
-def apply_field_frame(sdout, dump, log=lambda *_: None, produced=()):
-    """
-    Give the field the whole 16:9 frame: no painted letterbox, no 448-of-480
-    crop, the background centred in it, and the model cull widened to match.
-    FINDINGS-88.
-
-    Seven words from `ff7nx_letterbox` plus two from `ff7nx_modelcull`. No
-    caves, no displaced instructions, every one an immediate or a single
-    store, byte-exactly reversible.
-
-    Three things belong here rather than in the modules.
-
-      * TWO GATES, NOT ONE. The frame height and the movie quad are the
-        "Full-height 16:9 field" checkbox: they are one visual change and
-        splitting them is worse than doing neither, because a field that has
-        moved and an FMV that has not makes the cut jump 24 px. The model cull
-        is NOT on that checkbox and has no switch of its own -- its box is
-        4:3-sized, which against a 16:9 frame is a plain bug, and there is no
-        configuration in which an NPC should be culled while still inside the
-        picture. It follows the 16:9 setting alone.
-      * BOTH GATES ARE UNDER 16:9, AND THAT IS NOT CAUTION. At 4:3 the 448-of-480
-        letterbox is the framing FF7 was authored in and the port paints it
-        deliberately; opening it would show 32 game units the composition
-        never expected on every field. `ff7nx_modelcull`'s numbers are worse
-        than useless at 4:3 -- they keep models alive outside a frame that
-        never widened. FFNx guards both the same way: its uncrop helpers go
-        through `is_fieldmap_wide()` and its model cull through
-        `widescreen_enabled`.
-      * THE MOVIE QUAD IS THE THIRD THING THAT HAS TO MOVE. FF7's FMVs hand
-        straight over to gameplay, so the quad (game (0,0)-(640,H)) has to be
-        shifted the same +16 game units or the cut jumps 24 px and models
-        drawn over the video sit low against it. `ff7nx_moviealign` is a
-        12-word cave in the padding pool, and it is the only cave here.
-      * THE TWO HALVES OF THE CENTRING TRAVEL TOGETHER. The four tile origins
-        (224 -> 232) move the background; `[0xCFF200]` (224 -> 240) moves the
-        field sprites -- steam, fire, the reactor effects. 232 in tile units
-        and 240 in game units are the SAME +16 game units. Shipping one
-        without the other puts characters 24 px off the ground they stand on,
-        which is exactly what HANDOFF-85's "attempt 2" looked like and exactly
-        what a mis-encoded 232 did on 2026-08-07. `ff7nx_letterbox` writes
-        both or neither.
-      * A CONSTANT IS VERIFIED BY DECODING IT BACK. FINDINGS-88 8d: a patch
-        that verifies its STRUCTURE has not verified its CONTENT. Both modules
-        assert at import that every replacement word's immediate is the number
-        in the patch's own name, and `--verify` prints it.
-
-    Runs with the other module passes, before `apply_movie_clip`. Both take
-    padding holes, and the allocator re-checks that its holes are still zero
-    IN THE MODULE IT IS HANDED, so whichever runs second sees what the first
-    took. Order between them does not matter; only that they are sequential.
-    """
-    want_frame = ff7nx_letterbox.enabled()
-    want_cull = ff7nx_modelcull.enabled()
-    want_movie = ff7nx_moviealign.enabled()
-    want_mcull = want_cull and ff7nx_moviecull.enabled()
-    want_clamp = ff7nx_camclamp.enabled()
-    if not (want_frame or want_cull or want_movie or want_mcull
-            or want_clamp):
-        # SAY SO. `ff7nx_ws.apply_module` learned this the expensive way and
-        # wrote it down: "Silence here cost a whole build." A pass that is
-        # gated OFF and prints nothing is indistinguishable in the log from a
-        # pass that was never wired in, and on 2026-08-07 that ambiguity cost
-        # a build and a boot -- the log went straight from the page-size pass
-        # to the movie clip and there was no way to tell which had happened.
-        log('')
-        log('field frame: NOT APPLIED -- the field keeps its painted '
-            'letterbox and its 448-of-480 crop, and the model cull keeps its '
-            '4:3 box.')
-        log(f'  16:9 is {"ON" if _ws_on() else "OFF"} '
-            f'({ff7nx_ws.WIDESCREEN_ENV}={os.environ.get(ff7nx_ws.WIDESCREEN_ENV, "")!r})')
-        for name, env, want in (
-                ('frame height', FIELD_FRAME_ENV, want_frame),
-                ('movie align', MOVIE_ALIGN_ENV, want_movie),
-                ('model cull', MODEL_CULL_ENV, want_cull)):
-            log(f'  {name:14s} {"on" if want else "off"}   '
-                f'({env}={os.environ.get(env, "<unset, follows 16:9>")!r})')
-        log('  frame height and movie align are the "Full-height 16:9 field" '
-            'checkbox; the model cull has no switch and follows 16:9 alone.')
-        log('  See FINDINGS-88. To force it on for one build: '
-            f'{FIELD_FRAME_ENV}=1 {MODEL_CULL_ENV}=1 {MOVIE_ALIGN_ENV}=1')
-        return []
-    if dump is None or not dump.nso:
-        log('! field frame: needs exefs/main from a full game dump; skipped')
-        return []
-    dest = os.path.join(sdout, 'atmosphere', 'contents', TITLE_ID, 'exefs',
-                        'main')
-    fresh = {os.path.normpath(os.path.abspath(p)) for p in produced}
-    built = os.path.normpath(os.path.abspath(dest)) in fresh
-    src = dest if built else dump.nso
-    log('')
-    log('opening the field frame to 16:9 ...' if want_frame
-        else 'widening the field model cull to 16:9 ...')
-    if not built and not os.path.exists(src):
-        log('! field frame: no module to patch')
-        return []
-    # Same refusal to clobber as apply_movie_clip: if no earlier pass produced
-    # exefs/main this run, `src` is the dump's stock module, and writing that
-    # over an sdout/main a previous build patched would silently revert 60 FPS,
-    # the field buffer and everything else.
-    if not built and os.path.exists(dest):
-        try:
-            same = (os.path.getsize(dest) == os.path.getsize(dump.nso)
-                    and open(dest, 'rb').read() == open(dump.nso, 'rb').read())
-        except OSError:
-            same = False
-        if not same:
-            log(f'! field frame: {dest}')
-            log('  already holds a module this build did not produce. Not '
-                'touching it.')
-            return []
-    log(f'  base main   {src}'
-        + ('   (previous patch output)' if built else '   (from dump)'))
-    if not built:
-        shutil.copyfile(src, dest)
-    rc = 0
-    if want_frame:
-        rc |= ff7nx_letterbox.apply(dest, log=log)
-    if want_cull:
-        rc |= ff7nx_modelcull.apply(dest, log=log)
-    if want_movie:
-        rc |= ff7nx_moviealign.apply(dest, log=log)
-    if want_mcull:
-        # AFTER ff7nx_modelcull, always: the cave's not-playing branch is the
-        # displaced word, so running it first would bake 40/400 into both
-        # arms. ff7nx_moviecull refuses in that case rather than writing a
-        # cave that does nothing, but the ordering is the real guarantee.
-        rc |= ff7nx_moviecull.apply(dest, log=log)
-    if want_clamp:
-        rc |= ff7nx_camclamp.apply(dest, log=log)
-    if rc:
-        log('! field frame: one or more passes refused -- the module is '
-            'whatever the passes that DID run left. Check the lines above.')
-    log(f'  wrote {dest}')
-    log('  PASS/FAIL on hardware: walk to the bottom of a field. No black '
-        'band, characters on the ground, NPCs already there at the side '
-        'edges rather than appearing.')
-    return [dest] if not built else []
-
-
-MOVIE_CLIP_ENV = ff7nx_movieclip.MOVIECLIP_ENV
-
-
-def apply_movie_clip(sdout, dump, log=lambda *_: None, produced=()):
-    """
-    Clip drawing to the 4:3 picture while a movie plays, so field models stop
-    being drawn in the black 16:9 margin beside an FMV. HANDOFF-80 §5.0.
-
-    A 17-word cave in `ff7nx_cave`'s padding pool, hooked at +0x1133FE8 --
-    the last instruction before `b +0x11521C0`, which is the only tail-call
-    to the glScissor PLT stub in the module. While the movie's `is_playing`
-    flag is set it shrinks the scissor box to the central WS_SCALE of
-    whatever was asked for; otherwise the box is byte-identical.
-
-    Derivation is in ff7nx_movieclip.py. Three things belong here:
-
-      * It hooks a FUNCTION, not a vtable slot. Two earlier versions patched
-        the driver's per-draw calls at +0x10D9F3C / +0x10D9F54 (vtable +0x188
-        and +0x190). The first scaled the whole picture -- +0x188 is the
-        viewport -- and the second did nothing at all, because the renderer
-        actually constructed is not the class whose vtable the image lets you
-        read. Hooking downstream of the dispatch removes that whole class of
-        error.
-      * THE BAND COMES FROM THE SHIPPED SHADER. `ff7nx_movieclip` reads
-        `#define WS_SCALE` out of the `romfs/ff7/shaders/tlmain_vv.glsl` this
-        very SD tree carries and bakes it in as 16.16. That file is what
-        moves the picture, so it is the only honest source -- and it means
-        this pass and `ff7nx_ws`'s shader can never disagree.
-      * IT REFUSES ON A 4:3 BUILD. With widescreen off WS_SCALE is 1.0, the
-        shader moves nothing, there is no margin, and shrinking the box would
-        be a regression rather than a no-op. `clips_anything()` is checked
-        here as well as in the module so the log says why.
-
-    Runs after every other module pass, on their output, for the same reason
-    they run late: it edits `exefs/main`, and the cave allocator re-checks
-    that its padding holes are still zero IN THE MODULE BEING PATCHED, so it
-    must see what the earlier caves actually took. It also has to run after
-    `ff7nx_shaders`/`ff7nx_ws` have written the shader it reads.
-    """
-    # ------------------------------------------------------------------
-    # RETIRED -- FINDINGS-91 §1. Refused HERE rather than left to the
-    # module's default, because the default is not the last word: the GUI
-    # writes SEVENTH_NX_MOVIE_CLIP from a saved checkbox on every build, and
-    # a settings.json written before the retirement says `movie_clip: true`.
-    # That is not hypothetical -- it is what put the stale margins back on
-    # the first build after the retirement landed. A gate that any older
-    # settings file can reopen is not a gate.
-    #
-    # `SEVENTH_NX_MOVIE_CLIP=force` still applies it, for an A/B and nothing
-    # else. The word is deliberately not '1', so no checkbox can produce it.
-    # ------------------------------------------------------------------
-    if os.environ.get(MOVIE_CLIP_ENV, '').strip().lower() != 'force':
-        if ff7nx_movieclip.enabled():
-            log('movie 4:3 clip: RETIRED, not applied')
-            log('  The scissor clipped the frame CLEAR as well as the models, '
-                'so the margins kept the last field frame drawn before the '
-                'FMV instead of going black. ff7nx_moviecull does the same '
-                'job through the model cull, which cannot reach the clear.')
-            log('  (SEVENTH_NX_MOVIE_CLIP=force overrides this for an A/B.)')
-        return []
-    log('! movie 4:3 clip: FORCED ON. This is the retired scissor patch and '
-        'it WILL leave stale field art in the 16:9 margins during every FMV.')
-    if dump is None or not dump.nso:
-        log('! movie 4:3 clip: needs exefs/main from a full game dump; '
-            'skipped')
-        return []
-    # The 4:3 check, before anything else is logged: on a build with
-    # widescreen off there is no margin for a model to be drawn in, the
-    # shader's WS_SCALE is 1.0, and clipping to "the central 1.0" is a no-op
-    # at best. Say so once and leave.
-    ws = ff7nx_ws.ws_scale()
-    if not ff7nx_movieclip.clips_anything(ws):
-        log('')
-        log(f'movie 4:3 clip: WS_SCALE is {ws:.8f} -- this build is 4:3, so '
-            f'nothing is ever drawn outside the picture and there is nothing '
-            f'to clip. Not applied.')
-        return []
-    dest = os.path.join(sdout, 'atmosphere', 'contents', TITLE_ID, 'exefs',
-                        'main')
-    fresh = {os.path.normpath(os.path.abspath(p)) for p in produced}
-    built = os.path.normpath(os.path.abspath(dest)) in fresh
-    src = dest if built else dump.nso
-    log('')
-    log('clipping models to the movie\'s 4:3 rect ...')
-    if not built and not os.path.exists(src):
-        log('! movie 4:3 clip: no module to patch')
-        return []
-    # REFUSAL TO CLOBBER. This pass defaults ON, which every other module pass
-    # does not, so it is the one that can find itself running alone: if no
-    # other pass produced exefs/main this run, `src` is the DUMP's stock
-    # module, and writing that over an sdout/main a previous build patched
-    # silently reverts 60 FPS, the field buffer and everything else. Same
-    # check, and the same wording, as apply_field_bg.
-    if not built and os.path.exists(dest):
-        try:
-            same = (os.path.getsize(dest) == os.path.getsize(dump.nso)
-                    and open(dest, 'rb').read() == open(dump.nso, 'rb').read())
-        except OSError:
-            same = False
-        if not same:
-            log(f'! movie 4:3 clip: {dest}')
-            log('  already holds a module this build did not produce -- most '
-                'likely a patched one from an earlier run. Basing on the '
-                "dump's stock copy would silently throw those patches away, "
-                'so nothing was written.')
-            log('  Turn the 60 FPS switch on so the passes run together, or '
-                'delete sdout/ and rebuild.')
-            return []
-    log(f'  base main   {src}'
-        + ('   (previous patch output)' if built else '   (from dump)'))
-    tmp = dest + '.movieclip-tmp'
-    try:
-        ok = ff7nx_movieclip.apply_to_nso(src, tmp, log)
-    except Exception as exc:                                   # noqa: BLE001
-        log(f'! movie 4:3 clip: {type(exc).__name__}: {exc}')
-        ok = False
-    if not ok:
-        if os.path.exists(tmp):
-            os.remove(tmp)
-        log('! movie 4:3 clip: NOT applied -- the rest of the build is still '
-            'valid, models just keep spilling into the margin during FMVs.')
-        return []
-    os.replace(tmp, dest)
-    log(f'  wrote {dest}')
-    log('  PASS/FAIL on hardware: Reactor 1 explosion, Cloud on the left '
-        'margin. Sliced at the movie edge = the scissor is honoured.')
     return [dest] if not built else []
 
 

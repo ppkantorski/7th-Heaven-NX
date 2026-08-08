@@ -72,6 +72,109 @@ def lzs_store(data):
     return bytes(out)
 
 
+# Reference encoding, derived from lzs_decompress() above rather than from a
+# spec, so the two cannot drift apart:
+#
+#     start = len(out) - ((len(out) - 18 - offset) & 0xFFF)
+#
+# With `i` bytes already emitted and a match at absolute position `p`, the
+# distance is `d = i - p`, and the equation is satisfied for
+#
+#     offset = (i - 18 - d) & 0xFFF = (p - 18) & 0xFFF
+#
+# `& 0xFFF` makes that valid for p < 18 too -- the arithmetic is modular on
+# both sides. d must be 1..4095: d == 4096 would encode as 0 and decode to
+# start == len(out), which is not a back-reference at all.
+MAX_MATCH = 18
+MIN_MATCH = 3
+WINDOW = 4095
+
+
+def lzs_compress(data, max_chain=24):
+    """
+    Real LZS compression in the exact dialect lzs_decompress() reads.
+
+    WHY THIS EXISTS
+    ---------------
+    Every field written back to flevel.lgp used to go through lzs_store(),
+    which is literal-only and therefore ~12.5% LARGER than the raw data.
+    Vanilla's own entries are properly compressed at roughly 2.4:1, so
+    re-encoding a field cost about 2.8x its stored size EVEN IF THE MOD
+    CHANGED NOTHING ABOUT IT. With one or two fields that is invisible; with
+    Cosmos Limit Break, which replaces the background section of 683 of the
+    741 fields, flevel.lgp went from 131 MB to 333 MB.
+
+    Greedy matching with a hash chain on 3-byte prefixes. `max_chain` bounds
+    how many candidate positions are tried per byte -- the whole point is to
+    stay fast enough to run over a few hundred MB of field data, so this
+    trades a little ratio for a lot of speed. Measured on Cosmos Limit
+    Break's fields: ~0.31 of raw (better than vanilla's own encoder) at
+    ~1.4 MB/s.
+
+    NOT verified here on purpose: the caller checks the round trip (see
+    Archive.encode_field), because "the output decompresses to exactly the
+    input" is the only property that matters and it is cheap to assert.
+    """
+    n = len(data)
+    out = bytearray()
+    chains = {}
+    i = 0
+    bit = 8
+    ctrl = 0
+    ctrl_idx = 0
+    while i < n:
+        if bit == 8:
+            ctrl_idx = len(out)
+            out.append(0)
+            ctrl = 0
+            bit = 0
+        best_len = 0
+        best_pos = 0
+        if i + MIN_MATCH <= n:
+            chain = chains.get(data[i:i + MIN_MATCH])
+            if chain:
+                floor = i - WINDOW
+                if floor < 0:
+                    floor = 0
+                limit = n - i
+                if limit > MAX_MATCH:
+                    limit = MAX_MATCH
+                tried = 0
+                for p in reversed(chain):
+                    if p < floor:
+                        break
+                    tried += 1
+                    if tried > max_chain:
+                        break
+                    length = MIN_MATCH
+                    while length < limit and data[p + length] == data[i + length]:
+                        length += 1
+                    if length > best_len:
+                        best_len = length
+                        best_pos = p
+                        if length == limit:
+                            break
+        if best_len >= MIN_MATCH:
+            enc = (best_pos - 18) & 0xFFF
+            out.append(enc & 0xFF)
+            out.append(((enc >> 4) & 0xF0) | (best_len - MIN_MATCH))
+            step = best_len
+        else:
+            ctrl |= 1 << bit            # set = literal
+            out.append(data[i])
+            step = 1
+        out[ctrl_idx] = ctrl
+        end = i + step
+        j = i
+        while j < end:
+            if j + MIN_MATCH <= n:
+                chains.setdefault(data[j:j + MIN_MATCH], []).append(j)
+            j += 1
+        i = end
+        bit += 1
+    return bytes(out)
+
+
 # ----------------------------------------------------------- field files
 
 def split_sections(raw):
@@ -153,8 +256,27 @@ class Archive:
     def decompressed(self, entry):
         return lzs_decompress(entry['payload'][4:])
 
-    def encode_field(self, raw):
-        enc = lzs_store(raw)
+    def encode_field(self, raw, compress=True):
+        """
+        Wrap raw field bytes as a stored LGP payload.
+
+        Compressed by default, and VERIFIED: the compressor's output is
+        decompressed with the same routine the game's format demands and
+        compared against the input. Anything short of an exact match falls
+        back to lzs_store(), which is literal-only and cannot be wrong. So
+        the worst case of a compressor bug is the old file size, never a
+        corrupt field.
+        """
+        enc = None
+        if compress:
+            try:
+                cand = lzs_compress(raw)
+                if lzs_decompress(cand) == raw:
+                    enc = cand
+            except Exception:                                  # noqa: BLE001
+                enc = None
+        if enc is None:
+            enc = lzs_store(raw)
         return struct.pack('<I', len(enc)) + enc
 
     def replace(self, payloads):

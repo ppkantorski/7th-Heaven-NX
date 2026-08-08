@@ -1,4 +1,28 @@
 {
+ "CosmosFMV30.iro": {
+  "enabled": true,
+  "options": {
+   "CHARACTER_TYPE": 1,
+   "NON_CHIBI_CHARACTER_TYPE": 1,
+   "Common": 1
+  }
+ },
+ "ff7-60fps-mod.iro": {
+  "enabled": true,
+  "options": {
+   "FPSMode": 3,
+   "AdvancedFA": 2,
+   "FlevelFix": 1,
+   "NinoFieldAnimation": 1,
+   "ChaosFieldAnimation": 0,
+   "FieldAnimation": 1,
+   "BattleAnimation": 1,
+   "KOTRAnimation60FPS": 1,
+   "KOTRAnimation30FPS": 0,
+   "Flevel60FPSFix": 1,
+   "Compatibility": 0
+  }
+ },
  "Ninostyle Battle.iro": {
   "enabled": true,
   "options": {
@@ -13,17 +37,29 @@
    "Cid": 1,
    "Sephiroth": 1,
    "Jessie Mod": 0,
-   "Other": 0,
+   "Other": 1,
    "busterizer": 0
+  }
+ },
+ "[Tsunamods] Avalanche Arisen Battle Scenes 1.0.DDS.iro": {
+  "enabled": true,
+  "options": {
+   "battle_bg": 1
+  }
+ },
+ "[AxlRose]_Blender_v1.iro": {
+  "enabled": true,
+  "options": {
+   "BLENDER": 1
   }
  },
  "Ninostyle Chibi.iro": {
   "enabled": true,
   "options": {
-   "fb": 0,
+   "fb": 1,
    "lazaro": 0,
-   "efryt fb": 0,
-   "alt tifa": 0,
+   "efryt fb": 1,
+   "alt tifa": 1,
    "Dynamic Weapons": 0,
    "buggy": 3,
    "chocobo": 2,
@@ -33,5 +69,180 @@
    "cargo_ship": 1,
    "gelnika": 1
   }
+ },
+ "Ninostyle Chibi Fixes and Additions v2.5.iro": {
+  "enabled": true,
+  "options": {
+   "fb": 1,
+   "dwaeris": 1,
+   "dwbarret": 1,
+   "dwcid": 1,
+   "dwcloud": 1,
+   "Buster Sword F": 0,
+   "Buster Sword B": 0,
+   "Barret": 0,
+   "Cloud": 0,
+   "Tifa": 0,
+   "Yuffie": 0,
+   "DW Battle Minigame": 1,
+   "Culling Scene Fix": 1,
+   "Chibi": 1,
+   "DW Battle Minigame 1": 1,
+   "Field": 1,
+   "01 - Buster Sword": 1,
+   "HardEdgeMotorbikeStory": 1,
+   "DW Battle Minigame 2": 1,
+   "Field 1": 1,
+   "01 - Buster Sword 1": 1,
+   "HardEdgeMotorbikeStory 1": 1,
+   "Field 2": 1,
+   "01 - Buster Sword 2": 1,
+   "HardEdgeMotorbikeStory 2": 1,
+   "Field 3": 1,
+   "Field 4": 1,
+   "Field 5": 1,
+   "Field 6": 1,
+   "Wonder Square": 1,
+   "City of The Ancients": 1,
+   "Sector 8": 1,
+   "Sector 7 Weapon Shop": 1,
+   "Mt. Corel": 1,
+   "Truck": 1,
+   "Monitor DW off": 1,
+   "Cloud / HardEdgeMotorbikeStory": 1
+  }
+ },
+ "CosmosLimitBreak.iro": {
+  "enabled": true,
+  "options": {
+   "LIMITBREAK": 1,
+   "UNCROP": 1,
+   "ATA": 1,
+   "LIMIT BREAK AA": 1,
+   "LIMIT BREAK AAF": 1,
+   "CONFIG": 1,
+   "CONFIG UPSCALES ONLY": 1,
+   "AA REMOVED": 1
+  }
+ },
+ "Echo-s.iro": {
+  "enabled": false,
+  "options": {
+   "Echo-S": 1,
+   "Time": 1,
+   "Music": 1,
+   "BVoice": 1,
+   "Grunts": 1,
+   "Auto": 1,
+   "NV_Attacks": 1,
+   "V_Attacks": 1,
+   "EchoeS Of The Planet": 1,
+   "Arranged": 1
+  }
+ },
+ "[Tsunamods]-Arranged-Soundtrack.iro": {
+  "enabled": true,
+  "options": {
+   "TSM Arranged": 1,
+   "Opening": 1
+  }
+ },
+ "[Tsunamods]_Cosmo_Memory.iro": {
+  "enabled": true,
+  "options": {
+   "Center": 1,
+   "Sound": 1,
+   "Grunts": 1,
+   "FA": 1,
+   "BA": 0,
+   "FMV": 1,
+   "Footsteps": 1,
+   "WM": 1,
+   "WM 1": 1,
+   "Base": 1,
+   "Ambience": 1,
+   "FA+BA": 1,
+   "FA 1": 1,
+   "BA 1": 1
+  }
+ },
+ "Enhanced Stock UI-rel2.iro": {
+  "enabled": false,
+  "options": {
+   "Main": 0,
+   "enhanced": 1,
+   "start": 1,
+   "Menu Options": 0,
+   "items_materia": 3,
+   "icons": 0,
+   "cursor": 1,
+   "bars": 2,
+   "fonts": 1,
+   "avatars": 1,
+   "opacity": 0,
+   "nt": 0,
+   "menuwidth": 0,
+   "forcenoaddon": 0,
+   "dialogueavatars": 0,
+   "fds": 1,
+   "fdb": 1,
+   "finger": 0,
+   "pos": 0,
+   "Battle Menu Options": 0,
+   "battleview": 3,
+   "ba": 0,
+   "tbb": 1,
+   "nbb": 0,
+   "hbb": 1,
+   "esuiscale": 0,
+   "force43": 1,
+   "Controller Options": 0,
+   "controller": 1,
+   "controllerorder": 1,
+   "controllerxinput": 0,
+   "ECHOS Options": 0,
+   "ECHOS": 0
+  }
+ },
+ "[Tsunamods]_Modern_Spell_Names.iro": {
+  "enabled": true,
+  "options": {
+   "Spells": 1
+  }
+ },
+ "CosmosGaia.iro": {
+  "enabled": false,
+  "options": {
+   "CG": 1
+  }
+ },
+ "__global__": {
+  "field_tex_cap": 512,
+  "battle_bg_tex_cap": 768,
+  "field_bg_page_px": 256,
+  "field_bg_budget_mb": 0.0,
+  "field_bg_partial": 1,
+  "field_bg_max_pages": 16,
+  "field_bg_replace_only": 2,
+  "field_bg_preset": 9,
+  "margin_art": 2,
+  "field_bg_ladder_v2": true,
+  "fps_60": true,
+  "movie_quality": "maximum",
+  "movie_fit": "native",
+  "movie_colour": "bt709",
+  "movie_30fps": true,
+  "analog_360": true,
+  "no_autorun": true,
+  "bg_clear": false,
+  "movie_clip": true,
+  "field_frame": true,
+  "no_cheats": true,
+  "limiter_fps": 66,
+  "widescreen": "ws-3d",
+  "field_buffer": 3,
+  "scaler": "hd",
+  "fxaa": "hd",
+  "video_shader": "hd"
  }
 }
