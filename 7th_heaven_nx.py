@@ -15,6 +15,8 @@ Layout expected in this script's directory:
     sdout/               created automatically, copy onto your SD card
 
 Run with no arguments for the UI, or --cli to build with saved settings.
+
+Copyright (c) 2026 ppkantorski
 """
 import json
 import os
