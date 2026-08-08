@@ -162,20 +162,36 @@ the vanilla one and the bounds are the stock ones), and cannot change a field
 whose script never moves the camera. The only frames it can move are the ones
 that are already outside the bounds -- which is the definition of the bug.
 
-WHY NOT Y
----------
-FFNx's unconditional tail clamp is `field_widescreen_width_clip_with_camera_range`,
-which is horizontal. The vertical twin is gated behind `is_fieldmap_uncropped()`
-and its own config key, and vanilla never clamped a scripted camera vertically
-either, so adding it would be a behaviour change with no measured symptom
-behind it.
+Y, WHICH THIS MODULE NOW ALSO DOES  (was "WHY NOT Y")
+-----------------------------------------------------
+It used to say: FFNx's unconditional tail clamp is
+`field_widescreen_width_clip_with_camera_range`, which is horizontal; the
+vertical twin `field_uncropped_height_clip_with_camera_range` is gated behind
+`isScriptedVerticalClipEnabled()` and its own per-field config key; vanilla
+never clamped a scripted camera vertically either; so adding it would be a
+behaviour change with no measured symptom behind it.
 
-A `--vertical` variant WAS written and then removed rather than shipped off
-by default: its word count came out wrong on the first run of its own
-assertion, and an untested option that only a future session will ever switch
-on is worse than no option at all. If a cutscene ever shows a black band top
-or bottom, the shape is `_clamp_block` + `_clamp_tail` again with
-RANGE_TOP/RANGE_BOTTOM and HALF_H, both of which are already defined here.
+**There is a measured symptom now.** Sector 8, the camera panning down from
+the LOVELESS billboards onto Aerith: a black band along the top at the
+extreme of the pan. HANDOFF-93 proposed that the port was clamping to the
+stock +/-112 while the uncropped view needs +/-120, and that the missing 8
+range units (24 device rows at 720p) were the band. `diag_camhalf.py`
+disassembled the clamp and that is not true -- see §2.1. The port is already
+on 120, the normal path is flush with the art on `md8_3`, and what is left is
+the path that does not clamp at all. Which is this one.
+
+Cosmos's config asks for the vertical clip on ten fields explicitly
+(`scripted_vertical_clip = true`). This module does not read that key: it
+clamps every field, for the same reason the x leg does. The clamp is
+idempotent, so on a field whose script stays legal it is a no-op, and the
+per-field gate is already baked into the range data. Following FFNx's opt-in
+here would mean shipping a config reader to reproduce a default that FFNx only
+has because it cannot edit the archive.
+
+The shape is exactly what this docstring predicted before there was any
+evidence for it -- `_clamp_block` + `_clamp_tail` with RANGE_TOP/RANGE_BOTTOM
+and HALF_H -- which is the one thing in HANDOFF-93 that survived contact with
+the measurement.
 """
 from __future__ import annotations
 
@@ -218,7 +234,7 @@ DELTA_X_OFF = 4                 # -> 0xCC15F0  field_curr_delta_world_pos_x
 DELTA_Y_OFF = 8                 # -> 0xCC15F4
 
 HALF_W = 0xA0                   # 160, the stock half-view; see §2
-HALF_H = 0x78                   # 120
+HALF_H = 0x78                   # 120, and MEASURED -- see §2.1
 
 CTX = 22                        # x22, the guest CPU context
 BASE = 19                       # w19 = 0xCC15EC
@@ -226,7 +242,37 @@ BASE = 19                       # w19 = 0xCC15EC
 COND_GT = 12
 COND_LT = 11
 
-N_WORDS = 24
+# +0x30 in field_trigger_header -- FFNx calls it `short field_30[4]` and
+# never touches it. MEASURED zero in all 711 fields of the built archive, all
+# eight bytes, which is why it can carry the per-field vertical-clip flag.
+# `field_14[4]` at +0x14 was the obvious candidate and is NOT free: 86 fields
+# use it.
+VCLIP_FLAG_OFF = 0x30
+VCLIP_FLAG_SITES = 8            # bytes at +0x30..+0x37, only the first used
+
+N_WORDS_X = 24                  # horizontal only -- the shipped v1
+N_WORDS_XY = 47                 # both axes, y gated per field  (v3)
+
+# EVERY LENGTH THIS MODULE HAS EVER WRITTEN, newest first.
+#
+# `cave_length` probes these and only these, so a module carrying an OLDER
+# cave can still be reverted -- which is the only way v3 can replace v2 on a
+# module that is already on hardware. v3 shipped without this list and could
+# not revert its own predecessor: `--revert` reported "does not end in the
+# displaced word plus a return branch" and refused, correctly, because 45 was
+# no longer a length it knew about. Removing a length from this list strands
+# every module built with it.
+#
+#   24  v1  x only
+#   45  v2  x and y, ungated -- the one that froze 198 cameras
+#   47  v3  x and y, gated on field_trigger_header + 0x30
+LEGACY_LENGTHS = (45,)
+KNOWN_LENGTHS = (N_WORDS_XY,) + LEGACY_LENGTHS + (N_WORDS_X,)
+N_WORDS = N_WORDS_X             # kept so old callers still read something
+
+
+def n_words(vertical=True):
+    return N_WORDS_XY if vertical else N_WORDS_X
 
 ANCHORS = [
     (0x9F7DC4, 0xF00046B6, 'adrp x22, #0x12ce000  \\ the guest context,'),
@@ -244,7 +290,80 @@ ANCHORS = [
     (0x9F8784, 0xA94157F6, 'ldp x22, x21, [sp, #0x10]  w21/w22 restored after'),
     (0x9F8788, 0xF84407F7, 'ldr x23, [sp], #0x40       the frame is torn down'),
     (0x10FC3A0, 0x34000180, 'the guest->host address helper, first word'),
+    # DELTA_Y_OFF was defined in this file from the first revision and never
+    # used, so it was never checked. It is checked now, because the vertical
+    # leg writes through it and an unverified constant is how HANDOFF-89's
+    # third leg went into the wrong global.
+    #
+    # The normal path's write-back, immediately after the clip call, does both
+    # axes in the same shape one after the other:
+    #
+    #   +0x9F8510  ldrsh w8, [x0]        the clipped x
+    #   +0x9F8514  add   w0, w19, #4     &0xCC15F0
+    #   +0x9F8518  neg   w20, w8
+    #   +0x9F8520  bl    xlat
+    #   +0x9F8524  strh  w20, [x0]       delta_x = -x
+    #   +0x9F852C  sub   w0, w8, #6      the point's SECOND short
+    #   +0x9F8534  ldrsh w8, [x0]        the clipped y
+    #   +0x9F8538  add   w0, w19, #8     &0xCC15F4
+    #
+    # so +4 is x and +8 is y, and the negation the cave applies is the game's
+    # own convention on both axes rather than a guess carried over from x.
+    (0x9F8514, 0x11001260, 'add w0, w19, #4   &delta_x -- DELTA_X_OFF'),
+    (0x9F8538, 0x11002260, 'add w0, w19, #8   &delta_y -- DELTA_Y_OFF'),
 ]
+
+
+# -------------------------------------------------- the measured half-height
+#
+# §2.1 -- WHY HALF_H IS 120 AND NOT 112, AND WHY THAT IS NOT A CHOICE
+#
+# HANDOFF-93 predicted that the port clamps the camera vertically to the stock
+# +/-112 while the uncropped view needs +/-120, and that the missing 8 units
+# were the black band. `diag_camhalf.py` disassembled both clamps and that is
+# not what the port does:
+#
+#     field_clip_with_camera_range         +0xA11530 .. +0xA11898
+#       +0xA115A8  sub w8, w8, #160     right - 160     camera_range +0x10
+#       +0xA11668  add w8, w8, #160     left  + 160     camera_range +0x0C
+#       +0xA11720  sub w9, w8, #120     bottom - 120    camera_range +0x12
+#       +0xA117E8  add w8, w8, #120     top   + 120     camera_range +0x0E
+#       ... and the second copy of each at +0xA11600/+0xA116B4/
+#           +0xA11778/+0xA11834
+#
+#     field_layer3_clip_with_camera_range  +0xA108A0
+#       19 immediates of 160, 17 of 120, and again no 112.
+#
+# ZERO immediates of 112 in either function. The port's vertical half-view has
+# always been 120 -- it matches FFNx's `background.cpp:447/449`, which are also
+# a bare 120 with no `enable_uncrop` term. (HANDOFF-93 cited
+# `background.cpp:133`'s `enable_uncrop ? 120 : 112`; that constant is the
+# layer-3/4 tile WRAP, not the camera clamp. Right number, wrong line, and the
+# wrong conclusion followed from it.)
+#
+# So the normal path was never broken. Checked against the built archive:
+# md8_3, the LOVELESS pan, has camera_range top -200 bottom 200, and at 120 the
+# camera travels y in [-80, +80], putting the visible span at exactly
+# [-200, +200] -- flush with the art, no overshoot to find.
+#
+# That eliminates HANDOFF-93 §3 and §4 outright and leaves §5: the SCRIPTED
+# path, which does not clamp at all. Which is this module, and it only ever
+# did x.
+CLIP_LO = 0xA11530              # field_clip_with_camera_range
+CLIP_HI = 0xA11898              # its `ret`
+VERTICAL_HALF_SITES = (0xA11720, 0xA11778, 0xA117E8, 0xA11834)
+STOCK_HALF_H = 0x70             # 112 -- what the port does NOT use
+
+
+def _find_imm(t, lo, hi, imm):
+    """Every add/sub-immediate in [lo, hi) whose immediate is `imm`."""
+    out = []
+    for va in range(lo, hi, 4):
+        w = struct.unpack_from('<I', t, va)[0]
+        if (w & 0x7F000000) in (0x11000000, 0x51000000) \
+                and ((w >> 10) & 0xFFF) == imm and not ((w >> 22) & 3):
+            out.append(va)
+    return out
 
 
 def _fmt(word):
@@ -295,26 +414,128 @@ def _clamp_tail(addr, i0):
     ]
 
 
-def cave_words(addr, return_va):
-    """The whole cave, laid out at addr(i)."""
-    skip = addr(N_WORDS - 2)                      # the displaced instruction
+def _header_ptr(addr, i0, skip=None):
+    """
+    The host pointer to `field_triggers_header` in x0.
+
+    Six words with the null check, five without. The vertical leg needs a
+    SECOND copy because `_clamp_block` leaves x0 pointing at the delta it just
+    wrote, not at the header.
+
+    Five words rather than stashing the pointer in a callee-saved register.
+    x23 is in fact free here -- the prologue saves it, nothing between the hook
+    and `ldr x23, [sp], #0x40` at +0x9F8788 reads it -- but that is one more
+    unproven claim about register liveness in a cave that runs on every field
+    frame, and re-deriving costs five words out of a padding hole. The idiom is
+    the same one the first leg already proves.
+    """
     w = [
         A.movz(0, HDR_PTR & 0xFFFF),
         A.movk_hi(0, HDR_PTR >> 16),
-        A.bl(addr(2), XLAT),
+        A.bl(addr(i0 + 2), XLAT),
         A.ldr(0, 0, 0),                           # guest header pointer
-        A.cbz(0, addr(4), skip),
-        A.bl(addr(5), XLAT),                      # -> host header
     ]
-    w += _clamp_block(addr, 6, skip, DELTA_X_OFF,
-                      RANGE_LEFT, RANGE_RIGHT, HALF_W)
-    w += _clamp_tail(addr, 16)
-    w += [HOOK_ORIG, A.b(addr(len(w) + 1), return_va)]
-    assert len(w) == N_WORDS, 'N_WORDS is %d, body is %d' % (N_WORDS, len(w))
+    if skip is not None:
+        w.append(A.cbz(0, addr(i0 + 4), skip))    # no field loaded -> nothing
+    w.append(A.bl(addr(i0 + len(w)), XLAT))       # -> host header
     return w
 
 
-DISASM = [
+def _vclip_gate(addr, i0, skip):
+    """
+    Two words: the PER-FIELD opt-in for the vertical clamp.
+
+    WHY THIS EXISTS, AND WHY v2 WAS WRONG TO LEAVE IT OUT
+    ----------------------------------------------------
+    FFNx gates the vertical scripted clip and does not gate the horizontal
+    one (`ff7/field/background.cpp:559`):
+
+        void field_uncropped_height_clip_with_camera_range(vector2<short>* p)
+        {
+            if(!widescreen.isScriptedClipEnabled()) return;
+            p->y += widescreen.getVerticalOffset();
+            if(widescreen.isScriptedVerticalClipEnabled()) {
+                if (p->y > camera_range.bottom - 120) p->y = ...bottom - 120;
+                if (p->y < camera_range.top    + 120) p->y = ...top    + 120;
+            }
+        }
+
+    `scripted_clip` defaults TRUE (one field in Cosmos's config turns it off),
+    `scripted_vertical_clip` defaults FALSE and five fields opt in. v2 read
+    that asymmetry, decided to ignore it, and wrote down two reasons:
+
+        "The clamp is idempotent, so on a field whose script stays legal it
+         is a no-op, and the per-field gate is already baked into the range
+         data."
+
+    Both are false, and each has a symptom.
+
+      * NOT A NO-OP. Field scripts pan the camera to positions the range
+        forbids -- that is what an elevator does. Vanilla allowed it. Clamped,
+        the camera stops at `top + 120`, holds while the elevator keeps
+        moving, and releases when the script brings it back inside. Patrick
+        reported exactly that on the reactor elevator, in those words.
+      * NOTHING IS BAKED. `ff7nx_ws.clamped_range()` copies `top` and
+        `bottom` through UNTOUCHED -- HANDOFF-93 0.2 says so. The x leg's gate
+        really is baked into the data, which is why the same sentence is true
+        for x and false for y. The reasoning was carried across an axis it
+        does not survive.
+
+    Measured over the built archive, the ungated clamp:
+
+        198 of 711 fields have a range EXACTLY 240 units tall, so
+            `top + 120 == bottom - 120` and the camera is frozen at one y --
+            `blinele` (the Shinra HQ elevator), `elminn_1`, `elmtow`,
+            `junele2` among them
+         10 more invert and are skipped by `_clamp_block`'s guard
+        503 keep real travel, and stick at the last few units of it
+
+    So the gate is not caution, it is the difference between clamping five
+    fields and clamping seven hundred.
+
+    THE FLAG
+    --------
+    One byte at `field_trigger_header + 0x30`, written into section 8 by
+    `ff7nx_vclip` from the same `scripted_vertical_clip` key FFNx reads. Zero
+    means leave the scripted camera alone, which is both FFNx's default and
+    vanilla's behaviour, so an archive built without that pass gets the
+    horizontal clamp and nothing else -- the safe direction.
+
+    `w20` is the scratch because it is dead here and `_clamp_block`'s first
+    instruction overwrites it. `w22` would have been the obvious pick and is
+    NOT free: `_clamp_tail`'s `ldr w0, [x22, #0x14]` reads it.
+    """
+    return [
+        A.ldrb(20, 0, VCLIP_FLAG_OFF),            # ldrb w20, [x0, #0x30]
+        A.cbz(20, addr(i0 + 1), skip),            # not opted in -> skip
+    ]
+
+
+def cave_words(addr, return_va, vertical=True):
+    """
+    The whole cave, laid out at addr(i).
+
+    `vertical=False` reproduces the shipped horizontal-only v1 byte for byte,
+    which is what makes `--revert` of an older module and the A/B possible.
+    """
+    n = n_words(vertical)
+    skip = addr(n - 2)                            # the displaced instruction
+    w = _header_ptr(addr, 0, skip)                            # 6
+    w += _clamp_block(addr, 6, skip, DELTA_X_OFF,
+                      RANGE_LEFT, RANGE_RIGHT, HALF_W)        # 10 -> 16
+    w += _clamp_tail(addr, 16)                                # 6  -> 22
+    if vertical:
+        w += _header_ptr(addr, 22)                            # 5  -> 27
+        w += _vclip_gate(addr, 27, skip)                      # 2  -> 29
+        w += _clamp_block(addr, 29, skip, DELTA_Y_OFF,
+                          RANGE_TOP, RANGE_BOTTOM, HALF_H)    # 10 -> 39
+        w += _clamp_tail(addr, 39)                            # 6  -> 45
+    w += [HOOK_ORIG, A.b(addr(len(w) + 1), return_va)]        # 2
+    assert len(w) == n, 'n_words is %d, body is %d' % (n, len(w))
+    return w
+
+
+_DISASM_X = [
     'mov w0, #0xf454', 'movk w0, #0xcf, lsl #16', 'bl #0x10fc3a0',
     'ldr w0, [x0]', 'cbz w0, #skip', 'bl #0x10fc3a0',
     'ldrsh w20, [x0, #0x10]', 'ldrsh w21, [x0, #0xc]',
@@ -324,8 +545,29 @@ DISASM = [
     'cmp w8, w20', 'csel w8, w20, w8, gt',
     'cmp w8, w21', 'csel w8, w21, w8, lt',
     'neg w8, w8', 'strh w8, [x0]',
-    'ldr w0, [x22, #0x14]', 'b #0x9f8750',
 ]
+
+_DISASM_Y = [
+    'mov w0, #0xf454', 'movk w0, #0xcf, lsl #16', 'bl #0x10fc3a0',
+    'ldr w0, [x0]', 'bl #0x10fc3a0',
+    'ldrb w20, [x0, #0x30]', 'cbz w20, #skip',
+    'ldrsh w20, [x0, #0x12]', 'ldrsh w21, [x0, #0xe]',
+    'sub w20, w20, #0x78', 'add w21, w21, #0x78',
+    'cmp w21, w20', 'b.gt #skip',
+    'add w0, w19, #8', 'bl #0x10fc3a0', 'ldrsh w8, [x0]', 'neg w8, w8',
+    'cmp w8, w20', 'csel w8, w20, w8, gt',
+    'cmp w8, w21', 'csel w8, w21, w8, lt',
+    'neg w8, w8', 'strh w8, [x0]',
+]
+
+_DISASM_TAIL = ['ldr w0, [x22, #0x14]', 'b #0x9f8750']
+
+
+def disasm(vertical=True):
+    return _DISASM_X + (_DISASM_Y if vertical else []) + _DISASM_TAIL
+
+
+DISASM = disasm(False)          # the v1 listing, for anything that imported it
 
 
 # --------------------------------------------------------------- the model
@@ -455,24 +697,62 @@ def walk_physical(t, hook=HOOK_VA, n=None):
 
 
 def cave_length(t):
-    """N_WORDS if the installed cave walks back to the displaced word."""
-    got = walk(t, n=N_WORDS)
-    if got and _b_target(got[-1][1], got[-1][0]) == RETURN_VA \
-            and got[-2][1] == HOOK_ORIG:
-        return N_WORDS
+    """
+    The installed cave's word count, or None.
+
+    EVERY length this module has ever written is probed -- see
+    `KNOWN_LENGTHS`. `--revert` has to remove whichever is actually there, and
+    a wrong count would leave live words behind or zero words that are not
+    ours. The end marker -- the displaced instruction followed by a branch to
+    RETURN_VA -- is what distinguishes them, so this is a measurement and not
+    a preference.
+    """
+    for n in KNOWN_LENGTHS:
+        got = walk(t, n=n)
+        if got and len(got) == n \
+                and _b_target(got[-1][1], got[-1][0]) == RETURN_VA \
+                and got[-2][1] == HOOK_ORIG:
+            return n
     return None
 
 
+def installed_vertical(t):
+    """
+    True/False for which variant is in the module, None if none is.
+
+    A LEGACY vertical cave (45 words, ungated) counts as vertical, so
+    `--apply` sees "x and y is installed, x and y is wanted" and would call it
+    a no-op. `installed_current` is what distinguishes "has a y leg" from "has
+    THIS y leg", and `apply` uses it so a v2 module is upgraded rather than
+    left alone.
+    """
+    n = cave_length(t)
+    if n is None:
+        return None
+    return n != N_WORDS_X
+
+
+def installed_current(t):
+    """True only for the cave THIS revision writes."""
+    return cave_length(t) == N_WORDS_XY
+
+
 # ------------------------------------------------------------------ patches
-def build_patches(img, starts, log=print):
+def build_patches(img, starts, log=print, vertical=True):
     def build(_entry, addr):
-        return cave_words(addr, RETURN_VA)
+        return cave_words(addr, RETURN_VA, vertical)
 
     entry, out = ff7nx_cave.emit_laid_out(
         ff7nx_cave.HolePool(bytearray(img), starts=starts), build, span=0x80000)
     out[HOOK_VA] = A.b(HOOK_VA, entry)
-    log('  scripted camera clamp cave: %d words in padding, entry +%#x  '
-        '(x only -- see WHY NOT Y)' % (N_WORDS, entry))
+    log('  scripted camera clamp cave: %d words in padding, entry +%#x  (%s)'
+        % (n_words(vertical), entry,
+           'x and y' if vertical else 'x only'))
+    if vertical:
+        log('    x -> [left + %d, right - %d]   the bounds '
+            'field_clip_with_camera_range uses' % (HALF_W, HALF_W))
+        log('    y -> [top  + %d, bottom - %d]  MEASURED in that function at '
+            '+0xA11720/+0xA117E8' % (HALF_H, HALF_H))
     log('  (the 60 FPS cave region is not touched)')
     return out
 
@@ -500,7 +780,8 @@ def _emu():
 
 
 def emulate(delta_x, left, right, hdr=0x2200000,
-            delta_y=0, top=0, bottom=0, no_field=False):
+            delta_y=0, top=0, bottom=0, no_field=False, vertical=True,
+            vclip=1):
     """
     Execute the cave's real words against a fake guest memory.
 
@@ -511,16 +792,21 @@ def emulate(delta_x, left, right, hdr=0x2200000,
     Cpu, arm64emu = _emu()
     mem = arm64emu.Mem()
     base = 0x3000000
-    n = N_WORDS
+    n = n_words(vertical)
     mem.setu(HDR_PTR, 0 if no_field else hdr, 4)
     mem.setu(hdr + RANGE_LEFT, left & 0xFFFF, 2)
     mem.setu(hdr + RANGE_RIGHT, right & 0xFFFF, 2)
     mem.setu(hdr + RANGE_TOP, top & 0xFFFF, 2)
     mem.setu(hdr + RANGE_BOTTOM, bottom & 0xFFFF, 2)
+    # The per-field opt-in `ff7nx_vclip` writes into section 8. `vclip=1` is
+    # the default HERE and only here, so the existing y cases keep testing the
+    # clamp itself; the archive's default is 0 and `vclip=0` below is what
+    # tests that.
+    mem.setu(hdr + VCLIP_FLAG_OFF, vclip & 0xFF, 1)
     mem.setu(W19_BASE + DELTA_X_OFF, delta_x & 0xFFFF, 2)
     mem.setu(W19_BASE + DELTA_Y_OFF, delta_y & 0xFFFF, 2)
 
-    words = cave_words(lambda i: base + 4 * i, base + 4 * n)
+    words = cave_words(lambda i: base + 4 * i, base + 4 * n, vertical)
 
     class Stub(Cpu):
         def step(self, w, pc):
@@ -544,7 +830,7 @@ def emulate(delta_x, left, right, hdr=0x2200000,
 
 
 # ------------------------------------------------------------------ verify
-def check_encoding(log=print):
+def check_encoding(log=print, vertical=True):
     try:
         from capstone import Cs, CS_ARCH_ARM64, CS_MODE_LITTLE_ENDIAN
     except ImportError:
@@ -552,14 +838,15 @@ def check_encoding(log=print):
         return True
     md = Cs(CS_ARCH_ARM64, CS_MODE_LITTLE_ENDIAN)
     base = 0x1000
-    words = cave_words(lambda i: base + 4 * i, base + 4 * N_WORDS)
+    n = n_words(vertical)
+    words = cave_words(lambda i: base + 4 * i, base + 4 * n, vertical)
     blob = b''.join(struct.pack('<I', x) for x in words)
     got = [(i.mnemonic + ' ' + i.op_str).strip() for i in md.disasm(blob, base)]
     ok = len(got) == len(words)
     if not ok:
         log('  ! capstone decoded %d of %d words' % (len(got), len(words)))
         return False
-    for k, (g, want) in enumerate(zip(got, DISASM)):
+    for k, (g, want) in enumerate(zip(got, disasm(vertical))):
         loose = '#skip' in want or want.startswith('b #')
         if (g.split()[0] if loose else g) != (want.split()[0] if loose
                                               else want):
@@ -603,12 +890,96 @@ def verify(main=None, log=print):
            % (left, right, dx, got['x'], want, travel(left, right), what))
 
     log('')
+    log('  the VERTICAL leg, executed, against the same model at half = %d:'
+        % HALF_H)
+    log('    the constant is not FFNx\'s and not assumed -- it is READ OUT OF')
+    log('    the port at +0xA11720 / +0xA11778 / +0xA117E8 / +0xA11834, the')
+    log('    four vertical immediates in field_clip_with_camera_range. There')
+    log('    is no 112 anywhere in that function or in the layer-3 one.')
+    log('')
+    log('    (all rows below have the per-field opt-in flag SET; the rows')
+    log('     after them are the same fields with it clear, which is the')
+    log('     archive default and vanilla behaviour)')
+    log('')
+    log('    range            delta_y    cave      model    travel')
+    ycases = [
+        (-200, 200, 100, 'md8_3 (Sector 8, the LOVELESS pan) -- script high'),
+        (-200, 200, -100, 'md8_3, the other end'),
+        (-200, 200, 80, 'md8_3 at the bound exactly -- must not move'),
+        (-200, 200, 0, 'md8_3 centred -- must not move'),
+        (-120, 120, 40, 'a 240-unit range: pinned to 0, no vertical travel'),
+        (-256, 256, 300, 'a tall field, script far below'),
+        (-120, 112, 40, 'md8_5: 232 units, lo > hi -- refused, left alone'),
+    ]
+    for top, bottom, dy, what in ycases:
+        got = emulate(0, -2000, 2000, delta_y=dy, top=top, bottom=bottom)
+        want = clamp(dy, top, bottom, HALF_H)
+        ck(got['y'] == want,
+           '%5d..%-5d  %6d -> %6d  (model %6d, travel %4d)  %s'
+           % (top, bottom, dy, got['y'], want,
+              travel(top, bottom, HALF_H), what))
+
+    log('')
+    log('  THE PER-FIELD GATE -- flag clear means the scripted camera is left')
+    log('  exactly as the script wrote it, which is what an elevator needs:')
+    for top, bottom, dy, what in ycases:
+        got = emulate(0, -2000, 2000, delta_y=dy, top=top, bottom=bottom,
+                      vclip=0)
+        ck(got['y'] == dy,
+           '%5d..%-5d  %6d -> %6d  UNTOUCHED   %s'
+           % (top, bottom, dy, got['y'], what))
+    got = emulate(0, -2000, 2000, delta_y=300, top=-120, bottom=120, vclip=0)
+    ck(got['y'] == 300,
+       'blinele-shaped (240 units, would be PINNED): the script gets its '
+       'camera back')
+    got = emulate(152, -258, 258, delta_y=300, top=-256, bottom=256, vclip=0)
+    ck(got['x'] == clamp(152, -258, 258) and got['y'] == 300,
+       'and the flag gates ONLY y -- x still clamps (x %d, y %d), which is '
+       'FFNx: scripted_clip defaults true, scripted_vertical_clip false'
+       % (got['x'], got['y']))
+
+    log('')
+    log('  the two legs do not interfere:')
+    got = emulate(152, -258, 258, delta_y=100, top=-200, bottom=200)
+    ck(got['x'] == clamp(152, -258, 258)
+       and got['y'] == clamp(100, -200, 200, HALF_H),
+       'x and y clamp to their own axes in one pass (x %d, y %d)'
+       % (got['x'], got['y']))
+    got = emulate(0, -2000, 2000, delta_y=100, top=-200, bottom=200)
+    ck(got['x'] == 0, 'a legal x is untouched while y is clamped')
+    got = emulate(152, -258, 258, delta_y=0, top=-2000, bottom=2000)
+    ck(got['y'] == 0, 'a legal y is untouched while x is clamped')
+
+    log('')
+    log('  BACKWARD COMPATIBILITY -- the check that v3 shipped without:')
+    ck(24 in KNOWN_LENGTHS and 45 in KNOWN_LENGTHS
+       and N_WORDS_XY in KNOWN_LENGTHS,
+       'KNOWN_LENGTHS carries every cave this module has written '
+       '(v1 24, v2 45, v3 %d) -- a module built with any of them can still '
+       'be reverted' % N_WORDS_XY)
+    ck(KNOWN_LENGTHS[0] == N_WORDS_XY,
+       'the current length is probed first, so a fresh cave is never '
+       'mistaken for a legacy one')
+    ck(len(set(KNOWN_LENGTHS)) == len(KNOWN_LENGTHS),
+       'no length is listed twice')
+    ck(N_WORDS_XY not in LEGACY_LENGTHS,
+       'the current length is not also marked legacy -- if it were, --apply '
+       'would try to upgrade a module that is already correct, forever')
+
+    log('')
     log('  the guards:')
     got = emulate(9999, -258, 258, no_field=True)
     ck(got['x'] == 9999, 'no field loaded (header pointer 0) -> nothing '
                          'is written')
+    got = emulate(9999, -258, 258, delta_y=9999, top=0, bottom=0,
+                  no_field=True)
+    ck(got['y'] == 9999, 'no field loaded -> the VERTICAL leg is skipped too '
+                         '(one cbz covers both)')
     got = emulate(9999, 100, 120)
     ck(got['x'] == 9999, 'a degenerate range (lo > hi) -> nothing is written')
+    got = emulate(0, -2000, 2000, delta_y=9999, top=-120, bottom=112)
+    ck(got['y'] == 9999, 'md8_5\'s 232-unit range (lo > hi at 120) -> the y '
+                         'leg is skipped, x still runs')
     # The displaced word is `ldr w0, [x22, #0x14]` and the instruction the
     # cave returns to is `str w0, [x22, #0x10]` -- the guest's `mov esp, ebp`.
     # If the cave ever returned without running the displaced word, or left
@@ -662,6 +1033,23 @@ def verify(main=None, log=print):
     if not fails:
         ck(True, 'all %d anchors match, and w19 is written only in the '
                  'prologue' % len(ANCHORS))
+    log('')
+    log('  the vertical half-view, read out of THIS module rather than '
+        'assumed:')
+    for va in VERTICAL_HALF_SITES:
+        got = w32(t, va)
+        imm = (got >> 10) & 0xFFF
+        shape = got & 0x7F000000
+        ck(shape in (0x11000000, 0x51000000) and imm == HALF_H,
+           '+%#09x is %s -> %s #%d  (want add/sub #%d)'
+           % (va, _fmt(got),
+              'sub' if shape == 0x51000000 else
+              ('add' if shape == 0x11000000 else '??'), imm, HALF_H))
+    ck(not _find_imm(t, CLIP_LO, CLIP_HI, STOCK_HALF_H),
+       'no 112 immediate anywhere in field_clip_with_camera_range -- the '
+       'port was never on the stock half-height, so there is nothing to '
+       'compensate and HANDOFF-93 §4 is eliminated')
+
     st = state(t)
     log('    +%#09X  %s   %s' % (HOOK_VA, _fmt(w32(t, HOOK_VA)), st))
     if st == 'patched':
@@ -670,10 +1058,29 @@ def verify(main=None, log=print):
                           'plus a return to +%#x' % RETURN_VA)
         if n:
             got = walk(t, n=n)
-            want = cave_words(lambda i: got[i][0], RETURN_VA)
+            want = cave_words(lambda i: got[i][0], RETURN_VA,
+                              n == N_WORDS_XY)
             ck([x for _, x in got] == want,
                'every word in the WRITTEN module matches what cave_words() '
                'lays out at those exact addresses')
+
+    # Does the vertical evidence actually bite? Rewrite the module's own
+    # `sub w9, w8, #120` as `#112` -- i.e. manufacture the world HANDOFF-93
+    # assumed -- and the site check must notice. A check that passes on both
+    # the real module and the counterfactual is not a check.
+    log('')
+    log('  mutation -- the vertical evidence must be falsifiable:')
+    mut = bytearray(t)
+    got = struct.unpack_from('<I', mut, VERTICAL_HALF_SITES[0])[0]
+    struct.pack_into('<I', mut, VERTICAL_HALF_SITES[0],
+                     (got & ~(0xFFF << 10)) | (STOCK_HALF_H << 10))
+    imm = (struct.unpack_from('<I', bytes(mut),
+                              VERTICAL_HALF_SITES[0])[0] >> 10) & 0xFFF
+    ck(imm == STOCK_HALF_H and _find_imm(bytes(mut), CLIP_LO, CLIP_HI,
+                                         STOCK_HALF_H)
+       == [VERTICAL_HALF_SITES[0]],
+       'a module whose +%#x carried #112 IS detected -- so "no 112 anywhere" '
+       'is a measurement, not a tautology' % VERTICAL_HALF_SITES[0])
 
     for name, va, word in (
             ('a moved w19 prologue', 0x9F7DCC, 0xD503201F),
@@ -724,13 +1131,16 @@ def show(main, log=print):
     log('    +%#09X  %s  %s' % (HOOK_VA, _fmt(w32(t, HOOK_VA)), state(t)))
     if state(t) == 'patched':
         n = cave_length(t)
-        log('    cave length %s word(s)  (x only)' % n)
+        vert = installed_vertical(t)
+        log('    cave length %s word(s)  (%s)'
+            % (n, 'unrecognised -- neither %d nor %d' % (N_WORDS_X, N_WORDS_XY)
+               if vert is None else ('x and y' if vert else 'x only')))
     bad = check_anchors(t, log)
     log('    anchors: %s' % ('OK' if not bad else '%d FAILED' % len(bad)))
     return 1 if bad else 0
 
 
-def apply(main, revert=False, log=print):
+def apply(main, revert=False, log=print, vertical=True):
     import nso_patcher
     import nxmap
     main = Path(resolve_main(main))
@@ -750,13 +1160,41 @@ def apply(main, revert=False, log=print):
             return 1
     else:
         if state(t) == 'patched':
-            log('  scripted camera clamp: already installed')
-            return 0
-        if not check_encoding(log):
+            got = installed_vertical(t)
+            n_now = cave_length(t)
+            stale = (vertical and n_now in LEGACY_LENGTHS)
+            if stale:
+                log('  scripted camera clamp: a LEGACY %d-word cave is '
+                    'installed (ungated vertical leg) -- removing it first'
+                    % n_now)
+                if revert_patches(t, log) is None:
+                    return 1
+                log('  ! run --revert, then --apply. Refusing to write two '
+                    'caves in one pass.')
+                return 1
+            if got == vertical:
+                log('  scripted camera clamp: already installed (%s)'
+                    % ('x and y' if vertical else 'x only'))
+                return 0
+            # An x-only cave is in the module and the y leg is wanted, or the
+            # reverse. Upgrading in place would leave the old words live, so
+            # take the old one out first rather than layering. This is the
+            # "two owners" failure from FINDINGS-91 §2.3 in cave form.
+            log('  scripted camera clamp: a %s cave is installed and %s is '
+                'wanted -- removing the old one first'
+                % ('x and y' if got else 'x only',
+                   'x and y' if vertical else 'x only'))
+            old = revert_patches(t, log)
+            if old is None:
+                return 1
+            log('  ! run --revert, rebuild, then apply. Refusing to write two '
+                'caves in one pass.')
+            return 1
+        if not check_encoding(log, vertical):
             log('! scripted camera clamp: an encoder disagrees with capstone; '
                 'refusing')
             return 1
-        words = build_patches(m.img, set(m.arm_starts), log)
+        words = build_patches(m.img, set(m.arm_starts), log, vertical)
 
     patches = [{'name': ('hook -> cave' if va == HOOK_VA else 'cave word'),
                 'va': '0x%X' % va,
@@ -778,14 +1216,17 @@ def apply(main, revert=False, log=print):
                 'word. DO NOT BOOT THIS.')
             return 1
         got = walk(t2, n=n)
-        want = cave_words(lambda i: got[i][0], RETURN_VA)
+        want = cave_words(lambda i: got[i][0], RETURN_VA, vertical)
         if [x for _, x in got] != want:
             log('  ! the written cave differs from cave_words(). '
                 'DO NOT BOOT THIS.')
             return 1
         log('  the scripted camera is now clamped to '
-            '[range.left + 160, range.right - 160], the same bounds '
-            'field_clip_with_camera_range uses on the normal path')
+            '[range.left + %d, range.right - %d]%s, the same bounds '
+            'field_clip_with_camera_range uses on the normal path'
+            % (HALF_W, HALF_W,
+               ' and [range.top + %d, range.bottom - %d]' % (HALF_H, HALF_H)
+               if vertical else ''))
     return 0
 
 
@@ -798,7 +1239,12 @@ def main(argv=None):
     ap.add_argument('--revert', action='store_true')
     ap.add_argument('--show', action='store_true')
     ap.add_argument('--verify', action='store_true')
+    ap.add_argument('--horizontal-only', action='store_true',
+                    help='ship the v1 cave (x only). For an A/B against the '
+                         'build that is already on hardware -- the vertical '
+                         'leg is what fixes the band at the top of a pan.')
     a = ap.parse_args(argv)
+    vertical = not a.horizontal_only
 
     if a.show:
         if not a.main:
@@ -807,7 +1253,7 @@ def main(argv=None):
     if a.apply or a.revert:
         if not a.main:
             ap.error('need a path to exefs/main')
-        return apply(a.main, revert=a.revert)
+        return apply(a.main, revert=a.revert, vertical=vertical)
     print('ff7nx_camclamp -- vanilla never clamps a scripted camera')
     print('')
     return verify(a.main, log=print)

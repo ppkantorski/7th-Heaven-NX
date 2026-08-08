@@ -34,6 +34,7 @@ import ff7nx_fieldbuf
 import ff7nx_fieldbg
 import ff7nx_movieclip
 import ff7nx_letterbox
+import ff7nx_vclip
 import ff7nx_modelcull
 import ff7nx_moviealign
 import ff7nx_moviecull
@@ -3843,6 +3844,29 @@ def _bake_widescreen_ranges(archive, payloads, widescreen, log):
     # the clamp; moving the range moves the bounds, which is a different
     # thing, and pretending otherwise would put the camera slightly wrong on
     # every field that uses them.
+    # THE PER-FIELD VERTICAL-CLIP FLAG.
+    #
+    # Here rather than in `ff7nx_ws` because it is not a camera RANGE -- it is
+    # the gate on `ff7nx_camclamp`'s vertical leg, and one owner per fact. It
+    # runs on the same `payloads` dict immediately after, so a field whose
+    # range was just rewritten is decoded once more and the flag set on the
+    # already-staged bytes rather than on the archive's original.
+    #
+    # Default OFF everywhere, which is FFNx's default and vanilla's behaviour.
+    # If this pass is skipped or fails, the vertical clamp simply never fires
+    # -- the Sector 8 band comes back and no camera is ever frozen. That is
+    # the safe direction, and it is the opposite of what the ungated clamp
+    # did.
+    try:
+        vstats = ff7nx_vclip.apply_archive(
+            archive, payloads, lgp, config,
+            encode=lambda raw: _encode_field_cached(archive, raw),
+            log=log)
+        stats['vclip'] = vstats
+    except Exception as exc:                                   # noqa: BLE001
+        log(f'  ! vertical clip: pass skipped ({exc}); the scripted camera '
+            f'will not be clamped vertically on any field')
+
     gap = ff7nx_ws.config_report(config)
     if gap['point_shift']:
         log(f'    note: {len(gap["point_shift"])} field(s) also ask for '
@@ -5742,14 +5766,27 @@ def apply_field_frame(sdout, dump, log=lambda *_: None, produced=()):
         shifted the same +16 game units or the cut jumps 24 px and models
         drawn over the video sit low against it. `ff7nx_moviealign` is a
         12-word cave in the padding pool, and it is the only cave here.
-      * THE TWO HALVES OF THE CENTRING TRAVEL TOGETHER. The four tile origins
-        (224 -> 232) move the background; `[0xCFF200]` (224 -> 240) moves the
-        field sprites -- steam, fire, the reactor effects. 232 in tile units
-        and 240 in game units are the SAME +16 game units. Shipping one
-        without the other puts characters 24 px off the ground they stand on,
-        which is exactly what HANDOFF-85's "attempt 2" looked like and exactly
-        what a mis-encoded 232 did on 2026-08-07. `ff7nx_letterbox` writes
-        both or neither.
+      * THE CENTRING HAS THREE LEGS, NOT TWO, AND THEY TRAVEL TOGETHER. This
+        entry said "two halves" until 2026-08-08 and the missing third is what
+        put Cloud beside the ladder in the Reactor 1 escape:
+
+            four tile origins  224 -> 232   the BACKGROUND   (+8 tile x2)
+            [0xCFF200]         224 -> 240   field SPRITES    (steam, fire)
+            set_field_viewport y 0 -> 16    3D MODELS        (via _42)
+
+        All three are the SAME +16 game units -- 24 device rows at 720p -- and
+        FFNx writes the first and third from one `if` (ff7_opengl.cpp:312).
+        Ship two of the three and characters are 24 px off the ground they
+        stand on: HANDOFF-85's "attempt 2", the mis-encoded 232 of 2026-08-07,
+        and v7's h=480 are all the same omission wearing different clothes.
+        `ff7nx_letterbox` writes all three or none.
+      * THE FIELD VIEWPORT HEIGHT IS NOT A KNOB. It stays 448 in every mode.
+        The view is opened by the uncrop SCISSOR, exactly as FFNx does it
+        (renderer.cpp:1667), and the uncrop caves are gated on the literal
+        pair `y == 16 && h == 448`. Setting h to 480 opens the picture by
+        accident, disarms the three caves that were meant to open it, and
+        rescales every model against a background that did not rescale. The
+        module refuses to plan that combination now rather than print it.
       * A CONSTANT IS VERIFIED BY DECODING IT BACK. FINDINGS-88 8d: a patch
         that verifies its STRUCTURE has not verified its CONTENT. Both modules
         assert at import that every replacement word's immediate is the number

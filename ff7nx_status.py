@@ -99,7 +99,13 @@ def _walk_via_module(t, hook):
 
 # hook sites that carry a cave: (module, leg, va)
 CAVES = [
-    ('letterbox',  'viewport y (leg 3)',        0x9298EC),
+    # Leg 3 is LIVE again (v9). It was retired on a check that compared
+    # models against the background at ORIGIN 224 while every build ships
+    # 232 -- the one term that makes this a bug was the term the check left
+    # out. Measured as a delta against stock, with the origins at 232, only
+    # (viewport y = 16, h = 448) is flat zero at every screen height. It is
+    # also the pair the three uncrop caves trigger on.
+    ('letterbox',  'viewport y',                0x9298EC),
     ('letterbox',  '[0xCFF208] (v4 defect)',    0x9299D0),
     ('letterbox',  'uncrop setviewport',        0x10D67C8),
     ('letterbox',  'uncrop gl_load_state',      0x10D9458),
@@ -122,6 +128,26 @@ CAVES = [
     ('movieclip',  'scissor band  (RETIRED)',   0x1133FE8),
 ]
 
+# caves with more than one shape, where the WORD COUNT is the diagnosis.
+# A bare number here is not readable -- 24 and 45 are both healthy caves that
+# do different things, and only one of them fixes the band at the top of a
+# scripted vertical pan.
+def _camclamp_note(t):
+    try:
+        import ff7nx_camclamp as CC
+    except Exception:
+        return ''
+    vert = CC.installed_vertical(t)
+    if vert is None:
+        return '   <-- unrecognised length; neither the x-only nor the x+y cave'
+    if vert:
+        return '   x and y'
+    return ('   x ONLY  <-- a scripted VERTICAL pan is still unclamped; '
+            'this is the band at the top of the Sector 8 / LOVELESS pan')
+
+
+CAVE_NOTES = {0x9F874C: _camclamp_note}
+
 # caves whose ABSENCE is correct: {hook: why}
 CAVES_WANT_ABSENT = {
     0x1133FE8: 'RETIRED -- it scissored the presentation blit, which froze '
@@ -132,8 +158,18 @@ CAVES_WANT_ABSENT = {
 SINGLES = [
     ('letterbox',  'painted bars',       0x10F3DDC,
      {0xBD00CD40: 'ON  (stock)', 0xB900CD5F: 'off'}, 'off'),
+    # v9: 448, ALWAYS. h is the model matrix's _22 -- a SCALE -- while the
+    # thing that moved the background is the tile origin, an OFFSET. No value
+    # of h can cancel an offset, so 480 is zero only at mid screen and 24 px
+    # out at each end; flat ground cannot see that and the Reactor 1 ladder
+    # can. 480 also disarms the three uncrop caves, which are gated on the
+    # literal pair `y == 16 && h == 448` (FFNx renderer.cpp:1667). The view
+    # is opened by the scissor, never by h.
     ('letterbox',  'field frame h',      0x9298BC,
-     {0x321A0BE8: '448 (stock)', 0x52803C08: '480  <- stretches models'}, '448 (stock)'),
+     {0x321A0BE8: '448  (with viewport y=16: models on the scenery)',
+      0x52803C08: '480  <- v7 defect: models 24px out top/bottom AND the '
+                  'uncrop caves never fire'},
+     '448  (with viewport y=16: models on the scenery)'),
     ('letterbox',  'layer 1 origin',     0xA06EA8,
      {0x321B0BE9: '224 (stock)', 0x52801D09: '232'}, '232'),
     ('letterbox',  'layer 2 origin',     0xA05AA4,
@@ -241,6 +277,10 @@ def main(argv=None):
             continue
         live += 1
         extra = ''
+        if hook in CAVE_NOTES:
+            extra = CAVE_NOTES[hook](t)
+            if '<--' in extra:
+                warn.append('%s / %s: %s' % (mod, leg, extra.strip(' <-')))
         if hook in CAVES_WANT_ABSENT:
             extra = '   <-- should NOT be hooked (%s)' % CAVES_WANT_ABSENT[hook]
             warn.append('%s / %s is hooked and should not be' % (mod, leg))

@@ -241,23 +241,62 @@ is used by POINTER, so an `add` was invisible to it -- the same shape of miss
 as FINDINGS-84's "nothing reads 0xCFF200".  `_matrix_readers` now looks for
 both, and refuses if it finds neither.
 
-WORD TWO (h 448 -> 480) IS NOW OFF BY DEFAULT
-=============================================
-h is `_22`.  480 makes it 1.0 instead of FF7's 448/480, which is a 1.0714x
-vertical STRETCH of every 3D model about mid screen: zero error in the
-middle, +-16 game units (24 px at 720p) at the edges.  That is the residual
-"characters are slightly off, and it depends where they are standing".
-FFNx never touches h.  It moves y, which changes `_42` alone and leaves the
-scale where the game authored it.
+THE SCALE, NOT THE OFFSET -- WORD TWO IS BACK ON, AND WHY THAT IS NOT A FLIP-FLOP
+=================================================================================
+h is `_22`, the vertical scale of every 3D model.  The v5 text below this
+paragraph said 480 was a 1.0714x STRETCH and turned it off.  That was correct
+arithmetic against a 448-unit background and it is the wrong answer now,
+because the uncrop made the background 480 units and nobody re-derived the
+model side.
 
-    y=0  h=448   _22 0.93333  _42 +0.06667   stock: models on rows 0..672
-    y=16 h=448   _22 0.93333  _42  0         FFNx field_center: rows 24..696
-    y=0  h=480   _22 1.0      _42  0         v4: rows 0..720, STRETCHED
+**`_22` is not "the value FF7 authored".  It is a ratio, and it has to match
+whatever the background is doing.**
 
-Rows 24..696 is also exactly where `ff7nx_moviealign` puts a 4:3 movie quad,
-so the corrected leg closes the vertical half of the movie overlap for free:
-a model can no longer be drawn above or below the picture during an FMV.
-`ff7nx_movieclip` owns the horizontal half and is unchanged.
+    background 448 units   ->  _22 must be 448/480 = 0.93333   h = 448
+    background 480 units   ->  _22 must be 1.0                 h = 480
+
+The background is 480: the 2D ortho at +0x10DA018 was always (0,640,480,0),
+and the three uncrop caves force the clip rect to (0,480) so nothing trims it.
+The build log has said so on its own two lines for several builds:
+
+    background    rows 0..719
+    3D models     rows 24..696      <- 24 px short at each end
+
+Measured, as model row minus background row, for a model standing at game y:
+
+    y=0  h=448   _22 0.93333  _42 +0.06667    +0 .. -48 px   stock (bg 448)
+    y=16 h=448   _22 0.93333  _42  0         +24 ..  -24 px   v5   (bg 480)
+    y=0  h=480   _22 1.0      _42  0           0 EVERYWHERE   <- correct
+    y=16 h=480   _22 1.0      _42 -0.06667   +24 everywhere
+
+The v5 pair is zero at mid screen and wrong by up to 24 px at the top and
+bottom.  That is invisible on flat ground -- every flat-ground test this
+project ever ran puts the character near the middle -- and it is exactly
+"characters are very slightly off on ladders", because a ladder is the one
+place a character travels the full height of the frame.
+
+Note what y does at h=480: `_42 = -y/240` is a PURE offset there, so y=16
+would put every model 24 px low at every height.  The +16 that
+`ff7_field_center` wants is already carried twice, by the tile origins
+(224 -> 232) and the sprite origin (224 -> 240), and both of those move the
+PICTURE.  The models never needed a third shift; y=16 existed only to cancel
+half of the `_22` error, and with `_22` correct it has nothing left to do.
+So `plan()` pairs the viewport y with h, not with `field_center`.
+
+THE MOVIE BAND, WHICH THIS USED TO PIGGYBACK ON
+------------------------------------------------
+Rows 24..696 is also where `ff7nx_moviealign` puts a 4:3 movie quad, and v5
+counted that as a free win: a model could not be drawn above or below the
+picture during an FMV because the model band happened to be the movie band.
+Opening the models to 0..720 gives that up.
+
+It is already covered, by the module that was written to cover it.
+`ff7nx_moviebars` paints four opaque quads over the finished frame while a
+movie plays, and its top and bottom are y 0..16/480 and 464/480..1 -- device
+rows 0..24 and 696..720, exactly the rows the model band used to exclude.
+Drawn last, over everything.  So the overlap is handled by the module that
+owns it rather than as a side-effect of a scale error, which is the better
+arrangement anyway: one job, one owner.
 
     python3 ff7nx_letterbox.py <main> --verify
     python3 ff7nx_letterbox.py <main> --show
@@ -460,17 +499,82 @@ CENTER_MODEL_Y  = 16            # game units, the same +16 as the other two
 # The scratch register at each site is one whose next access is a WRITE (or
 # which is never touched again), checked against the real instruction stream
 # rather than assumed, and NZCV is rewritten before it is read at all three.
+# THE BATTLE RECT.  v10.
+#
+# `battle_enter` (x86 0x41AD00) writes the battle viewport into the same four
+# globals eleven other consumers read as {x, y, w, h}:
+#
+#     [0x9AAD4C] = 0        x        ARM +0x8D410  str w19 (wzr)
+#     [0x9AAD50] = 0        y        ARM +0x8D41C  str w28 (wzr)
+#     [0x9AAD5C] = 640      w        ARM +0x8D428  str w24, w24 = #0x280
+#     [0x9AAD68] = 332      h        ARM +0x8D440  str w26, w26 = #0x14c
+#
+# battle_enter was NOT resolvable by FFNx's own anchor -- it has no address in
+# its name and `get_relative_call(battle_enter, 0x17)` names 0x41B577, which
+# has ZERO call sites in this build (it is switch-1.03_5, not PC 1.02). It was
+# found instead from the operand pattern: FFNx patches `+0x229` to
+# `&wide_viewport_width` and `+0x22F` to `&wide_viewport_x`, six bytes apart,
+# and exactly ONE place in the executable has a reference to 0x9AAD5C followed
+# six bytes later by one to 0x9AAD4C. All four of FFNx's offsets then land on
+# the right instruction types, which is four independent confirmations.
+#
+# AND IT CONFIRMS THE CAPTURE. 332 of 480 game units is 0.69167 of the frame;
+# at 720p that is 498 device rows, and the battle scene in the hardware
+# capture ends at row ~498 with the UI below it. The rect is (0, 0, 640, 332)
+# and the band is everything under row 498.
+#
+# WHY NOT SIMPLY WRITE 480 INTO THE HEIGHT, WHICH IS WHAT FFNx DOES
+# -----------------------------------------------------------------
+# Because `_42` is not carved out. Battle is driver mode 3, where
+# gfx_drv_setviewport forces `_22 = 1.0` -- so the height does NOT rescale
+# anything -- but `_42 = -((y + h/2) - 240)/240` still moves with it:
+#
+#     (0, 0, 640, 332)   _22 1.00000   _42 0.30833    rows   0..498
+#     (0, 0, 640, 480)   _22 1.00000   _42 0.00000    rows   0..720
+#
+# 0.30833 / 2 * 720 = 111 device rows. Writing 480 opens the band and shifts
+# every model down 111 px, which is the opposite of the request ("nothing
+# moved, just rendering more pixels"). FFNx can do it because FFNx does not
+# have this port's mode-3 carve-out sitting next to an uncarved _42.
+#
+# So battle takes the same shape the FIELD leg already takes: open the DEVICE
+# RECT, leave the matrix alone. y1 is already 0 for this rect, so the whole
+# leg is "make the extent the full target height".
+BATTLE_VP_Y = 0
+BATTLE_VP_H = 332               # [0x9AAD68], ARM +0x8D3CC `mov w26, #0x14c`
+
 UNCROP_SITES = [
-    #  hook        stock        y   h   y1  acc  T   name
-    (0x10D67C8, 0x0B0D01EF,  1,  3, 13, 15, 16, 'gfx_drv_setviewport'),
-    (0x10D9458, 0x0B110000,  9, 11, 17,  0,  2, 'gl_load_state'),
-    (0x10D9E34, 0x0B120021, 10, 12, 18,  1,  2, 'begin_scene'),
+    #  hook        stock        y   h   y1  acc  T   SY  name
+    #
+    # SY is the register holding scale_y -- the render target height, loaded
+    # from [[0x12CE580]], the same slot ws_emu feeds. Read out of each site
+    # rather than assumed, and live at every hook:
+    #   A  +0x10D678C ldr w12  -> used +0x10D67A4/A8, hook +0x10D67C8
+    #   B  +0x10D9400 ldr w16  -> used +0x10D940C/10, hook +0x10D9458
+    #   C  +0x10D9DEC ldr w17  -> used +0x10D9DF8/FC, hook +0x10D9E34
+    (0x10D67C8, 0x0B0D01EF,  1,  3, 13, 15, 16, 12, 'gfx_drv_setviewport'),
+    (0x10D9458, 0x0B110000,  9, 11, 17,  0,  2, 16, 'gl_load_state'),
+    (0x10D9E34, 0x0B120021, 10, 12, 18,  1,  2, 17, 'begin_scene'),
 ]
 
 
-def _uncrop_body(y, h, y1, acc, t_):
-    """cmp/csel/csel/add/sub -- no branches, so it survives hole scattering."""
-    return [
+def _uncrop_body(y, h, y1, acc, t_, sy=None):
+    """
+    cmp/csel only -- no branches, so it survives hole scattering.
+
+    TWO LEGS, and they are mutually exclusive by construction: the field rect
+    is (y=16, h=448) and the battle rect is (y=0, h=332), so at most one can
+    match on any given call. The field leg runs first and leaves `acc` and
+    `y1` untouched when it does not match, which is what lets the battle leg
+    read `acc` afterwards.
+
+    FIELD  -- open symmetrically: y1 -> 0 and the extent grows by 2*y1.
+    BATTLE -- y1 is ALREADY 0, so a symmetric open is a no-op and the extent
+              has to be set outright. `wSY` is the render target height, so
+              "the extent becomes wSY" is exactly "draw to the bottom of the
+              frame", with `y1` left at 0 and the matrix untouched.
+    """
+    w = [
         0x71000000 | (16 << 10) | (y << 5) | 31,      # cmp  wY, #16
         0x1A800000 | (31 << 16) | (y1 << 5) | t_,     # csel wT, wY1, wzr, eq
         0x71000000 | (448 << 10) | (h << 5) | 31,     # cmp  wH, #448
@@ -478,6 +582,18 @@ def _uncrop_body(y, h, y1, acc, t_):
         0x0B000000 | (t_ << 16) | (1 << 10) | (acc << 5) | acc,   # add acc,acc,T,lsl#1
         0x4B000000 | (t_ << 16) | (y1 << 5) | y1,     # sub  wY1, wY1, wT
     ]
+    if sy is not None:
+        w += [
+            # cmp  wY, #0             ; the battle rect's y
+            0x71000000 | (BATTLE_VP_Y << 10) | (y << 5) | 31,
+            # csel wT, wSY, wACC, eq  ; T = target height if y matches, else acc
+            0x1A800000 | (acc << 16) | (sy << 5) | t_,
+            # cmp  wH, #332           ; the battle rect's h
+            0x71000000 | (BATTLE_VP_H << 10) | (h << 5) | 31,
+            # csel wACC, wT, wACC, eq ; acc = T if h matches, else unchanged
+            0x1A800000 | (acc << 16) | (t_ << 5) | acc,
+        ]
+    return w
 
 
 UNCROP_HOOK     = UNCROP_SITES[0][0]        # kept for the older messages
@@ -494,7 +610,23 @@ UNCROP_SIG = [
     (0x10D9E28, 0xD368FE52),    # C  lsr x18, x18, #0x28
     (0x10D9E38, 0xB3605E4E),    # C  bfi x14, x18, #0x20, #0x18
     (0x10D9DDC, 0x2943310B),    # C  ldp w11, w12, [x8, #0x18]   -- w, h
+    # v10: the scale_y load at each site. The battle leg reads this register
+    # and a wrong one would produce a plausible-looking rect out of whatever
+    # happened to be there, which is the least debuggable failure available.
+    (0x10D678C, 0xB940018C),    # A  ldr w12, [x12]   scale_y
+    (0x10D9400, 0xB9400210),    # B  ldr w16, [x16]   scale_y
+    (0x10D9DEC, 0xB9400231),    # C  ldr w17, [x17]   scale_y
 ]
+
+# The scale_y load per site, so the register the battle leg READS can be
+# checked against the register the module WRITES. Without this the emulator
+# happily seeds whatever register the table declares and a wrong one is
+# invisible -- which it was, for two of the three sites, until this existed.
+SCALE_LOADS = {
+    0x10D67C8: 0x10D678C,       # A gfx_drv_setviewport
+    0x10D9458: 0x10D9400,       # B gl_load_state
+    0x10D9E34: 0x10D9DEC,       # C begin_scene
+}
 
 # Word seven: THE FADE QUAD.  v8.
 #
@@ -1027,14 +1159,49 @@ def plan(t: bytes, revert: bool, field_center: bool,
          frame: bool = False, letterbox: bool = True,
          main=None) -> tuple[list[dict], list[str]]:
     """
-    `frame` (the field viewport height 448 -> 480) now defaults OFF.
+    `frame` IS RETIRED.  v9.  The field viewport height stays 448 in every
+    mode, and `frame=True` is accepted only so existing callers keep working.
 
-    It was on by default in v4 on the strength of "the d3dviewport matrix is
-    write-only", which was a defect in _matrix_readers, not a fact about the
-    module. h is _22 -- the vertical scale of every 3D model -- so 480 is a
-    480/448 = 1.0714 stretch. FFNx never changes h; it changes y, which moves
-    _42 alone and leaves the scale where FF7 authored it. Leave it off unless
-    you are deliberately A/B-ing it.
+    THE v7 REASONING WAS BACKWARDS, AND HERE IS THE MEASUREMENT
+    ----------------------------------------------------------
+    v7 argued "the background is 480 units tall, so _22 must be 1.0, so
+    h = 480".  It checked that claim with `_align_err`, which compared the
+    model row against `1.5 * gy` -- the background at origin **224**.  The
+    build ships origin **232**.  The one term that makes this a bug was the
+    term the check left out, so the check reported PASS on the broken state
+    and FAIL on the correct one.
+
+    Deltas from STOCK, which is known-good because the 4:3 game shipped and
+    its models stand on its scenery.  Model rows are `ws_emu` on the real
+    encoded words of gfx_drv_setviewport; the background row is the tile
+    origin at +0xA06EA8, `dst_y = (ORIGIN - tile.y) * mult`, mult = 2, at
+    1.5 device px per game unit:
+
+        config          model delta vs stock        background delta   error
+        y=0  h=448      +0                          +24 (origin 232)   -24 flat
+        y=16 h=448      +24  flat                   +24                 0  <- THIS
+        y=0  h=480      +0 +12 +24 +36 +48          +24                -24..+24
+        y=16 h=480      +24 +36 +48 +60 +72         +24                  0..+48
+
+    Only `y=16, h=448` is flat zero at every screen height.  That is also
+    exactly what FFNx ships (ff7_opengl.cpp:312) --
+
+        patch_code_byte(field_init_viewport_values + 0x35, 16)   <- y = 16
+        patch_code_int (field_init_viewport_values + 0x6E, 240)  <- [0xCFF200]
+
+    -- and FFNx never touches h at all.  The view is opened by the SCISSOR
+    (renderer.cpp:1667), not by the viewport height.
+
+    AND h = 480 DISARMS THE UNCROP IT WAS SUPPOSED TO MATCH
+    ------------------------------------------------------
+    `_uncrop_body` is `cmp wY,#16 / cmp wH,#448 / csel` -- FFNx's trigger,
+    word for word.  At (0, 480) that condition is FALSE, so all three uncrop
+    caves are installed and dormant.  h = 480 did not "match" the uncrop; it
+    replaced it, and it replaced it with something that also moved the models.
+    Restoring the pair re-arms the caves and fixes the alignment with the same
+    two words.
+
+    `frame=False` is now the only behaviour and is kept as a no-op argument.
     """
     patches, notes = [], []
 
@@ -1053,8 +1220,11 @@ def plan(t: bytes, revert: bool, field_center: bool,
             notes.append(f'  letterbox quads  {"restored" if revert else "OFF"} '
                          f'@ +{LETTERBOX_STORE:#09X}')
 
+    # v9: h is ALWAYS 448 -- see the docstring. It is driven back to 448 on
+    # --apply the same way [0xCFF208] is, so a module carrying v7's 480 is
+    # repaired in place rather than left in a state no path produces.
     cur_f = w32(t, FRAME_HEIGHT)
-    want_f = WORD_H_448 if (revert or not frame) else WORD_H_480
+    want_f = WORD_H_448
     if cur_f == want_f:
         notes.append(f'  field frame height: already '
                      f'{STOCK_FRAME_H if want_f == WORD_H_448 else OPEN_FRAME_H}')
@@ -1115,17 +1285,80 @@ def plan(t: bytes, revert: bool, field_center: bool,
         patches += _plan_model_y(t, main, STOCK_MODEL_Y, notes,
                                  site=CFF208_SITE, label='[0xCFF208] (v4 defect)',
                                  pool=pool)
+        # THE VIEWPORT Y IS PAIRED WITH field_center.  v9 -- v7 had this
+        # inverted; see the plan() docstring for the measurement.
+        #
+        # ff7_field_center is +16 game units and it has THREE owners in this
+        # port. They move together or not at all:
+        #
+        #   tile origins  224 -> 232   +8 tile units x mult 2 = +16 game units
+        #   sprite origin 224 -> 240   +16 game units          [0xCFF200]
+        #   viewport y      0 ->  16   +16 game units          <- this leg
+        #
+        # Error against the background, from ws_emu on the real words, at
+        # game y 0/120/240/360/480 with the origins at 232:
+        #
+        #   y=0  h=448   -24 -24 -24 -24 -24    picture moved, models did not
+        #   y=16 h=448     0   0   0   0   0    <- this
+        #   y=0  h=480   -24 -12   0 +12 +24    v7: zero at MID SCREEN only
+        #   y=16 h=480     0 +12 +24 +36 +48
         want_my = STOCK_MODEL_Y if stock else CENTER_MODEL_Y
         patches += _plan_model_y(t, main, want_my, notes,
                                  site=MODEL_Y_SITE, label='viewport y', pool=pool)
         patches += _plan_uncrop(t, main, not stock, notes, pool=pool)
         patches += _plan_fade(t, main, not stock, notes, pool=pool)
+        _assert_uncrop_armed(t, patches)
         taken = [p['va'] for p in patches]
         if len(set(taken)) != len(taken):
             dup = sorted({v for v in taken if taken.count(v) > 1})
             raise RuntimeError(f'two legs claimed the same word(s): {dup}')
 
     return patches, notes
+
+
+def _assert_uncrop_armed(t: bytes, patches: list[dict]) -> None:
+    """
+    v9.  The uncrop caves fire only on `y == 16 && h == 448`.
+
+    `_uncrop_body` encodes FFNx's renderer.cpp:1667 trigger literally:
+
+        cmp  wY, #16        csel wT, wY1, wzr, eq
+        cmp  wH, #448       csel wT, wT,  wzr, eq
+
+    v7 changed the rect to (0, 480) and left all three caves installed.  The
+    condition is then never true, so 33 words of padding ran every frame and
+    did nothing -- and the bars looked fixed anyway because h = 480 opens the
+    rect by itself, which is what made the null result unreadable.
+
+    This asserts the FINAL state the plan produces, not the state on disk,
+    because both words are usually being written in the same run.
+    """
+    final = {p['va']: p for p in patches}
+
+    def _word_after(va, cur):
+        # `_fmt` emits LITTLE-ENDIAN bytes. Reading that back with int(..,16)
+        # gives a byte-swapped word, which is how the first draft of this
+        # check refused its own repair path. Unpack it the way it was packed.
+        p = final.get(hex(va))
+        if p is None:
+            return cur
+        return struct.unpack('<I', bytes.fromhex(p['set'].replace(' ', '')))[0]
+
+    h_word = _word_after(FRAME_HEIGHT, w32(t, FRAME_HEIGHT))
+    uncrop_on = any('uncrop' in p['name'] and 'unhook' not in p['name']
+                    for p in patches) or state(t)['uncrop']
+    if not uncrop_on:
+        return
+    if h_word != WORD_H_448:
+        raise RuntimeError(
+            'the uncrop caves are gated on h == 448 and the plan leaves h at '
+            '480: they would be installed and dormant. This is the v7 defect.')
+    y_planned = any(p['va'] == hex(MODEL_Y_SITE) for p in patches)
+    if not y_planned and _read_model_y(t, MODEL_Y_SITE) != CENTER_MODEL_Y:
+        raise RuntimeError(
+            'the uncrop caves are gated on y == 16 and the plan leaves the '
+            'viewport y at %r: they would never fire.'
+            % (_read_model_y(t, MODEL_Y_SITE),))
 
 
 def _plan_fade(t, main, want, notes, pool=None):
@@ -1188,9 +1421,35 @@ def _plan_uncrop(t, main, want, notes, pool=None):
     gfx_drv_setviewport computed.
     """
     ps = []
-    for hook, stock, y, h, y1, acc, t_, name in UNCROP_SITES:
+    for hook, stock, y, h, y1, acc, t_, sy, name in UNCROP_SITES:
         cur = w32(t, hook)
         on = (cur != stock)
+        if on and want:
+            # v10: "ALREADY ON" IS NOT THE SAME AS "ALREADY CURRENT".
+            #
+            # The body grew from 6 words to 10 when the battle leg went in. A
+            # module carrying the OLD cave answers `on == want` and would be
+            # left exactly as it is -- installed, field leg working, battle
+            # leg absent, and the log cheerfully saying "already on". That is
+            # the same defect `ff7nx_camclamp`'s LEGACY_LENGTHS fixed one
+            # module over, and it is worth catching in the same build rather
+            # than on hardware.
+            body = _uncrop_body(y, h, y1, acc, t_, sy)
+            chain = _model_y_cave(t, cur, hook)
+            live = [w32(t, va) for va in chain if va != hook]
+            live = [w for w in live if (w & 0xFC000000) != 0x14000000]
+            # `emit_hooked` lays out body + the DISPLACED word, so a correct
+            # chain reads one longer than the body. Getting that +1 wrong made
+            # the check reject the very cave it had just written -- which is
+            # why the assertion below runs on a freshly applied module too.
+            got = len(live) - 1
+            if got != len(body):
+                raise RuntimeError(
+                    'uncrop %s carries a %d-word body and this revision emits '
+                    '%d. Run --revert then --apply; refusing to leave a stale '
+                    'cave installed.' % (name, got, len(body)))
+            notes.append(f'  uncrop {name}: already on ({got}-word body)')
+            continue
         if on == want:
             notes.append(f'  uncrop {name}: already {"on" if want else "off"}')
             continue
@@ -1206,7 +1465,7 @@ def _plan_uncrop(t, main, want, notes, pool=None):
         import ff7nx_cave
         out, entry = ff7nx_cave.emit_hooked(
             pool if pool is not None else _pool(main),
-            hook, stock, _uncrop_body(y, h, y1, acc, t_))
+            hook, stock, _uncrop_body(y, h, y1, acc, t_, sy))
         for va in sorted(out):
             old = w32(t, va)
             if va != hook and old != 0:
@@ -1216,8 +1475,22 @@ def _plan_uncrop(t, main, want, notes, pool=None):
         notes.append(f'  uncrop {name:<20} ON @ +{hook:#09X}   '
                      f'({len(out) - 1} word(s) in padding, entry +{entry:#x})')
     if want and ps:
-        notes.append('    -> clip rect (0,480) on ALL THREE copies; the matrix '
-                     'still sees (16,448)')
+        # This line used to end "the matrix still sees (16,448)", stated as a
+        # reassurance. It was the defect: a 480-unit clip rect over a 448-unit
+        # model matrix is a scale mismatch, and it went out in several builds
+        # with the two numbers printed next to each other. The rect and the
+        # matrix have to agree, so the height word now moves with the caves.
+        notes.append('    -> FIELD  clip rect (0,480) on ALL THREE copies; '
+                     'the matrix keeps (16,448), which is both what the '
+                     'caves trigger on and what puts models on the scenery')
+        notes.append('    -> BATTLE clip rect (0,%d) -> the full target '
+                     'height on the same three copies. The matrix is NOT '
+                     'touched (_42 stays %.5f), so the scene does not move '
+                     '-- it just keeps drawing below the UI band instead of '
+                     'stopping at device row %d of 720.'
+                     % (BATTLE_VP_H,
+                        -((BATTLE_VP_Y + BATTLE_VP_H / 2.0) - 240.0) / 240.0,
+                        720 * BATTLE_VP_H // 480))
     return ps
 
 
@@ -1299,7 +1572,7 @@ def _plan_model_y(t, main, want, notes, site=None, label=None, pool=None):
 # once: build.py called apply() with the default and silently shipped the frame
 # without the centring, which is the exact half-applied state FINDINGS-88 8d
 # describes. One default, one meaning.
-def apply(main, revert=False, field_center=True, frame=False, letterbox=True,
+def apply(main, revert=False, field_center=True, frame=True, letterbox=True,
           log=print) -> int:
     import nso_patcher
 
@@ -1378,13 +1651,57 @@ def _report_frame(st: dict, log=print) -> None:
     log(f'    background    rows 0..719   (2D ortho, clipped only by the rect)')
     log(f'    3D models     rows {y1}..{y2}   '
         f'(viewport y={vy} h={h}: _42 -> centre, _22 = {scale:.5f})')
-    if abs(scale - 448 / 480.0) > 1e-9:
-        log(f'    ! _22 is {scale:.5f}, not {448/480:.5f} -- models are '
-            f'stretched vertically by {scale/(448/480):.4f}x about mid screen')
+
+    # MODEL-TO-BACKGROUND ALIGNMENT, stated as a number rather than left for
+    # someone to notice on a ladder.
+    #
+    # v9: THE BACKGROUND TERM WAS MISSING, and it is the whole bug.
+    #
+    # This block used to compare the model row against `1.5 * gy`, i.e. the
+    # background at ORIGIN 224. Every shipped build puts it at 232. So the
+    # check was blind to exactly the defect it was written to catch, and it
+    # printed "+0 at every screen height: ladders included" over a build in
+    # which a ladder is 24 px out at the top of the screen and 24 px the
+    # other way at the bottom.
+    #
+    # The origin is disassembled, not assumed: +0xA06EA8 is `mov w9, #0xe0`
+    # feeding `sub w8, w9, w8` -- dst_y = (ORIGIN - tile.y) * mult, mult = 2,
+    # and 720 device rows over 480 game units is 1.5 px per unit. So moving
+    # the origin by one unit moves the picture by 3 device rows, flat.
+    # Both sides are DELTAS AGAINST STOCK. The absolute correspondence
+    # between a model's frame y and the background's game y is not known
+    # from this module -- but it does not have to be. Stock is aligned
+    # (the 4:3 game shipped), so preserving the relationship is sufficient
+    # and is the only claim the numbers here can actually support.
+    origin = st['origins'][0][1] if st.get('origins') else STOCK_ORIGIN_Y
+    bg_shift = (origin - STOCK_ORIGIN_Y) * 2 * 1.5
+
+    def _row(_y, _h, gy):
+        _42 = -((_y + _h / 2.0) - 240.0) / 240.0
+        return (1.0 - ((_h / 480.0) * (1.0 - gy / 240.0) + _42)) / 2.0 * 720.0
+
+    errs = [(gy, (_row(vy, h, gy) - _row(0, STOCK_FRAME_H, gy)) - bg_shift)
+            for gy in (0, 120, 240, 360, 480)]
+    worst = max(abs(e) for _gy, e in errs)
+    log(f'    background    tile origin {origin} -> the picture sits '
+        f'{bg_shift:+.0f} device rows vs stock, flat at every height')
+    log('    model vs background, in device rows, at game y '
+        '0 / 120 / 240 / 360 / 480:')
+    log('      %s' % '  '.join('%+.0f' % e for _gy, e in errs))
+    if worst < 0.5:
+        log('      -> 0 at every screen height: models sit ON the scenery '
+            'wherever a character stands, ladders included')
+    else:
+        log(f'      ! up to {worst:.0f} px out -- models do NOT stand on the '
+            f'scenery. With the tile origins at {origin}, the only pair that '
+            f'is flat zero at every height is viewport y=16 with h=448, '
+            f'which is also FFNx\'s (ff7_opengl.cpp:312) and is the pair the '
+            f'uncrop caves trigger on. h=480 is zero at MID SCREEN ONLY: '
+            f'flat ground cannot see it and a LADDER can.')
     if (y1, y2) == (24, 696):
-        log('    -> the model band is exactly the movie band (a 4:3 FMV lands '
-            'on 24..696 too), so a character cannot be drawn above or below '
-            'the picture during a cutscene')
+        log('    -> the model band is the movie band (24..696); note '
+            'ff7nx_moviebars covers rows 0..24 and 696..720 during an FMV '
+            'anyway, so this is not a reason to keep it')
     o = st['origins'][0][1]
     log(f'    tile window   [bg.y-{o}, bg.y+{240 - o + 224 - 224 if False else 240 - o}]'
         f'   vs the camera clamp bg.y <= range.bottom-8')
@@ -1484,10 +1801,74 @@ def verify(main=None, log=print) -> int:
     ck(240 - CENTER_ORIGIN_Y == 8 and CENTER_ORIGIN_Y - 224 == 8,
        'origin 232 splits the extra 16 units as 8 above / 8 below')
     ck(240 - STOCK_ORIGIN_Y == 16, 'origin 224 puts all 16 extra units below')
-    ck(CENTER_MODEL_Y == 16 and (CENTER_ORIGIN_Y - STOCK_ORIGIN_Y) * 2 == 16
-       and 240 - 224 == 16,
-       'all three legs move the SAME +16 game units: tiles +8x2, sprites +16, '
-       'models +16')
+    ck((CENTER_ORIGIN_Y - STOCK_ORIGIN_Y) * 2 == 16 and 240 - 224 == 16,
+       'both PICTURE legs move the same +16 game units: tiles +8x2, '
+       'sprites +16')
+
+    # THE INVARIANT, WITH THE TERM v7 LEFT OUT.
+    #
+    # v7's version of this compared the model row against `1.5 * gy` -- the
+    # background at ORIGIN 224 -- while every build ships 232. So the one
+    # term that makes this a bug was the term the invariant omitted, and it
+    # certified the broken pair and condemned the correct one. It is not
+    # enough for a check to sample five heights if it samples them against
+    # the wrong picture.
+    #
+    # `origin` is a REQUIRED argument now. There is no default, deliberately:
+    # a default is how the term went missing in the first place.
+    #
+    # AND IT IS A DELTA AGAINST STOCK, NOT AN ABSOLUTE.  The first draft of
+    # this fix compared the model row against `1.5 * gy + bg_shift` -- the
+    # absolute form, just with the missing term restored -- and the very
+    # last assertion below caught it: STOCK does not satisfy it. Stock puts
+    # models on 1.4*gy and the background on 1.5*gy, and stock is aligned,
+    # because a model's `gy` and the background's game y are NOT the same
+    # coordinate. The viewport is what converts one into the other.
+    #
+    # So the only thing that can be asserted without re-deriving the whole
+    # projection is that the RELATIONSHIP is unchanged from the 4:3 game,
+    # which shipped and whose characters stand on its scenery. Both sides
+    # are deltas; the unknown absolute cancels.
+    def _model_row(vy, h, gy):
+        s = h / 480.0
+        m42 = -((vy + h / 2.0) - 240.0) / 240.0
+        return (1.0 - (s * (1.0 - gy / 240.0) + m42)) / 2.0 * 720.0
+
+    def _align_err(vy, h, origin):
+        bg = (origin - STOCK_ORIGIN_Y) * 2 * 1.5      # flat, from +0xA06EA8
+        return [(_model_row(vy, h, gy) - _model_row(0, STOCK_FRAME_H, gy)) - bg
+                for gy in (0, 120, 240, 360, 480)]
+
+    # Stated through the CONSTANTS the planner uses, not through literals,
+    # so that changing a constant and leaving the reasoning behind -- which
+    # is what v7 did -- fails here instead of on hardware.
+    ck(max(abs(e) for e in
+           _align_err(CENTER_MODEL_Y, STOCK_FRAME_H, CENTER_ORIGIN_Y)) < 1e-9,
+       f'the shipped triple (origin {CENTER_ORIGIN_Y}, viewport y '
+       f'{CENTER_MODEL_Y}, h {STOCK_FRAME_H}): models land on the background '
+       f'at all five screen heights -- and it is FFNx\'s pair too, '
+       f'ff7_opengl.cpp:312')
+    ck(OPEN_FRAME_H not in (STOCK_FRAME_H,)
+       and max(abs(e) for e in
+               _align_err(CENTER_MODEL_Y, OPEN_FRAME_H, CENTER_ORIGIN_Y)) > 1.0
+       and max(abs(e) for e in
+               _align_err(STOCK_MODEL_Y, OPEN_FRAME_H, CENTER_ORIGIN_Y)) > 1.0,
+       f'and NEITHER viewport y is right at h={OPEN_FRAME_H} -- h is not a '
+       f'free knob that y can be tuned against, which is the mistake v7 made')
+    for vy, h, worst in ((0, 448, 24.0), (0, 480, 24.0), (16, 480, 48.0)):  # noqa: E501
+        got = max(abs(e) for e in _align_err(vy, h, CENTER_ORIGIN_Y))
+        ck(abs(got - worst) < 1e-9,
+           f'origin 232, y={vy} h={h} is {got:.0f} px out at worst -- the '
+           f'check can fail, so passing above means something')
+    e480 = _align_err(0, 480, CENTER_ORIGIN_Y)
+    ck(abs(e480[2]) < 1e-9 and abs(e480[0] + 24.0) < 1e-9
+       and abs(e480[4] - 24.0) < 1e-9,
+       'v7\'s pair (y=0 h=480) is EXACTLY 0 at mid screen and 24 px out at '
+       'each end -- flat ground cannot see it, a LADDER can, and that is the '
+       'reported symptom')
+    ck(max(abs(e) for e in _align_err(0, 448, STOCK_ORIGIN_Y)) < 1e-9,
+       'and the wholly stock pair is zero too, which is why the 4:3 game '
+       'shipped looking right -- the invariant reproduces known-good')
     for w, v, rd, name in _WORD_TABLE:
         ck(_decode_movz(w) == (v, rd),
            f'{name}: {w:08X} really is mov w{rd}, #{v}')
@@ -1572,6 +1953,31 @@ def verify(main=None, log=print) -> int:
     ck(window_rows(448, 720, 16) == (24, 696) and 720 * 16 // 480 == 24,
        'the model band and the shifted movie quad share the same 24 px inset')
 
+    # v10: THE BATTLE RECT, and why the height is not simply raised to 480.
+    def _m42(y, h):
+        return -((y + h / 2.0) - 240.0) / 240.0
+    ck(abs(_m42(BATTLE_VP_Y, BATTLE_VP_H) - 0.3083333) < 1e-6,
+       f'battle ({BATTLE_VP_Y},{BATTLE_VP_H}) has _42 = '
+       f'{_m42(BATTLE_VP_Y, BATTLE_VP_H):.5f}, NOT zero -- the rect is not '
+       f'centred, so h is not free to move')
+    ck(abs(_m42(0, 480)) < 1e-9,
+       'and h=480 would make _42 = 0, i.e. FFNx\'s fix MOVES this port\'s '
+       'battle scene by %.0f device rows'
+       % (_m42(BATTLE_VP_Y, BATTLE_VP_H) / 2 * 720))
+    ck(720 * BATTLE_VP_H // 480 == 498,
+       f'battle draws {720 * BATTLE_VP_H // 480} of 720 rows at 720p, which '
+       f'is where the hardware capture\'s UI band starts')
+    ck(BATTLE_VP_Y == 0,
+       'the battle rect starts at y=0, so the leg only has to extend the '
+       'BOTTOM -- a symmetric open would be a no-op')
+    for _hk, _st, _y, _h, _y1, _acc, _t, _sy, _nm in UNCROP_SITES:
+        _ld = dict(UNCROP_SIG)[SCALE_LOADS[_hk]]
+        ck((_ld & 0x1F) == _sy,
+           f'{_nm}: the battle leg reads w{_sy} and the module loads scale_y '
+           f'into w{_ld & 0x1F} -- declared register matches the image')
+        ck(_sy not in (_y, _h, _y1, _acc, _t),
+           f'{_nm}: scale_y w{_sy} does not collide with y/h/y1/acc/tmp')
+
     # v7: execute EVERY copy's cave body as the hardware would, on every rect
     # the driver is handed. Each must open (16,448) to the full frame and be
     # byte-identical on everything else. Patching a subset is the v6 defect.
@@ -1585,8 +1991,14 @@ def verify(main=None, log=print) -> int:
         for wrd in body + [displaced]:
             if (wrd & 0xFF000000) == 0x71000000:                  # cmp wN,#imm
                 Z = (R[(wrd >> 5) & 31] == ((wrd >> 10) & 0xFFF))
-            elif (wrd & 0xFFE00000) == 0x1A800000:                # csel wD,wN,wzr,eq
-                R[wrd & 31] = R[(wrd >> 5) & 31] if Z else 0
+            elif (wrd & 0xFFE00000) == 0x1A800000:                # csel wD,wN,wM,eq
+                # v10: the ELSE OPERAND IS A REGISTER, not always wzr. It was
+                # hardcoded to 0 here, which was correct for the field leg and
+                # silently wrong for the battle one -- an emulator that cannot
+                # express the instruction cannot test it.
+                rn, rm = (wrd >> 5) & 31, (wrd >> 16) & 31
+                pick = rn if Z else rm
+                R[wrd & 31] = 0 if pick == 31 else R[pick]
             elif (wrd & 0xFF000000) == 0x0B000000:                # add wD,wN,wM,lsl#s
                 R[wrd & 31] = R[(wrd >> 5) & 31] + (R[(wrd >> 16) & 31] << ((wrd >> 10) & 63))
             elif (wrd & 0xFF000000) == 0x4B000000:                # sub wD,wN,wM
@@ -1595,13 +2007,22 @@ def verify(main=None, log=print) -> int:
                 raise AssertionError(f'unmodelled word {wrd:08X}')
         return R[R['_y1']], R[R['_acc']]
 
-    for _hook, _stock, _y, _h, _y1, _acc, _t, _name in UNCROP_SITES:
-        body = _uncrop_body(_y, _h, _y1, _acc, _t)
-        ymap = {'_y': _y, '_h': _h, '_y1': _y1, '_acc': _acc, _t: 0}
+    for _hook, _stock, _y, _h, _y1, _acc, _t, _sy, _name in UNCROP_SITES:
+        body = _uncrop_body(_y, _h, _y1, _acc, _t, _sy)
         for screen in (720, 1080, 1440):
+            # `_sy` really is the render target height at every hook, so the
+            # emulator seeds it with the screen and the battle leg is tested
+            # at three resolutions rather than at 720p only.
+            ymap = {'_y': _y, '_h': _h, '_y1': _y1, '_acc': _acc,
+                    _t: 0, _sy: screen}
             ck(_run(body, _stock, screen, 16, 448, ymap) == (0, screen),
-               f'{_name} @ {screen}p: (16,448) -> 0..{screen}, exact, no bars')
-            for yy, hh in ((0, 480), (0, 448), (24, 432), (16, 480), (0, 224)):
+               f'{_name} @ {screen}p: FIELD (16,448) -> 0..{screen}, no bars')
+            ck(_run(body, _stock, screen, BATTLE_VP_Y, BATTLE_VP_H, ymap)
+               == (0, screen),
+               f'{_name} @ {screen}p: BATTLE ({BATTLE_VP_Y},{BATTLE_VP_H}) '
+               f'-> 0..{screen}, drawn to the bottom')
+            for yy, hh in ((0, 480), (0, 448), (24, 432), (16, 480), (0, 224),
+                           (0, 333), (1, 332), (16, 332), (0, 331)):
                 want = (screen * yy // 480,
                         screen * hh // 480 + screen * yy // 480)
                 ck(_run(body, _stock, screen, yy, hh, ymap) == want,
@@ -1675,15 +2096,18 @@ def main(argv=None) -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('main', nargs='?', help='path to exefs/main')
     ap.add_argument('--apply', action='store_true',
-                    help='bars off + ff7_field_center (h stays 448)')
+                    help='bars off + ff7_field_center + h 480 (models match '
+                         'the 480-unit background)')
     ap.add_argument('--revert', action='store_true', help='back out everything')
     ap.add_argument('--revert-frame', action='store_true',
                     help='back out the frame height only, keep the bars off')
     ap.add_argument('--no-frame', action='store_true',
-                    help=argparse.SUPPRESS)      # now the default
+                    help='keep h at 448 and put the viewport y back to 16 -- '
+                         'the v5 pair. MEASURED to misalign models by +24 px '
+                         'at the top of the screen through 0 in the middle to '
+                         '-24 px at the bottom. A/B only.')
     ap.add_argument('--open-frame', action='store_true',
-                    help='ALSO set the field viewport h to 480. This stretches '
-                         'every 3D model by 480/448; A/B only.')
+                    help=argparse.SUPPRESS)      # now the default
     ap.add_argument('--show', action='store_true')
     ap.add_argument('--verify', action='store_true')
     ap.add_argument('--no-center', action='store_true',
@@ -1708,7 +2132,7 @@ def main(argv=None) -> int:
         return apply(a.main, revert=False, field_center=centered,
                      frame=False, letterbox=False)
     return apply(a.main, revert=a.revert, field_center=centered,
-                 frame=a.open_frame and not a.no_frame)
+                 frame=not a.no_frame)
 
 
 if __name__ == '__main__':
