@@ -1,0 +1,13 @@
+{
+  "name": "LOADING TEST v2 - int3 at entry point. If game CRASHES on boot, our patched bytes ARE what's executing. If it boots normally, either the deploy isn't landing or something (anti-tamper?) is substituting/reverting code at runtime.",
+  "_note": "va/expect verified directly against this exe's real bytes: AddressOfEntryPoint = 0x40b6e0, actual byte there = 55 (push ebp), NOT 8B as the prior version of this file claimed -- that was wrong and would always fail-safe/skip. Fixed.",
+  "expect_marker": "yama",
+  "patches": [
+    {
+      "name": "int3 at entry point (crash-if-executed)",
+      "va": "0x40b6e0",
+      "expect": "55",
+      "set": "CC"
+    }
+  ]
+}

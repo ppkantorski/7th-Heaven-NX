@@ -1,0 +1,13 @@
+{
+  "name": "FIELD RENDER LIMITER UNCAP - the actual function FFNx replaces (fps_limiter_field), not the logic-tick lever",
+  "expect_marker": "yama",
+  "_note": "VA 0x6384e6 resolved from FFNx's own ff7_data.h address table: get_relative_call(field_sub_6388EE=0x6388EE, 0x58) -> 0x6384e6. Confirmed by disassembly: push ebp; mov ebp,esp; sub esp,0x10; ... busy-wait comparing QPC time against a threshold at [0xcff890]. Called as: push eax; call 0x6384e6; add esp,4 (cdecl, caller cleans stack, so overwriting entry with a bare RET is safe even though it ignores the arg). This is the literal function FFNx's replace_function(ff7_externals.fps_limiter_field, ff7_limit_fps) overwrites wholesale on PC. Patching it to `ret` immediately makes FIELD mode fully UNCAPPED (no smoothing, expect fast/jittery motion if it has any effect at all) -- it is a diagnostic, not finished 60fps.",
+  "patches": [
+    {
+      "name": "fps_limiter_field entry -> ret (uncapped field mode)",
+      "va": "0x6384e6",
+      "expect": "55",
+      "set": "C3"
+    }
+  ]
+}

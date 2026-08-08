@@ -1,0 +1,19 @@
+{
+  "name": "FF7 60fps experiment (TEMPLATE - not yet working)",
+  "expect_marker": "yama",
+  "_note": "Fill in real patches. va/expect/set are hex. 'expect' is verified before writing so a wrong exe fails safely. See EXE_PATCHING.md.",
+  "patches": [
+    {
+      "name": "EXAMPLE byte patch - replace with the real frame-limiter target",
+      "va": "0x000000",
+      "expect": "00 00",
+      "set": "90 90"
+    },
+    {
+      "name": "EXAMPLE code cave - injected x86 runs before the stolen bytes",
+      "hook_va": "0x000000",
+      "steal": 6,
+      "code": "90 90"
+    }
+  ]
+}

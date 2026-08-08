@@ -1,0 +1,54 @@
+{
+  "name": "FF7 frame-pacing diagnostic v2 (HALF speed, pure byte patch, no code cave)",
+  "expect_marker": "yama",
+  "patches": [
+    {
+      "name": "frame_duration 50->100 (half speed) @ 0x408a57",
+      "va": "0x408a57",
+      "expect": "6A 32",
+      "set": "6A 64"
+    },
+    {
+      "name": "frame_duration 50->100 (half speed) @ 0x6cb57d",
+      "va": "0x6cb57d",
+      "expect": "6A 32",
+      "set": "6A 64"
+    },
+    {
+      "name": "frame_duration 50->100 (half speed) @ 0x6fffe8",
+      "va": "0x6fffe8",
+      "expect": "6A 32",
+      "set": "6A 64"
+    },
+    {
+      "name": "frame_duration 50->100 (half speed) @ 0x701f9c",
+      "va": "0x701f9c",
+      "expect": "6A 32",
+      "set": "6A 64"
+    },
+    {
+      "name": "frame_duration 50->100 (half speed) @ 0x719c41",
+      "va": "0x719c41",
+      "expect": "6A 32",
+      "set": "6A 64"
+    },
+    {
+      "name": "frame_duration 50->100 (half speed) @ 0x71ffdc",
+      "va": "0x71ffdc",
+      "expect": "6A 32",
+      "set": "6A 64"
+    },
+    {
+      "name": "frame_duration 50->100 (half speed) @ 0x7223d4",
+      "va": "0x7223d4",
+      "expect": "6A 32",
+      "set": "6A 64"
+    },
+    {
+      "name": "frame_duration 50->100 (half speed) @ 0x74bc1e",
+      "va": "0x74bc1e",
+      "expect": "6A 32",
+      "set": "6A 64"
+    }
+  ]
+}

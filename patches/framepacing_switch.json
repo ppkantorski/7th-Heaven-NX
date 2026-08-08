@@ -1,0 +1,12 @@
+{
+  "name": "FF7 Switch-exe frame-pacing test (HALF speed) - Switch's OWN ff7_en, no anti-tamper",
+  "expect_marker": "yama",
+  "patches": [
+    {
+      "name": "frame_duration 50->100 @ 0x408a57",
+      "va": "0x408a57",
+      "expect": "6A 32",
+      "set": "6A 64"
+    }
+  ]
+}

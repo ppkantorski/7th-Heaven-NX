@@ -1,0 +1,12 @@
+{
+  "name": "INTEGRITY ISOLATION TEST - flips ONE never-executed padding byte",
+  "expect_marker": "yama",
+  "patches": [
+    {
+      "name": "inert padding byte 0x7b5635: 00->90 (never executed)",
+      "va": "0x7b5635",
+      "expect": "00",
+      "set": "90"
+    }
+  ]
+}
