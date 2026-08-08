@@ -3,6 +3,8 @@ Planning and building: turn a set of enabled mods into an SD-card tree.
 
 Classification is exact rather than heuristic -- every candidate file is
 matched by name against the real contents of the user's own archives.
+
+Copyright (c) 2026 ppkantorski
 """
 import hashlib
 import json
