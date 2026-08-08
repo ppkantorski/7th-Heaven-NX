@@ -40,6 +40,8 @@ import ff7nx_moviealign
 import ff7nx_moviecull
 import ff7nx_moviebars
 import ff7nx_camclamp
+import ff7nx_battlewide
+import ff7nx_swirlscale
 import ff7nx_uncrop
 import ff7nx_marginblack
 import ff7nx_marginpage
@@ -5724,6 +5726,8 @@ def apply_bg_clear(sdout, dump, log=lambda *_: None, produced=()):
 FIELD_FRAME_ENV = ff7nx_letterbox.LETTERBOX_ENV
 MODEL_CULL_ENV = ff7nx_modelcull.MODELCULL_ENV
 MOVIE_ALIGN_ENV = ff7nx_moviealign.MOVIEALIGN_ENV
+BATTLE_WIDE_ENV = ff7nx_battlewide.BATTLEWIDE_ENV
+SWIRL_SCALE_ENV = ff7nx_swirlscale.SWIRLSCALE_ENV
 
 
 def _ws_on():
@@ -5818,6 +5822,8 @@ def apply_field_frame(sdout, dump, log=lambda *_: None, produced=()):
                                     '')).strip().lower() == 'force'
     want_bars = ff7nx_moviebars.enabled()
     want_clamp = ff7nx_camclamp.enabled()
+    want_battle = ff7nx_battlewide.enabled()
+    want_swirl = ff7nx_swirlscale.enabled()
     if not (want_frame or want_cull or want_movie or want_mcull
             or want_bars or want_clamp):
         # SAY SO. `ff7nx_ws.apply_module` learned this the expensive way and
@@ -5836,6 +5842,8 @@ def apply_field_frame(sdout, dump, log=lambda *_: None, produced=()):
                 ('frame height', FIELD_FRAME_ENV, want_frame),
                 ('movie align', MOVIE_ALIGN_ENV, want_movie),
                 ('movie bars', ff7nx_moviebars.MOVIEBARS_ENV, want_bars),
+                ('battle overlays', BATTLE_WIDE_ENV, want_battle),
+                ('swirl scale', SWIRL_SCALE_ENV, want_swirl),
                 ('model cull', MODEL_CULL_ENV, want_cull)):
             log(f'  {name:14s} {"on" if want else "off"}   '
                 f'({env}={os.environ.get(env, "<unset, follows 16:9>")!r})')
@@ -5908,6 +5916,31 @@ def apply_field_frame(sdout, dump, log=lambda *_: None, produced=()):
         rc |= ff7nx_moviecull.apply(dest, log=log)
     if want_clamp:
         rc |= ff7nx_camclamp.apply(dest, log=log)
+    # --- the battle overlays -------------------------------------------
+    # Independent of everything above: different functions, no shared words,
+    # no ordering constraint.  They are here rather than in a pass of their
+    # own because they patch the same exefs/main and share the 16:9 gate;
+    # splitting them out would duplicate the copy-and-refuse logic for no
+    # gain.
+    #
+    # NEITHER touches the STORED battle rect, which is what lets them coexist
+    # with ff7nx_letterbox's uncrop leg -- that leg matches the literal rect
+    # `cmp wY,#0 / cmp wH,#332`, and a stored change would silently stop it
+    # firing and bring the black band back.  Both modules assert this in
+    # --verify; FINDINGS-99 4 is the build that proved it matters.
+    if want_battle:
+        rc |= ff7nx_battlewide.apply_all(dest, log=log)
+    else:
+        log('  battle overlays: OFF -- summon and limit-break flashes and '
+            'the battle fade cover only the middle 4:3. '
+            f'({BATTLE_WIDE_ENV}='
+            f'{os.environ.get(BATTLE_WIDE_ENV, "<unset>")!r})')
+    if want_swirl:
+        rc |= ff7nx_swirlscale.apply(dest, log=log)
+    else:
+        log('  swirl scale: OFF -- the battle-entry swirl squeezes the 16:9 '
+            f'freeze frame into 4:3. ({SWIRL_SCALE_ENV}='
+            f'{os.environ.get(SWIRL_SCALE_ENV, "<unset>")!r})')
     if rc:
         log('! field frame: one or more passes refused -- the module is '
             'whatever the passes that DID run left. Check the lines above.')

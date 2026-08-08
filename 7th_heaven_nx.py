@@ -2756,6 +2756,16 @@ def launch_ui():
         # and is deliberately NOT written here, so it stays unset and the
         # module falls through to ff7nx_ws.enabled().
         os.environ.pop(build.MODEL_CULL_ENV, None)
+        # The BATTLE OVERLAYS and the SWIRL SCALE are on the same footing as
+        # the model cull and get no switch either.  Every value they write is
+        # a widescreen value -- x -107, w 854, h 480, and a 4/3 vertex scale --
+        # so at 4:3 they are not a milder version of themselves, they are
+        # wrong.  There is no configuration in which you want the battle fade
+        # to cover the middle 4:3 of a 16:9 frame.  They follow ff7nx_ws and
+        # nothing else; the two env vars exist for a diagnostic A/B and are
+        # deliberately NOT written here.
+        os.environ.pop(build.BATTLE_WIDE_ENV, None)
+        os.environ.pop(build.SWIRL_SCALE_ENV, None)
         os.environ[build.ff7nx_fieldbuf.SCALE_ENV] = str(
             current_field_buffer())
         os.environ[build.ff7nx_shaders.SCALER_ENV] = current_scaler()
@@ -2902,6 +2912,8 @@ def main():
         # SEVENTH_NX_MODEL_CULL and SEVENTH_NX_MOVIE_BARS are deliberately left
         # unset: the cull follows 16:9 rather than this checkbox, and the FMV
         # margin bars follow MOVIE_ALIGN_ENV, which is set just above.
+        # SEVENTH_NX_BATTLE_WIDE and SEVENTH_NX_SWIRL_SCALE likewise follow
+        # 16:9 -- see the dialog for why they have no switch.
         if build.field_bg_repack.MAX_TOTAL_PAGES_ENV not in os.environ:
             os.environ[build.field_bg_repack.MAX_TOTAL_PAGES_ENV] = str(
                 saved.get('__global__', {}).get(
