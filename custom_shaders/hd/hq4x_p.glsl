@@ -19,176 +19,116 @@ in vec4 vTextureCoord6;
 
 layout(location = 0) out vec4 pColor;
 
-// ---------------------------------------------------------------- HD core
-// Catmull-Rom bicubic reconstruction, 9 hardware-bilinear taps.
+// ---------------------------------------------------------------------------
+// hd_grade_only -- 7th_heaven_nx
 //
-// WHY NOT xBR/HQ4X: those are PIXEL-ART algorithms. They look for hard steps
-// between flat colour regions and rebuild them as clean diagonals. Cosmos
-// Limit Break's backgrounds are AI-upscaled continuous-tone art, so there are
-// no flat regions and no hard steps -- the detector either finds nothing (and
-// falls back to a blend, i.e. soft) or fires on gradient noise (and produces
-// the waxy, plastic, over-smoothed look). "Crisp" is nearest-neighbour, which
-// is why it looks blocky.
+// This is the STOCK filter, byte-for-byte, plus the black-point and
+// saturation grading from the `hd` set. The Catmull-Rom reconstruction and
+// the unsharp mask are GONE.
 //
-// What continuous-tone art wants is a good RECONSTRUCTION filter. Catmull-Rom
-// is interpolating (it passes exactly through every source texel, so nothing
-// is smeared) and its negative lobes restore the high frequencies bilinear
-// throws away. Smooth AND crisp, which is the combination that was missing.
-
-// How much extra acutance on top of Catmull-Rom. 0.0 = pure Catmull-Rom.
+// WHY. The `hd` set did two unrelated things: it RECONSTRUCTED (Catmull-Rom
+// + `HD_SHARPEN` unsharp) and it GRADED (black point + saturation). Only the
+// grading was ever visibly worth having -- with field textures at 256 the
+// reconstruction has almost nothing to reconstruct. The unsharp, meanwhile,
+// rings against hard high-contrast edges, and a white glyph inside a black
+// outline is the worst input it can get: that is the "dirty black pixels"
+// around every character. Confirmed on hardware -- restoring the stock
+// filters made the text clean, and hd2 (HD_SHARPEN 0.35) still showed it,
+// so lowering the sharpen was never going to be enough.
 //
-// MEASURED, not guessed. Seven real 256x256 crops from a built flevel were
-// downsampled 2x and reconstructed, and the result compared against the
-// original -- so "better" means CLOSER TO THE TRUE ART, not merely sharper.
-// With the anti-ring clamp applied, as it is below:
+// The `HD_ANTIRING` clamp in the hd set did not help here and could not:
+// it clamps to the local 2x2 min/max, and around text that range is the
+// full black-to-white span, so it permits the entire overshoot.
 //
-//     HD_SHARPEN     RMSE    detail   pixels hitting the clamp
-//       0.35        6.255     73.0%        24.4%     <- the old default
-//       0.70        6.030     75.1%        28.1%
-//       1.00        5.876     76.5%        31.3%     <- now
-//       1.50        5.688     78.2%        36.6%
-//       3.00        5.489     81.2%        49.1%     RMSE minimum
-//       6.00        5.793     83.4%        64.8%     past it, worse again
-//
-// The sharpening is NOT inventing detail: error falls monotonically until
-// about 3.0. It is recovering high frequencies the reconstruction alone
-// leaves behind. 0.35 was leaving real accuracy on the table.
-//
-// The reason to stop at 1.0 rather than 3.0 is the last column. A clamped
-// pixel is one the sharpen pushed outside its 2x2 source range, so it got
-// pulled back to the edge of it. At 3.0 half of all pixels are pinned to a
-// neighbourhood extreme, which is posterisation -- exactly the "pixelated"
-// look the filter exists to avoid. RMSE cannot see that; it reads a hard
-// edge as accurate. 1.0 takes most of the accuracy for a clamp rate barely
-// above the old default.
-//
-// For reference, this beats a bigger kernel outright: Lanczos-3 scored
-// RMSE 7.326 / 80.4% detail at 25-36 taps, against 5.876 / 76.5% here at 13.
-// Sharpening a good short kernel is worth more than a longer one.
-//
-// Sharpening luminance only was also tried and is slightly WORSE
-// (6.067 vs 6.030 at 0.70), so this stays RGB.
-//
-// 1.5 if you want more; past 3.0 it degrades on the measurements, not just
-// to taste.
-const float HD_SHARPEN = 1.0;
-
-// Anti-ringing. Catmull-Rom overshoots at high-contrast edges, which shows up
-// as a bright/dark halo. Clamping the result into the range of the four
-// nearest texels removes the halo without softening the edge itself.
-// 1.0 = full clamp, 0.0 = off.
-const float HD_ANTIRING = 1.0;
-
-vec4 hd_catmullrom(sampler2D tex, vec2 uv, vec2 ts)
-{
-	vec2 pos = uv * ts;
-	vec2 c1  = floor(pos - 0.5) + 0.5;
-	vec2 f   = pos - c1;
-
-	vec2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f));
-	vec2 w1 = 1.0 + f * f * (-2.5 + 1.5 * f);
-	vec2 w2 = f * (0.5 + f * (2.0 - 1.5 * f));
-	vec2 w3 = f * f * (-0.5 + 0.5 * f);
-
-	// fold the two centre taps into one bilinear fetch: 16 taps -> 9
-	vec2 w12 = w1 + w2;
-	vec2 o12 = w2 / w12;
-
-	vec2 t0  = (c1 - 1.0) / ts;
-	vec2 t3  = (c1 + 2.0) / ts;
-	vec2 t12 = (c1 + o12) / ts;
-
-	vec4 r = vec4(0.0);
-	r += texture(tex, vec2(t0.x,  t0.y))  * (w0.x  * w0.y);
-	r += texture(tex, vec2(t12.x, t0.y))  * (w12.x * w0.y);
-	r += texture(tex, vec2(t3.x,  t0.y))  * (w3.x  * w0.y);
-	r += texture(tex, vec2(t0.x,  t12.y)) * (w0.x  * w12.y);
-	r += texture(tex, vec2(t12.x, t12.y)) * (w12.x * w12.y);
-	r += texture(tex, vec2(t3.x,  t12.y)) * (w3.x  * w12.y);
-	r += texture(tex, vec2(t0.x,  t3.y))  * (w0.x  * w3.y);
-	r += texture(tex, vec2(t12.x, t3.y))  * (w12.x * w3.y);
-	r += texture(tex, vec2(t3.x,  t3.y))  * (w3.x  * w3.y);
-	return r;
-}
-
-// ---- background-only grading -------------------------------------------
-// These touch the FIELD BACKGROUND ONLY. Character models, battle and UI are
-// drawn by other shaders (colortex_p.glsl and friends) and are not affected,
-// so this cannot disturb anything that already looks right.
-//
-// WHY THIS EXISTS. The packer used to quantise by truncation (>> 3), which
-// always rounds DOWN and biased every background pixel -3.49/255, up to
-// -7/255 in the shadows. That was a bug and it is fixed -- the quantiser now
-// rounds, measured bias 0.00 -- but the accidental side effect was crushed
-// blacks, which read as contrast. Correct shadows look "faded" beside them.
-//
-// So the DATA is right and the LOOK changed. Rather than un-fix the packer
-// and bring the banding back, the punch is restored here where it costs
-// nothing and is tunable.
+// The grading is additionally SKIPPED for 512x512 textures. That is the font
+// atlas (romfs/ff7/font/TBGoPro_Regular_0.png) and nothing else -- the field
+// art in the cache is 1024x1024 (198 files), 1431x826, 6366x3103, 1920x1080
+// and 400x225, with no 512x512 among them. So text comes out bit-identical
+// to vanilla and the backgrounds still get their blacks back.
+// ---------------------------------------------------------------------------
 
 // Pulls the bottom of the range back down. 0.014 (= 3.5/255) undoes exactly
-// the lift the quantiser fix introduced; 0.02-0.03 goes beyond it for more
-// contrast. 0.0 is neutral and photometrically correct.
+// the lift the quantiser fix introduced. 0.0 is neutral.
 const float HD_BLACK_POINT = 0.014;
 
-// 1.0 is untouched. 1.05-1.15 if the upscaled art looks washed out -- AI
-// upscales frequently desaturate slightly, and that is the mod's art rather
-// than anything this shader did.
+// 1.0 is untouched. 1.05 counters the slight desaturation of AI upscales.
 const float HD_SATURATION = 1.05;
 
-vec4 hd_grade(vec4 c)
+vec3 hd_grade_rgb(vec3 rgb, vec2 ts)
 {
+	// the font atlas is the only 512x512 texture in play -- leave text alone
+	if (ts.x == 512.0 && ts.y == 512.0) return rgb;
+
 	if (HD_BLACK_POINT > 0.0)
 	{
-		c.rgb = max(c.rgb - HD_BLACK_POINT, 0.0) / (1.0 - HD_BLACK_POINT);
+		rgb = max(rgb - HD_BLACK_POINT, 0.0) / (1.0 - HD_BLACK_POINT);
 	}
 	if (HD_SATURATION != 1.0)
 	{
-		float l = dot(c.rgb, vec3(0.299, 0.587, 0.114));
-		c.rgb = clamp(mix(vec3(l), c.rgb, HD_SATURATION), 0.0, 1.0);
+		float l = dot(rgb, vec3(0.299, 0.587, 0.114));
+		rgb = clamp(mix(vec3(l), rgb, HD_SATURATION), 0.0, 1.0);
 	}
-	return c;
-}
-
-vec4 hd_sample(sampler2D tex, vec2 uv)
-{
-	vec2 ts = vec2(textureSize(tex, 0));
-	vec4 cr = hd_catmullrom(tex, uv, ts);
-
-	// the four texels this pixel sits between -- used both for the extra
-	// acutance and for the halo clamp, so they cost one fetch each and
-	// nothing more
-	vec2 pos = uv * ts;
-	vec2 c   = floor(pos - 0.5) + 0.5;
-	vec4 s00 = texture(tex, (c + vec2(0.0, 0.0)) / ts);
-	vec4 s10 = texture(tex, (c + vec2(1.0, 0.0)) / ts);
-	vec4 s01 = texture(tex, (c + vec2(0.0, 1.0)) / ts);
-	vec4 s11 = texture(tex, (c + vec2(1.0, 1.0)) / ts);
-
-	// unsharp against the bilinear reconstruction of the same four texels.
-	// (cr - bilinear) IS the detail Catmull-Rom recovers, so scaling it is
-	// edge sharpening by construction -- it is zero in flat areas and only
-	// grows where there is real structure, so it cannot amplify noise.
-	vec2 fr   = pos - c;
-	vec4 bil  = mix(mix(s00, s10, fr.x), mix(s01, s11, fr.x), fr.y);
-	vec4 outc = cr + (cr - bil) * HD_SHARPEN;
-
-	vec4 lo = min(min(s00, s10), min(s01, s11));
-	vec4 hi = max(max(s00, s10), max(s01, s11));
-	return mix(outc, clamp(outc, lo, hi), HD_ANTIRING);
+	return rgb;
 }
 
 void main()
 {
-	// hd mode -- 7th_heaven_nx. Here vTextureCoord0 is already the centre.
-	float keep = pParam2.x * 0.0;
-	pColor = hd_grade(hd_sample(Sampler0, vTextureCoord0)) + vec4(keep);
-
-	// stock behaviour: this pass doubles as the depth write when asked
+	vec3 dt = pParam1.xyz;
+	
+	float mx = pParam1.w;		// start smoothing wt.
+	float k = pParam2.x;		// wt. decrease factor
+	float max_w = pParam2.y;	// max filter weigth
+	float min_w = pParam2.z;	// min filter weigth
+	float lum_add = pParam2.w;	// effects smoothing
+	
+	vec3 c  = texture(Sampler0, vTextureCoord0.xy).rgb;
+	vec3 i1 = texture(Sampler0, vTextureCoord1.xy).rgb;
+	vec3 i2 = texture(Sampler0, vTextureCoord2.xy).rgb;
+	vec3 i3 = texture(Sampler0, vTextureCoord3.xy).rgb;
+	vec3 i4 = texture(Sampler0, vTextureCoord4.xy).rgb;
+	vec3 o1 = texture(Sampler0, vTextureCoord5.xy).rgb;
+	vec3 o3 = texture(Sampler0, vTextureCoord6.xy).rgb;
+	vec3 o2 = texture(Sampler0, vTextureCoord5.zw).rgb;
+	vec3 o4 = texture(Sampler0, vTextureCoord6.zw).rgb;
+	vec3 s1 = texture(Sampler0, vTextureCoord1.zw).rgb;
+	vec3 s2 = texture(Sampler0, vTextureCoord2.zw).rgb;
+	vec3 s3 = texture(Sampler0, vTextureCoord3.zw).rgb;
+	vec3 s4 = texture(Sampler0, vTextureCoord4.zw).rgb;
+	
+	float ko1 = dot(abs(o1 - c), dt);
+	float ko2 = dot(abs(o2 - c), dt);
+	float ko3 = dot(abs(o3 - c), dt);
+	float ko4 = dot(abs(o4 - c), dt);
+	
+	float k1 = min(dot(abs(i1 - i3), dt), max(ko1, ko3));
+	float k2 = min(dot(abs(i2 - i4), dt), max(ko2, ko4));
+	
+	float w1 = min(k2, k2 * ko3/ko1);
+	float w2 = min(k1, k1 * ko4/ko2);
+	float w3 = min(k2, k2 * ko1/ko3);
+	float w4 = min(k1, k1 * ko2/ko4);
+	
+	c = (w1*o1 + w2*o2 + w3*o3 + w4*o4 + 0.001*c) / (w1 + w2 + w3 + w4 + 0.001);
+	w1 = k * dot(abs(i1-c) + abs(i3-c), dt) / (0.125 * dot(i1+i3, dt) + lum_add);
+	w2 = k * dot(abs(i2-c) + abs(i4-c), dt) / (0.125 * dot(i2+i4, dt) + lum_add);
+	w3 = k * dot(abs(s1-c) + abs(s3-c), dt) / (0.125 * dot(s1+s3, dt) + lum_add);
+	w4 = k * dot(abs(s2-c) + abs(s4-c), dt) / (0.125 * dot(s2+s4, dt) + lum_add);
+	
+	w1 = clamp(w1 + mx, min_w, max_w); 
+	w2 = clamp(w2 + mx, min_w, max_w);
+	w3 = clamp(w3 + mx, min_w, max_w); 
+	w4 = clamp(w4 + mx, min_w, max_w);
+	
+	vec3 stockrgb = (w1*(i1+i3) + w2*(i2+i4) + w3*(s1+s3) + w4*(s2+s4) + c) / (2.0 * (w1+w2+w3+w4) + 1.0);
+	pColor = vec4(hd_grade_rgb(stockrgb, vec2(textureSize(Sampler0, 0))), texture(Sampler0, vTextureCoord0).a);
+	
 	if (pParam1.w > 0.0)
 	{
-		vec2 ts = vec2(textureSize(Sampler0, 0));
-		vec2 uv = (floor(vTextureCoord0 * ts) + 0.5) / ts;
-		gl_FragDepth = texture(Sampler0, uv).r;
+		// UNGRADED, deliberately. Stock wrote pColor.r here, and pColor was
+		// the raw filter output; now pColor is graded, so reading it back
+		// would feed a black-point-crushed value into the DEPTH buffer and
+		// silently move geometry. The grade is a display transform and must
+		// not reach depth.
+		gl_FragDepth = stockrgb.r;
 	}
 }

@@ -15,19 +15,16 @@ in vec2 vTextureCoord3;
 
 void main()
 {
-	// hd mode -- 7th_heaven_nx.
-	//
-	// DEPTH IS DELIBERATELY NOT FILTERED. This buffer decides which pixels of
-	// the field art draw in front of the character models. Any interpolation
-	// invents depths that exist nowhere in the source, and Catmull-Rom's
-	// overshoot would invent ones outside the source range entirely -- along a
-	// railing or a doorway that is a halo of wrong occlusion, with the model
-	// clipping through or vanishing behind thin geometry. Nearest keeps every
-	// depth exact. The one-pixel mismatch against the smoothly filtered colour
-	// is invisible; wrong occlusion is not.
-	float keep = pParam.w * 0.0;
-	vec2 ts = vec2(textureSize(Sampler0, 0));
-	vec2 uv = (vTextureCoord0 + vTextureCoord3) * 0.5;
-	uv = (floor(uv * ts) + 0.5) / ts;
-	gl_FragDepth = texture(Sampler0, uv).r + keep;
+	vec3 ide = pParam.xyz;
+	float eps = pParam.w;
+	
+	vec3 a = texture(Sampler0, vTextureCoord1).rgb;
+	vec3 d = texture(Sampler0, vTextureCoord3).rgb;
+	float av1 = dot(abs(a - d), ide) + eps;
+	
+   	vec3 b = texture(Sampler0, vTextureCoord0).rgb;
+	vec3 c = texture(Sampler0, vTextureCoord3).rgb;
+	float av2 = dot(abs(c - b), ide) + eps;
+	
+	gl_FragDepth = vec3((av1*(c.rgb + b.rgb) + av2*(d.rgb + a.rgb)) / (2.0*(av1+av2))).r;
 }
