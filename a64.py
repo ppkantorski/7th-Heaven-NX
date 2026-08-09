@@ -198,3 +198,48 @@ def add_reg_lsr(rd, rn, rm, sh):
 def movz_movk(rd, val):
     """The two words that build a full 32-bit constant in Wd."""
     return [movz(rd, val & 0xFFFF), movk_hi(rd, (val >> 16) & 0xFFFF)]
+
+
+# --- 64-bit compare / select / bitfield, and the shifted 32-bit add -------
+# Added for ff7nx_uiclip, which has to scale the LOW HALF of two packed
+# 64-bit rect words while leaving the high half alone, and choose between the
+# scaled and unscaled pair without branching (a branch-free cave is one
+# ff7nx_cave.emit_chained can scatter across padding holes with no custom
+# walker). Every one of these is checked against capstone in that module's
+# --verify, so a typo here cannot reach an image.
+def add_reg_lsl(rd, rn, rm, sh):
+    """add Wd, Wn, Wm, LSL #sh"""
+    return 0x0B000000 | (rm << 16) | (sh << 10) | (rn << 5) | rd
+
+
+def bfi64(rd, rn, lsb, width):
+    """
+    bfi Xd, Xn, #lsb, #width -- insert Xn[width-1:0] at Xd[lsb+width-1:lsb],
+    PRESERVING every other bit of Xd. capstone renders the lsb=0 form as
+    `bfxil`; same encoding, and the ARM ARM says so.
+    """
+    immr = (-lsb) % 64
+    imms = width - 1
+    return 0xB3400000 | (immr << 16) | (imms << 10) | (rn << 5) | rd
+
+
+def cmp_reg64(rn, rm):
+    """cmp Xn, Xm  (subs XZR, Xn, Xm)"""
+    return 0xEB000000 | (rm << 16) | (rn << 5) | 31
+
+
+def ccmp_reg64(rn, rm, nzcv, cond):
+    """
+    ccmp Xn, Xm, #nzcv, cond -- compare if `cond` holds, else ADOPT #nzcv as
+    the flags. Chaining two of these is how the cave tests a 128-bit rect
+    for equality in two instructions and no branch.
+    """
+    return 0xFA400000 | (rm << 16) | (cond << 12) | (rn << 5) | nzcv
+
+
+def csel64(rd, rn, rm, cond):
+    """csel Xd, Xn, Xm, cond -- Xd = cond ? Xn : Xm"""
+    return 0x9A800000 | (rm << 16) | (cond << 12) | (rn << 5) | rd
+
+
+EQ = 0

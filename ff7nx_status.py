@@ -74,26 +74,34 @@ def _walk(W, hook):
     raise RuntimeError('cave chain from +%#x did not terminate' % hook)
 
 
-def _walk_via_module(t, hook):
-    """
-    Ask the owning module to walk a cave that `_walk` cannot.
+# hooks whose own module knows how to walk them: {hook: module name}
+#
+#   ff7nx_moviebars  puts its shared quad-issue subroutine AFTER the return,
+#                    reached by `bl`, so `_walk` counts 72 of 127 words.
+#   ff7nx_uiclip     returns to hook+0xC, not hook+4 -- it owns the three
+#                    words that set up the viewport call, not just the one it
+#                    displaced, so `_walk`'s return test never fires and the
+#                    chain walk runs off the end.
+#
+# Both are the same failure in the end: `_walk` is a heuristic and these are
+# the caves it does not fit. Asking the owner is exact, and the owner already
+# has to be right about this or its own revert would corrupt the image.
+_WALKERS = {
+    0x10E0A4C: 'ff7nx_moviebars',
+    0x10D9F48: 'ff7nx_uiclip',
+}
 
-    `_walk` stops at the `b` back to the game, which is right for every cave
-    written before this one -- their return branch is their last word.
-    `ff7nx_moviebars` deliberately puts its shared quad-issue subroutine AFTER
-    the return, reached by `bl`, so that its only `b` is the return and its own
-    revert can use the same chain rule as everything else. The consequence is
-    that `_walk` counts 72 of 127 words and, more to the point, the COLLISION
-    CHECK never sees the tail. That is the one thing this script exists for, so
-    it asks the module rather than growing a second heuristic.
-    """
-    if hook != 0x10E0A4C:
+
+def _walk_via_module(t, hook):
+    """Ask the owning module to walk a cave that `_walk` cannot."""
+    name = _WALKERS.get(hook)
+    if name is None:
         return None
     try:
-        import ff7nx_moviebars as MB
+        mod = __import__(name)
+        got = mod.walk_physical(t)
     except Exception:                                          # noqa: BLE001
         return None
-    got = MB.walk_physical(t)
     return ([hook] + list(got)) if got else None
 
 
@@ -122,6 +130,18 @@ CAVES = [
     ('moviealign', 'movie quad +16',            0x10DE8F0),
     ('moviebars',  'FMV margin bars',           0x10E0A4C),
     ('camclamp',   'scripted camera clamp',     0x9F874C),
+    # FINDINGS-103. The 2D draw helper's per-window viewport rect is computed
+    # /640 with no widescreen term, so it clips on the unscaled 2x mapping
+    # while the shader draws on 1.5x+160 -- borders vanish outward from
+    # centre. The cave puts the shader's own transform on the rect,
+    # x -> (3x)/4 + tW/8, and passes FULL-SCREEN rects through untouched by
+    # comparing them against the full rect rather than against a literal 640.
+    #
+    # This was TWO WORDS once (point the viewport pair at the full pair) and
+    # that shipped and was wrong: it deleted the clip FF7 uses to hide a
+    # window's contents while the box opens and closes, so dialogue text
+    # outlived its box. Scaling the rect keeps that clip and corrects it.
+    ('uiclip',     '2D viewport scale',         0x10D9F48),
     # RETIRED -- see ff7nx_movieclip.enabled(). Hooked here means the scissor
     # is narrowing the whole frame during an FMV, which freezes stale field
     # art in the 16:9 margins. `not hooked` is now the wanted state.
@@ -187,6 +207,35 @@ SINGLES = [
     # RETIRED with the module. The stock b.eq being PRESENT is now correct:
     # it means the scissor path early-outs on a full-frame box, which is what
     # we want now that nothing narrows it.
+    # `uiclip` is a CAVE now, listed above -- and these two words are its
+    # ANCHORS, so they must read STOCK in both states. The cave replicates
+    # them rather than editing them; if either one is the old two-word patch
+    # (0xF943FB41 / 0xF943FF42) the module will refuse, which is the intended
+    # outcome: that patch is the one that made dialogue text outlive its box.
+    ('uiclip',     '2D viewport x1 (anchor)', 0x10D9F4C,
+     {0xF9440341: '[x26,#0x800]  stock, as the cave requires',
+      0xF943FB41: '[x26,#0x7F0]  <-- the RETIRED two-word patch'},
+     '[x26,#0x800]  stock, as the cave requires'),
+    ('uiclip',     '2D viewport x2 (anchor)', 0x10D9F50,
+     {0xF9440742: '[x26,#0x808]  stock, as the cave requires',
+      0xF943FF42: '[x26,#0x7F8]  <-- the RETIRED two-word patch'},
+     '[x26,#0x808]  stock, as the cave requires'),
+    # HANDOFF-104. The credits fade quad's left/right x. Stock loads the
+    # guest globals (0 and 640 -- the 4:3 core); patched materialises -107
+    # and 747 straight into d0. The y pair is deliberately NOT listed: it
+    # must stay stock or the intro grows top/bottom bars it never had.
+    ('credits',    'fade quad left  v0', 0x10A1D6C,
+     {0xBD400000: 'guest 0xF4F5A0 (0)  <-- fade is 4:3 only',
+      0x92800D48: '-107  (16:9 correct)'}, '-107  (16:9 correct)'),
+    ('credits',    'fade quad left  v1', 0x10A1F08,
+     {0xBD400000: 'guest 0xF4F5A0 (0)  <-- fade is 4:3 only',
+      0x92800D48: '-107  (16:9 correct)'}, '-107  (16:9 correct)'),
+    ('credits',    'fade quad right v2', 0x10A20A0,
+     {0xBD400000: 'guest 0xF4F5A8 (640)  <-- fade is 4:3 only',
+      0xD2805D68: '747  (16:9 correct)'}, '747  (16:9 correct)'),
+    ('credits',    'fade quad right v3', 0x10A2230,
+     {0xBD400000: 'guest 0xF4F5A8 (640)  <-- fade is 4:3 only',
+      0xD2805D68: '747  (16:9 correct)'}, '747  (16:9 correct)'),
     ('movieclip',  'bypass (RETIRED)',   0x11377C4,
      {0x54000160: 'stock  (correct -- movieclip is retired)',
       0xD503201F: 'removed  <-- movieclip is still installed'},

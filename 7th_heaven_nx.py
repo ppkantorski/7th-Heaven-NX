@@ -1445,11 +1445,45 @@ def launch_ui():
              'the data half on its own, or to prepare flevel on a machine '
              'with no dump. If you pick it and wonder why nothing changed on '
              'the console, that is why; the build log says so too.\n\n'
-             'KNOWN GAPS with full widescreen: battle is still letterboxed '
-             'above the UI band, full-screen 2D effects (swirl, summon '
-             'flashes) still cover only the middle 4:3, and the fields with '
-             'no camera range in the mod’s config can show a black bar at '
-             'the left edge when the camera pans.', True),
+             'FIXED since this text was written: the battle scene now draws '
+             'to the bottom of the frame instead of stopping at the UI band; '
+             'the battle-entry swirl fills the frame instead of squeezing '
+             'the 16:9 picture into 4:3; and the battle fade and the summon '
+             'and limit-break flashes cover the whole frame; and menu and '
+             'dialogue boxes keep the border on the side that faces screen '
+             'centre; and the intro/prelude no longer SMEARS credit text '
+             'into the side margins -- its fade covers the whole frame and '
+             'its colour buffer is cleared every frame. Those follow this '
+             'setting automatically and have no switch of their own.\n\n'
+             'KNOWN GAPS with full widescreen: the battle fade-in animation '
+             'sweeps only the top ~70% before snapping, because its strip '
+             'stride still scales to the old 332-unit height; the victory '
+             'fade-to-black and some battle flashes are still 4:3; and the '
+             'fields with no camera range in the mod’s config can show a '
+             'black bar at the left edge when the camera pans; and in the '
+             'intro/prelude, credit lines are visible sitting in the side '
+             'margins while they wait to slide in. The smear is gone, but '
+             'the margins are not painted black yet -- the gate that would '
+             'do it needs a flag the game does not keep. See HANDOFF-104.'
+             '\n\n'
+             'CORRECTED: this text used to say the clipped window borders '
+             'were “NOT a widescreen bug”, on the grounds that the window '
+             'geometry is a stock data table this build never touches. The '
+             'geometry was innocent; the CLIP was not. The scale lives in '
+             'the vertex shader, so 2D geometry is scaled but a window’s own '
+             'viewport rect — computed on the CPU — is not, and the two only '
+             'agree at the centre of the screen. A box left of centre lost '
+             'its right border, a box right of centre lost its left one. '
+             'Fixed, and it follows this setting. See FINDINGS-103.\n\n'
+             'AND CORRECTED AGAIN: the first fix for that pointed the window '
+             'clip at the whole screen. Borders came back, but dialogue text '
+             'started outliving its box — the text kept drawing over the '
+             'field while the box shrank away — because that same clip is '
+             'what hides a window’s contents as it opens and closes. It is '
+             'now SCALED rather than removed, so the clip still does its job '
+             'and does it in the right place. If you saw text linger after '
+             'its box, that build is what did it, and this one does not.',
+             True),
             ('combo', 'Field render resolution', fbuf_var,
              [l for _, l in FIELD_BUF_CHOICES],
              'THE FIX FOR THE VERTICAL BANDS. The port draws the field into '
@@ -2766,6 +2800,18 @@ def launch_ui():
         # deliberately NOT written here.
         os.environ.pop(build.BATTLE_WIDE_ENV, None)
         os.environ.pop(build.SWIRL_SCALE_ENV, None)
+        # The 2D VIEWPORT CLIP is the same case again, and the STRONGEST of
+        # them. At 4:3 the geometry and the window clip are both on the
+        # unscaled 2x mapping, so they agree and the clip is doing its real
+        # job -- clipping the contents FF7 stages off-screen and slides in.
+        # This patch removes that clip, so at 4:3 it is not "milder", it is
+        # WRONG. It must follow 16:9 and nothing else. FINDINGS-103.
+        os.environ.pop(build.UI_CLIP_ENV, None)
+        # The CREDITS FADE QUAD is the same case: -107 and 747 are
+        # widescreen values, and at 4:3 the visible span IS 0..640, so
+        # widening the quad would drag it off both edges of a frame that
+        # was never narrowed. Follows 16:9, no switch. HANDOFF-104.
+        os.environ.pop(build.CREDITS_ENV, None)
         os.environ[build.ff7nx_fieldbuf.SCALE_ENV] = str(
             current_field_buffer())
         os.environ[build.ff7nx_shaders.SCALER_ENV] = current_scaler()
@@ -2912,8 +2958,9 @@ def main():
         # SEVENTH_NX_MODEL_CULL and SEVENTH_NX_MOVIE_BARS are deliberately left
         # unset: the cull follows 16:9 rather than this checkbox, and the FMV
         # margin bars follow MOVIE_ALIGN_ENV, which is set just above.
-        # SEVENTH_NX_BATTLE_WIDE and SEVENTH_NX_SWIRL_SCALE likewise follow
-        # 16:9 -- see the dialog for why they have no switch.
+        # SEVENTH_NX_BATTLE_WIDE, SEVENTH_NX_SWIRL_SCALE,
+        # SEVENTH_NX_UI_CLIP and SEVENTH_NX_CREDITS likewise follow 16:9 --
+        # see the dialog for why they have no switch.
         if build.field_bg_repack.MAX_TOTAL_PAGES_ENV not in os.environ:
             os.environ[build.field_bg_repack.MAX_TOTAL_PAGES_ENV] = str(
                 saved.get('__global__', {}).get(

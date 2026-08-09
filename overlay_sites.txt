@@ -1,0 +1,58 @@
+=== ISSUE 1: the complete ARM word list ===
+
+function                       guest     ARM word    stock              replacement              value
+----------------------------------------------------------------------------------------------------------------------
+swirl_enter_40164E             0x9A04D8  +0x000ED30  ldrh w24, [x0]     movz w24, #106           swirl_off_x = 106
+swirl_enter_40164E             0x9A04D8  +0x000ED90  ldr w8, [x0]       movz w8, #106            swirl_off_x = 106
+swirl_enter_40164E             0x9A04D4  +0x000ED4C  ldrh w24, [x0]     movz w24, #64            swirl_off_y = 64
+swirl_enter_40164E             0x9A04D4  +0x000EDB4  ldrh w22, [x0]     movz w22, #64            swirl_off_y = 64
+swirl_enter_sub_401810         0x99F330  +0x000F4D8  ldrh w8, [x0]      movz w8, #854            wide_viewport_width = 854
+swirl_loop_sub_4026D4          0x9A04D8  +0x0013C5C  ldr w8, [x0]       movn w8, #106            wide_viewport_x = -107
+battle_sub_58ACB9              0x9AAD4C  +0x06DF0DC  ldr w8, [x0]       movn w8, #106            wide_viewport_x = -107
+battle_sub_58ACB9              0x9AAD4C  +0x06DF1F8  ldr w8, [x0]       movn w8, #106            wide_viewport_x = -107
+display_battle_damage_5BB410   0x9AAD4C  +0x07C56A8  ldr w8, [x0]       movn w8, #106            wide_viewport_x = -107
+display_battle_damage_5BB410   0x9AAD4C  +0x07C5700  ldr w8, [x0]       movn w8, #106            wide_viewport_x = -107
+battle_sub_5BD050              0x9AAD5C  +0x07CBCF0  ldrh w8, [x0]      movz w8, #854            wide_viewport_width = 854
+battle_sub_5BD050              0x9AAD5C  +0x07CBE08  ldrh w8, [x0]      movz w8, #854            wide_viewport_width = 854
+battle_sub_5BD050              0x9AAD5C  +0x07CBFEC  ldrh w8, [x0]      movz w8, #854            wide_viewport_width = 854
+battle_sub_5BD050              0x9AAD5C  +0x07CC100  ldrh w8, [x0]      movz w8, #854            wide_viewport_width = 854
+battle_sub_5BD050              0x9AAD5C  +0x07CC270  ldrh w8, [x0]      movz w8, #854            wide_viewport_width = 854
+battle_sub_5BD050              0x9AAD4C  +0x07CBD74  ldrh w8, [x0]      movz w8, #0xFF95         wide_viewport_x = -107
+battle_sub_5BD050              0x9AAD4C  +0x07CBEA4  ldrh w8, [x0]      movz w8, #0xFF95         wide_viewport_x = -107
+battle_sub_5BD050              0x9AAD4C  +0x07CC06C  ldrh w8, [x0]      movz w8, #0xFF95         wide_viewport_x = -107
+battle_sub_5BD050              0x9AAD4C  +0x07CC2EC  ldrh w8, [x0]      movz w8, #0xFF95         wide_viewport_x = -107
+battle_draw_quad_5BD473        0x9AAD4C  +0x07CCFCC  ldrh w20, [x0]     movz w20, #0xFF95        wide_viewport_x = -107
+battle_draw_quad_5BD473        0x9AAD4C  +0x07CD0AC  ldrh w19, [x0]     movz w19, #0xFF95        wide_viewport_x = -107
+
+  21 ARM word(s); 22 FFNx dword site(s) covered
+
+=== the tail-merge ===
+  battle_sub_5BD050 x86 +0x16A and +0x1BB are two copies of the same
+  call sequence (push 0x8fe218 / 0x8fe21c ... call 0x5BD290).  The
+  recompiler TAIL-MERGED them: x86 +0x134 block ends at ARM +0x7CC178
+  with `b #0x7cc2d0`, joining the +0x17E block, and the 0x9AAD4C read
+  at ARM +0x7CC2EC serves BOTH.  So 4 ARM words cover 5 x86 sites and
+  nothing is missing.  This is only safe because FFNx gives both sites
+  the same value; a merge under two different values would be
+  unpatchable at one word and would need the block split first.
+
+=== is x0 still needed after each site? (would break a one-word swap) ===
+  *** +0x000ED30  followed by: sub w0, w21, #0xc
+  *** +0x000ED90  followed by: sub w0, w21, #0x1c
+  *** +0x000ED4C  followed by: sub w0, w21, #0xa
+  *** +0x000EDB4  followed by: sub w0, w21, #0x1a
+  *** +0x000F4D8  followed by: ldrh w9, [x0, #2]
+  *** +0x06DF0DC  followed by: mov w0, w19
+  *** +0x06DF1F8  followed by: mov w0, w19
+  *** +0x07C56A8  followed by: sub w0, w8, #0x74
+  *** +0x07C5700  followed by: sub w0, w8, #0x74
+  *** +0x07CCFCC  followed by: add w0, w8, #8
+  *** +0x07CD0AC  followed by: add w0, w8, #0x10
+  11 site(s) where x0 is read again within 3 instructions
+
+=== swirl_enter_40164E +0xE8 : the imm 0x40 -> 85 companion ===
+  ARM +0x000ED20  str w22, [x0]   <- store to 0x9A04DC
+        prev  +0x000ED10 bl #0x10fc3a0
+        prev  +0x000ED14 str w24, [x0]
+        prev  +0x000ED18 add w0, w21, #8
+        prev  +0x000ED1C bl #0x10fc3a0

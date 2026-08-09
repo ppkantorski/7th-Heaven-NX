@@ -606,7 +606,75 @@ class Cpu:
             set_ = (v >> bit) & 1
             taken = set_ if (w & 0x01000000) else not set_
             return pc + imm * 4 if taken else None
+        # ---- 64-bit compare / select / bitfield ---------------------------
+        # Added for ff7nx_uiclip, whose cave has to compare two PACKED 64-bit
+        # rect words and rewrite only their low halves. Every form below is
+        # 64-bit; the 32-bit equivalents already live further up and are left
+        # exactly as they were. Flags are computed by _setflags64, which is
+        # _setflags32 widened -- it is a separate function rather than a
+        # parameter so that nothing already passing can change behaviour.
+        if (w & 0xFF200000) == 0xEB000000:                    # subs Xd,Xn,Xm,sh
+            amt = (w >> 10) & 0x3F
+            typ = (w >> 22) & 3
+            if typ != 0:
+                raise Unsupported('subs64 shift type %d at 0x%X' % (typ, pc))
+            a, b = self.get(rn), (self.get(rm) << amt) & M64
+            res = (a - b) & M64
+            self._setflags64(a, b, res, True)
+            s(rd, res)
+            return None
+        if (w & 0xFFE00C10) == 0xFA400000:                    # ccmp Xn,Xm,#f,c
+            # If the condition holds, do the compare; otherwise ADOPT the
+            # immediate as the flags outright. That second half is the whole
+            # point of the instruction and the reason the cave needs no
+            # branch: a failed first compare installs nzcv=0, which clears Z.
+            cond = (w >> 12) & 0xF
+            nzcv = w & 0xF
+            if self.cond(cond):
+                a, b = self.get(rn), self.get(rm)
+                self._setflags64(a, b, (a - b) & M64, True)
+            else:
+                self.n = (nzcv >> 3) & 1
+                self.z = (nzcv >> 2) & 1
+                self.c = (nzcv >> 1) & 1
+                self.v = nzcv & 1
+            return None
+        if (w & 0xFFE00C00) == 0x9A800000:                    # csel Xd,Xn,Xm,c
+            cond = (w >> 12) & 0xF
+            return s(rd, self.get(rn) if self.cond(cond) else self.get(rm))
+        if (w & 0xFFC00000) == 0xB3400000:                    # BFM, 64-bit
+            # BFI and BFXIL are the same encoding; which one you get is
+            # decided by imms vs immr, NOT by the mnemonic capstone prints.
+            # (capstone renders the cave's word as `bfxil`; it is the
+            # imms >= immr arm, and it is what `bfi Xd,Xn,#0,#32` assembles
+            # to.) Bits of Xd outside the inserted field are PRESERVED --
+            # that preservation is exactly what carries y through untouched.
+            immr = (w >> 16) & 0x3F
+            imms = (w >> 10) & 0x3F
+            src, dst = self.get(rn), self.get(rd)
+            if imms >= immr:
+                width = imms - immr + 1
+                m = (1 << width) - 1
+                return s(rd, (dst & ~m) | ((src >> immr) & m))
+            width = imms + 1
+            lsb = 64 - immr
+            m = ((1 << width) - 1) << lsb
+            return s(rd, (dst & ~m & M64) | (((src & ((1 << width) - 1))
+                                             << lsb) & M64))
         raise Unsupported('unsupported instruction %08X at 0x%X' % (w, pc))
+
+    def _setflags64(self, a, b, res, sub):
+        self.n = 1 if res & 0x8000000000000000 else 0
+        self.z = 1 if (res & M64) == 0 else 0
+        sa = a - (1 << 64) if a & 0x8000000000000000 else a
+        sb = b - (1 << 64) if b & 0x8000000000000000 else b
+        sr = res - (1 << 64) if res & 0x8000000000000000 else res
+        if sub:
+            self.c = 1 if (a & M64) >= (b & M64) else 0
+            self.v = 1 if (sa - sb) != sr else 0
+        else:
+            self.c = 1 if (a & M64) + (b & M64) > M64 else 0
+            self.v = 1 if (sa + sb) != sr else 0
 
     # ---- helpers ---------------------------------------------------------
     def _addr(self, rn, off):

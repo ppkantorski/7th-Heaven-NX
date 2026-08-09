@@ -43,7 +43,6 @@ import ff7nx_camclamp
 import ff7nx_battlewide
 import ff7nx_swirlscale
 import ff7nx_uiclip
-import ff7nx_credits
 import ff7nx_uncrop
 import ff7nx_marginblack
 import ff7nx_marginpage
@@ -5731,7 +5730,6 @@ MOVIE_ALIGN_ENV = ff7nx_moviealign.MOVIEALIGN_ENV
 BATTLE_WIDE_ENV = ff7nx_battlewide.BATTLEWIDE_ENV
 SWIRL_SCALE_ENV = ff7nx_swirlscale.SWIRLSCALE_ENV
 UI_CLIP_ENV = ff7nx_uiclip.UICLIP_ENV
-CREDITS_ENV = ff7nx_credits.CREDITS_ENV
 
 
 def _ws_on():
@@ -5829,10 +5827,8 @@ def apply_field_frame(sdout, dump, log=lambda *_: None, produced=()):
     want_battle = ff7nx_battlewide.enabled()
     want_swirl = ff7nx_swirlscale.enabled()
     want_uiclip = ff7nx_uiclip.enabled()
-    want_credits = ff7nx_credits.enabled()
     if not (want_frame or want_cull or want_movie or want_mcull
-            or want_bars or want_clamp or want_battle or want_swirl
-            or want_uiclip or want_credits):
+            or want_bars or want_clamp):
         # SAY SO. `ff7nx_ws.apply_module` learned this the expensive way and
         # wrote it down: "Silence here cost a whole build." A pass that is
         # gated OFF and prints nothing is indistinguishable in the log from a
@@ -5851,8 +5847,7 @@ def apply_field_frame(sdout, dump, log=lambda *_: None, produced=()):
                 ('movie bars', ff7nx_moviebars.MOVIEBARS_ENV, want_bars),
                 ('battle overlays', BATTLE_WIDE_ENV, want_battle),
                 ('swirl scale', SWIRL_SCALE_ENV, want_swirl),
-                ('2D viewport scale', UI_CLIP_ENV, want_uiclip),
-                ('credits fade quad', CREDITS_ENV, want_credits),
+                ('2D viewport clip', UI_CLIP_ENV, want_uiclip),
                 ('model cull', MODEL_CULL_ENV, want_cull)):
             log(f'  {name:14s} {"on" if want else "off"}   '
                 f'({env}={os.environ.get(env, "<unset, follows 16:9>")!r})')
@@ -5907,14 +5902,6 @@ def apply_field_frame(sdout, dump, log=lambda *_: None, produced=()):
         # game y 0 or y 16. ff7nx_moviebars READS +0x10DE8F0 to find out, so
         # running it first would place the top and bottom bars 24 px away from
         # the picture they are supposed to meet.
-        #
-        # FMV ONLY. A credits arm was tried and ROLLED BACK -- HANDOFF-104
-        # s5.1. Its gate read [0xF4F454], which looked like "the credits are
-        # running" from its three write sites but is sticky: the clear sits
-        # inside one arm of a jump-table sub-state machine, so once the intro
-        # set it the pillarbox painted over the whole game. The intro's side
-        # margins are still handled, but by ff7nx_credits' colour clear, not
-        # by this.
         rc |= ff7nx_moviebars.apply(dest, log=log)
     else:
         log('  movie margin bars: OFF -- models will draw over the black '
@@ -5958,7 +5945,7 @@ def apply_field_frame(sdout, dump, log=lambda *_: None, produced=()):
         log('  swirl scale: OFF -- the battle-entry swirl squeezes the 16:9 '
             f'freeze frame into 4:3. ({SWIRL_SCALE_ENV}='
             f'{os.environ.get(SWIRL_SCALE_ENV, "<unset>")!r})')
-    # --- the 2D viewport scale -------------------------------------------
+    # --- the 2D viewport clip -------------------------------------------
     # FINDINGS-103. `ff7nx_ws` puts the widescreen scale in the VERTEX SHADER,
     # so 2D geometry lands at 1.5x + 160 -- but a window's own viewport rect
     # is still computed on the CPU with a hardcoded /640 and no widescreen
@@ -5966,40 +5953,15 @@ def apply_field_frame(sdout, dump, log=lambda *_: None, produced=()):
     # left of centre loses its RIGHT border, one wholly right of centre loses
     # its LEFT border, and an edge near 320 loses part of one.
     #
-    # A 21-word cave at +0x10D9F48 puts the shader's own transform on the
-    # rect -- x -> (3x)/4 + tW/8 -- and leaves FULL-SCREEN rects alone.
-    #
-    # NOT "point the viewport at the full rect". That was the first version,
-    # it was two words, it shipped, and it fixed the borders by DELETING the
-    # clip -- which is also the clip FF7 uses to hide a window's contents
-    # while the box opens and closes, so dialogue text went on drawing over
-    # the field after its box had shrunk away. The rect has to be scaled, not
-    # replaced. `ff7nx_uiclip` anchors on those two words being stock and
-    # refuses if it finds the old patch.
-    #
-    # Nothing else in this pass touches +0x10D9D70, so there is no ordering
-    # constraint. It is last only so its log line sits with the other 16:9
-    # corrections.
+    # Two words in the per-draw helper +0x10D9D70, which nothing else in this
+    # pass touches, so there is no ordering constraint. It is last only so its
+    # log line sits with the other 16:9 corrections.
     if want_uiclip:
         rc |= ff7nx_uiclip.apply(dest, log=log)
     else:
-        log('  2D viewport scale: OFF -- menu and dialogue boxes lose the '
+        log('  2D viewport clip: OFF -- menu and dialogue boxes lose the '
             'border on whichever side faces screen centre. '
             f'({UI_CLIP_ENV}={os.environ.get(UI_CLIP_ENV, "<unset>")!r})')
-    # --- the credits fade quad ------------------------------------------
-    # HANDOFF-104. The intro/prelude is FF7's CREDITS mode -- a still texture,
-    # music and 2D text, NOT an FMV, which is why ff7nx_moviebars never
-    # covered it. Its black fade quad spans game x 0..640, so at 16:9 the side
-    # margins are never repainted and the credit text FF7 stages off-screen
-    # smears there. FFNx fixes this by name (src/ff7/widescreen.cpp:299,
-    # "// Credits fix"); this is the same correction, x only, y untouched so
-    # the quad stays full height.
-    if want_credits:
-        rc |= ff7nx_credits.apply(dest, log=log)
-    else:
-        log('  credits fade quad: OFF -- the intro fade covers only the '
-            'middle 4:3 and credit text smears in the side margins. '
-            f'({CREDITS_ENV}={os.environ.get(CREDITS_ENV, "<unset>")!r})')
     if rc:
         log('! field frame: one or more passes refused -- the module is '
             'whatever the passes that DID run left. Check the lines above.')
