@@ -1112,9 +1112,17 @@ def apply_to_flevel(archive, payloads, art, encode=None, log=print,
                    else archive.decompressed(entry))
             new, s = fill_field(name, raw, lgp, art, scope=scope)
             st['read'] += 1
-            for k in ('cells', 'filled', 'black', 'no_dds', 'borrowed',
-                      'wild', 'darkened'):
-                st[k] += s[k]
+            # MERGE EVERY INTEGER COUNTER, NOT A HARDCODED LIST.
+            #
+            # This list was fixed at seven names, so `uncovered` -- the atlas
+            # gap counter -- never reached the aggregate and `summarise` never
+            # printed its line, which made a build that HAD the fix look
+            # identical to one that did not. Any counter added to `fill_field`
+            # from now on shows up without touching this function.
+            for k, v in s.items():
+                if isinstance(v, int) and not isinstance(v, bool) \
+                        and isinstance(st.get(k), int):
+                    st[k] += v
             ps = s.get('pal')
             if ps and ps.get('slots_repointed'):
                 P = st['pal']

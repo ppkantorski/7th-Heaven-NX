@@ -2084,6 +2084,14 @@ def launch_ui():
                                  # Off/256 ladder, so 256 is never read back
                                  # as the old "off". See initial_fbg_value.
                                  'field_bg_ladder_v2': True,
+                                 # FINDINGS-122. No widget yet, but it MUST be
+                                 # written back: this dict is rebuilt from
+                                 # scratch on every save, so a key that is only
+                                 # read would be silently dropped the next time
+                                 # the user touches any other control.
+                                 'field_bg_single_screen_cap':
+                                     bool(_global_setting(
+                                         'field_bg_single_screen_cap', True)),
                                  'fps_60': bool(fps_var.get()),
                                  'movie_quality': current_movie_quality(),
                                  'movie_fit': current_movie_fit(),
@@ -2823,6 +2831,11 @@ def launch_ui():
         # parser, one number in one place.
         build.field_bg_dense.MAX_TRUECOLOR_PAGES = \
             current_field_bg_truecolor()
+        # FINDINGS-122. Same wiring style as the line above: the value IS the
+        # constant, set here, no variable and no parser. Settings-only for now
+        # -- see _global_setting.
+        build.field_bg_pagecap.SINGLE_SCREEN_HARD_CAP = bool(
+            _global_setting('field_bg_single_screen_cap', True))
         os.environ[build.field_bg_repack.MAX_TOTAL_PAGES_ENV] = str(
             current_field_bg_max_pages())
         build.field_bg_repack.apply_growth_mode(
@@ -3011,6 +3024,12 @@ def main():
             saved.get('__global__', {}).get(
                 'field_bg_truecolor_pages',
                 build.field_bg_dense.MAX_TRUECOLOR_PAGES))
+        # FINDINGS-122: the hard 256-tile cap on single-screen fields. On by
+        # default; the switch exists so it can be A/B'd against a build without
+        # it rather than argued about.
+        build.field_bg_pagecap.SINGLE_SCREEN_HARD_CAP = bool(
+            saved.get('__global__', {}).get(
+                'field_bg_single_screen_cap', True))
         if build.field_bg_repack.REPLACE_ONLY_ENV not in os.environ:
             build.field_bg_repack.apply_growth_mode(
                 saved.get('__global__', {}).get('field_bg_replace_only', 2))

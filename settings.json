@@ -227,6 +227,7 @@
   "field_bg_preset": 9,
   "margin_art": 2,
   "field_bg_ladder_v2": true,
+  "field_bg_single_screen_cap": true,
   "fps_60": true,
   "movie_quality": "maximum",
   "movie_fit": "native",

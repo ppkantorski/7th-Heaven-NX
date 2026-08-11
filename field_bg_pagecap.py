@@ -110,11 +110,60 @@ MAX_PAGES = FN.BG_MAX_PAGES       # 42, and `cmp ..., 0x2a` agrees
 
 T_TEXID = FN.TILE_TEXTURE_ID      # 32
 T_FX_PAGE = FN.TILE_TEXTURE_ID2   # 34
+T_DSTX = 2
+T_DSTY = 4
+TILE = 16
+
+# ---------------------------------------------------------------- FINDINGS-122
+# THE GRANDFATHERING BELOW ASSUMES A SCROLL. MOST FIELDS DO NOT SCROLL.
+#
+# `effective_cap` raises the limit to `max(256, vanilla's worst page)` because
+# `add_page_tile` counts tiles SUBMITTED THIS FRAME, and a large scrolling
+# field only ever submits a screenful. That is right, and the docstring
+# already names the exception it never implemented:
+#
+#     "In a single-screen room like mkt_mens that is every tile, so the file
+#      count IS the frame count and 256 is exact."
+#
+# In a single-screen room the two counts are the same number, so vanilla's
+# headroom is not headroom at all -- and the 16:9 widening is exactly what
+# pushes a one-screen field over. MEASURED on md8_1, the Sector 8 fire scene:
+#
+#     vanilla per page   {0: 671, 1: 219}                  worst 671
+#     built   per page   {0: 416, 1: 269, 2: 23, 26: 256}  worst 416
+#     effective_cap = max(256, 671) = 671   ->  verify() = []
+#
+# so a page named by 269 tiles shipped as safe. Tiles 257+ run off the end of
+# the 0x1804-byte record into the NEXT page's counter, and slot 2 -- the page
+# straight after slot 1 in load order -- is where 11 of the 12 black squares
+# on that screen sample from. Pages 15 and 26 sit at exactly 256 because the
+# cap did run on them; page 1 is the one that escaped.
+#
+# 25 single-screen fields in the shipped build hold a page over 256:
+# ujunon5 469, sininb34 457, ujunon4 417, junair2 367, las4_0 336, blin3_1 313,
+# blin68_2 307, hyou12 299, tin_3 291, hyou4 278, hyou13_2 277, junin7 275,
+# mds7st32 274, mds7st33 274, junele2 273, rckt3 272, rckt32 272, md8_1 269,
+# hyou8_2 266, tin_4 264, spipe_1 262, semkin_1 259, junbin5 258, hyou5_1 257,
+# spipe_2 257.
+#
+# 103 fields are over by file count; only these 25 are one screen, so the
+# other 78 keep the grandfathering and cost nothing.
+SINGLE_SCREEN_HARD_CAP = True
+
+# The 16:9 field window in game units, and the slack that still counts as one
+# screen. 426x240 is the visible window, measured by aligning render_field's
+# output to a 1280x720 capture (best MAD at x0 = -213, y0 = -120). The widened
+# tile extent is 448x240 -- 22px wider than the window, which is the widening's
+# own overshoot and not a scroll, so the slack has to cover it.
+SINGLE_SCREEN_W = 426
+SINGLE_SCREEN_H = 240
+SINGLE_SCREEN_SLACK = 32
 
 
 class CapStats:
     __slots__ = ('pages_before', 'pages_added', 'tiles_moved', 'over',
-                 'refused', 'fx_over')
+                 'refused', 'fx_over', 'single_screen', 'ss_pages',
+                 'ss_tiles')
 
     def __init__(self):
         self.pages_before = 0
@@ -123,6 +172,16 @@ class CapStats:
         self.over = {}            # slot -> tile count before the split
         self.refused = []         # (slot, tiles) we could not split
         self.fx_over = {}         # fx slot -> tile count, reported only
+        self.single_screen = {}   # FINDINGS-122: slot -> binding tiles, the
+        #                           pages the hard 256 caught that the
+        #                           grandfathered cap let through
+        # ATTRIBUTABLE to the single-screen rule alone -- what this field
+        # would NOT have cost without it. `pages_added` is the field's total
+        # and counts work the grandfathered cap was already doing; reporting
+        # that as the new rule's cost overstated it 2.5x in the first build
+        # (46 pages / 3,851 tiles claimed against 12 / 537 actually added).
+        self.ss_pages = 0
+        self.ss_tiles = 0
 
     def __bool__(self):
         return bool(self.pages_added or self.refused)
@@ -149,8 +208,80 @@ def worst(sec9, src_px=None):
     return max(main.values()) if main else 0
 
 
+def effective_counts(sec9, src_px=None):
+    """
+    {page slot: tiles that BIND it} -- the fx page when a tile carries one,
+    the texture id otherwise.
+
+    THIS IS THE COUNT THE CONSOLE MAKES, AND `counts()` IS NOT.
+
+    `counts()` returns the raw `T_TEXID` histogram, which is what the
+    grandfathered cap has always used. That number is not what `add_page_tile`
+    sees: a tile that names an fx page binds the fx page, so the texture id it
+    also carries never becomes a call. MEASURED, over the 200 single-screen
+    fields of Switch vanilla:
+
+        by raw T_TEXID          many fields over 256 -- blue_2 739, bugin1a
+                                668, hyou5_2 953, and they have shipped since
+                                1997 without overrunning anything
+        by effective page       ZERO fields over 256
+
+    Vanilla's own tooling never puts more than 256 binding tiles on a page in
+    a room where every tile is submitted every frame. That is the invariant,
+    and it is the one our build breaks: 25 single-screen fields, 1,280 tiles
+    over. See FINDINGS-122.
+    """
+    d2px = src_px if src_px is not None else FN.VANILLA_PX
+    pages, tex_start, _tex_end = FN.parse_texture_block(sec9, d2px)
+    present = {s for s, p in enumerate(pages) if p is not None}
+    spans = FN._layer_tile_spans(sec9, sec9.find(b'BACK'), tex_start)
+    out = defaultdict(int)
+    for off in spans:
+        fx = sec9[off + T_FX_PAGE]
+        out[fx if (fx and fx in present) else sec9[off + T_TEXID]] += 1
+    return dict(out)
+
+
+def tile_extent(sec9, src_px=None):
+    """(width, height) in game units of the field's whole layer-1..n tile grid.
+
+    Returns (0, 0) for a section with no tiles.
+    """
+    d2px = src_px if src_px is not None else FN.VANILLA_PX
+    pages, tex_start, _tex_end = FN.parse_texture_block(sec9, d2px)
+    spans = FN._layer_tile_spans(sec9, sec9.find(b'BACK'), tex_start)
+    xs = []
+    ys = []
+    for off in spans:
+        xs.append(struct.unpack_from('<h', sec9, off + T_DSTX)[0])
+        ys.append(struct.unpack_from('<h', sec9, off + T_DSTY)[0])
+    if not xs:
+        return 0, 0
+    return max(xs) + TILE - min(xs), max(ys) + TILE - min(ys)
+
+
+def is_single_screen(sec9, src_px=None,
+                     win_w=None, win_h=None, slack=None):
+    """
+    True when every tile in the field can be on screen at once, so the file
+    count IS the frame count and vanilla's page counts prove nothing.
+
+    See the FINDINGS-122 note at the top of this module.
+    """
+    win_w = SINGLE_SCREEN_W if win_w is None else win_w
+    win_h = SINGLE_SCREEN_H if win_h is None else win_h
+    slack = SINGLE_SCREEN_SLACK if slack is None else slack
+    try:
+        w, h = tile_extent(sec9, src_px)
+    except Exception:                                          # noqa: BLE001
+        return False
+    if not w:
+        return False
+    return w <= win_w + slack and h <= win_h + slack
+
+
 def effective_cap(vanilla_sec9=None, src_px=None,
-                  max_tiles=MAX_TILES_PER_PAGE):
+                  max_tiles=MAX_TILES_PER_PAGE, sec9=None):
     """
     The per-field limit to enforce: `max(256, whatever vanilla already did)`.
 
@@ -178,6 +309,13 @@ def effective_cap(vanilla_sec9=None, src_px=None,
 
     With no vanilla section to compare against, the answer is a flat 256 --
     the conservative choice.
+
+    FINDINGS-122: this scalar is the GRANDFATHERED cap and is unchanged. The
+    single-screen rule is applied per page by `single_screen_over`, not here,
+    because dropping this scalar to 256 for every single-screen field would
+    split 81 fields and add 150 pages -- almost all of it on pages where the
+    raw `T_TEXID` count is enormous but the binding count is one, i.e. pages
+    vanilla itself "exceeds" and has always been fine on.
     """
     if vanilla_sec9 is None:
         return max_tiles
@@ -186,6 +324,27 @@ def effective_cap(vanilla_sec9=None, src_px=None,
     except Exception:                                          # noqa: BLE001
         return max_tiles
     return max(max_tiles, max(main.values()) if main else 0)
+
+
+def single_screen_over(sec9, src_px=None, max_tiles=MAX_TILES_PER_PAGE):
+    """
+    {slot: binding tiles} for the pages a SINGLE-SCREEN field puts over the
+    hard 256, or {} when the rule does not apply.
+
+    This is the whole of FINDINGS-122's change. It is additive: it can only
+    ever add pages to the `over` set that `effective_cap`'s grandfathering
+    let through, and only in a field where every tile is submitted every
+    frame, and only for pages vanilla's own tooling never overfills.
+    """
+    if not SINGLE_SCREEN_HARD_CAP:
+        return {}
+    if not is_single_screen(sec9, src_px):
+        return {}
+    try:
+        eff = effective_counts(sec9, src_px)
+    except Exception:                                          # noqa: BLE001
+        return {}
+    return {s: n for s, n in eff.items() if n > max_tiles}
 
 
 def cap_section9(sec9, src_px=None, max_tiles=MAX_TILES_PER_PAGE,
@@ -200,7 +359,7 @@ def cap_section9(sec9, src_px=None, max_tiles=MAX_TILES_PER_PAGE,
     raises the limit to whatever vanilla already survives. See
     `effective_cap`.
     """
-    max_tiles = effective_cap(vanilla_sec9, src_px, max_tiles)
+    max_tiles = effective_cap(vanilla_sec9, src_px, max_tiles, sec9=sec9)
     st = CapStats()
     d2px = src_px if src_px is not None else FN.VANILLA_PX
     # A section this module cannot parse is LEFT ALONE and named, never
@@ -220,7 +379,27 @@ def cap_section9(sec9, src_px=None, max_tiles=MAX_TILES_PER_PAGE,
     _main, fxc = counts(sec9, d2px)
     st.fx_over = {s: n for s, n in fxc.items() if n > max_tiles}
 
-    over = {s: offs for s, offs in by_page.items() if len(offs) > max_tiles}
+    # FINDINGS-122. A single-screen field submits every tile every frame, so
+    # its binding count IS its frame count and vanilla's headroom is not
+    # headroom. Those pages get the hard 256; every other page in the field
+    # keeps the grandfathered cap, so this can only ever ADD to `over`.
+    ss_over = single_screen_over(sec9, d2px, MAX_TILES_PER_PAGE)
+    st.single_screen = dict(ss_over)
+
+    def _cap_for(slot):
+        return MAX_TILES_PER_PAGE if slot in ss_over else max_tiles
+
+    over = {s: offs for s, offs in by_page.items()
+            if len(offs) > _cap_for(s)}
+
+    # A page that is over only through the FX byte cannot be split here: the
+    # splitter repoints `T_TEXID`, and these tiles do not bind through it.
+    # NAME them rather than reporting the field as safe. MEASURED: 5 of the
+    # 25 -- las4_0, sininb34, spipe_1, ujunon4, ujunon5.
+    for s, n in ss_over.items():
+        if len(by_page.get(s, ())) <= MAX_TILES_PER_PAGE:
+            st.refused.append((s, n))
+
     if not over:
         return sec9, st
     st.over = {s: len(o) for s, o in over.items()}
@@ -265,7 +444,11 @@ def cap_section9(sec9, src_px=None, max_tiles=MAX_TILES_PER_PAGE,
             continue
         grp = FC._group(slot)
         free = free_by_group.get(grp) if grp is not None else None
-        rest = over[slot][max_tiles:]
+        # PER-PAGE CAP, NOT THE FIELD SCALAR. A single-screen page gets the
+        # hard 256 while the rest of the field keeps the grandfathered limit;
+        # slicing with the scalar here left `rest` empty and split nothing.
+        _cap = _cap_for(slot)
+        rest = over[slot][_cap:]
         while rest:
             if not free:
                 # No free slot in this page's OWN band. Refusing is the only
@@ -274,7 +457,7 @@ def cap_section9(sec9, src_px=None, max_tiles=MAX_TILES_PER_PAGE,
                 st.refused.append((slot, len(rest)))
                 break
             dst = free.pop(0)
-            chunk, rest = rest[:max_tiles], rest[max_tiles:]
+            chunk, rest = rest[:_cap], rest[_cap:]
             # BYTE-FOR-BYTE duplicate. Same size flag, same depth, same
             # pixels, so every repointed tile keeps its u, v and palette and
             # samples identical texels.
@@ -284,6 +467,12 @@ def cap_section9(sec9, src_px=None, max_tiles=MAX_TILES_PER_PAGE,
                 buf[off + T_TEXID] = dst
             st.pages_added += 1
             st.tiles_moved += len(chunk)
+            # Attribute this page to the single-screen rule only for the part
+            # the grandfathered cap would NOT have split anyway.
+            if slot in ss_over and _cap < max_tiles:
+                _would = max(0, len(over[slot]) - max_tiles)
+                st.ss_pages += 1
+                st.ss_tiles += max(0, len(chunk) - _would)
 
     out = FN.replace_texture_block(bytes(buf), pages, tex_start, tex_end)
     return out, st
@@ -390,7 +579,7 @@ def clamp_palettes(sec9, sec3, src_px=None):
 def verify(sec9, src_px=None, max_tiles=MAX_TILES_PER_PAGE,
            vanilla_sec9=None):
     """[] when the section is safe, else a list of complaints."""
-    max_tiles = effective_cap(vanilla_sec9, src_px, max_tiles)
+    max_tiles = effective_cap(vanilla_sec9, src_px, max_tiles, sec9=sec9)
     bad = []
     try:
         main, fx = counts(sec9, src_px)
@@ -399,11 +588,21 @@ def verify(sec9, src_px=None, max_tiles=MAX_TILES_PER_PAGE,
         # two such sections in the game are skipped by every other pass too,
         # and reporting them here would make the build cry wolf.
         return []
+    ss_over = single_screen_over(sec9, src_px, MAX_TILES_PER_PAGE)
     for slot, n in sorted(main.items()):
         if n > max_tiles:
             bad.append('page %d is named by %d tiles (limit %d) -- '
                        'add_page_tile will overrun into page %d\'s counter'
                        % (slot, n, max_tiles, slot + 1))
+    # FINDINGS-122: the field is one screen, so every tile is submitted every
+    # frame and the binding count is the frame count. Vanilla never exceeds
+    # 256 here, in any of its 200 single-screen fields.
+    for slot, n in sorted(ss_over.items()):
+        if n > max_tiles:
+            continue                      # already reported above
+        bad.append('page %d BINDS %d tiles (hard limit %d) in a single-screen '
+                   'field -- add_page_tile will overrun into page %d\'s '
+                   'counter' % (slot, n, MAX_TILES_PER_PAGE, slot + 1))
     for slot, n in sorted(fx.items()):
         if n > max_tiles:
             bad.append('fx page %d is named by %d tiles (limit %d)'

@@ -2798,6 +2798,10 @@ def _convert_field_backgrounds(archive, payloads, log, dds_sources=()):
     raw_capped = []                   # (field, bytes it would have decompressed
                                       # to) -- dropped by FIELD_BG_RAW_CAP
     pagecap = {'fields': 0, 'pages': 0, 'tiles': 0, 'worst': 0}
+    # FINDINGS-122: pages caught by the single-screen hard 256 that the
+    # grandfathered cap let through. Counted separately so the change is one
+    # line in the log diff instead of a shift inside an existing number.
+    pagecap_single = {'fields': 0, 'pages': 0, 'tiles': 0, 'names': []}
     palclamp = {'fields': 0, 'tiles': 0}
     pagecap_dropped = []              # (field, pages) the raw cap refused
     pagecap_refused = []              # (field, [(slot, tiles), ...])
@@ -3067,6 +3071,13 @@ def _convert_field_backgrounds(archive, payloads, log, dds_sources=()):
                 pagecap['tiles'] += _cst.tiles_moved
                 pagecap['worst'] = max(pagecap['worst'],
                                        max(_cst.over.values()))
+                if getattr(_cst, 'single_screen', None):
+                    # ATTRIBUTABLE ONLY. `pages_added` is the field's total and
+                    # includes work the grandfathered cap was already doing.
+                    pagecap_single['fields'] += 1
+                    pagecap_single['pages'] += getattr(_cst, 'ss_pages', 0)
+                    pagecap_single['tiles'] += getattr(_cst, 'ss_tiles', 0)
+                    pagecap_single['names'].append(name)
         if _cst is not None and _cst.refused:
             pagecap_refused.append((name, _cst.refused))
         if _dense_ok:
@@ -3282,6 +3293,27 @@ def _convert_field_backgrounds(archive, payloads, log, dds_sources=()):
             'max(256, what vanilla already does), because the limit is on '
             'SIMULTANEOUSLY VISIBLE tiles and a scrolling field only ever '
             'submits a screenful.')
+    if pagecap_single['fields']:
+        log(f"          SINGLE-SCREEN HARD CAP: "
+            f"{pagecap_single['fields']} field(s), "
+            f"{pagecap_single['pages']} page(s) added, "
+            f"{pagecap_single['tiles']} tile(s) repointed -- "
+            + ', '.join(pagecap_single['names'][:12])
+            + ('' if len(pagecap_single['names']) <= 12 else ', ...'))
+        log('          A field whose whole tile grid fits on one screen '
+            'submits EVERY tile every frame, so its binding count IS its '
+            'frame count and vanilla\'s headroom is not headroom. MEASURED: '
+            'over the 200 single-screen fields of Switch vanilla, ZERO put '
+            'more than 256 BINDING tiles on a page; our build broke that in '
+            '25 fields, 1,280 tiles over. md8_1 shipped page 1 at 269 through '
+            'a grandfathered cap of 671, and slot 2 -- the page straight '
+            'after it in load order -- is where 11 of the 12 black squares on '
+            'that screen sample from. FINDINGS-122.')
+        log('          The count is the BINDING page (the fx page when a tile '
+            'carries one), not the raw texture id. By raw id vanilla itself '
+            'is "over" constantly -- blue_2 739, hyou5_2 953 -- and has '
+            'shipped since 1997, which is how we know the raw id is not what '
+            'add_page_tile sees.')
     if pagecap_dropped:
         log(f'      ! page cap: {len(pagecap_dropped)} field(s) needed a '
             f'split that would cross FIELD_BG_RAW_CAP, so they keep the '
