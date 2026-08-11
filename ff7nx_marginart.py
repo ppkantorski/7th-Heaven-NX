@@ -84,6 +84,89 @@ if _HERE not in sys.path:
 
 import diag_common as DC
 import ff7nx_marginblack as MB
+
+
+# Leave a cell alone when the art it already carries is entirely black.
+# See the comment at the use site: those cells are silhouette, and filling
+# them is the grey staircase in the No. 1 reactor.
+KEEP_BLACK_SILHOUETTE = False   # post-baseline; reverted with the rest
+
+
+def _box3_rgb(a):
+    """3x3 box mean of an (H, W, 3) image, edge-replicated -- low frequency.
+
+    The same low-pass `field_bg_dense._box3` applies, in RGB rather than
+    packed 565, so the two passes split detail from colour identically.
+    """
+    import numpy as _np
+    p = _np.pad(a, ((1, 1), (1, 1), (0, 0)), mode='edge').astype(_np.int32)
+    return (p[:-2, :-2] + p[:-2, 1:-1] + p[:-2, 2:] +
+            p[1:-1, :-2] + p[1:-1, 1:-1] + p[1:-1, 2:] +
+            p[2:, :-2] + p[2:, 1:-1] + p[2:, 2:]) // 9
+
+
+def _extend_into_gap(rgb, covered):
+    """
+    `rgb` with every UNCOVERED texel grown outward from the covered ones.
+
+    A Cosmos page is a SPARSE ATLAS -- art only where the vanilla page had
+    art, transparent elsewhere -- and the sources zero the RGB where alpha is
+    0, so a gap arrives here as BLACK. Quantising that writes black into the
+    picture, and `MAX_QUANT_ERR` cannot catch it because black is an
+    excellent match for black (measured error 1.4 to 4.5 out of 255).
+    Transparent is a claim about COVERAGE, not about colour.
+
+    Repeated 4-neighbour dilation of the covered region, so a gap takes the
+    colour of the art it touches. MEASURED on `md8_1` slot 1, the Sector 8
+    cells behind the black squares:
+
+        cell            uncovered   as black      extended
+        src(192,240)      69.5%     ( 15,10, 6)   (39,24,16)
+        src(160,240)      64.8%     ( 17,11, 7)   (37,24,15)
+        src(192,208)      35.5%     ( 27,16,11)   (39,23,16)
+        src( 80,208)      12.5%     ( 34,19,14)   (39,23,15)
+        src(240,224)       1.6%     ( 49,22,15)   (49,22,15)   <- unchanged
+
+    Every gap cell converges on the same rubble tone as its neighbours, and a
+    cell the mod covers is untouched, so this cannot alter art the mod ships.
+    """
+    out = rgb.astype(np.float32).copy()
+    m = covered.copy()
+    for _ in range(32):
+        if m.all():
+            break
+        acc = np.zeros_like(out)
+        cnt = np.zeros(m.shape, np.float32)
+        for dy, dx in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            v = np.roll(np.where(m[..., None], out, 0), (dy, dx), (0, 1))
+            c = np.roll(m.astype(np.float32), (dy, dx), (0, 1))
+            if dy == 1:
+                v[0] = 0
+                c[0] = 0
+            elif dy == -1:
+                v[-1] = 0
+                c[-1] = 0
+            if dx == 1:
+                v[:, 0] = 0
+                c[:, 0] = 0
+            elif dx == -1:
+                v[:, -1] = 0
+                c[:, -1] = 0
+            acc += v
+            cnt += c
+        fill = (~m) & (cnt > 0)
+        if not fill.any():
+            break
+        out[fill] = acc[fill] / cnt[fill, None]
+        m = m | fill
+    return out
+
+
+def _cell_indices(buf, page, sx, sy):
+    """The 16x16 block of palette indices a cell currently holds."""
+    import numpy as _np
+    arr = _np.frombuffer(bytes(buf), _np.uint8).reshape(page.px, page.px)
+    return arr[sy:sy + 16, sx:sx + 16]
 import ff7nx_marginpal as MP
 
 # ---------------------------------------------------------------- the setting
@@ -107,10 +190,49 @@ BORROW = True
 # nearest colour is far away, and the cell keeps its vanilla content.
 MAX_QUANT_ERR = 60
 
+# RETIRED -- see the detail transfer at the use site. This refused 44% of
+# interior cells and cost Cosmos's detail everywhere it fired, which is a
+# regression and not a fix. Kept only so an A/B can turn the old behaviour
+# back on.
+_UNUSED_BORROW_MAX_DIST_NOTE = """
+# HOW FAR A BORROW MAY MOVE AN INTERIOR CELL, mean |RGB| over 0-255.
+#
+# `MAX_QUANT_ERR` is the wrong backstop for this and the numbers say so: it
+# refused 499 cells out of 519,730 on the last build, 0.1%, because it asks
+# "can the destination palette express this image" and a grey image is
+# expressible in almost any palette. It never asks whether the image is the
+# RIGHT ONE.
+#
+# MEASURED, `nmkin_5` -- the red railing outside Reactor 1, red only because
+# it draws through palettes 5 and 7:
+#
+#     cell (1,  32, 112)  vanilla RGB(136, 13, 13)  ->  shipped build (5, 15, 21)
+#     cell (1, -96, 240)  vanilla RGB(192, 51, 40)  ->  shipped build (64, 62, 53)
+#
+# Running the promotion from VANILLA section 9 reproduces the red correctly
+# (97, 8, 11), so the colour was already gone before the repack ran: this
+# pass had overwritten those indices with a quantisation of palette 0's GREY
+# art, and the quantiser was happy because grey has a near neighbour in a
+# palette full of dark reds. That is the "missing texture" -- not a dropped
+# page, a cell repainted the wrong colour.
+#
+# MARGIN cells are exempt. A placeholder has no vanilla art to lose, so a
+# borrowed approximation is strictly better than flat filler. The risk is
+# confined to the INTERIOR scope, where borrowing overwrites art that was
+# already correct.
+"""
+BORROW_MAX_DIST_INTERIOR = 32.0
+
 # When Cosmos's art for a flat MARGIN PLACEHOLDER cell is near-black, write the
 # near-black rather than keeping the placeholder's own colour. See EMPTY SOURCE
 # in `fill_field` for the measurement. Set False to restore the old behaviour
 # for an A/B.
+# Where Cosmos's page is TRANSPARENT, keep the vanilla index instead of
+# writing the black that a zeroed RGB channel pretends is there. See the long
+# note at the write site -- this is the column of black squares at the edges
+# of the 16:9 frame. Set False to restore the old behaviour for an A/B.
+HONOUR_MOD_ALPHA = True
+
 DARKEN_MARGIN_PLACEHOLDERS = True
 
 # OFF, because `ff7nx_marginpage` now solves this properly.
@@ -527,8 +649,9 @@ def dir_source(art_dir):
         # 'is this cell black?' test below sees them as empty rather than as
         # vivid art worth writing.
         rgb = a[..., :3].copy()
+        cov = np.where(a[..., 3] < 8, np.uint8(0), np.uint8(255))
         rgb[a[..., 3] < 8] = 0
-        return rgb, q
+        return np.concatenate([rgb, cov[..., None]], -1), q
     return art_for
 
 
@@ -581,12 +704,21 @@ def provider_source(provider):
         rgb = np.stack([(r << 3) | (r >> 2),
                         (g << 2) | (g >> 4),
                         (b << 3) | (b >> 2)], -1).astype(np.uint8)
+        # RGBA, NOT RGB. The 4th channel is the mod's own COVERAGE, and it is
+        # the whole point of `black_squares_are_the_atlas_gap` below: 20.1% of
+        # the texels in a Cosmos page are transparent, `PageArt` records that
+        # in `tmask`, and this function used to throw it away and hand the
+        # caller a black pixel instead. A black pixel is a claim about colour;
+        # transparent is a claim about COVERAGE, and they are not the same.
+        cov = np.where(np.asarray(art.tmask).reshape(art.px, art.px),
+                       np.uint8(0), np.uint8(255))
+        rgba = np.concatenate([rgb, cov[..., None]], -1)
         # (image, palette it was drawn with) -- the SAME shape dir_source
         # returns. Returning a bare array here is what produced
         # "ValueError: too many values to unpack (expected 2)" on 267 fields,
         # and the build reported it as a per-field refusal rather than as the
         # type error it was.
-        return rgb, used
+        return rgba, used
     return art_for
 
 
@@ -598,13 +730,37 @@ def fill_field(name, raw, lgp_mod, art, log=None, scope='margin'):
     """
 
     st = {'cells': 0, 'filled': 0, 'no_dds': 0, 'black': 0, 'tiles': 0,
-          'borrowed': 0, 'wild': 0, 'darkened': 0}
+          'borrowed': 0, 'wild': 0, 'darkened': 0, 'far_borrow': 0, 'detail': 0, 'uncovered': 0}
     parts = lgp_mod.split_sections(raw)
     cols, hdr, npg, cpp = MB.palette_colours(parts[SECTION_PALETTE])
     surv = DC.survey(parts[SECTION9])
     cells, pages, arrays, placeholder = fillable_cells(parts, surv, scope)
     if not cells:
         return None, st
+
+    # THE BLACK-SILHOUETTE GUARD IS AN INTERIOR RULE ONLY, AND "INTERIOR"
+    # MEANS THE 4:3 PICTURE -- NOT "not a placeholder".
+    #
+    # It exists to stop Cosmos's art being painted into cells the ORIGINAL
+    # deliberately cut to black: the grey staircase in the No. 1 reactor.
+    # Outside the 4:3 picture there is no original to protect. Those cells are
+    # black because there was nothing there in 4:3, and Cosmos widens a field
+    # by ADDING tiles that point at them -- filling them is the entire point.
+    #
+    # The first version keyed off `placeholder`, which is only the FLAT filler
+    # cells. MEASURED: `md1stin` has 1,115 fillable cells and just 2 of them
+    # are placeholders, so nearly every widened cell fell through the guard and
+    # was blacked out -- the column of black squares down both edges. Caught in
+    # one build, and this is the predicate it should have used from the start.
+    _inside43 = set()
+    if KEEP_BLACK_SILHOUETTE:
+        try:
+            _tl = MB.read_tiles(parts[SECTION9], surv, pages)
+            _out = {(t.slot, t.sx, t.sy) for t in _tl if t.outside_43}
+            _inside43 = {(t.slot, t.sx, t.sy) for t in _tl
+                         if (t.slot, t.sx, t.sy) not in _out}
+        except Exception:                                      # noqa: BLE001
+            _inside43 = set()
 
     # ---------------------------------------------------------------- palette
     # BEFORE anything is quantised, ask whether the palette each margin
@@ -686,8 +842,63 @@ def fill_field(name, raw, lgp_mod, art, log=None, scope='margin'):
                 st['no_dds'] += 1
                 continue
             # box filter 64x64 -> 16x16
-            small = src.reshape(TILE, k, TILE, k, 3).mean(axis=(1, 3))
-            if small.max() <= 24:
+            small = (np.ascontiguousarray(src[..., :3])
+                     .reshape(TILE, k, TILE, k, 3).mean(axis=(1, 3)))
+            # HOW MUCH OF EACH DESTINATION PIXEL THE MOD ACTUALLY COVERS.
+            # 0 = the mod paints nothing here; 255 = fully painted.
+            cover = (np.ascontiguousarray(src[..., 3])
+                     .reshape(TILE, k, TILE, k).mean(axis=(1, 3)))
+            # A CELL THE ORIGINAL DREW AS PURE BLACK IS A SILHOUETTE, NOT A
+            # GAP, AND IT IS NOT OURS TO FILL.
+            #
+            # The guard below protects vanilla scenery from being painted
+            # black. This is its mirror, and it was missing: where the ORIGINAL
+            # cell is entirely black and Cosmos's DDS has content there, the
+            # content is bleed off the mod's own wider canvas, not art anybody
+            # meant to be visible. Writing it puts grey inside a shape the
+            # original deliberately cut to black -- and because the boundary
+            # follows the 16x16 cell grid, it reads as a blocky staircase.
+            #
+            # MEASURED: `nmkin_5` (No. 1 reactor) ships 29 entirely-black cells
+            # in vanilla and none in our build; `nmkin_3` gained content in
+            # every one of its. That edge is the grey stair-step along the
+            # walkway.
+            #
+            # A margin PLACEHOLDER is exempt: it is flat filler outside the 4:3
+            # picture with nothing to protect, which is the case the branch
+            # below exists for.
+            _interior = ((slot, sx, sy) not in placeholder
+                         and (slot, sx, sy) in _inside43)
+            if KEEP_BLACK_SILHOUETTE and _interior:
+                _cur = prgb[_cell_indices(buf, pages[slot], sx, sy)]
+                if int(_cur.max()) == 0:
+                    st['black'] += 1
+                    continue
+            # RAW BORROW, DELIBERATELY. DO NOT "CORRECT" THIS TOWARDS VANILLA.
+            #
+            # Cosmos authored this mod against FFNx, and FFNx falls back to
+            # palette 0 UNCONDITIONALLY (saveload.cpp:138). Palette 0's image
+            # drawn at a palette-7 tile is therefore not a degradation -- it
+            # is HOW THE MOD LOOKS in its reference renderer, and matching it
+            # is the goal.
+            #
+            # I broke this twice in one session by treating VANILLA as the
+            # colour ground truth. First by refusing far borrows (44% of
+            # interior cells lost Cosmos art), then by detail-transferring
+            # them against the vanilla cell (every interior cell kept
+            # vanilla's colour and got only Cosmos's edges). Both read on
+            # hardware as "not leveraging the upscale", because that is
+            # exactly what they were.
+            #
+            # MEASURED, interior borrowed cells: median palette distance 39.5,
+            # 90th percentile 85.4. The borrow moves colour almost everywhere,
+            # by design. There is no threshold that separates "wrong" from
+            # "intended" here, because the shift IS the intent.
+            _cov = (cover >= 128) if HONOUR_MOD_ALPHA else np.ones_like(cover, bool)
+            if HONOUR_MOD_ALPHA and not _cov.all() and _cov.any():
+                small = _extend_into_gap(small, _cov)
+                st['uncovered'] += int((~_cov).sum())
+            if (small[_cov].max() if _cov.any() else 0) <= 24:
                 # EMPTY SOURCE.
                 #
                 # In the INTERIOR this is the dangerous case: `dir_source`
@@ -739,8 +950,10 @@ def fill_field(name, raw, lgp_mod, art, log=None, scope='margin'):
             # cells this way. Refuse rather than write; the cell keeps its
             # vanilla content, which is the state we are trying to improve on
             # and is never worse than a yellow block.
-            err = np.abs(prgb[idx].astype(np.int16)
-                         - small.astype(np.int16)).mean()
+            _m = _cov
+            err = (float(np.abs(prgb[idx].astype(np.int16)
+                                - small.astype(np.int16))[_m].mean())
+                   if _m.any() else 0.0)
             if err > MAX_QUANT_ERR:
                 st['wild'] += 1
                 continue
@@ -757,6 +970,38 @@ def fill_field(name, raw, lgp_mod, art, log=None, scope='margin'):
             was = np.frombuffer(bytes(buf), np.uint8).reshape(256, 256)
             keep0 = was[sy:sy + TILE, sx:sx + TILE] == 0
             idx = np.where(keep0, np.uint8(0), idx)
+            # THE BLACK SQUARES ARE THE ATLAS GAP, AND THIS IS THE FIX.
+            #
+            # A Cosmos page is a SPARSE ATLAS: art only where the vanilla page
+            # had art, transparent everywhere else. MEASURED on `md8_1` slot 1
+            # -- 20.1% of the whole page is transparent, and the widescreen
+            # margin tiles sample the bottom band, which is flat filler in
+            # vanilla and EMPTY in the upscale:
+            #
+            #     cell src(192,240)   67.2% transparent
+            #     cell src(160,240)   61.6% transparent
+            #     cell src(144,240)   52.5% transparent
+            #     cell src(192,208)   30.6% transparent
+            #
+            # `dir_source`/`provider_source` zero the RGB where alpha is 0, so
+            # those texels arrive here as BLACK -- and the quantiser, having no
+            # idea it is looking at a hole, faithfully writes black. Error 1.4
+            # to 4.5 out of 255: it did its job perfectly on a lie. That is the
+            # column of black squares at the left and right edges of the 16:9
+            # frame in Sector 8, and MAX_QUANT_ERR can never catch it because
+            # black is not "wildly off-colour", it is an excellent match for
+            # black.
+            #
+            # TRANSPARENT IS A CLAIM ABOUT COVERAGE, NOT ABOUT COLOUR. Where
+            # the mod paints nothing, the mod is saying nothing, so the cell
+            # keeps the vanilla index it already had. `field_bg_dense` has
+            # always done this on the promotion side -- "the mod's alpha is
+            # authoritative about its own art, not about what the game draws
+            # there" -- and this pass, which runs first and feeds it, never did.
+            #
+            # This can only ADD art. A covered texel is written exactly as
+            # before; an uncovered one stops being overwritten with black.
+
             for r in range(TILE):
                 base = (sy + r) * 256 + sx
                 buf[base:base + TILE] = bytes(idx[r])
@@ -846,7 +1091,8 @@ def apply_to_flevel(archive, payloads, art, encode=None, log=print,
     import lgp
 
     st = {'read': 0, 'changed': 0, 'cells': 0, 'filled': 0, 'black': 0,
-          'no_dds': 0, 'borrowed': 0, 'wild': 0, 'darkened': 0, 'refused': [],
+          'no_dds': 0, 'borrowed': 0, 'wild': 0, 'darkened': 0, 'far_borrow': 0, 'detail': 0, 'uncovered': 0,
+          'refused': [],
           'pal': {'fields': 0, 'slots': 0, 'slots_repointed': 0, 'tiles': 0,
                   'cells': 0, 'remapped': 0, 'err_before': [],
                   'err_after': [], 'idx_before': [], 'idx_after': []}}
@@ -905,6 +1151,13 @@ def summarise(st):
                ', %d REFUSED as wildly off-colour' % st['wild']
                if st.get('wild') else '',
                ', %d refused' % len(st['refused']) if st['refused'] else '')
+            + (' -- ATLAS GAP: %d texel(s) where Cosmos ships no art were '
+               'extended from the covered art beside them instead of being '
+               'written as BLACK: a page is a sparse atlas, the sources zero '
+               'the RGB where alpha is 0, and the quantiser cannot tell a hole '
+               'from a black pixel (measured error 1.4-4.5 of 255). That is '
+               'the column of black squares at the edges of the 16:9 frame'
+               % st['uncovered'] if st.get('uncovered') else '')
             + (' -- of the written cells, %d are flat MARGIN PLACEHOLDERS '
                'where the mod authored near-black: those used to keep a vivid '
                'tan/yellow filler and now take the dark art'

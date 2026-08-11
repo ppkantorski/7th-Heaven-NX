@@ -644,6 +644,109 @@ def rgba_to_565_buf(rgba, npx, width=None, black_ok=False):
     return v.astype('<u2').tobytes()
 
 
+# --------------------------------------------------------------------------
+# resampling
+# --------------------------------------------------------------------------
+# How a 1024x1024 Cosmos page becomes a 256px (or 512px) background page.
+#
+# WHAT WAS HERE BEFORE, AND WHAT WAS ACTUALLY WRONG WITH IT
+# ---------------------------------------------------------
+# `img.resize(..., Image.BOX if w > page_px else Image.NEAREST)`.
+#
+# For 1024 -> 256 that BOX is an exact 4x4 area average, and a two-pass
+# bilinear halving (1024 -> 512 -> 256) computes the SAME thing to within
+# rounding, because bilinear at an exact 2:1 step IS a 2x2 average. So
+# "two-pass bilinear" on its own is not the fix -- it is a different spelling
+# of the filter that is already running.
+#
+# A THEORY THAT WAS TESTED AND IS FALSE -- do not re-derive it
+# -----------------------------------------------------------
+# The obvious suspect was alpha bleed: PIL averaging the RGB of fully
+# transparent texels into their opaque neighbours at equal weight, which
+# would put a dark fringe on every cutout edge. It does not happen. MEASURED
+# with a synthetic 1024px page, opaque grey 160 up to x=513 and transparent
+# black beyond, resized to 256 with BOX:
+#
+#     output col 128 (source 512..515 = 2 opaque + 2 transparent)
+#         naive per-band average would be    rgb  80, alpha 128
+#         Pillow actually returns            rgb 159, alpha 128
+#
+# 159, not 80. Pillow premultiplies internally for RGBA. Adding our own
+# premultiply/un-premultiply on top DOUBLE-APPLIES it and drives edge pixels
+# to 255 -- which is what the first version of this function did before the
+# test above caught it. There is nothing to fix here.
+#
+# WHAT IS ACTUALLY CHANGED
+# ------------------------
+#   1. NEAREST on the way UP -> BILINEAR. Any page whose art is smaller than
+#      the target got point sampling: hard blocky edges sitting next to
+#      correctly filtered neighbours in the same picture. This is a real
+#      defect and it is the only unambiguous one.
+#
+#   2. A halving ladder before the final step. At 1024 -> 256 this is a
+#      no-op to within rounding -- two 2:1 BOX passes and one 4:1 BOX pass
+#      compute the same average -- so it changes nothing today. It matters at
+#      the sizes we are heading for: 1024 -> 320 is 3.2:1, where one BOX pass
+#      buckets 3 or 4 source texels per output pixel and the bucket
+#      boundaries beat against the 16-texel tile grid. Halving to 640 first
+#      leaves a clean 2:1 remainder.
+#
+# SO IF THE 256px PAGES STILL LOOK WRONG, IT IS NOT THIS FUNCTION. The next
+# suspects, in order, are the RGB565 quantiser with its ordered dither
+# (`rgba_to_565_buf` above) and the BORROW path -- the build log's own
+# numbers say only 67,579 of 324,712 promoted cells are exact art from the
+# mod and 204,868 are borrowed from another (page, palette).
+RESAMPLE_DOWN = 'BOX'         # per ladder step when shrinking
+RESAMPLE_UP = 'BILINEAR'      # was NEAREST -- see (1) above
+RESAMPLE_LADDER = True        # halve repeatedly before the final step
+
+
+def _filter(name):
+    from PIL import Image
+    try:
+        return getattr(Image.Resampling, name)
+    except AttributeError:                                     # Pillow < 9.1
+        return getattr(Image, name)
+
+
+def resample_rgba(rgba, w, h, px, log=None):
+    """(w x h) RGBA bytes -> (px x px) RGBA bytes, alpha-weighted.
+
+    Returns the input unchanged when it is already the right size, so a
+    correctly sized page costs nothing and stays byte-identical.
+    """
+    from PIL import Image
+    if (w, h) == (px, px):
+        return rgba
+    img = Image.frombytes('RGBA', (w, h), rgba)
+    if w > px or h > px:
+        # Pillow already weights RGBA colour by alpha; see the note above for
+        # the measurement that proves it. Nothing to premultiply here.
+        f = _filter(RESAMPLE_DOWN)
+        cw, ch = w, h
+        # ONLY when the ratio is not a whole number.
+        #
+        # MEASURED on random 1024px pages: at 1024 -> 256 and 1024 -> 512 a
+        # single BOX pass IS the exact area average, and halving first is
+        # very slightly WORSE because the intermediate is re-quantised to 8
+        # bits (max |delta| 7/255, mean 1.0). At 1024 -> 320 the two differ
+        # by a mean of 15.6 -- that is the beat this exists to remove.
+        #
+        # Gating on `w % px` therefore makes this function a byte-exact
+        # no-op at every page size we ship today, so it cannot be blamed for
+        # anything in the current build, and it only engages at the awkward
+        # sizes.
+        if RESAMPLE_LADDER and (w % px or h % px):
+            while (cw // 2 >= px and ch // 2 >= px
+                   and (cw // 2, ch // 2) != (px, px)):
+                cw, ch = cw // 2, ch // 2
+                img = img.resize((cw, ch), f)
+        if (cw, ch) != (px, px):
+            img = img.resize((px, px), f)
+        return img.tobytes()
+    return img.resize((px, px), _filter(RESAMPLE_UP)).tobytes()
+
+
 class PageArt:
     """One (page, palette) image as a packed 565 page, ready to crop cells."""
 
@@ -651,13 +754,8 @@ class PageArt:
 
     def __init__(self, dds_bytes, page_px):
         import dds_decode
-        from PIL import Image
         rgba, w, h = dds_decode.decode_dds(dds_bytes)
-        if (w, h) != (page_px, page_px):
-            img = Image.frombytes('RGBA', (w, h), rgba)
-            img = img.resize((page_px, page_px),
-                             Image.BOX if w > page_px else Image.NEAREST)
-            rgba = img.tobytes()
+        rgba = resample_rgba(rgba, w, h, page_px)
         self.px = page_px
         n = page_px * page_px
         # black_ok stays FALSE: 0 means transparent to the engine and a

@@ -56,16 +56,49 @@ import ff7nx_marginart
 import field_bg_native
 import field_bg_repack
 import field_bg_compact
+import field_bg_pagecap
 
 # Largest DECOMPRESSED field file this build wrote. apply_field_bg
 # needs it: the game decompresses a field into a fixed 2,000,000-byte
 # buffer (see ff7nx_fieldbg section E) and a repacked field overflows
 # it. Set by _build_flevel, read by apply_field_bg.
 FIELD_BG_MAX_RAW = 0
-# The largest a field may decompress to before `ff7nx_fieldbg.field_buffer_bytes`
-# (next power of two at or above 125% of it) doubles the loader's buffer past
-# the proven 2,097,152. MEASURED: exactly one field of 711 crossed it.
-FIELD_BG_RAW_CAP = 2097152 * 4 // 5
+# THE LOADER BUFFER WE ARE WILLING TO ASK FOR, and the field size that keeps
+# `ff7nx_fieldbg.field_buffer_bytes` (next power of two at or above 125% of the
+# largest field) inside it.
+#
+# This was 2,097,152 -- one doubling of the stock 2,000,000 -- because that is
+# what had been proven on hardware, and at 256px exactly one field of 711 ever
+# crossed the 4/5 mark. At 512px it is the single thing standing between here
+# and the goal. MEASURED, build 19, at 512px with the cap still at 1,677,721:
+#
+#     366 of 709 field(s) DROPPED their whole repack
+#     15 field(s) could not have an over-full page split and CAN STILL CRASH,
+#        mkt_mens among them
+#
+# So more than half the archive silently built at the old settings, and the
+# 256-tiles-per-page fix could not be applied to the rooms that needed it --
+# which is why Men's Hall came back.
+#
+# THIS IS A CEILING, NOT A SIZE. `field_buffer_bytes` picks the next power of
+# two above 125% of whatever the biggest field in THIS build actually is, so
+# raising the ceiling costs nothing unless a field needs it: a 256px build
+# still lands on 2,097,152, and a 512px build lands on 8,388,608 because that
+# is what its largest field asks for. What the ceiling does is stop a runaway
+# and decide which fields get silently dropped -- and dropping 366 of them is
+# far worse than one more doubling.
+#
+# The buffer is a guest heap allocation, and `ff7nx_heap` raised that heap
+# from the port's hardcoded 64 MB to 256. 16 MB is 6% of it against 13% for
+# the stock 2 MB in the stock 64 MB pool, so the ceiling is more generous
+# than the shipping game's and still leaves the heap emptier.
+#
+# Projected from the shipped archive, the largest field at 512px is ~4.6 MB.
+# A worst case of 12 truecolor pages at 512px is 6.3 MB of pixels alone, and
+# the page-cap split can add one more, so 8 MB as a CEILING would have been
+# one unlucky field away from dropping something again.
+FIELD_BG_BUFFER_MAX = 16 * 1024 * 1024
+FIELD_BG_RAW_CAP = FIELD_BG_BUFFER_MAX * 4 // 5
 import dds_decode
 from PIL import Image
 
@@ -2388,6 +2421,128 @@ def _bg_texture_pages(sec9):
     return pages
 
 
+# Fields whose mod BACKGROUND is held back because the field runs out of
+# FF7's HEAP when it carries one. Sections 1-8 are unaffected -- only the
+# section-9 background reverts to Switch vanilla.
+#
+# WHY THIS EXISTS, and it is a workaround, not a fix.
+#
+# MEASURED, from an Atmosphere crash report (FS 2002-6065, an nnSdk Abort
+# out of fopen): the faulting call is `fopen("Documents/heap_dump.txt","w")`
+# at +0x10EE6A0, and the function that makes it prints '<heap>' and
+# 'remain2:0x%08x' -- it is FF7's HEAP DUMP. Its caller at +0x10EE860 is the
+# allocator: it walks the free list (size at blk+0x14, next at blk+0x1c),
+# needs `requested + 0x34`, and when no block is big enough it dumps the heap
+# and returns NULL. So the field does not have a bad tile or a bad page. It
+# runs the game out of memory, and the abort is the dying diagnostic --
+# which is why every structural check on this field passes.
+#
+# CONFIRMED ON HARDWARE: mkt_mens ships at 441,281 bytes with our repacked
+# background (section 9: 225,409 -> 422,007, two pages promoted to
+# truecolor). Handing 192 KB back by restoring vanilla section 9 makes it
+# load. So the remaining headroom in that room is under 192 KB.
+#
+# THE REAL FIX IS IN, AND THIS LIST NOW TURNS ITSELF OFF.
+#
+# FINDINGS-106: the heap reservation is not in FF7 at all. The port binds
+# the Win32 API by name through a shim table at 0x1196B98, and its
+# `HeapCreate` (+0x10EE7B0) throws away the arguments ff7_en passes it
+# (x86 0x40E019 asks for a growable 4 KB heap) and hands back a hardcoded
+# 64 MB pool. `ff7nx_heap.py` raises it -- nine words, and `apply_heap`
+# writes them into exefs/main at the end of the build.
+#
+# So this list is conditional on `ff7nx_heap.HEAP_MB`. At the stock 64 MB it
+# holds mkt_mens back exactly as it always did. At any raised size it holds
+# NOTHING back, because the only reason it ever existed was the 64 MB
+# ceiling and keeping it on would mask the very thing the next build is
+# meant to test.
+#
+# THAT COUPLING IS REAL AND IT IS ONE-WAY. _build_flevel runs long before
+# apply_heap, so a raised HEAP_MB means flevel.lgp ships mkt_mens's full mod
+# background and DEPENDS on the module patch landing. If apply_heap fails --
+# no game dump, a module an earlier build already patched -- the SD tree is
+# inconsistent and Men's Hall crashes again. apply_heap says so in those
+# words when it fails; this is the same contract apply_field_bg already has
+# with the page size.
+#
+# ADDING A FIELD: if another room crashes on entry with no visual warning,
+# put its section-8 name here and rebuild. Losing one room's upscaled
+# background beats losing the room. If it crashes on a RAISED heap, that is
+# a finding, not a field to add -- write it down before reaching for this.
+HEAP_TIGHT_FIELDS = {
+    'mkt_mens',      # Wall Market, Men's Hall (the gym). Crash MEASURED.
+}
+
+
+def _heap_is_raised():
+    """True when this build will write a heap larger than the port's 64 MB.
+
+    Asks ff7nx_heap the same question apply_heap does, and answers False if
+    the module is missing or the size it names cannot actually be encoded --
+    so a build that will NOT get the patch keeps the workaround.
+    """
+    try:
+        import ff7nx_heap
+    except ImportError:
+        return False
+    mb = ff7nx_heap.HEAP_MB
+    return mb != ff7nx_heap.STOCK_MB and ff7nx_heap.encodable(mb) is None
+
+
+def _heap_tight_fields():
+    """The hold-back list, empty once the heap patch is in the build.
+
+    No environment variable. The list is a code constant and the switch is
+    `ff7nx_heap.HEAP_MB`, which is also a code constant -- one setting, in
+    one place, that both halves of the build read.
+    """
+    if _heap_is_raised():
+        return set()
+    return set(HEAP_TIGHT_FIELDS)
+
+
+def _hold_back_heap_tight(chunks, log):
+    """Revert section 9 to Switch vanilla for the fields named above."""
+    names = _heap_tight_fields()
+    if not names:
+        if _heap_is_raised():
+            import ff7nx_heap
+            log('  field background: heap hold-back is OFF because this '
+                f'build raises FF7\'s heap to {ff7nx_heap.HEAP_MB} MB -- '
+                'every field, including mkt_mens (Men\'s Hall), keeps its '
+                'full mod background')
+            log('    this flevel.lgp now DEPENDS on exefs/main getting the '
+                'heap patch. If the module pass at the end of this build '
+                'does not run, Men\'s Hall will crash on entry again.')
+        else:
+            log('  field background: heap hold-back list is EMPTY -- every '
+                'field keeps its mod background')
+        return chunks
+    kept = {}
+    held = []
+    for field, sections in chunks.items():
+        if field.lower() in names and 9 in sections:
+            rest = {i: v for i, v in sections.items() if i != 9}
+            held.append(field)
+            if rest:
+                kept[field] = rest
+        else:
+            kept[field] = sections
+    if held:
+        log('  field background: %d field(s) kept their Switch-vanilla '
+            'background because the room runs FF7 out of HEAP with ours '
+            '(sections 1-8 still come from the mod): %s'
+            % (len(held), ', '.join(sorted(held))))
+        log('    this is a WORKAROUND, and the fix now exists: raise '
+            'ff7nx_heap.HEAP_MB above 64 and this list turns itself off.')
+    missing = sorted(n for n in names
+                     if not any(f.lower() == n for f in chunks))
+    if missing:
+        log('  field background: heap hold-back names not present in this '
+            'build (harmless): %s' % ', '.join(missing))
+    return kept
+
+
 def _cap_field_backgrounds(chunks, log, max_pages):
     """
     Hold back section-9 replacements whose background needs more texture
@@ -2640,6 +2795,12 @@ def _convert_field_backgrounds(archive, payloads, log, dds_sources=()):
     no_cover = no_fit = 0
     skipped = []
     skipped_all_or_nothing = []       # (field, pages it would have promoted)
+    raw_capped = []                   # (field, bytes it would have decompressed
+                                      # to) -- dropped by FIELD_BG_RAW_CAP
+    pagecap = {'fields': 0, 'pages': 0, 'tiles': 0, 'worst': 0}
+    palclamp = {'fields': 0, 'tiles': 0}
+    pagecap_dropped = []              # (field, pages) the raw cap refused
+    pagecap_refused = []              # (field, [(slot, tiles), ...])
     page_cost = []                    # (field, live pages, bytes) for the
                                       # per-field ceiling report below
     for name in sorted(archive.index):
@@ -2791,6 +2952,24 @@ def _convert_field_backgrounds(archive, payloads, log, dds_sources=()):
                     # decompression buffer from the proven 2,097,152 to an
                     # untested 4,194,304 for the WHOLE GAME. Not worth one
                     # field.
+                    #
+                    # AND IT USED TO BE SILENT, WHICH COST A DIAGNOSIS.
+                    #
+                    # At 256px this never fires -- MEASURED across the shipped
+                    # flevel, 0 of 711 fields cross the cap and the largest is
+                    # 1,424,642. At a bigger page size it fires constantly:
+                    # projecting the same 711 fields with section 9's pixel
+                    # payload scaled by (px/256)^2 gives 17 fields over at
+                    # 320px, 170 at 384px, 354 at 448px and 515 at 512px.
+                    #
+                    # Every one of those reverts to its pre-repack section 9
+                    # with no promotion at all, and said nothing. A 512px
+                    # build therefore came out looking like "512px does not
+                    # work" when what actually happened is that three quarters
+                    # of the game quietly built at the old settings. Name
+                    # them.
+                    raw_capped.append(
+                        (name, len(raw) - len(parts[8]) + len(_try9)))
                     _try9, _dense_ok = _pre9, False
                 cst = None
                 if field_bg_compact.enabled():
@@ -2821,6 +3000,75 @@ def _convert_field_backgrounds(archive, payloads, log, dds_sources=()):
             if _af is not None:
                 art.close()
         new9 = _try9
+        # ---- 256 TILES PER PAGE. THE ONLY HARD LIMIT THE GAME ACTUALLY HAS.
+        #
+        # FINDINGS-110. `add_page_tile` (x86 0x6464BA) appends into a 42-slot
+        # array of 0x1804-byte records -- 4 bytes of count then exactly 256
+        # entries of 0x18 -- and NEVER bounds-checks. Tile 257 on a page
+        # writes its float x straight into the NEXT page's counter, and the
+        # submit loop hands that value to draw_graphics_object, which turns it
+        # into a several-hundred-megabyte malloc. That is the Men's Hall
+        # crash, and it is why 64, 256 and 512 MB heaps all failed with
+        # byte-identical stacks.
+        #
+        # Every page-moving pass above can cause it: the dense repack packs
+        # onto fewer pages (6.17 -> 2.26 per field) and the compactor merges
+        # byte-identical cells, so several tiles come to share one cell and a
+        # page passes 256 without gaining a single cell. This runs LAST and
+        # enforces the invariant on whatever they produced.
+        #
+        # The limit is on SIMULTANEOUSLY VISIBLE tiles, so the cap is
+        # max(256, what vanilla already does for this field) -- vanilla
+        # crater_2 names one page from 1912 tiles and has been fine since
+        # 1997 because it scrolls. MEASURED across the shipped flevel: that
+        # rule touches 142 fields and adds 189 pages; a flat 256 would touch
+        # 413, add 704 and still leave 17 over.
+        try:
+            _van9 = lgp.split_sections(archive.decompressed(entry))[8]
+        except Exception:                                      # noqa: BLE001
+            _van9 = None
+        # A TILE MAY NOT NAME A PALETTE THE FIELD DOES NOT HAVE.
+        #
+        # Cosmos's widescreen tiles carry whatever palette byte they happened
+        # to have, because FFNx replaces the page with a DDS and never applies
+        # it -- `ff7nx_marginpal` documents exactly this. On the Switch the
+        # index IS applied. MEASURED on `md8_1`, the Sector 8 fire scene:
+        # fourteen layer-2 tiles at dx -224/-208 and 192/208 name palette 13
+        # when the field ships thirteen, and that set of coordinates is the
+        # column of black rectangles down both edges of the screen.
+        # `marginpal` only repoints LAYER 1 placeholder tiles, so nothing
+        # caught these.
+        try:
+            new9, _npal, _npg = field_bg_pagecap.clamp_palettes(
+                new9, parts[3], src_px=px)
+            if _npal:
+                palclamp['fields'] += 1
+                palclamp['tiles'] += _npal
+        except Exception as exc:                               # noqa: BLE001
+            log(f'  ! field background: {name} palette clamp failed -- {exc}')
+        try:
+            _cap9, _cst = field_bg_pagecap.cap_section9(
+                new9, src_px=px, vanilla_sec9=_van9)
+        except Exception as exc:                               # noqa: BLE001
+            log(f'  ! field background: {name} page cap failed -- {exc}')
+            _cap9, _cst = new9, None
+        if _cst is not None and _cst.pages_added:
+            # The split duplicates the overloaded page BYTE FOR BYTE into a
+            # free slot and repoints the excess tiles, so every moved tile
+            # keeps its u, v and palette and samples identical texels. The
+            # only cost is the extra page, and it is only paid where we
+            # exceeded what vanilla ships.
+            if (len(raw) - len(parts[8]) + len(_cap9)) > FIELD_BG_RAW_CAP:
+                pagecap_dropped.append((name, _cst.pages_added))
+            else:
+                new9 = _cap9
+                pagecap['fields'] += 1
+                pagecap['pages'] += _cst.pages_added
+                pagecap['tiles'] += _cst.tiles_moved
+                pagecap['worst'] = max(pagecap['worst'],
+                                       max(_cst.over.values()))
+        if _cst is not None and _cst.refused:
+            pagecap_refused.append((name, _cst.refused))
         if _dense_ok:
             dense['fields'] += 1
             dense['cells'] += dst.cells
@@ -3008,6 +3256,64 @@ def _convert_field_backgrounds(archive, payloads, log, dds_sources=()):
                 f'fields with 1 truecolor page were clean, fields with 3-4 '
                 f'were black. Tune with '
                 f'{field_bg_repack.BUDGET_ENV}=<megabytes>.')
+    if palclamp['tiles']:
+        log(f"      PALETTE CLAMP: {palclamp['tiles']} tile(s) in "
+            f"{palclamp['fields']} field(s) named a palette the field does "
+            f"not have, and were repointed at the palette their cell is "
+            f"actually drawn with.")
+        log('          Cosmos leaves the palette byte of its widescreen tiles '
+            'at whatever it was, because FFNx replaces the page with a DDS '
+            'and never applies it. The Switch applies it, and an index past '
+            'the end of the table reads whatever follows -- which is the '
+            'black rectangles down the edges of md8_1.')
+    if pagecap['fields'] or pagecap_dropped or pagecap_refused:
+        log(f"      PAGE CAP (256 tiles per page, the game's own limit): "
+            f"{pagecap['fields']} field(s) had a page split, "
+            f"{pagecap['pages']} page(s) added, {pagecap['tiles']} tile(s) "
+            f"repointed. Worst page held {pagecap['worst']} tiles.")
+        log('          add_page_tile (x86 0x6464BA) appends into 42 slots of '
+            '0x1804 bytes -- 4 of count then exactly 256 entries of 0x18 -- '
+            'and never bounds-checks, so tile 257 writes its x coordinate '
+            "into the NEXT page's counter and the submit loop turns that "
+            'into a several-hundred-MB malloc. FINDINGS-110.')
+        log('          The split duplicates the page byte for byte and '
+            'repoints the excess tiles, so every moved tile keeps its u, v '
+            'and palette and samples identical texels. The cap is '
+            'max(256, what vanilla already does), because the limit is on '
+            'SIMULTANEOUSLY VISIBLE tiles and a scrolling field only ever '
+            'submits a screenful.')
+    if pagecap_dropped:
+        log(f'      ! page cap: {len(pagecap_dropped)} field(s) needed a '
+            f'split that would cross FIELD_BG_RAW_CAP, so they keep the '
+            f'over-full page and CAN STILL CRASH: '
+            + ', '.join(n for n, _ in pagecap_dropped[:12]))
+    if pagecap_refused:
+        log(f'      ! page cap: {len(pagecap_refused)} field(s) could not be '
+            f'capped (tiles naming an absent page, or no free slot in the '
+            f'42-page array): '
+            + ', '.join(n for n, _ in pagecap_refused[:12]))
+    if raw_capped:
+        worst = sorted(raw_capped, key=lambda r: -r[1])[:12]
+        log(f'  ! field background: {len(raw_capped)} of {len(page_cost)} '
+            f'field(s) DROPPED their whole repack because the field would '
+            f'decompress to more than FIELD_BG_RAW_CAP '
+            f'({FIELD_BG_RAW_CAP:,} bytes). Each one ships its pre-repack '
+            f'section 9 -- no promotion, no compaction, nothing.')
+        for nm, n in worst:
+            log(f'        {nm:<12} would have been {n:,} bytes')
+        if len(raw_capped) > len(worst):
+            log(f'        ... and {len(raw_capped) - len(worst)} more')
+        log('    THIS IS A BUILD POLICY, NOT A HARDWARE LIMIT. The cap is '
+            '4/5 of the 2,097,152-byte loader buffer that has been proven on '
+            'hardware; crossing it makes ff7nx_fieldbg.field_buffer_bytes '
+            'patch the loader to the next power of two, which has not been. '
+            'At 256px it never fires. At a bigger page size it fires for '
+            'most of the game, which is what "512px does not work" has '
+            'looked like.')
+        log('    To go past it: raise FIELD_BG_RAW_CAP in build.py and accept '
+            'the larger loader buffer. With the guest heap raised there is '
+            'room for it -- an 8 MB buffer is 3% of a 256 MB heap where it '
+            'was 13% of the stock 64 MB.')
     if skipped_all_or_nothing:
         worst = sorted(skipped_all_or_nothing,
                        key=lambda r: -r[1])[:12]
@@ -3909,6 +4215,9 @@ def _build_flevel(archive_path, chunks, field_files, romfs, log,
     cap = _field_bg_cap()
     if cap and chunks:
         chunks = _cap_field_backgrounds(chunks, log, cap)
+
+    if chunks:
+        chunks = _hold_back_heap_tight(chunks, log)
 
     for name, (src, _) in field_files.items():
         entry = archive.index.get(name)
@@ -5619,6 +5928,107 @@ def apply_field_bg(sdout, dump, log=lambda *_: None, produced=()):
             'before using this SD tree.')
         return []
     os.replace(tmp, dest)
+    return [dest] if not built else []
+
+
+def apply_heap(sdout, dump, log=lambda *_: None, produced=()):
+    """
+    Raise FF7's guest heap from the 64 MB the port hardcoded.
+
+    THIS IS THE ONE THAT MATTERS. Every field-texture ceiling in this
+    project -- truecolor on every page, all of Cosmos's art, 512px pages --
+    is the same ceiling, and it is FF7 running out of heap, not a rendering
+    problem. HANDOFF-105 has the crash log; ff7nx_heap.py has the
+    disassembly. Short version:
+
+      * The port does not recompile the Win32 API. It binds it by NAME
+        through a 203-entry shim table at 0x1196B98, and `HeapCreate`
+        (+0x10EE7B0) IGNORES the arguments `ff7_en` passes it (x86 0x40E019
+        asks for a growable 4 KB heap with no maximum) and hands back a
+        fixed 64 MB pool at guest 0x02000000.
+      * `HeapAlloc` (+0x10EE860) is FIRST FIT. When the free list runs out
+        it dumps the heap to "Documents/heap_dump.txt", which cannot exist
+        on Switch, and nnSdk aborts. That abort IS the Men's Hall crash.
+      * The pool cannot simply grow. `<virt>` sits immediately above it and
+        every guest region is carved from ONE 80 MB host malloc that has
+        4.44 MB spare. So the patch moves three things together: heap size,
+        `<virt>` base, arena size -- nine words, five of which are inlined
+        copies of the same lazy arena init.
+
+    HEAP_TIGHT_FIELDS -- the mkt_mens section-9 holdback -- is the bandaid
+    this replaces. It stays in place until a build with this pass has been
+    walked through Men's Hall on hardware with the list emptied; see §4.3 of
+    the handoff for that test.
+
+    Runs after every other module pass, on their output, for exactly the
+    same reason they run last: it edits `exefs/main`, and basing on the
+    dump's stock module would silently revert whatever they wrote. Same
+    refusal-to-clobber check, same wording, as apply_field_bg.
+
+    No cave space. All nine words are in-place immediates in the memory
+    shims at +0x10EE5xx / +0x10EE7xx / +0x10FBxxx / +0x10FCxxx / +0x10FDxxx,
+    nowhere near the 60 FPS sites or the tail gap at 0x1152660. The guest
+    BASE is deliberately not touched: the port's own graphics driver passes
+    0x02000000 to `HeapAlloc`/`HeapFree` as a literal in twelve places, and
+    keeping the base means none of them move.
+    """
+    import ff7nx_heap
+    mb = ff7nx_heap.HEAP_MB
+    if mb == ff7nx_heap.STOCK_MB:
+        return []
+    why = ff7nx_heap.encodable(mb)
+    if why:
+        log(f'! guest heap: HEAP_MB = {mb} cannot be written -- {why}')
+        return []
+    if dump is None or not dump.nso:
+        log('! guest heap: needs exefs/main from a full game dump; skipped')
+        return []
+    dest = os.path.join(sdout, 'atmosphere', 'contents', TITLE_ID, 'exefs',
+                        'main')
+    fresh = {os.path.normpath(os.path.abspath(p)) for p in produced}
+    built = os.path.normpath(os.path.abspath(dest)) in fresh
+    src = dest if built else dump.nso
+    log('')
+    log(f'raising the FF7 guest heap {ff7nx_heap.STOCK_MB} -> {mb} MB ...')
+    if not built and os.path.exists(dest):
+        try:
+            same = (os.path.getsize(dest) == os.path.getsize(dump.nso)
+                    and open(dest, 'rb').read() == open(dump.nso, 'rb').read())
+        except OSError:
+            same = False
+        if not same:
+            log(f'! guest heap: {dest}')
+            log('  already holds a module this build did not produce -- most '
+                'likely a patched one from an earlier run. Basing on the '
+                "dump's stock copy would silently throw those patches away, "
+                'so nothing was written.')
+            log('  Turn the 60 FPS switch on so the passes run together, or '
+                'delete sdout/ and rebuild.')
+            return []
+    log(f'  base main   {src}'
+        + ('   (previous patch output)' if built else '   (from dump)'))
+    tmp = dest + '.heap-tmp'
+    already = (ff7nx_heap.read_mb(src) == mb)
+    if not ff7nx_heap.apply_to_nso(src, tmp, log, mb):
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        if not already:
+            log('! guest heap: FAILED -- and this one is NOT harmless.')
+            log('  _build_flevel already dropped the heap hold-back because '
+                f'HEAP_MB is {mb}, so flevel.lgp in this SD tree ships '
+                'mkt_mens with its full mod background and expects the '
+                'raised heap. With a stock 64 MB module, Men\'s Hall will '
+                'crash on entry.')
+            log('  Either fix the cause above and rebuild, or set '
+                'ff7nx_heap.HEAP_MB = 64 and rebuild so flevel.lgp goes back '
+                'to holding that room back.')
+        return []
+    os.replace(tmp, dest)
+    log('  the host arena is one malloc out of nnSdk\'s heap, which '
+        '+0x1150DE0 sizes to ALL available application memory rounded down '
+        'to 2 MB -- so this is not competing with a fixed reservation. If '
+        'it ever does not fit, map_region aborts at +0x10FB580 on boot '
+        'rather than corrupting anything.')
     return [dest] if not built else []
 
 

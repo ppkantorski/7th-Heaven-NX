@@ -77,6 +77,45 @@ def margin_palettes(sec9, npg):
     return out
 
 
+def _is_marker(v):
+    """
+    True when a key value is a CHROMA-KEY MARKER rather than a colour an
+    artist chose.
+
+    NOT CURRENTLY APPLIED. The classification below is measured and sound,
+    but wiring it in was one of three unverified changes in a single build
+    and that build was a clear downgrade. Kept, unused, so it can be tested
+    on its own.
+
+    A marker is fully saturated: one channel at the top of its range and
+    another at the bottom. Real field art in this game is desaturated -- the
+    palettes are browns, slates and olives.
+
+    MEASURED over all 6,423 palettes in the vanilla archive: 281 (4.4%)
+    classify as markers, and the values are exactly the textbook keys --
+
+        0x03E0  (  0, 255,   0)  green     138
+        0x7FE0  (  0, 255, 255)  cyan       57
+        0x001F  (255,   0,   0)  red        32
+        0x7C1F  (255,   0, 255)  magenta    23   <- onna_52, the Honey Bee
+        0x7C00  (  0,   0, 255)  blue       17
+        0x03FF  (255, 255,   0)  yellow      6
+
+    while every key known from hardware to be ART falls outside it: the
+    Sector 5 park's (24,131,197), the reactor stairs' (32,98,164),
+    onna_52's own palette 0 at (49,41,49).
+
+    THIS IS THE DISTINCTION THE PASS HAS BEEN MISSING. Forcing every key to
+    black killed the markers and the art together (the park speckles);
+    leaving every key alone spared the art and the markers together. The two
+    groups do not overlap and never have.
+    """
+    r = (v & 31) * 255 // 31
+    g = ((v >> 5) & 31) * 255 // 31
+    b = ((v >> 10) & 31) * 255 // 31
+    return max(r, g, b) >= 224 and min(r, g, b) <= 32
+
+
 def _neighbour_colour(sec9, npg, pal):
     """
     The mean 5-bit colour of the pixels that sit NEXT TO an index-0 pixel, on
@@ -176,6 +215,30 @@ def _overlay_palettes(sec9, surv=None):
     return out | _blend_band_palettes(sec9, surv)
 
 
+def _opaque_band_palettes(sec9, surv=None):
+    """Palette indices named by any tile whose EFFECTIVE page is depth-1 and
+    in the OPAQUE band (field_bg_native.D1_GROUPS' blend-4 range).
+
+    The mirror of `_blend_band_palettes`, and the set that must NOT have its
+    key blacked: on an opaque page index 0 is drawn as a solid colour, so
+    black is a black rectangle rather than an identity element.
+    """
+    import field_bg_native as _FN
+    lo, hi, _b = _FN.D1_GROUPS[0]
+    out = set()
+    try:
+        surv = surv if surv is not None else DC.survey(sec9)
+        pages = {p.slot: p for p in surv['pages']}
+        for t in MB.read_tiles(sec9, surv, pages):
+            eff = sec9[t.off + 34] or t.slot     # fx page byte, else its own
+            p = pages.get(eff)
+            if p is not None and p.depth == 1 and lo <= eff < hi:
+                out.add(t.pal)
+    except Exception:                                          # noqa: BLE001
+        return set()
+    return out
+
+
 def _blend_band_palettes(sec9, surv=None):
     """
     Palette indices named by any tile drawing from a depth-1 page in the
@@ -257,6 +320,61 @@ def blacken_keys(sec3, sec9):
     # ...EXCEPT the palettes drawn on an additive or average page, where the
     # key's colour is ADDED rather than drawn over. See _blend_band_palettes.
     blend_pals = _overlay_palettes(sec9)
+    # ...AND NOT THE ONES ALSO DRAWN ON AN OPAQUE PAGE.
+    #
+    # `_overlay_palettes` blacks the key of EVERY layer-2+ palette, on the
+    # reasoning that "black is the identity element" for the blend. That is
+    # true when the overlay is actually blended. It is false when the overlay
+    # is drawn from an OPAQUE page, and `_blend_band_palettes`'s own docstring
+    # says so in as many words: "On an OPAQUE page that is exactly why the
+    # de-fringe helps: the key's colour is drawn, and filtering bleeds it into
+    # the art, so it should carry the art's colour rather than punch a hole."
+    #
+    # MEASURED on `md8_1`, the Sector 8 fire scene:
+    #
+    #     palette 4   layer 2, page slot 1 (OPAQUE band)   10,181 index-0 px
+    #     palette 10  layer 2, page slot 1 (OPAQUE band)    2,422 index-0 px
+    #     vanilla keys 0x6203 RGB(96,64,24) and 0x5184 RGB(80,48,32)
+    #
+    # Twelve and a half thousand pixels of mid-brown, forced to black, drawn
+    # opaque over the backdrop. That is the dark blocks on the stairs and the
+    # black speckling in the Sector 5 park.
+    #
+    # So the rule is per palette rather than per layer: a palette that any
+    # tile draws from an opaque page follows the opaque rule and gets
+    # de-fringed. A palette that ONLY ever appears on a blend band keeps the
+    # black key, which is the Sector 6 grey-block case `_overlay_palettes` was
+    # written for and which this does not touch.
+    # ...and an overlay palette that is ALSO drawn from an opaque page is
+    # LEFT EXACTLY AS VANILLA SHIPPED IT -- neither blacked nor de-fringed.
+    #
+    # Both branches are wrong for it, and each has a hardware report behind
+    # the other one:
+    #
+    #   de-fringe it  ->  a pale wash over a 16x16 rectangle. That is the
+    #                     Sector 6 grey blocks `_overlay_palettes` was
+    #                     written to stop.
+    #   black it      ->  a BLACK rectangle drawn opaque over the backdrop.
+    #                     MEASURED on `md8_1`: palettes 4 and 10 are layer-2
+    #                     tiles on page slot 1, the opaque band, carrying
+    #                     10,181 and 2,422 index-0 pixels, and their vanilla
+    #                     keys are 0x6203 RGB(96,64,24) and 0x5184
+    #                     RGB(80,48,32). Forced to black that is the dark
+    #                     blocks on the stairs and the speckling in the park.
+    #
+    # Vanilla's own value is the one colour known to be right in both
+    # situations: it is what the artists chose and what the game shipped and
+    # ran with for thirty years. This module already states the principle --
+    # "The safe direction is to change nothing" -- it just had no branch for
+    # it. Palettes that only ever appear on a blend band keep the black key,
+    # so the fx/steam fix is untouched.
+    # BUILD 28 ADDED `_leave = _overlay_palettes & _opaque_band_palettes`
+    # HERE AND IT IS REMOVED AGAIN. Together with the two `continue`s below it
+    # took the pass from 3,267 palette pages de-fringed across 601 fields
+    # (builds 20-27) to 1,199 across 441 -- 2,068 palettes stopped being
+    # touched, 785 of them bright colours left to draw as authored. Reverted
+    # to the build-27 behaviour, which is the last state you called good.
+    _leave = set()
     import numpy as np
 
     cols = np.frombuffer(sec3, '<u2', count=cpp * npg,
@@ -266,6 +384,9 @@ def blacken_keys(sec3, sec9):
     skipped = 0
     for p in sorted(used):
         off = hdr + (p * cpp) * 2
+        if p in _leave:
+            skipped += 1
+            continue
         if p in blend_pals:
             # OVERLAY PALETTE: entry 0 must be BLACK, not de-fringed and not
             # left at whatever the mod authored. Black is the identity element
@@ -281,15 +402,74 @@ def blacken_keys(sec3, sec9):
         old = struct.unpack_from('<H', buf, off)[0]
         counts = _neighbour_colour(sec9, npg, p)
         if counts is None:
-            # The palette draws no index-0 pixel anywhere, so the key is never
-            # reachable. Black it out: it cannot be seen, and if some path we
-            # have not found reaches it, black is the safe value.
+            # NO NEIGHBOURING ART, SO NOTHING TO DE-FRINGE -- AND NOTHING TO
+            # DECIDE. LEAVE IT.
+            #
+            # This used to write BLACK, on the reasoning that a palette which
+            # draws no index-0 pixel cannot show its key, so black is a safe
+            # default. It is not safe, and this module's own summary line says
+            # why: "the console DRAWS index 0 rather than discarding it
+            # (proved: blacking it out removed the Sector 6 yellow and put
+            # black speckles everywhere else)".
+            #
+            # MEASURED on `md8_1`, the Sector 8 fire scene, layer-1 palettes:
+            #
+            #     pal 0   vanilla 0x07C0 (0,248,0)  ->  ours 0x0000    64 tiles
+            #     pal 1   vanilla 0x7B86 (120,112,48) -> ours 0x0000   52 tiles
+            #     pal 2   vanilla 0x4A84 (72,80,32)   -> ours 0x0000   64 tiles
+            #     pal 3   vanilla 0x8447 (128,136,56) -> ours 0x0000   39 tiles
+            #
+            # Palette 0's key is 0x07C0, pure green -- the classic chroma key.
+            # Turning it black does not make it invisible, it makes it BLACK,
+            # and 219 layer-1 tiles in one field carry it. That is the black
+            # speckling reported in the Sector 5 park and the dark blocks on
+            # the stairs here.
+            #
+            # `_neighbour_colour` returning None means this pass has no
+            # evidence about what the key should be. The honest answer to no
+            # evidence is to change nothing: vanilla's value is at least the
+            # value the artists chose and the value the game shipped with.
+            #
+            # UNLESS IT IS A MARKER. "The value the artists chose" is the
+            # whole argument for leaving it, and it does not apply to pure
+            # magenta or pure green -- nobody chose those as scenery, they are
+            # the transparency flag this port fails to honour. If such a key
+            # ever reaches a pixel it is wrong by construction, so black it:
+            # black is what the pixel would be if the port discarded index 0
+            # the way the mod's reference renderer does.
+            # A palette that draws no index-0 pixel cannot show its key, so
+            # black is the safe default. RESTORED to the build-27 behaviour.
             new = 0
         else:
             v = cols[p].astype(np.int64)
             w = counts.astype(np.float64)
             w[0] = 0.0                        # never average the key into itself
             if not w.any():
+                # EVERY PIXEL THIS PALETTE DRAWS IS INDEX 0. There is no art
+                # to average, and blacking the key turns the WHOLE PAGE black.
+                #
+                # MEASURED across the built archive: 110 pages are entirely
+                # index 0 and 5,128 tiles draw from them. Vanilla has ZERO
+                # such pages -- they are created by
+                # `ff7nx_marginpage.split_section9`, which allocates
+                # `np.zeros((256, 256))` for a new palette-pure page and then
+                # moves the flat 16:9 placeholder cells onto it. A flat
+                # placeholder IS index 0, so the page stays all zero, and its
+                # entire appearance is whatever entry 0 holds.
+                #
+                # Vanilla drew the authored filler colour there. Blacking it
+                # draws a solid black page -- which is the regular grid of
+                # black squares over the Honey Bee keyhole scene and a large
+                # share of the black rectangles elsewhere.
+                #
+                # No evidence, so change nothing: keep the value the game
+                # shipped with -- UNLESS it is a marker, which is never the
+                # value anyone chose. On a page that is 100% index 0 the key
+                # IS the whole page, so a magenta marker here paints a solid
+                # magenta rectangle. That is the Honey Bee keyhole grid:
+                # onna_52 palettes 1 and 3 both key 0x7C1F, and over half of
+                # its slots 1 and 2 is index 0 in the built archive.
+                # RESTORED to the build-27 behaviour.
                 new = 0
             else:
                 tot = float(w.sum())

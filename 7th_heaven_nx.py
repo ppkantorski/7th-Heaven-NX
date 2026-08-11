@@ -276,8 +276,14 @@ FIELD_BG_PAGE_PX_CHOICES = [
 # The page SIZE is the real control: at 256px every page on every field fits
 # with the worst field at 4.50 MB, so there is nothing left for a cap to
 # protect. The numeric entries stay for bisecting a suspected ceiling.
+# Megabytes of RUNTIME truecolor cost per field (6*px^2 a page). The labels
+# name what each buys at the two sizes that matter, because the number means
+# a different picture at each: 4.5 MB is twelve pages at 256px and three at
+# 512px, and that is the whole reason this is in bytes and not pages.
 FIELD_BG_BUDGET_CHOICES = [
-    (0.0,  'Unlimited \u2014 recommended (choose the page size instead)'),
+    (0.0,  'Unlimited \u2014 right at 256px, NOT at 512px'),
+    (3.0,  '3.0 MB \u2014  2 pages at 512px,  8 at 256px (safest at 512)'),
+    (4.5,  '4.5 MB \u2014  3 pages at 512px, 12 at 256px'),
     (4.0,  '4.0 MB \u2014 conservative (only ONE 768px page fits)'),
     (5.0,  '5.0 MB'),
     (5.5,  '5.5 MB \u2014 the old default'),
@@ -298,9 +304,40 @@ FIELD_BG_BUDGET_CHOICES = [
 # it is the direct cause of a truecolor page sitting next to a paletted one.
 # A field that cannot be done completely keeps its Switch-vanilla background,
 # which is correct, just not upgraded.
-FIELD_BG_PARTIAL_CHOICES = [
-    (0, 'All or nothing \u2014 recommended (a field is never half-upgraded)'),
-    (1, 'Partial \u2014 promote whatever fits, leave the rest paletted'),
+# TRUECOLOR PAGES PER FIELD.
+#
+# The value IS `field_bg_dense.MAX_TRUECOLOR_PAGES` -- how many pages of a
+# field the dense repack may promote from 8-bit paletted to 16-bit.
+#
+# THIS CONTROL USED TO BE "field background promotion" AND IT DID NOTHING.
+# It set `field_bg_repack.all_or_nothing()`, and `field_bg_repack.upgrade()`
+# stopped being called when `field_bg_dense.dense_repack()` replaced it --
+# which never reads the setting. MEASURED: zero references in field_bg_dense,
+# and build.py's `st` (which carried `pages_allornothing`) is set to None and
+# never reassigned, so the report could not fire either. Both values produced
+# byte-identical builds while the log printed "PARTIAL promotion:" as though
+# something had happened. FINDINGS-110 \u00a75.
+#
+# The slot is reused rather than added because a dead control that prints a
+# claim about a code path that no longer runs is worse than no control.
+#
+# 3 is what shipped. It was NOT measured as a ceiling -- field_bg_dense's own
+# comment says it is descriptive ("the working promotion never put more than
+# THREE truecolor pages in one field, mean 1.41"), and the numbers behind it
+# came from 512px experiments whose model `budget_bytes()` already retracts.
+# The thing it was really guarding against -- field_load_textures giving up
+# part-way and leaving pages on handle 0 -- turned out to be the 256-tiles-
+# per-page overrun, which `field_bg_pagecap` now prevents outright.
+# 3 IS A HARD CEILING NOW, NOT A TUNING CHOICE. The opaque truecolor band is
+# slots 26, 27, 28 -- see field_bg_native.D2_OPAQUE_SLOTS for the measurement
+# (every depth-2 page in the entire vanilla archive is in one of those three,
+# and every build of ours that used slot 29+ produced black squares). Values
+# above 3 are not offered because the repack cannot honour them.
+FIELD_BG_TRUECOLOR_CHOICES = [
+    (3, '3 pages per field \u2014 the opaque band is 3 slots wide'),
+    (0, 'Off \u2014 no truecolor promotion at all'),
+    (2, '2 pages per field'),
+    (1, '1 page per field'),
 ]
 
 # THE SETTING THAT BUYS PAGE SIZE WITHOUT BLACK SQUARES.
@@ -436,11 +473,15 @@ FIELD_BG_PRESET_CHOICES = [
 ]
 
 FIELD_BG_PRESETS = {
-    #        px   replace_only  max_pages  partial  budget
-    0:   (0,      0,            12,        0,       0.0),
-    1:   (256,    2,            12,        0,       0.0),
-    2:   (384,    2,            12,        0,       0.0),
-    3:   (512,    2,            12,        0,       0.0),
+    #        px   replace_only  max_pages  truecolor  budget
+    #
+    # The fourth column used to be the dead `partial` flag and was 0 in every
+    # row, which is why swapping the control for a real one needed a real
+    # value here. 3 is what the build has always produced.
+    0:   (0,      0,            12,        3,         0.0),
+    1:   (256,    2,            12,        3,         0.0),
+    2:   (384,    2,            12,        3,         0.0),
+    3:   (512,    2,            12,        3,         0.0),
 }
 
 
@@ -854,6 +895,14 @@ def run_build(mods, enabled, settings_by_mod, log, progress,
     # whatever every earlier cave actually took. Gated on the 16:9 setting; at
     # 4:3 it is a no-op by design. FINDINGS-88, FINDINGS-92.
     produced += build.apply_field_frame(SDOUT_DIR, DUMP, log, produced)
+    # The FF7 guest heap, after every other module pass and on their output.
+    # Nine words in the memory shims; it shares no site, no cave and no
+    # padding hole with anything above, so it is last purely by the same rule
+    # they all follow -- whoever edits exefs/main last must see what everyone
+    # else wrote. This is the pass that lifts the ceiling on truecolor pages,
+    # Cosmos art coverage and 512px backgrounds; ff7nx_heap.HEAP_MB is the
+    # setting, and it is a CODE CONSTANT, not an environment variable.
+    produced += build.apply_heap(SDOUT_DIR, DUMP, log, produced)
     # The custom PIXEL shader sets (background scaler, FXAA). These touch no
     # module at all, so they can go anywhere -- but they must go BEFORE
     # prune_stale, because that is what deletes them again when the setting
@@ -924,11 +973,12 @@ def launch_ui():
     if initial_fbg_value not in fbg_label_by_value:
         initial_fbg_value = 0
 
-    fpart_label_by_value = dict(FIELD_BG_PARTIAL_CHOICES)
-    fpart_value_by_label = {v: k for k, v in FIELD_BG_PARTIAL_CHOICES}
-    initial_fpart_value = global_saved.get('field_bg_partial', 0)
-    if initial_fpart_value not in fpart_label_by_value:
-        initial_fpart_value = 0
+    ftc_label_by_value = dict(FIELD_BG_TRUECOLOR_CHOICES)
+    ftc_value_by_label = {v: k for k, v in FIELD_BG_TRUECOLOR_CHOICES}
+    initial_ftc_value = global_saved.get(
+        'field_bg_truecolor_pages', build.field_bg_dense.MAX_TRUECOLOR_PAGES)
+    if initial_ftc_value not in ftc_label_by_value:
+        initial_ftc_value = build.field_bg_dense.MAX_TRUECOLOR_PAGES
 
     fmaxp_label_by_value = dict(FIELD_BG_MAX_PAGES_CHOICES)
     fmaxp_value_by_label = {v: k for k, v in FIELD_BG_MAX_PAGES_CHOICES}
@@ -1176,10 +1226,11 @@ def launch_ui():
     def current_field_bg_page_px():
         return fbg_value_by_label.get(fbg_var.get(), 0)
 
-    fpart_var = tk.StringVar(value=fpart_label_by_value[initial_fpart_value])
+    ftc_var = tk.StringVar(value=ftc_label_by_value[initial_ftc_value])
 
-    def current_field_bg_partial():
-        return fpart_value_by_label.get(fpart_var.get(), 0)
+    def current_field_bg_truecolor():
+        return ftc_value_by_label.get(
+            ftc_var.get(), build.field_bg_dense.MAX_TRUECOLOR_PAGES)
 
     fmaxp_var = tk.StringVar(value=fmaxp_label_by_value[initial_fmaxp_value])
 
@@ -1230,7 +1281,7 @@ def launch_ui():
     # the dialog does not silently show "Custom" for a stock configuration.
     def _match_preset():
         cur = (current_field_bg_page_px(), current_field_bg_replace_only(),
-               current_field_bg_max_pages(), current_field_bg_partial(),
+               current_field_bg_max_pages(), current_field_bg_truecolor(),
                current_field_bg_budget_mb())
         for key, vals in FIELD_BG_PRESETS.items():
             if cur == vals:
@@ -1252,7 +1303,7 @@ def launch_ui():
         fbg_var.set(fbg_label_by_value[px])
         frepl_var.set(frepl_label_by_value[repl])
         fmaxp_var.set(fmaxp_label_by_value[maxp])
-        fpart_var.set(fpart_label_by_value[part])
+        ftc_var.set(ftc_label_by_value[part])
         fbud_var.set(fbud_label_by_value[bud])
 
     _applying_preset = []
@@ -1272,7 +1323,7 @@ def launch_ui():
             fpre_var.set(fpre_label_by_value[_match_preset()])
 
     fpre_var.trace_add('write', _apply_preset_guarded)
-    for _v in (fbg_var, frepl_var, fmaxp_var, fpart_var, fbud_var):
+    for _v in (fbg_var, frepl_var, fmaxp_var, ftc_var, fbud_var):
         _v.trace_add('write', _preset_to_custom)
 
     movie_label_by_value = dict(MOVIE_QUALITY_CHOICES)
@@ -1678,17 +1729,33 @@ def launch_ui():
              'Sizes other than 256 patch exefs/main AND rewrite flevel.lgp, '
              'and both halves are needed. 256px needs no module patch at all, '
              'so it is the only one testable without a full game dump.', True),
-            ('combo', 'Field background promotion', fpart_var,
-             [l for _, l in FIELD_BG_PARTIAL_CHOICES],
-             'What to do with a field whose pages do not ALL fit.\n\n'
-             'All or nothing leaves such a field on its Switch-vanilla '
-             'background \u2014 correct, just not upgraded. Partial promotes '
-             'the busiest pages until the budget runs out and leaves the rest '
-             'paletted, which is what puts a truecolor page next to a '
-             'paletted one inside the same picture. Partial was the old '
-             'behaviour and is kept for comparison.\n\n'
-             'With the budget unlimited and a page size of 256 or 128, '
-             'nothing is ever held back and this setting stops mattering.',
+            ('combo', 'Field background TRUECOLOR pages', ftc_var,
+             [l for _, l in FIELD_BG_TRUECOLOR_CHOICES],
+             'How many pages of a field may be promoted from 8-bit paletted '
+             'to 16-bit truecolor.\n\n'
+             'A truecolor page costs 0.38 MB against a paletted page\u2019s '
+             '0.31 MB \u2014 seven hundredths of a megabyte \u2014 so this '
+             'is cheap in memory. What it is NOT cheap in is PAGES: a '
+             'promotion ADDS a page, because the original paletted one must '
+             'stay alive for every cell that could not move (colour-key '
+             'cells, fx-page tiles).\n\n'
+             'RAISE THIS WITH PAGE GROWTH ON "NO GROWTH", NOT "OFF". '
+             'Compaction rides with no-growth and nothing else \u2014 it is '
+             'the pass that pays for the promoted pages out of the originals, '
+             'which are mostly empty afterwards. MEASURED: with it on, 1,165 '
+             'pages freed and 5.6 pages per field; with growth "Off" it does '
+             'not run, the count goes to 7.5 per field, and '
+             'field_load_textures starts abandoning the load \u2014 which is '
+             'what black squares are.\n\n'
+             '3 is what shipped, and it was never measured as a ceiling \u2014 '
+             'the numbers behind it came from 512px experiments whose model '
+             'has since been retracted. What it was really guarding against '
+             'was the 256-tiles-per-page overrun (FINDINGS-110), and that is '
+             'now prevented outright by field_bg_pagecap.\n\n'
+             'This control previously said "Field background promotion" and '
+             'did nothing at all: it fed field_bg_repack.all_or_nothing(), '
+             'and the pass that reads it stopped being called. Both settings '
+             'produced byte-identical builds.',
              True),
             ('combo', 'Field background page growth', frepl_var,
              [l for _, l in FIELD_BG_REPLACE_ONLY_CHOICES],
@@ -1767,32 +1834,35 @@ def launch_ui():
              'every field that goes over.', True),
             ('combo', 'Field background memory budget', fbud_var,
              [l for _, l in FIELD_BG_BUDGET_CHOICES],
-             'A hard ceiling on the texture memory ONE field may end up '
-             'using. Unlimited is recommended \u2014 set the page size and the '
-             'page ceiling instead, and use this only to bisect.\n\n'
-             'IT WAS BROKEN, AND IT IS FIXED. The old version charged every '
-             'page the field already had, INCLUDING the ones that promoting '
-             'would free \u2014 billing the old page and its replacement at '
-             'the same time, as if both existed at once. The heavier the '
-             'field, the less it was allowed to promote:\n\n'
-             '    2 existing pages \u2192 3 promotions allowed\n'
-             '    5 existing pages \u2192 2\n'
-             '    8 existing pages \u2192 2\n'
-             '   12 existing pages \u2192 1\n\n'
-             'So the field with the most art to fix got ONE page, and the '
-             'setting meant to prevent a half-paletted picture reliably '
-             'produced one. That was arithmetic, not tuning.\n\n'
-             'It now projects the section as it would actually be \u2014 freed '
-             'pages removed, new pages added \u2014 and tests that. Verified '
-             'over all 709 fields: nothing exceeds the number you pick, and '
-             'the heaviest field lands exactly on it.\n\n'
-             'Note it is still measured in MEGABYTES while what actually '
-             'fails is the TEXTURE COUNT, so \u201cmax pages per field\u201d is '
-             'the more direct control. 6.06 MB was measured black on '
-             'nmkin_1 at 512px pages; that is the only hardware datum there '
-             'is, and it does not transfer across page sizes.', True),
-        ]),
-        ('Model & battle textures', [
+             'A hard ceiling on the TRUECOLOR texture memory one field may '
+             'use, in megabytes of RUNTIME cost \u2014 6\u00d7px\u00b2 per '
+             'page, i.e. the pixels plus the 32bpp surface the engine builds '
+             'from them.\n\n'
+             'IT WAS DEAD UNTIL NOW, and that is worth knowing because the '
+             'log has been quoting it for months. It was read only by '
+             'field_bg_repack.upgrade(), and upgrade() stopped being called '
+             'when field_bg_dense replaced it \u2014 zero references to the '
+             'budget in that module. Any value you picked produced the same '
+             'build. It is now enforced where the promotion actually '
+             'happens.\n\n'
+             'THIS IS THE RIGHT UNIT ONCE THE PAGE SIZE MOVES. A ceiling in '
+             'PAGES means something four times bigger the moment you go from '
+             '256px to 512px \u2014 the same 12 pages cost 4.56 MB at 256 '
+             'and 18.00 MB at 512. Bytes do not do that:\n\n'
+             '    budget      at 256px        at 512px\n'
+             '    3.0 MB      8 pages         2 pages\n'
+             '    4.5 MB     12 pages         3 pages\n'
+             '    6.0 MB     16 pages         4 pages\n\n'
+             'For reference, the last build with no black squares measured '
+             'mean 1.87 MB per field and a heaviest field of 4.75 MB. The '
+             '512px build that DID show black squares measured mean 4.72 MB '
+             'and a heaviest of 12.31 MB. Somewhere between those is the '
+             'ceiling field_load_textures actually has, and this is the '
+             'control that bisects it.\n\n'
+             'Unlimited is right at 256px, where a truecolor page is only '
+             '0.07 MB more than the paletted one it replaces. At 512px it is '
+             'not.',
+             True),
             ('combo', 'Field model texture cap', cap_var,
              [l for _, l in FIELD_TEX_CAP_CHOICES],
              'Downscales oversized char.lgp / world_us.lgp model textures.',
@@ -2000,8 +2070,8 @@ def launch_ui():
                                      current_field_bg_page_px(),
                                  'field_bg_budget_mb':
                                      current_field_bg_budget_mb(),
-                                 'field_bg_partial':
-                                     current_field_bg_partial(),
+                                 'field_bg_truecolor_pages':
+                                     current_field_bg_truecolor(),
                                  'field_bg_max_pages':
                                      current_field_bg_max_pages(),
                                  'field_bg_replace_only':
@@ -2048,7 +2118,7 @@ def launch_ui():
     bg_cap_var.trace_add('write', save_settings_now)
     fbg_var.trace_add('write', save_settings_now)
     fbud_var.trace_add('write', save_settings_now)
-    fpart_var.trace_add('write', save_settings_now)
+    ftc_var.trace_add('write', save_settings_now)
     fmaxp_var.trace_add('write', save_settings_now)
     frepl_var.trace_add('write', save_settings_now)
     # MISSING UNTIL NOW, and `test_gui_settings.py` was failing on it:
@@ -2747,8 +2817,12 @@ def launch_ui():
         fbg_px_value = current_field_bg_page_px()
         os.environ[build.field_bg_repack.BUDGET_ENV] = str(
             current_field_bg_budget_mb())
-        os.environ[build.field_bg_repack.PARTIAL_ENV] = str(
-            current_field_bg_partial())
+        # The value IS the constant. build.py reads
+        # `field_bg_dense.MAX_TRUECOLOR_PAGES` when it walks the promotion
+        # ladder, so setting it here is the whole wiring -- no variable, no
+        # parser, one number in one place.
+        build.field_bg_dense.MAX_TRUECOLOR_PAGES = \
+            current_field_bg_truecolor()
         os.environ[build.field_bg_repack.MAX_TOTAL_PAGES_ENV] = str(
             current_field_bg_max_pages())
         build.field_bg_repack.apply_growth_mode(
@@ -2852,10 +2926,12 @@ def launch_ui():
                           'flevel.lgp to match; both halves are needed, so '
                           'do not mix an flevel from one setting with a '
                           'module from another.')
-            if current_field_bg_partial():
-                log_write('    PARTIAL promotion: a field whose pages do not '
-                          'all fit keeps the ones that do and leaves the rest '
-                          'paletted.')
+            _tc = current_field_bg_truecolor()
+            log_write('    truecolor: up to %d page(s) per field may be '
+                      'promoted from 8-bit paletted to 16-bit (3 is what '
+                      'shipped).' % _tc if _tc else
+                      '    truecolor: OFF -- no page is promoted; every page '
+                      'stays 8-bit paletted.')
 
         def worker():
             ok = False
@@ -2928,9 +3004,13 @@ def main():
                 saved.get('__global__', {}).get(
                     'field_bg_budget_mb',
                     build.field_bg_repack.DEFAULT_BUDGET_MB))
-        if build.field_bg_repack.PARTIAL_ENV not in os.environ:
-            os.environ[build.field_bg_repack.PARTIAL_ENV] = str(
-                saved.get('__global__', {}).get('field_bg_partial', 0))
+        # Truecolor pages per field. The saved value IS
+        # `field_bg_dense.MAX_TRUECOLOR_PAGES`; the old PARTIAL_ENV it used
+        # to write fed a code path that stopped being called.
+        build.field_bg_dense.MAX_TRUECOLOR_PAGES = int(
+            saved.get('__global__', {}).get(
+                'field_bg_truecolor_pages',
+                build.field_bg_dense.MAX_TRUECOLOR_PAGES))
         if build.field_bg_repack.REPLACE_ONLY_ENV not in os.environ:
             build.field_bg_repack.apply_growth_mode(
                 saved.get('__global__', {}).get('field_bg_replace_only', 2))

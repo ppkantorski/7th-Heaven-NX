@@ -89,19 +89,74 @@ T_TEXID = FN.TILE_TEXTURE_ID            # 32
 T_FX_PAGE = FN.TILE_TEXTURE_ID2         # 34
 T_SRC_X_BIG, T_SRC_Y_BIG = 42, 46
 
-BANDS = {4: (0x1A, 0x21), 1: (0x21, 0x28), 0: (0x28, 0x2A)}     # truecolor
+# The truecolor bands, taken from field_bg_native so there is ONE definition.
+# Band 4 is three slots wide, not seven -- see FN.D2_OPAQUE_SLOTS for the
+# measurement (vanilla puts every depth-2 page it has in 26, 27 or 28, and
+# every build of ours that used 29+ produced black squares).
+BANDS = {b: (lo, hi) for lo, hi, b in FN.D2_GROUPS}             # truecolor
 D1_BANDS = {4: (0x00, 0x0F), 1: (0x0F, 0x18), 0: (0x18, 0x1A)}  # paletted
+
+
+# HOW FAR A PALETTE-0 BORROW MAY MOVE A CELL, IN MEAN |RGB| OVER 0-255.
+#
+# `source_cell` falls back to palette 0's art when the mod ships nothing for
+# the palette a tile names, because FFNx does (saveload.cpp:138). On a
+# PALETTED page that is harmless -- the index is recoloured by the tile's own
+# palette on the way to the screen. On a TRUECOLOR page the pixels ARE the
+# final colour, so a borrow bakes palette 0's colours in permanently and the
+# tile's own palette is never applied again.
+#
+# MEASURED on hardware, `nmkin_5` -- the red railing outside Reactor 1, which
+# is red only because it draws through palette 7:
+#
+#     dst (1, 32, 112)   slot 2 -> 27   palette 5    RGB(136, 13, 13) -> (5, 15, 21)
+#     dst (1, -96, 240)  slot 3 -> 28   palette 7    RGB(192, 51, 40) -> (64, 62, 53)
+#
+# Bright red becomes grey. The cell was promoted to truecolor and took
+# palette 0's grey art with it. That is the "missing texture" -- the tile is
+# present, the page is present, the art is simply the wrong variant.
+#
+# The comment at the borrow site already predicted this and said what to do:
+# "If it is brown again, GATE THIS ON THE PALETTE DISTANCE rather than
+# deleting it: distance < 8 was 0.7% of candidates and distance < 32 was
+# 4.6%." It is brown again -- `mds6_3` is a yellow wash and the railing is
+# grey -- so this is that gate.
+#
+# A refused borrow is not a lost cell: it falls through to the paletted page,
+# which `ff7nx_marginart` has already filled with Cosmos art quantised
+# against the tile's OWN palette. Right colours at 8 bits, instead of wrong
+# colours at 16.
+# OFF. `_detail_transfer` ALREADY SOLVES THIS, AND BETTER.
+#
+# I added this gate to stop a borrow baking palette 0's grey over the red
+# railing in `nmkin_5`. It did stop it -- and it stopped 44% of Cosmos's
+# detail with it, which is a regression, not a fix. The reason is three lines
+# below the borrow site: when `src_pal != pal` this module already calls
+# `_detail_transfer(out, pal_ref)`, which takes STRUCTURE from the borrowed
+# upscale and COLOUR from the palette the cell actually names. A borrow here
+# has not been able to change a cell's colour since that function landed.
+#
+# The grey railing was never this module's doing. `ff7nx_marginart` runs
+# FIRST, borrows the same art, quantises it into the paletted page with no
+# detail transfer at all, and that page is what `pal_ref` reads. The colour
+# was already gone before this code saw the cell. The fix belongs there, and
+# it is there now -- as a detail transfer, so nothing is refused.
+#
+# Set to a finite value only to A/B the borrow itself. It should stay off.
+BORROW_MAX_DIST = float('inf')
 
 
 class Stats:
     __slots__ = ('cells', 'pages', 'tiles', 'from_art', 'from_art_borrow',
-                 'from_vanilla', 'keyed', 'fx_pairs', 'refused', 'pages_before')
+                 'from_vanilla', 'keyed', 'fx_pairs', 'refused', 'pages_before',
+                 'borrow_refused')
 
     def __init__(self):
         self.cells = self.pages = self.tiles = 0
         self.from_art = self.from_art_borrow = self.from_vanilla = 0
         self.keyed = self.fx_pairs = 0
         self.pages_before = 0
+        self.borrow_refused = 0
         self.refused = None
 
 
@@ -135,6 +190,39 @@ def _pal_rgb(sec3):
     return ((r5 << 11) | (g6 << 5) | b5).astype(np.uint16), npg, cpp
 
 
+def _pal_distance(pal565, pal, idx):
+    """
+    Mean |RGB| over 0-255 between palette 0 and palette `pal`, measured over
+    the PIXELS of `idx` -- every pixel counted once, so an index that covers
+    the cell weighs more than one that touches a corner.
+
+    PER PIXEL, NOT PER UNIQUE INDEX. Weighing unique indices equally let
+    `nmkin_5` dst (1, 16, 112) through at 30.4 when its rendered colour moves
+    RGB(136,13,13) -> (5,15,21): the red dominates the cell but is only one
+    entry of many, so averaging over entries buried it. Counting pixels puts
+    that cell at 44.5 and refuses it, which is what the screen says should
+    happen.
+
+    Index 0 is excluded: it is the colour key, not art, and `ff7nx_palkey`
+    rewrites it independently of either palette.
+
+    Returns 0.0 when the cell draws nothing but the key -- there is no colour
+    to get wrong, so a borrow is free.
+    """
+    u = idx.reshape(-1)
+    u = u[u != 0]
+    if u.size == 0:
+        return 0.0
+    a = pal565[0][u].astype(np.int32)
+    b = pal565[pal][u].astype(np.int32)
+    # R5G6B5 -> 0-255 per channel, matching the numbers in BORROW_MAX_DIST.
+    def chans(v):
+        return np.stack([((v >> 11) & 31) << 3,
+                         ((v >> 5) & 63) << 2,
+                         (v & 31) << 3], -1).astype(np.int32)
+    return float(np.abs(chans(a) - chans(b)).mean())
+
+
 def _band_of(slot, depth):
     g = FN._group_of(slot, FN.D1_GROUPS if depth == 1 else FN.D2_GROUPS)
     return 4 if g is None else g
@@ -150,8 +238,12 @@ def _uses_key(pages, arrays, k):
 
 def collect(sec9, pages, tiles):
     """
-    keys      {(slot, sx, sy, pal): {'band', 'key', 'tiles': [off, ...]}}
+    keys      {(slot, sx, sy, pal): {'band', 'key', 'l2', 'tiles': [...]}}
     fx_of     {key: fxkey}   the two that must share a grid index
+
+    `l2` is True when ANY tile drawing this cell is on layer 2 or above. That
+    is the difference between a colour key that is a real cut-out and one that
+    is just entry 0's colour -- see the module docstring, constraint 2.
     """
     keys, fx_of = {}, {}
     for t in tiles:
@@ -163,14 +255,18 @@ def collect(sec9, pages, tiles):
         rec = keys.get(k)
         if rec is None:
             rec = keys[k] = {'band': _band_of(t.slot, p.depth),
-                             'key': False, 'tiles': []}
+                             'key': False, 'l2': False, 'tiles': []}
+        if t.layer >= 2:
+            rec['l2'] = True
         rec['tiles'].append(t.off)
         f = sec9[t.off + T_FX_PAGE]
         if f and f in pages:
             fk = (f, t.sx, t.sy, pal if pages[f].depth == 1 else -1)
             if fk not in keys:
                 keys[fk] = {'band': _band_of(f, pages[f].depth),
-                            'key': rec['key'], 'tiles': []}
+                            'key': rec['key'], 'l2': rec['l2'], 'tiles': []}
+            elif rec['l2']:
+                keys[fk]['l2'] = True
             fx_of.setdefault(k, set()).add(fk)
     return keys, fx_of
 
@@ -329,16 +425,70 @@ def _detail_transfer(art565, tgt565):
     return (((r << 11) | (g << 5) | b) & ~np.uint16(0x0020)).astype(np.uint16)
 
 
-def source_cell(k, rec, pages, arrays, pal565, art_for, pals_for, st):
-    """A (16, 16) uint16 R5G6B5 cell, from the mod's art where it exists."""
+def black_fraction(arrays, pal565, k):
+    """How much of this cell is OPAQUE BLACK on its paletted page.
+
+    Index 0 is the colour key and is excluded: it is not black, it is the
+    key. Any other index whose palette colour is 0x0000 is real, opaque,
+    dead black.
+    """
     slot, sx, sy, pal = k
+    idx = arrays[slot][sy:sy + TILE, sx:sx + TILE]
+    col = pal565[pal][idx]
+    return float(((col == 0) & (idx != 0)).mean())
+
+
+def _up(a, s):
+    """Nearest-neighbour block upscale by an integer factor. s == 1 is free."""
+    if s == 1:
+        return a
+    return np.repeat(np.repeat(a, s, axis=0), s, axis=1)
+
+
+def source_cell(k, rec, pages, arrays, pal565, art_for, pals_for, st,
+                scale=1):
+    """A (16*scale, 16*scale) uint16 R5G6B5 cell, from the mod's art.
+
+    `scale` is `page_px // 256`. AT 256 IT IS 1 AND NOTHING BELOW CHANGES.
+
+    THIS FUNCTION USED TO THROW THE EXTRA RESOLUTION AWAY. `ArtProvider` is
+    built at the page size, so at 512px `art.px` is 512 -- and the art path
+    then read it with `buf[sy*s:(sy+TILE)*s:s]`, a stride of `s`, which is
+    NEAREST-NEIGHBOUR POINT SAMPLING back down to a 16x16 cell. The DDS went
+    1024 -> BOX -> 512 -> every-other-texel -> 256. That is both why a 512px
+    build produced 256px pages and why the downsampling looked bad: the
+    careful filter in PageArt was undone one line later by a stride.
+    """
+    slot, sx, sy, pal = k
+    # A TILE MAY NAME A PALETTE THE FIELD DOES NOT HAVE, AND THAT MUST NOT
+    # TAKE THE WHOLE FIELD DOWN WITH IT.
+    #
+    # Cosmos leaves the palette byte of its widescreen tiles at whatever it
+    # was, because FFNx replaces the page with a DDS and never applies it --
+    # `ff7nx_marginpal` documents this. So `pal` can be >= the palette count,
+    # `pal565[pal]` raises IndexError, `dense_repack` aborts, and build.py
+    # logs "not repacked -- index 5 is out of bounds for axis 0 with size 4".
+    # THE FIELD THEN GETS NO PROMOTION AT ALL: not one truecolor page, for one
+    # bad byte on one tile.
+    #
+    # `render_field.py` already handles this the same way and says so
+    # (HANDOFF-78 3.4: CLAMP). Clamping on the READ side changes no bytes in
+    # the archive -- it only decides which colour we bake for a cell that is
+    # currently rendering out of the end of the palette table anyway.
+    if pal >= len(pal565):
+        pal = len(pal565) - 1
     p = pages[slot]
     if p.depth == 2:
         a = arrays[slot]
         st.from_vanilla += 1
-        return a[sy:sy + TILE, sx:sx + TILE].copy()
+        # A depth-2 source page is already at the destination size, so its
+        # cell is (TILE*scale)^2 and needs no upscale.
+        t = TILE * scale
+        return a[sy * scale:sy * scale + t, sx * scale:sx * scale + t].copy()
 
     pal = rec.get('pal', pal)
+    if pal >= len(pal565):                    # see the clamp note above
+        pal = len(pal565) - 1
     # BORROW PALETTE 0 WHEN THE EXACT PALETTE IS NOT SHIPPED.
     # THIS IS FFNx'S OWN RULE, AND IT IS ONLY VALID ON A TRUECOLOR DESTINATION.
     #
@@ -423,10 +573,18 @@ def source_cell(k, rec, pages, arrays, pal565, art_for, pals_for, st):
     if art is not None:
         st.from_art += 1
     elif art_for is not None and pal != 0:
-        art = art_for(slot, 0)
-        if art is not None:
-            src_pal = 0
-            st.from_art_borrow += 1
+        # ONLY BORROW WHEN PALETTE 0 IS THE SAME COLOUR. See BORROW_MAX_DIST.
+        # Measured over the indices THIS CELL actually draws, not the whole
+        # table -- a palette can differ wildly in entries the cell never uses.
+        if BORROW_MAX_DIST == float('inf') or _pal_distance(
+                pal565, pal,
+                arrays[slot][sy:sy + TILE, sx:sx + TILE]) <= BORROW_MAX_DIST:
+            art = art_for(slot, 0)
+            if art is not None:
+                src_pal = 0
+                st.from_art_borrow += 1
+        else:
+            st.borrow_refused += 1
 
     # THE RECOLOUR IS DISABLED. IT IS BROKEN, AND HERE IS WHY.
     #
@@ -446,24 +604,36 @@ def source_cell(k, rec, pages, arrays, pal565, art_for, pals_for, st):
     #
     # Do not re-enable this without the vanilla indices. It has cost one build.
     idx = arrays[slot][sy:sy + TILE, sx:sx + TILE]
-    zero = idx == 0
+    zero = _up(idx == 0, scale)
     if art is not None:
         buf = np.frombuffer(art.buf, np.uint16).reshape(art.px, art.px)
         s = art.px // 256
-        out = buf[sy * s:(sy + TILE) * s:s, sx * s:(sx + TILE) * s:s].copy()
+        # Take every texel the destination cell can hold. `step` is only >1
+        # when the art is BIGGER than the page -- e.g. 512px art into a 256px
+        # page -- and even then PageArt has already box-filtered the DDS down
+        # to `art.px`, so the stride is a last resort rather than the filter.
+        step = max(1, s // scale)
+        t = TILE * scale
+        out = buf[sy * s:sy * s + t * step:step,
+                  sx * s:sx * s + t * step:step].copy()
+        if out.shape != (t, t):                       # art smaller than asked
+            out = _up(buf[sy * s:(sy + TILE) * s, sx * s:(sx + TILE) * s],
+                      scale // max(1, s)).copy()
+        pal_ref = _up(pal565[pal][idx], scale)
         if src_pal != pal:
             # BORROWED. Keep the detail, take the colour from the palette this
             # cell actually names. See _detail_transfer.
-            out = _detail_transfer(out, pal565[pal][idx])
+            out = _detail_transfer(out, pal_ref)
         # Where the ART is transparent, fall back to the paletted pixel: the
         # mod's alpha is authoritative about its own art, not about what the
         # game draws there.
-        tm = art.tmask[sy * s:(sy + TILE) * s:s, sx * s:(sx + TILE) * s:s]
-        if tm.any():
-            out[tm] = pal565[pal][idx][tm]
+        tm = art.tmask[sy * s:sy * s + t * step:step,
+                       sx * s:sx * s + t * step:step]
+        if tm.shape == out.shape and tm.any():
+            out[tm] = pal_ref[tm]
     else:
         st.from_vanilla += 1
-        out = pal565[pal][idx].copy()
+        out = _up(pal565[pal][idx], scale).copy()
 
     # THE KEY SURVIVES THE MOVE. 0x0000 is the key in truecolor too --
     # MEASURED in the UNMODIFIED archive, which ships 435 truecolor cells
@@ -483,10 +653,83 @@ def source_cell(k, rec, pages, arrays, pal565, art_for, pals_for, st):
     out = (out & ~np.uint16(0x0020)).astype(np.uint16)
 
     out[out == FN.EMPTY] = FN.NEAR_BLACK      # colour that merely rounds to 0
-    if rec['key']:
-        out[zero] = FN.EMPTY                  # the real key, put back exactly
+    if rec['key'] and (rec.get('l2') or not PROMOTE_LAYER1_KEY):
+        # A REAL CUT-OUT: a layer-2+ overlay whose index 0 is meant to show
+        # what is behind it. Put the key back exactly.
+        out[zero] = FN.EMPTY
+    # On layer 1 index 0 is NOT a cut-out -- it is drawn, and its colour
+    # matters. Proved on hardware: setting entry 0 to black removed the
+    # Sector 6 yellow and put black speckles across Wall Market, which cannot
+    # happen if the index is discarded. So the colour above is kept as it is,
+    # lifted off 0x0000 by the line before this one so it cannot be mistaken
+    # for a key.
     return out
 
+
+# PROMOTE A LAYER-1 CELL THAT CONTAINS INDEX 0? DEFAULT OFF, AND HERE IS WHY
+# THE ANSWER IS NOT OBVIOUS.
+#
+# This module's constraint 2 says the layer-1 colour key is not a cut-out:
+# "Layer 1 has nothing behind it, so a 'transparent' pixel there was always
+# entry 0's colour; baking that colour is exactly equivalent." On that
+# reading, vetoing layer-1 keyed cells is a bug, and it costs a lot --
+# MEASURED over 265 vanilla fields, 22,378 of 62,646 keyed cells are layer-1
+# only, and allowing them lifts promotable cells 133,630 -> 155,456 (+16.3%).
+# At 512px over 187 fields it is +15.4% cells for +11% pages.
+#
+# BUT `field_bg_repack` RECORDS A MEASUREMENT AGAINST IT, in its own words:
+#
+#     "Baking entry 0's colour instead, on the theory that layer 1 has
+#      nothing behind it, is what I tried first: layer-1 tiles OVERLAP and
+#      the key is how an earlier one shows through a later one, so single
+#      pixels moved by up to 248 over 26 fields."
+#
+# Two claims in this codebase, opposite conclusions, both written as measured.
+# The difference may be real -- that note is about baking a colour into a
+# PALETTED page, this is about promoting a cell to truecolor -- or it may be
+# the same mistake twice. Nobody has run the A/B.
+#
+# So the code is here, gated, and off. Turning it on is a deliberate visual
+# experiment with a named prediction: if it is wrong, the fields to look at
+# are the 26 that note is about, and the symptom is a layer-1 tile losing the
+# pixels an overlapping neighbour used to show through.
+# A CELL THIS BLACK KEEPS ITS PALETTED PAGE. 0 disables the rule.
+#
+# THIS WAS DESIGNED, MEASURED, DOCUMENTED -- AND NEVER RAN. It lives in
+# `field_bg_repack.black_cell_threshold()`, which is read by
+# `PageArt.cell_opaque`, which is called by `field_bg_repack.upgrade()` --
+# the pass this module replaced. So `SEVENTH_NX_FIELD_BG_TRUE_BLACK` joined
+# the budget, the promotion flag and the partial flag as a control the build
+# log describes on every run while nothing acts on it.
+#
+# WHY IT MATTERS, and it is the cause of a visible artifact.
+#
+# A truecolor page has no index channel, so 0x0000 must mean transparent
+# (x86 0x6470E0). A black pixel therefore cannot be stored as black -- it is
+# lifted to NEAR_BLACK, which is now 0x0841 = RGB(8,8,8). On a promoted cell that
+# is invisible. At the BOUNDARY between a promoted cell and one that stayed
+# paletted it is not: true black meets 8/255 blue along a cell edge, and the
+# eye finds it immediately. That is the blue line in Men's Hall and the
+# patchy near-black squares in the reactor.
+#
+# The fix is the rule that was always meant to be here: a cell that is mostly
+# black has no detail to lose by staying paletted, so let it stay, and the
+# lift only ever lands on cells with a few stray black pixels among real
+# detail -- where it cannot be seen.
+#
+# The threshold's own measurements (field_bg_repack.black_cell_threshold):
+#
+#     reject cells that are   cells kept    black made TRUE black
+#          100% black           98.8%              22.1%
+#           25% black           92.5%              85.5%   <- default
+#            5% black           87.2%              98.1%
+#
+# 25% takes 85% of the benefit for 7.5% of the cells. Rejection is exactly
+# vanilla behaviour for that cell, so it cannot break anything: the cell keeps
+# the page it already had.
+TRUE_BLACK = 0.25
+
+PROMOTE_LAYER1_KEY = False
 
 MAX_TRUECOLOR_PAGES = 3
 _MAX_TOTAL_PAGES_DEFAULT = 12
@@ -568,7 +811,14 @@ def dense_repack(sec3, sec9, field='', art_for=None, pals_for=None, px=256,
 
     keys, fx_of = collect(sec9, pages, tiles)
     for k, rec in keys.items():
-        rec['pal'] = k[3] if -1 <= k[3] < npg else (k[3] % npg if npg else 0)
+        # BOUND BY THE ARRAY, NOT BY THE HEADER.
+        # `npg` is section 3's DECLARED palette count; `len(pal565)` is how
+        # many rows were actually built. When the two disagree -- and after
+        # the margin passes have rewritten section 3, they can -- `k[3] % npg`
+        # yields an index past the end of `pal565`, `source_cell` raises
+        # IndexError, and build.py logs the whole field as "not repacked".
+        _np = len(pal565)
+        rec['pal'] = k[3] if -1 <= k[3] < _np else (k[3] % _np if _np else 0)
         rec['key'] = _uses_key(pages, arrays, k)
     fx_cells = set(fx_of)
     for v in fx_of.values():
@@ -583,9 +833,39 @@ def dense_repack(sec3, sec9, field='', art_for=None, pals_for=None, px=256,
     # truecolor cells on layer 2 (`gldst`), which is not where these are.
     # This is the same rule `field_bg_repack.cells_transparent` applied, and
     # the build that had no speckles applied it.
+    # THE COLOUR-KEY VETO, NARROWED TO WHAT THE DOCSTRING ALWAYS SAID.
+    #
+    # Constraint 2 at the top of this module: "THE COLOUR KEY IS NOT A CUT-OUT
+    # ON LAYER 1 ... Layer 1 has nothing behind it, so a 'transparent' pixel
+    # there was always entry 0's colour; baking that colour is exactly
+    # equivalent. A cell used by any layer-2+ tile keeps 0x0000."
+    #
+    # The code did not do that. `_uses_key` asks only "does this cell contain
+    # index 0" and the filter vetoed every cell that does, layer 1 included --
+    # so the case the docstring explicitly calls safe was the one being
+    # refused. MEASURED over 265 vanilla fields:
+    #
+    #     depth-1 cells                     196,699
+    #     containing index 0                 62,646   (31.8%)
+    #        also drawn by a layer-2+ tile   40,268   <- real cut-outs, veto
+    #        LAYER 1 ONLY                    22,378   <- were vetoed anyway
+    #     promotable before                 133,630
+    #     promotable after                  155,456   (+16.3%)
+    #
+    # Layer-2+ keyed cells stay vetoed. Whether a truecolor page can carry a
+    # working cut-out at all is the open question (0x0000 on depth 2 -- this
+    # project has claims both ways and neither is settled), and answering it
+    # is not a prerequisite for the 22,378 cells above.
     cand = [k for k in keys
             if k not in fx_cells and pages[k[0]].depth == 1
-            and not keys[k]['key']]
+            and not (keys[k]['key']
+                     and (keys[k]['l2'] or not PROMOTE_LAYER1_KEY))]
+    if TRUE_BLACK > 0.0:
+        # See TRUE_BLACK. A mostly-black cell keeps its paletted page so that
+        # its black stays exactly black, instead of being lifted to 0x0001 and
+        # drawing a blue seam against its unpromoted neighbours.
+        cand = [k for k in cand
+                if black_fraction(arrays, pal565, k) < TRUE_BLACK]
     cand.sort(key=lambda k: (-len(keys[k]['tiles']), k))
     free_slots = [sl for sl in range(*BANDS[4]) if sl not in pages]
     # COUNT THE ONES ALREADY THERE. 26 vanilla pages across 400 fields are
@@ -593,6 +873,37 @@ def dense_repack(sec3, sec9, field='', art_for=None, pals_for=None, px=256,
     have_tc = sum(1 for p in pages.values() if p.depth == 2)
     room = max_total_pages() - len(pages)    # what the field can still afford
     cap = max(0, min(max_tc - have_tc, len(free_slots), room))
+    # THE PER-FIELD BYTE BUDGET, AND IT WAS DEAD UNTIL NOW.
+    #
+    # `field_bg_repack.budget_bytes()` was read only by `upgrade()`, which
+    # stopped being called when this pass replaced it -- so the GUI's
+    # "Field background budget (MB)" control changed nothing, exactly like
+    # "Field background promotion" did. MEASURED: zero references to `budget`
+    # in this module before this line.
+    #
+    # A page COUNT is the wrong unit once the page size moves. The same 12
+    # pages cost 4.56 MB at 256px and 18.00 MB at 512px, so a ceiling
+    # expressed in pages silently means something four times bigger the
+    # moment you change the size above it. Bytes do not do that.
+    #
+    # This bounds the TRUECOLOR half, which is the half that scales: at 512px
+    # a truecolor page is 1.50 MB against a paletted page's 0.31 MB, and
+    # build 20 measured mean 4.72 MB and a heaviest field of 12.31 MB where
+    # the last clean build was mean 1.87 MB and heaviest 4.75 MB.
+    try:
+        import field_bg_repack as _FR
+        _bud = _FR.budget_bytes()
+        if _bud < _FR.UNLIMITED:
+            # THE RUNTIME COST, not the stored size. A 512px truecolor page
+            # is 0.50 MB in the file and 1.50 MB once the engine builds its
+            # 32bpp surface from it (6*px^2), and it is the runtime figure
+            # the loader has to find. `_page_bytes` is the same function the
+            # build's cost report uses, so the budget and the report cannot
+            # disagree.
+            _page = _FR._page_bytes(px, 2)
+            cap = max(0, min(cap, int(_bud) // max(1, _page)))
+    except Exception:                                          # noqa: BLE001
+        pass
     if cap == 0:
         st.refused = 'already at the truecolor ceiling'
         return sec9, st
@@ -603,19 +914,35 @@ def dense_repack(sec3, sec9, field='', art_for=None, pals_for=None, px=256,
 
     dest = {}
     out = bytearray(sec9)
+    # THE DESTINATION PAGE IS `px` WIDE, NOT 256.
+    #
+    # This was hardcoded to 256 in three places -- the buffer, the write, and
+    # the Page it built -- so a 512px build produced 256px pages and every
+    # later pass, which is told `px`, then failed to parse the section.
+    # MEASURED: at 512px `field_bg_compact` raised "truncated pixels at slot
+    # 26" for essentially every field, i.e. COMPACTION WAS OFF for the whole
+    # archive, page counts grew ~2 per field, and that is what the black
+    # squares were.
+    #
+    # The tile COORDINATES stay in 256-space: a page holding the same layout
+    # at 2x carries identical u, v and extent (README-field-bg-512-MEASURED),
+    # so only the pixel buffer scales.
+    scale = max(1, px // 256)
+    side = GRID * TILE * scale
     for i, k in enumerate(chosen):
         pg, idx = divmod(i, PER_PAGE)
         slot = free_slots[pg]
         buf = dest.get(slot)
         if buf is None:
-            buf = dest[slot] = np.full((256, 256), FN.NEAR_BLACK, np.uint16)
+            buf = dest[slot] = np.full((side, side), FN.NEAR_BLACK, np.uint16)
         cy, cx = divmod(idx, GRID)
         try:
             cell = source_cell(k, keys[k], pages, arrays, pal565,
-                               art_for, pals_for, st)
+                               art_for, pals_for, st, scale)
         except Exception:                                      # noqa: BLE001
             continue
-        buf[cy * TILE:(cy + 1) * TILE, cx * TILE:(cx + 1) * TILE] = cell
+        t = TILE * scale
+        buf[cy * t:(cy + 1) * t, cx * t:(cx + 1) * t] = cell
         dx, dy = cx * TILE, cy * TILE
         for off in keys[k]['tiles']:
             out[off + T_TEXID] = slot
@@ -638,7 +965,7 @@ def dense_repack(sec3, sec9, field='', art_for=None, pals_for=None, px=256,
         if plist[sl] is not None and sl not in live and sl not in dest:
             plist[sl] = None
     for slot, buf in dest.items():
-        plist[slot] = FN.Page(slot, 0, 2, buf.tobytes(), 256)
+        plist[slot] = FN.Page(slot, 0, 2, buf.tobytes(), side)
     st.pages = len(dest)
     return FN.replace_texture_block(bytes(out), plist, tex_start, tex_end), st
 

@@ -200,7 +200,11 @@ def score_slot(img, cells, prgbs, quantise, npg):
         blk = img[sy * k:(sy + TILE) * k, sx * k:(sx + TILE) * k]
         if blk.shape[:2] != (TILE * k, TILE * k):
             continue
-        small = blk.reshape(TILE, k, TILE, k, 3).mean(axis=(1, 3))
+        # The art sources now hand back RGBA -- the 4th channel is the mod's
+        # own COVERAGE, which `ff7nx_marginart` uses to tell an atlas gap from
+        # a black pixel. This scorer only compares colour, so take RGB.
+        small = (np.ascontiguousarray(blk[..., :3])
+                 .reshape(TILE, k, TILE, k, 3).mean(axis=(1, 3)))
         if small.max() <= 24:                     # EMPTY SOURCE, see fill_field
             continue
         small = small.astype(np.uint8)

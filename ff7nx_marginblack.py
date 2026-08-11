@@ -99,7 +99,7 @@ user describes as correct. This module gives every other field the value the
 one correct field already has.
 
 Promotion to truecolor keeps it: `field_bg_native.rgb_to_565(0, 0, 8)`
-quantises to 0x0001, which is `NEAR_BLACK` in the depth-2 format, so the
+quantises to the depth-2 `NEAR_BLACK` (now 0x0841, RGB(8,8,8)), so the
 Cosmos repack running after this pass preserves the colour either way.
 
 ORDERING

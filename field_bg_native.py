@@ -115,7 +115,67 @@ def stored_bytes(px, depth):
     return PAGE_STORED_BYTES.get(px, px * px * 2)
 
 
-NEAR_BLACK = 0x0001          # blue 1/31 -- see below; MUST stay non-zero
+# THE DIMMEST NON-ZERO COLOUR THAT IS NOT A COLOUR.
+#
+# 0x0000 means transparent on a truecolor page, so a black pixel has to be
+# lifted off it. This was 0x0001 -- blue 8/255, and nothing else. MEASURED on
+# `mkt_mens`, counting every pixel the field actually draws:
+#
+#     vanilla   0x0001 =    400 px (0.28%)
+#     ours      0x0001 =  6,368 px (4.52%)
+#
+# FF7's field art is full of black outlines and shadow, and every one of them
+# inside a promoted cell became a BLUE outline. 4.5% of the picture, following
+# the art's own edges -- which is why it reads as blue LINES rather than as a
+# tint, and why TRUE_BLACK did not help: those cells are not mostly black,
+# they are detailed cells with black linework in them.
+#
+# THE FIX IS NOT HERE, IT IS IN THE SHADER, and changing this value was the
+# wrong instinct: it hides a mismatch by altering the art.
+#
+# `custom_shaders/hd/*.glsl` grades the picture with HD_BLACK_POINT, whose own
+# comment says it "undoes exactly the lift the quantiser fix introduced". It
+# was set to 0.014 = 3.5/255 while the lift is 8/255, so it undid less than
+# half of it and left 4.5/255 of PURE BLUE on every lifted pixel -- which is
+# the blue linework in Men's Hall. HD_BLACK_POINT is now 8/255 and both this
+# value and any other choice of dimmest-non-zero land on exactly (0,0,0).
+#
+# So this stays 0x0001, which is what the rest of the project documents.
+NEAR_BLACK = 0x0001          # blue 1/31 = 8/255; MUST stay non-zero
+# REVERTED to what build 30 shipped. The achromatic argument below is
+# still arithmetically right, but it went out in the same build as two
+# other unverified changes and the result was worse overall. It is a
+# one-line experiment to re-run ON ITS OWN once the baseline is good.
+# ACHROMATIC, NOT BLUE. 0x0001 is R0 G0 B8/255 -- pure blue -- and it was used
+# here for two builds. The shader's black point cannot remove it, and the
+# arithmetic is short enough to check:
+#
+#   `hd/2xsal_p.glsl` BLENDS BEFORE IT GRADES. A lifted texel is averaged with
+#   its neighbours by the 2xSaL filter and only then does `hd_grade_rgb` run:
+#
+#       lifted 0x0001 (0, 0, 0.0314) blended 50/50 with a mid-grey neighbour
+#         -> (0.2500, 0.2500, 0.2657)
+#       black point:  max(c - 0.03137, 0) / 0.96863
+#         -> (0.2256, 0.2256, 0.2418)        blue excess 0.0162 = 4.1/255
+#       HD_SATURATION 1.05 then pushes it further out
+#
+#   A UNIFORM SUBTRACT CANNOT REMOVE A PER-CHANNEL OFFSET FROM A BRIGHT PIXEL.
+#   It only zeroes a pixel lying entirely below the black point -- a flat black
+#   area. Edges are not flat black areas, and edges are where the lift lands:
+#   FF7's field art is full of black linework, so every outline inside a
+#   promoted cell picked up a blue rim. That is the "blue edging on textures"
+#   reported from Men's Hall, and it is why raising HD_BLACK_POINT from 0.014
+#   to 0.03137 did not remove it.
+#
+# 0x0841 is the same 8/255 floor with no hue: R 1/31 = 8, G 2/63 = 8, B 1/31 = 8.
+# Green's LSB is clear (G = 2), so the 0x07E0 smear rule below still holds.
+#
+# THE EARLIER GREY TEST FAILED FOR A DIFFERENT REASON. 0x0841 was tried once
+# and rejected as "looking grey and weird" -- correctly, because that build ran
+# HD_BLACK_POINT at 0.014, which leaves 4.5/255 of grey standing in every flat
+# black area. Grey lift and the 0.03137 black point have never been in the same
+# build. Together the flats crush to exactly 0 and the edges carry a neutral
+# 4/255 instead of a blue one.
 # The dimmest non-zero colour R5G6B5 can express, and the reason it has to be
 # non-zero at all:
 #
@@ -169,7 +229,38 @@ GREEN_LSB = 0x3E                     # mask applied to the 6-bit green field
 
 # slot -> blend group, per field_load_textures
 D1_GROUPS = ((0x00, 0x0F, 4), (0x0F, 0x18, 1), (0x18, 0x1A, 0))
-D2_GROUPS = ((0x1A, 0x21, 4), (0x21, 0x28, 1), (0x28, 0x2A, 0))
+# HOW MANY TRUECOLOR SLOTS THE OPAQUE BAND ACTUALLY HAS.
+#
+# This was 0x1A..0x21 -- seven slots, 26 through 32 -- and that is what the
+# x86 slot comparisons in `field_load_textures` imply (`cmp eax, 0x21`,
+# `cmp ecx, 0x28`). But those comparisons pick a BLEND MODE. They do not say
+# a slot is loadable.
+#
+# MEASURED across the ENTIRE vanilla archive, 709 fields: every depth-2 page
+# the shipping game contains lives in slot 26, 27 or 28.
+#
+#     slot 26: 26 pages    slot 27: 21 pages    slot 28: 4 pages
+#     slot 29+: NONE
+#
+# And our builds fail exactly when they cross it. The build that had no black
+# squares (`MAX_TRUECOLOR_PAGES = 3`) could only ever reach slots 26-28. Every
+# build since raised the ceiling, put pages in 29 and above, and produced
+# squares -- 159 of 709 fields in the current one. In Wall Market, `mkt_mens`
+# uses {26,27,28} and loads; `mrkt1`, `mrkt2` and `mrkt4` use {26..30} and do
+# not.
+#
+# So `MAX_TRUECOLOR_PAGES = 3` was never "the density measured on hardware".
+# It was the width of this band, and nobody knew that is what they were
+# measuring.
+#
+# THIS IS THE CONSERVATIVE READING AND IT IS DELIBERATE. If slots 29-32 turn
+# out to be loadable after all, widening this back is one number -- and the
+# evidence for widening it would have to be a build that puts a page there
+# and draws it, which is exactly the test that keeps failing.
+D2_OPAQUE_SLOTS = 3
+
+D2_GROUPS = ((0x1A, 0x1A + D2_OPAQUE_SLOTS, 4), (0x21, 0x28, 1),
+             (0x28, 0x2A, 0))
 
 TILE_SIZE = 52               # verified by round-trip over all 709 fields
 TILE_TEXTURE_ID = 32
@@ -341,8 +432,8 @@ def rgb_to_565(r, g, b, a=255, alpha_cut=8, black_ok=False):
 
     `black_ok` keeps genuine black as 0x0000. NEAR_BLACK exists only because
     EMPTY used to double as the transparency sentinel for the per-cell opacity
-    gate, so black had to be nudged off it -- but NEAR_BLACK is R0 G8 B0, a
-    dark GREEN, and it was 17.4% of every truecolor pixel in nmkin_1. The gate
+    gate, so black had to be nudged off it -- and it was 17.4% of every
+    truecolor pixel in nmkin_1, so its exact value matters. The gate
     reads the art's alpha now (PageArt.tmask), so callers writing art should
     pass black_ok=True. Rounds rather than truncates, onto the level*8 grid the
     engine reconstructs.

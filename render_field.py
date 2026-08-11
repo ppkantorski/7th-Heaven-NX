@@ -42,6 +42,7 @@ if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
 import field_bg_native as FN
+import diag_common as _DC
 import ff7nx_marginblack as MB
 import lgp
 
@@ -70,11 +71,27 @@ def _d2_rgb(buf):
                      ((v & 31) << 3).astype(np.uint8)], -1)
 
 
-def render(raw, layers=(1, 2), px=256):
-    """(H, W, 3) uint8, and the (x0, y0) of the canvas in game units."""
+def render(raw, layers=(1, 2), px=None):
+    """
+    (H, W, 3) uint8, and the (x0, y0) of the canvas in game units.
+
+    `px` is the size depth-2 pages use in THIS section. Pass None -- the
+    default -- to detect it.
+
+    DETECT, DO NOT ASSUME. This defaulted to 256 and every caller took the
+    default, so from the moment the build started emitting 512px truecolor
+    pages beside 256px paletted ones this function raised `Section9Error slot
+    27 has depth 4356` on every field of every build and rendered nothing.
+    That is the whole diagnostic blind: the one tool that can say WHICH pass
+    put a pixel on screen stopped opening the archive we were arguing about,
+    and the argument continued without it for four builds.
+    """
     parts = lgp.split_sections(raw)
     sec9 = parts[8]
-    pages, tex_start, _ = FN.parse_texture_block(sec9, px)
+    if px is None:
+        pages, tex_start, _, px = _DC.parse_pages(sec9)
+    else:
+        pages, tex_start, _ = FN.parse_texture_block(sec9, px)
     pmap = {p.slot: p for p in pages if p is not None}
     pal = _pal_rgb(parts[3])
     npg = pal.shape[0]
@@ -88,7 +105,7 @@ def render(raw, layers=(1, 2), px=256):
                                 .reshape(p.px, p.px))
 
     todo = []
-    for layer, offs in __import__('diag_common').walk_layers(
+    for layer, offs in _DC.walk_layers(
             sec9, sec9.find(b'BACK'), tex_start):
         if layer not in layers:
             continue
@@ -161,7 +178,8 @@ def main(argv=None):
     ap.add_argument('fields', nargs='+')
     ap.add_argument('--against', help='second archive; renders A | B | diff')
     ap.add_argument('--layers', default='1,2')
-    ap.add_argument('--px', type=int, default=256)
+    ap.add_argument('--px', type=int, default=None,
+                    help='depth-2 page size; detected per archive when omitted')
     ap.add_argument('-o', '--out', default='field_render.png')
     a = ap.parse_args(argv)
     layers = tuple(int(x) for x in a.layers.split(','))
