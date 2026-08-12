@@ -115,67 +115,46 @@ def stored_bytes(px, depth):
     return PAGE_STORED_BYTES.get(px, px * px * 2)
 
 
-# THE DIMMEST NON-ZERO COLOUR THAT IS NOT A COLOUR.
+# THE DIMMEST NON-ZERO COLOUR THAT IS NOT A COLOUR. FINDINGS-132.
 #
-# 0x0000 means transparent on a truecolor page, so a black pixel has to be
-# lifted off it. This was 0x0001 -- blue 8/255, and nothing else. MEASURED on
-# `mkt_mens`, counting every pixel the field actually draws:
+# 0x0000 means transparent on a truecolor page (x86 0x6470E0), so a black pixel
+# has to be lifted off it. A paletted page never needs this: black is an INDEX
+# and transparency is index 0, a separate channel -- which is exactly why the
+# picture looks right with truecolor off and wrong with it on.
+#
+# The lift was 0x0001 = RGB(0,0,8) -- PURE BLUE, chosen because blue has the
+# lowest luminance of the single-bit options (0.9/255 against 4.7 for green).
+# Luminance was never the problem. MEASURED on `mkt_mens`, every pixel the
+# field draws:
 #
 #     vanilla   0x0001 =    400 px (0.28%)
 #     ours      0x0001 =  6,368 px (4.52%)
 #
-# FF7's field art is full of black outlines and shadow, and every one of them
-# inside a promoted cell became a BLUE outline. 4.5% of the picture, following
-# the art's own edges -- which is why it reads as blue LINES rather than as a
-# tint, and why TRUE_BLACK did not help: those cells are not mostly black,
-# they are detailed cells with black linework in them.
+# FF7's field art is full of black linework, so 4.5% of the picture followed
+# the art's own edges in blue -- which is why it reads as blue LINES and not as
+# a tint, and why TRUE_BLACK did not help: those cells are detailed, not mostly
+# black.
 #
-# THE FIX IS NOT HERE, IT IS IN THE SHADER, and changing this value was the
-# wrong instinct: it hides a mismatch by altering the art.
+# AND A UNIFORM BLACK POINT CANNOT REMOVE IT. `custom_shaders/hd/*.glsl` BLENDS
+# BEFORE IT GRADES -- 2xSaL averages the lifted texel with its neighbours, then
+# hd_grade_rgb runs -- so the lift ends up inside BRIGHT pixels, where
+# subtracting a constant leaves the per-channel offset behind and HD_SATURATION
+# pulls the hue further out.
 #
-# `custom_shaders/hd/*.glsl` grades the picture with HD_BLACK_POINT, whose own
-# comment says it "undoes exactly the lift the quantiser fix introduced". It
-# was set to 0.014 = 3.5/255 while the lift is 8/255, so it undid less than
-# half of it and left 4.5/255 of PURE BLUE on every lifted pixel -- which is
-# the blue linework in Men's Hall. HD_BLACK_POINT is now 8/255 and both this
-# value and any other choice of dimmest-non-zero land on exactly (0,0,0).
+# So the lift must be ACHROMATIC, not merely dim. 0x0841 is R1 G2 B1 =
+# RGB(8,8,8), green's LSB clear so the 0x07E0 smear rule still holds, paired
+# with HD_BLACK_POINT = 0.03137 = 8/255 sized to cancel exactly this lift:
+# flat black crushes to 0, blended edges keep a neutral 4/255 instead of blue.
 #
-# So this stays 0x0001, which is what the rest of the project documents.
-NEAR_BLACK = 0x0001          # blue 1/31 = 8/255; MUST stay non-zero
-# REVERTED to what build 30 shipped. The achromatic argument below is
-# still arithmetically right, but it went out in the same build as two
-# other unverified changes and the result was worse overall. It is a
-# one-line experiment to re-run ON ITS OWN once the baseline is good.
-# ACHROMATIC, NOT BLUE. 0x0001 is R0 G0 B8/255 -- pure blue -- and it was used
-# here for two builds. The shader's black point cannot remove it, and the
-# arithmetic is short enough to check:
-#
-#   `hd/2xsal_p.glsl` BLENDS BEFORE IT GRADES. A lifted texel is averaged with
-#   its neighbours by the 2xSaL filter and only then does `hd_grade_rgb` run:
-#
-#       lifted 0x0001 (0, 0, 0.0314) blended 50/50 with a mid-grey neighbour
-#         -> (0.2500, 0.2500, 0.2657)
-#       black point:  max(c - 0.03137, 0) / 0.96863
-#         -> (0.2256, 0.2256, 0.2418)        blue excess 0.0162 = 4.1/255
-#       HD_SATURATION 1.05 then pushes it further out
-#
-#   A UNIFORM SUBTRACT CANNOT REMOVE A PER-CHANNEL OFFSET FROM A BRIGHT PIXEL.
-#   It only zeroes a pixel lying entirely below the black point -- a flat black
-#   area. Edges are not flat black areas, and edges are where the lift lands:
-#   FF7's field art is full of black linework, so every outline inside a
-#   promoted cell picked up a blue rim. That is the "blue edging on textures"
-#   reported from Men's Hall, and it is why raising HD_BLACK_POINT from 0.014
-#   to 0.03137 did not remove it.
-#
-# 0x0841 is the same 8/255 floor with no hue: R 1/31 = 8, G 2/63 = 8, B 1/31 = 8.
-# Green's LSB is clear (G = 2), so the 0x07E0 smear rule below still holds.
-#
-# THE EARLIER GREY TEST FAILED FOR A DIFFERENT REASON. 0x0841 was tried once
-# and rejected as "looking grey and weird" -- correctly, because that build ran
-# HD_BLACK_POINT at 0.014, which leaves 4.5/255 of grey standing in every flat
-# black area. Grey lift and the 0.03137 black point have never been in the same
-# build. Together the flats crush to exactly 0 and the edges carry a neutral
-# 4/255 instead of a blue one.
+# IT WAS TRIED ONCE AND REJECTED AS "GREY AND WEIRD" -- correctly, because that
+# build ran the black point at 0.014, which leaves grey standing in every flat
+# black area. The grey lift and the 8/255 black point have NEVER been in the
+# same build. Both move together or neither does.
+NEAR_BLACK = 0x0841          # ACHROMATIC R1 G2 B1 = RGB(8,8,8) in 565.
+#                            # Green LSB clear, so the 0x07E0 smear rule holds.
+#                            # Paired with HD_BLACK_POINT = 0.03137 = 8/255,
+#                            # which is sized to cancel exactly this lift.
+#                            # FINDINGS-132; the reasoning is below.
 # The dimmest non-zero colour R5G6B5 can express, and the reason it has to be
 # non-zero at all:
 #
@@ -288,6 +267,12 @@ class Page:
                 % (self.slot, self.size_flag, self.depth, self.px, self.px))
 
 
+# Section 9's terminator. `blackbgb` writes it three times and
+# `blackbgb.xone` twice; every other field writes it once. See the note at the
+# end of parse_texture_block.
+END_MARKER = b'ENDFINAL FANTASY7'
+
+
 def parse_texture_block(sec9, px=VANILLA_PX):
     """
     (pages, tex_start, tex_end) where `pages` has BG_MAX_PAGES entries, each
@@ -327,6 +312,42 @@ def parse_texture_block(sec9, px=VANILLA_PX):
         # size needs is a storage detail and never reaches a caller.
         pages.append(Page(slot, size_flag, depth, sec9[o:o + nbytes], side))
         o += nstored
+    # WHAT `blackbgb` IS, SO NOBODY HAS TO WONDER AGAIN. (FINDINGS-125)
+    #
+    # This check catches a DESYNCHRONISED walk: a wrong `px` reads pixel data as
+    # headers and ends nowhere near the end of the block, so requiring the walk
+    # to land near it is what makes a wrong size fail loudly instead of silently
+    # returning garbage.
+    #
+    # Two fields fall foul of it, in VANILLA, byte-identically in our build --
+    # `blackbgb` (148 trailing bytes) and `blackbgb.xone` (134). Their section 9
+    # writes the terminator `ENDFINAL FANTASY7` two or three times over with
+    # zero padding, where the rest of the game writes it once. A 1997 data
+    # quirk. We are not corrupting them; we are declining to read them, and the
+    # `! ... 2 field(s) not changed` warnings in every build are exactly that.
+    #
+    # MEASURED, trailing bytes over all 709 vanilla fields:
+    #
+    #        3 bytes  583 fields   (just `END`)      20 bytes  1 field (las2_1)
+    #       17 bytes  124 fields   (the full marker) 22 bytes  1 field (fship_4)
+    #      134 bytes    1 field    (blackbgb.xone)
+    #      148 bytes    1 field    (blackbgb)
+    #
+    # I TRIED TO WIDEN THIS AND IT WAS A MISTAKE. Matching "the tail must be
+    # terminators and zeros" rejected 704 of 709 fields, because the usual
+    # terminator is the three bytes `END`, not the full string. Matching
+    # prefixes instead fixed those but broke `fship_4` and `las2_1`, whose tails
+    # are the full marker followed by a SUFFIX fragment -- `...FANTASY7TASY7`,
+    # `...FANTASY7SY7`. Fixing two fields by breaking two others is not a fix.
+    #
+    # And the prize was never worth it: both are BLACK BACKGROUND fields used
+    # for fades. There is no margin art to add to a black screen, so skipping
+    # them costs nothing visually. The warnings are noise, not damage.
+    #
+    # Left exactly as it was. If it is ever revisited, the rule has to accept
+    # arbitrary marker FRAGMENTS, and it needs to be checked against all 709
+    # fields before it ships -- both of my attempts passed the two fields I was
+    # looking at and failed the archive.
     if not 0 <= n - o <= 64:
         raise Section9Error('TEXTURE block leaves %d trailing bytes' % (n - o))
     return pages, start, o
@@ -352,6 +373,59 @@ def build_texture_block(pages):
         if pad:
             out.append(b'\0' * pad)
     return b''.join(out)
+
+
+def scrub_green_lsb(pages):
+    """
+    Clear the green LSB on every depth-2 texel. Returns texels changed.
+
+    THE INVARIANT IS DOCUMENTED, VANILLA SATISFIES IT, AND WE BREAK IT.
+
+    The engine's non-565 display path (x86 0x63F350) shifts six bits of green
+    into a five-bit field and ORs green's low bit onto the TOP BIT OF BLUE. A
+    texel with 0x0020 set therefore gains a large blue component on that path.
+    `field_bg_dense` masks its own output twice for this reason.
+
+    MEASURED on the shipped build, 5 fields -- `blin67_4`, `fr_e`, `cosmo`,
+    `astage_b`, `cosmo2` -- 2.2 million texels, whole pages at a time:
+
+        vanilla blin67_4 slot 26   green LSB set on   0% of texels
+        ours    blin67_4 slot 26   green LSB set on 100%
+
+    and every value is EXACTLY vanilla's plus 0x0020, with the same 1,324
+    distinct values:
+
+        vanilla 0x398E -> ours 0x39AE      vanilla 0x4002 -> ours 0x4022
+        vanilla 0x39D0 -> ours 0x39F0      vanilla 0x414C -> ours 0x416C
+
+    So something ORs 0x0020 across whole pages. It is NOT `resize_depth2` --
+    that moves 2-byte units and never interprets them, verified by running it
+    on the vanilla page and getting 0% odd out. **The writer has not been
+    found.** One page of `blin67_4` is filled entirely with the constant
+    0x0020, which is the exact value the comment above `PAGE_STORED_BYTES`
+    warns against, and the constant that comment documents no longer exists in
+    this file -- it was deleted and its rationale left behind. That is the
+    thread to pull next.
+
+    This is a BACKSTOP, not the fix. It clears one bit of green -- below the
+    8-bit quantisation step, the same argument `field_bg_dense` already makes
+    for masking its own output -- so it cannot make anything worse, and it
+    restores the invariant whatever wrote it. The counter it returns is how we
+    find out if the real writer is ever fixed: it should fall to zero.
+    """
+    import numpy as _np
+    n = 0
+    for i, p in enumerate(pages):
+        if p is None or p.depth != 2:
+            continue
+        a = _np.frombuffer(p.data, _np.uint16)
+        bad = int((a & 0x0020).astype(bool).sum())
+        if not bad:
+            continue
+        n += bad
+        pages[i] = Page(p.slot, p.size_flag, p.depth,
+                        (a & _np.uint16(0xFFDF)).tobytes(), p.px)
+    return n
 
 
 def replace_texture_block(sec9, pages, tex_start, tex_end):

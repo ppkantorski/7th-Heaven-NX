@@ -247,7 +247,40 @@ class Archive:
         self.index = {e['name'].lower(): e for e in self.entries}
 
     def names(self):
-        return set(self.index)
+        """
+        Entry names, SORTED. Never a set.
+
+        THIS RETURNED A SET, AND IT MADE THE WHOLE BUILD NON-REPRODUCIBLE.
+
+        Python randomises string hashing per process (PYTHONHASHSEED), so a
+        set of names iterates in a different order in every run. Eleven passes
+        walk `names()` directly -- `ff7nx_marginart`, `ff7nx_marginpage`,
+        `ff7nx_palkey`, `ff7nx_ws`, `ff7nx_bgkey`, `ff7nx_vclip` and more --
+        and at least `ff7nx_palkey` carries state across fields, so the order
+        changed its decisions.
+
+        MEASURED across four builds, the palette key's own counter:
+
+            build 33  3,796 palette(s) LEFT ALONE
+            build 34  3,847
+            build 35  3,861
+            build 36  3,883        <- and build 36 changed ONE LOG LINE
+
+        Build 36 altered no archive logic whatsoever and still moved it by 22.
+        Two builds of identical settings did not produce identical archives,
+        which means part of every log diff this project has ever done was
+        noise, and a different set of ~20 palettes got de-fringed each time.
+
+        It also explains the note in `field_bg_pagecap.clamp_palettes`: "a
+        second reading of the same archive with the same call reported 0 tiles
+        repointed where the first reported 14, which means my own measurement
+        of this is not stable". It was not the measurement. It was this.
+
+        Sorted is the fix. No caller does set algebra on the result -- every
+        one of them either iterates it or immediately sorts it -- so a list is
+        a straight superset of what they used.
+        """
+        return sorted(self.index)
 
     def is_field(self, entry):
         p = entry['payload']

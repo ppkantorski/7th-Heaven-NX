@@ -96,6 +96,8 @@ import struct
 import sys
 from collections import defaultdict
 
+import numpy as np
+
 _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
@@ -148,22 +150,97 @@ TILE = 16
 #
 # 103 fields are over by file count; only these 25 are one screen, so the
 # other 78 keep the grandfathering and cost nothing.
-SINGLE_SCREEN_HARD_CAP = True
+#
+# ---------------------------------------------------------------- FINDINGS-123
+# "DOES THE FIELD FIT ON ONE SCREEN" WAS A HEURISTIC. THE MEASUREMENT IS BETTER.
+#
+# Build 34 shipped the single-screen test above. It fixed md8_1 -- 12 black
+# tiles down to 2, and the one that stayed was predicted -- but it only ever
+# looked at the 202 fields whose whole tile grid fits in a window. The quantity
+# `add_page_tile` actually counts is the tiles submitted THIS FRAME, which is
+# the tiles inside the camera window wherever the camera happens to be. That is
+# directly measurable and needs no heuristic and no slack constant.
+#
+# MEASURED with a sliding window over the tile grid, all 709 fields:
+#
+#     VANILLA   fields with any page over 256 in-window        0
+#               vanilla's maximum in-window, anywhere         256
+#     OURS      fields with any page over 256 in-window       27
+#               total tiles over                           2,682
+#
+# Vanilla never exceeds 256 in a window, in any field, at any camera position,
+# and it reaches EXACTLY 256. The original tooling packed right up to the limit
+# and never past it. That is the invariant, measured rather than assumed, and
+# it also validates the window itself: were it too generous, vanilla would come
+# out over. It does not, in 709 fields.
+#
+# Nine of the 27 are ordinary scrolling fields the single-screen test cannot
+# see at all -- trnad_3 355, ghotel 349, datiao_8 326, junpb_3 296, qd 267,
+# blin63_1 264, games 262, trnad_4 261, delmin1 257.
+#
+# The window rule is a strict SUPERSET of the single-screen rule: a field that
+# fits inside the window has exactly one window position, so its in-window
+# count is its total count. Nothing the old rule caught can be missed.
+WINDOW_HARD_CAP = True
 
-# The 16:9 field window in game units, and the slack that still counts as one
-# screen. 426x240 is the visible window, measured by aligning render_field's
-# output to a 1280x720 capture (best MAD at x0 = -213, y0 = -120). The widened
-# tile extent is 448x240 -- 22px wider than the window, which is the widening's
-# own overshoot and not a scroll, so the slack has to cover it.
+# The 16:9 field window in game units. Measured by aligning render_field's
+# output to a 1280x720 capture -- best MAD at x0 = -213, y0 = -120, so the
+# visible field is dx -213..212 by dy -120..119.
+WINDOW_W = 426
+WINDOW_H = 240
+
+# Retired with FINDINGS-123, kept so an old settings.json and any caller that
+# still names them keep working. `SINGLE_SCREEN_HARD_CAP` is read as a fallback
+# for `WINDOW_HARD_CAP` by the settings loader, nothing else.
+SINGLE_SCREEN_HARD_CAP = True
 SINGLE_SCREEN_W = 426
 SINGLE_SCREEN_H = 240
 SINGLE_SCREEN_SLACK = 32
 
+# ---------------------------------------------------------------- FINDINGS-123
+# THE SPLITTER WRITES THE TEXTURE ID. THIRTEEN PAGES BIND THROUGH THE FX BYTE.
+#
+# `cap_section9` repoints `T_TEXID` at tile offset 32. A tile that carries an
+# fx page binds the FX page, so a page reached only that way is invisible to
+# the splitter -- it is measured as over, and then refused.
+#
+# That set holds the worst offenders in the archive:
+#
+#     nivl_b22 p20 716   nivl_b2 p20 700   las0_2 p21 547, p17 261
+#     ujunon5  p20 469   ancnt2  p19 458   sininb34 p15 457, p16 297
+#     ujunon4  p20 417   las4_0  p19 336, p20 320   sininb35 p15 269, p16 264
+#     spipe_1  p15 262   junone5 p16 260   las4_1 p18 260   md_e1 p15 258
+#
+# Every one has 1-7 free slots in its OWN band, so the split is possible; only
+# the byte is wrong.
+#
+# OFF BY DEFAULT. This is the one change in this file that writes a byte no
+# pass has written before, and an fx page carries blend and animation state.
+# The duplicate is byte-for-byte and the band guard already refuses a move
+# across groups, so it should be safe -- but "should be" is what the four
+# regressions in HANDOFF-121 3.6 were built on. It gets its own build.
+FX_SPLIT = False
+
+# ---------------------------------------------------------------- FINDINGS-126
+# WHEN THERE IS NO FREE SLOT, LOOK AT THE PAGES THAT ARE ALREADY THERE.
+#
+# The cap has only ever known one move: duplicate an over-full page into a free
+# slot and repoint the excess. When the band is full it gives up and reports
+# "no free slot in the 42-page array". True, and beside the point -- the pages
+# already in that band are packed very unevenly:
+#
+#     rckt3    p26 256 in-window   p27 272 OVER   p28   2, 254 free cells
+#     junair2  p26 256             p27 367 OVER   p28  25, 231 free
+#     spipe_2  p26 257 OVER        p27 256        p28 101, 155 free
+#
+# There is room for all of them without adding a page. See `relocate_cells`.
+RELOCATE_CELLS = True
+
 
 class CapStats:
     __slots__ = ('pages_before', 'pages_added', 'tiles_moved', 'over',
-                 'refused', 'fx_over', 'single_screen', 'ss_pages',
-                 'ss_tiles')
+                 'refused', 'fx_over', 'window_over', 'ss_pages',
+                 'ss_tiles', 'strategy', 'relocated')
 
     def __init__(self):
         self.pages_before = 0
@@ -172,9 +249,11 @@ class CapStats:
         self.over = {}            # slot -> tile count before the split
         self.refused = []         # (slot, tiles) we could not split
         self.fx_over = {}         # fx slot -> tile count, reported only
-        self.single_screen = {}   # FINDINGS-122: slot -> binding tiles, the
-        #                           pages the hard 256 caught that the
-        #                           grandfathered cap let through
+        self.window_over = {}     # FINDINGS-123: slot -> tiles binding it in
+        #                           the worst window; the pages the hard 256
+        #                           caught that the grandfathered cap let
+        #                           through. Named `single_screen` in build
+        #                           34, when the test was an extent heuristic.
         # ATTRIBUTABLE to the single-screen rule alone -- what this field
         # would NOT have cost without it. `pages_added` is the field's total
         # and counts work the grandfathered cap was already doing; reporting
@@ -182,6 +261,8 @@ class CapStats:
         # (46 pages / 3,851 tiles claimed against 12 / 537 actually added).
         self.ss_pages = 0
         self.ss_tiles = 0
+        self.strategy = {}        # slot -> 'sequential' | 'round-robin'
+        self.relocated = {}       # slot -> cells moved into an existing page
 
     def __bool__(self):
         return bool(self.pages_added or self.refused)
@@ -240,6 +321,76 @@ def effective_counts(sec9, src_px=None):
         fx = sec9[off + T_FX_PAGE]
         out[fx if (fx and fx in present) else sec9[off + T_TEXID]] += 1
     return dict(out)
+
+
+def binding_positions(sec9, src_px=None):
+    """{page slot: [(dstx, dsty), ...]} for the tiles that BIND each page."""
+    d2px = src_px if src_px is not None else FN.VANILLA_PX
+    pages, tex_start, _tex_end = FN.parse_texture_block(sec9, d2px)
+    present = {s for s, p in enumerate(pages) if p is not None}
+    spans = FN._layer_tile_spans(sec9, sec9.find(b'BACK'), tex_start)
+    out = defaultdict(list)
+    for off in spans:
+        fx = sec9[off + T_FX_PAGE]
+        slot = fx if (fx and fx in present) else sec9[off + T_TEXID]
+        out[slot].append((struct.unpack_from('<h', sec9, off + T_DSTX)[0],
+                          struct.unpack_from('<h', sec9, off + T_DSTY)[0]))
+    return dict(out)
+
+
+def _worst_window(pts, win_w, win_h):
+    """
+    The most tiles of `pts` that any win_w x win_h window can contain.
+
+    Tiles sit on a 16-unit grid whose origin is the field's, not zero -- md8_1
+    is dx = -224 + 16k, dy = -120 + 16k, so dy % 16 == 8. Floor division keeps
+    the grid consecutive whatever the origin is; snapping with `v // 16 * 16`
+    against an assumed origin does not, and that mistake silently matches zero
+    tiles.
+
+    A window of `win_w` can straddle at most `ceil(win_w / 16) + 1` columns, so
+    that is the box swept over the grid. It is an upper bound by at most one
+    row and column -- deliberately, since being early is the safe direction --
+    and vanilla still comes out at exactly 256, never over.
+    """
+    arr = np.asarray(pts, np.int64)
+    gx = arr[:, 0] // TILE
+    gy = arr[:, 1] // TILE
+    gx -= gx.min()
+    gy -= gy.min()
+    w = int(gx.max()) + 1
+    h = int(gy.max()) + 1
+    cols = -(-win_w // TILE) + 1
+    rows = -(-win_h // TILE) + 1
+    if w <= cols and h <= rows:
+        return len(pts)                     # the whole page fits in one window
+    grid = np.zeros((h, w), np.int64)
+    np.add.at(grid, (gy, gx), 1)
+    ps = np.zeros((h + 1, w + 1), np.int64)
+    ps[1:, 1:] = grid.cumsum(0).cumsum(1)
+    best = 0
+    for y in range(max(1, h - rows + 1)):
+        y2 = min(y + rows, h)
+        band = ps[y2] - ps[y]
+        for x in range(max(1, w - cols + 1)):
+            x2 = min(x + cols, w)
+            n = int(band[x2] - band[x])
+            if n > best:
+                best = n
+    return best
+
+
+def window_counts(sec9, src_px=None, win_w=None, win_h=None):
+    """
+    {page slot: the most tiles binding it inside any one camera window}.
+
+    This is what `add_page_tile` counts: calls per submitted tile, and a tile
+    is submitted when it is in frame. See the FINDINGS-123 note above.
+    """
+    win_w = WINDOW_W if win_w is None else win_w
+    win_h = WINDOW_H if win_h is None else win_h
+    return {s: _worst_window(p, win_w, win_h)
+            for s, p in binding_positions(sec9, src_px).items() if p}
 
 
 def tile_extent(sec9, src_px=None):
@@ -326,25 +477,281 @@ def effective_cap(vanilla_sec9=None, src_px=None,
     return max(max_tiles, max(main.values()) if main else 0)
 
 
-def single_screen_over(sec9, src_px=None, max_tiles=MAX_TILES_PER_PAGE):
+def plan_split(items, cap, max_copies, win_w=None, win_h=None,
+               also_limit_total=False):
     """
-    {slot: binding tiles} for the pages a SINGLE-SCREEN field puts over the
-    hard 256, or {} when the rule does not apply.
+    How to divide one over-full page's tiles across `1 + max_copies` pages.
 
-    This is the whole of FINDINGS-122's change. It is additive: it can only
-    ever add pages to the `over` set that `effective_cap`'s grandfathering
-    let through, and only in a field where every tile is submitted every
-    frame, and only for pages vanilla's own tooling never overfills.
+    `items` is [(offset, dstx, dsty), ...]. Returns (groups, strategy) where
+    groups[0] stays on the source page and the rest each take a copy, or
+    (None, None) when no plan fits in the copies available.
+
+    TWO STRATEGIES, SEQUENTIAL TRIED FIRST AND AT EVERY SIZE.
+
+    Sequential -- chunks of `cap` in section-9 order -- is what the splitter
+    has always done, so trying it first at each k means every page the cap
+    already handles is divided exactly as before. Nothing that works changes.
+
+    It has a flaw the total-count era could not see: section-9 order is roughly
+    raster order, so a sequential chunk is a spatially CONTIGUOUS band, and a
+    camera window sitting over that band still draws nearly all of it. Cutting
+    a page in two can leave the in-window count almost untouched.
+
+    Round-robin over tiles sorted by screen position spreads every window's
+    tiles evenly across the copies instead. MEASURED, worst in-window count
+    after the split:
+
+        nivl_b22 p20  852 tiles   sequential 232   round-robin 179
+        nivl_b2  p20  836 tiles   sequential 232   round-robin 175
+        las0_2   p21  547 tiles   sequential 256   round-robin 183
+        ancnt2   p19  522 tiles   sequential 224   round-robin 153
+
+    which matters because it can need FEWER pages, and free slots are the
+    binding constraint: `nivl_b2` and `nivl_b22` need 4 pages sequentially and
+    3 round-robin, and have exactly 2 free slots in their band. Sequential
+    cannot fix the two worst fields in the archive. This can.
+
+    Every tile keeps its u, v and palette either way, and the copies are
+    byte-for-byte, so both strategies sample identical texels.
     """
-    if not SINGLE_SCREEN_HARD_CAP:
-        return {}
-    if not is_single_screen(sec9, src_px):
+    win_w = WINDOW_W if win_w is None else win_w
+    win_h = WINDOW_H if win_h is None else win_h
+    if not items:
+        return None, None
+    pos = [(x, y) for _o, x, y in items]
+    ordered = sorted(range(len(items)), key=lambda i: (pos[i][1], pos[i][0]))
+
+    def fits(groups):
+        # `also_limit_total` keeps the OLD outcome for a page that the
+        # grandfathered rule already caught. That rule divides by total count,
+        # and dropping the total constraint here would split such a page into
+        # FEWER pieces than build 38 did -- defensible, since the hardware
+        # limit is per frame and vanilla `crater_2` names a page from 1,912
+        # tiles, but it would change fields that currently work and cannot be
+        # A/B'd offline against a pre-cap input. Not worth it in the same build
+        # as the fx change.
+        if also_limit_total and any(len(g) > cap for g in groups):
+            return False
+        return all(_worst_window([pos[i] for i in g], win_w, win_h) <= cap
+                   for g in groups if g)
+
+    for k in range(1, max_copies + 2):
+        seq = [list(range(i * cap, min((i + 1) * cap, len(items))))
+               for i in range(-(-len(items) // cap))]
+        if len(seq) <= k and fits(seq):
+            return [[items[i][0] for i in g] for g in seq if g], 'sequential'
+        rr = [ordered[i::k] for i in range(k)]
+        if fits(rr):
+            return [[items[i][0] for i in g] for g in rr if g], 'round-robin'
+    return None, None
+
+
+UV_SCALE = 10_000_000
+T_SRC_UV = 42          # two uint32, u then v
+
+
+def _uv_encode(sx, sy):
+    """The bytes for a source coordinate. Verified to round-trip exactly on
+    every tile of every field: `sx = round(u / UV_SCALE * grid) * (256 // grid)`
+    inverts to `u = round(sx * UV_SCALE / 256)` for any grid, because
+    `step * grid` is always 256."""
+    return (int(round(sx * UV_SCALE / 256.0)),
+            int(round(sy * UV_SCALE / 256.0)))
+
+
+def _page_array(page):
+    dt = np.uint8 if page.depth == 1 else np.uint16
+    return np.frombuffer(page.data, dt).reshape(page.px, page.px).copy()
+
+
+def _cell_slice(page, sx, sy, grid):
+    """The pixel region of one source cell, in the page's own resolution."""
+    step = 256 // grid
+    side = page.px // grid
+    y0 = (sy // step) * side
+    x0 = (sx // step) * side
+    return slice(y0, y0 + side), slice(x0, x0 + side)
+
+
+def relocate_cells(sec9, buf, pages, spans, slot, need, group_slots,
+                   src_px, win_w=None, win_h=None,
+                   max_tiles=MAX_TILES_PER_PAGE):
+    """
+    Move cells off an over-full page into FREE CELLS of an under-full page in
+    the same group. Returns the number of cells moved.
+
+    WHY THIS EXISTS: THE SLOT WAS NEVER THE PROBLEM.
+
+    Five fields survived the fx-byte split still over the cap, and every one
+    was reported as "no free slot in the 42-page array". The opaque truecolor
+    band really is only three slots (26, 27, 28 -- FINDINGS-116), so a copy has
+    nowhere to go. But the pages already there are packed very unevenly:
+
+        rckt3    p26 256 in-window   p27 272 OVER   p28   2, 254 free cells
+        rckt32   p26 256             p27 272 OVER   p28   2, 254 free
+        junair2  p26 256             p27 367 OVER   p28  25, 231 free
+        spipe_2  p26 257 OVER        p27 256        p28 101, 155 free
+        las0_2   p21 547 OVER                       p22 173 free, p23 251 free
+
+    There is room for every one of them without adding a single page. The cap
+    only ever knew how to DUPLICATE a page and repoint tiles at the copy; it
+    never considered moving a cell to space that was already sitting there.
+
+    PIXEL-EXACT, on the same terms as the split: the cell's block is copied
+    byte for byte into a page of the same depth, size flag and resolution in
+    the same blend group, and the tile's `u`/`v` are rewritten to the new
+    coordinate. Same texels, same palette, same blend path.
+
+    ONLY PAGES BOUND BY THE TEXTURE ID. A tile has ONE uv pair, shared between
+    its main texture and its fx page, and `field_bg_compact`'s note is that an
+    fx pair must sit at the SAME grid coordinate. Moving an fx cell therefore
+    means moving its partner to the same new coordinate on a different page, in
+    lockstep, with both targets having that exact cell free. That is a harder
+    problem and it is not solved here.
+
+    MEASURED on the five fields this exists for:
+
+        rckt3   p27   272 tiles by texture id,   0 by fx
+        rckt32  p27   272 by id,   0 by fx
+        junair2 p27   367 by id,   0 by fx
+        spipe_2 p26   257 by id,   0 by fx
+        las0_2  p21     0 by id, 547 by fx        <- the paired case, NOT fixed
+
+    So four of the five are plain moves and the fifth is named rather than
+    half-done.
+    """
+    win_w = WINDOW_W if win_w is None else win_w
+    win_h = WINDOW_H if win_h is None else win_h
+    src = pages[slot]
+    if src is None:
+        return 0
+    grid = 8 if src.size_flag else 16
+    step = 256 // grid
+
+    # cell -> tile offsets, and the screen positions those tiles draw at
+    cells = defaultdict(list)
+    fx_cells = set()
+    for off in spans:
+        if buf[off + T_TEXID] != slot:
+            continue
+        u, v = struct.unpack_from('<II', bytes(buf), off + T_SRC_UV)
+        key = (int(round(u / UV_SCALE * grid)) * step,
+               int(round(v / UV_SCALE * grid)) * step)
+        cells[key].append(off)
+        if buf[off + T_FX_PAGE]:
+            fx_cells.add(key)
+
+    def positions(keys):
+        out = []
+        for k in keys:
+            for off in cells[k]:
+                out.append((struct.unpack_from('<h', bytes(buf),
+                                               off + T_DSTX)[0],
+                            struct.unpack_from('<h', bytes(buf),
+                                               off + T_DSTY)[0]))
+        return out
+
+    movable = [k for k in cells if k not in fx_cells]
+    if not movable:
+        return 0
+    # spatially ordered, so taking every other one thins the whole page evenly
+    # rather than carving a contiguous band out of it
+    movable.sort(key=lambda k: (min(p[1] for p in positions([k])),
+                                min(p[0] for p in positions([k]))))
+
+    # targets: same group, same geometry, with free cells
+    used_by = {}
+    for s in group_slots:
+        p = pages[s] if s < len(pages) else None
+        if p is None or s == slot:
+            continue
+        if (p.depth, p.px, p.size_flag) != (src.depth, src.px, src.size_flag):
+            continue
+        taken = set()
+        for off in spans:
+            if buf[off + T_TEXID] != s and buf[off + T_FX_PAGE] != s:
+                continue
+            u, v = struct.unpack_from('<II', bytes(buf), off + T_SRC_UV)
+            taken.add((int(round(u / UV_SCALE * grid)) * step,
+                       int(round(v / UV_SCALE * grid)) * step))
+        free = [(x * step, y * step) for y in range(grid) for x in range(grid)
+                if (x * step, y * step) not in taken]
+        if free:
+            used_by[s] = [free, taken, _page_array(p)]
+    if not used_by:
+        return 0
+
+    src_arr = _page_array(src)
+    # every target's current screen load, kept incrementally so the inner loop
+    # is not quadratic in the number of tiles
+    tgt_pos = {}
+    for s in used_by:
+        tgt_pos[s] = [(struct.unpack_from('<h', bytes(buf), o + T_DSTX)[0],
+                       struct.unpack_from('<h', bytes(buf), o + T_DSTY)[0])
+                      for o in spans
+                      if buf[o + T_TEXID] == s or buf[o + T_FX_PAGE] == s]
+
+    moved = 0
+    for key in movable:
+        if _worst_window(positions(list(cells)), win_w, win_h) <= max_tiles:
+            break                       # the page is under the cap; stop
+        probe = positions([key])
+        tgt = None
+        for s, (free, _taken, _arr) in used_by.items():
+            if not free:
+                continue
+            if _worst_window(tgt_pos[s] + probe, win_w, win_h) > max_tiles:
+                continue                # would only move the problem
+            tgt = s
+            break
+        if tgt is None:
+            break                       # nowhere left with room
+        free, taken, arr = used_by[tgt]
+        tx, ty = free.pop(0)
+        sy_s, sx_s = _cell_slice(src, key[0], key[1], grid)
+        ty_s, tx_s = _cell_slice(pages[tgt], tx, ty, grid)
+        arr[ty_s, tx_s] = src_arr[sy_s, sx_s]
+        taken.add((tx, ty))
+        eu, ev = _uv_encode(tx, ty)
+        for off in cells[key]:
+            buf[off + T_TEXID] = tgt
+            struct.pack_into('<II', buf, off + T_SRC_UV, eu, ev)
+        tgt_pos[tgt].extend(probe)
+        del cells[key]
+        moved += 1
+
+    if moved:
+        for s, (_free, _taken, arr) in used_by.items():
+            p = pages[s]
+            pages[s] = FN.Page(s, p.size_flag, p.depth, arr.tobytes(), p.px)
+    return moved
+
+
+def window_over(sec9, src_px=None, max_tiles=MAX_TILES_PER_PAGE):
+    """
+    {slot: tiles binding it in the worst window} for the pages this field puts
+    over the hard 256 within one screenful, or {} when nothing is over.
+
+    Additive by construction: it can only add pages to the `over` set that
+    `effective_cap`'s grandfathering let through, and only for pages that
+    exceed a limit vanilla satisfies in every one of its 709 fields.
+
+    A strict superset of FINDINGS-122's single-screen rule -- a field that fits
+    inside the window has one window position, so its in-window count is its
+    total count.
+    """
+    if not WINDOW_HARD_CAP:
         return {}
     try:
-        eff = effective_counts(sec9, src_px)
+        win = window_counts(sec9, src_px)
     except Exception:                                          # noqa: BLE001
         return {}
-    return {s: n for s, n in eff.items() if n > max_tiles}
+    return {s: n for s, n in win.items() if n > max_tiles}
+
+
+# FINDINGS-122's name, kept so nothing that still calls it breaks. The rule it
+# named is now a special case of `window_over`.
+single_screen_over = window_over
 
 
 def cap_section9(sec9, src_px=None, max_tiles=MAX_TILES_PER_PAGE,
@@ -376,15 +783,16 @@ def cap_section9(sec9, src_px=None, max_tiles=MAX_TILES_PER_PAGE,
     by_page = defaultdict(list)
     for off in spans:
         by_page[sec9[off + T_TEXID]].append(off)
+    fx_split_slots = set()      # slots whose split must write offset 34
     _main, fxc = counts(sec9, d2px)
     st.fx_over = {s: n for s, n in fxc.items() if n > max_tiles}
 
-    # FINDINGS-122. A single-screen field submits every tile every frame, so
-    # its binding count IS its frame count and vanilla's headroom is not
-    # headroom. Those pages get the hard 256; every other page in the field
-    # keeps the grandfathered cap, so this can only ever ADD to `over`.
-    ss_over = single_screen_over(sec9, d2px, MAX_TILES_PER_PAGE)
-    st.single_screen = dict(ss_over)
+    # FINDINGS-123. The most tiles binding one page inside one camera window.
+    # That is the number `add_page_tile` makes calls for, and vanilla never
+    # exceeds 256 of it in any of its 709 fields. Those pages get the hard 256;
+    # every other page keeps the grandfathered cap, so this only ever ADDS.
+    ss_over = window_over(sec9, d2px, MAX_TILES_PER_PAGE)
+    st.window_over = dict(ss_over)
 
     def _cap_for(slot):
         return MAX_TILES_PER_PAGE if slot in ss_over else max_tiles
@@ -392,12 +800,22 @@ def cap_section9(sec9, src_px=None, max_tiles=MAX_TILES_PER_PAGE,
     over = {s: offs for s, offs in by_page.items()
             if len(offs) > _cap_for(s)}
 
-    # A page that is over only through the FX byte cannot be split here: the
-    # splitter repoints `T_TEXID`, and these tiles do not bind through it.
-    # NAME them rather than reporting the field as safe. MEASURED: 5 of the
-    # 25 -- las4_0, sininb34, spipe_1, ujunon4, ujunon5.
+    # FX-BOUND PAGES. A tile carrying an fx page binds the fx page, so the
+    # splitter's `T_TEXID` write cannot move it. With FX_SPLIT off these are
+    # NAMED rather than reported as safe; with it on they are split by
+    # repointing offset 34 instead of 32.
+    fx_by_page = defaultdict(list)
+    for off in spans:
+        f = sec9[off + T_FX_PAGE]
+        if f and f in {p.slot for p in pages if p is not None}:
+            fx_by_page[f].append(off)
     for s, n in ss_over.items():
-        if len(by_page.get(s, ())) <= MAX_TILES_PER_PAGE:
+        if len(by_page.get(s, ())) > MAX_TILES_PER_PAGE:
+            continue                       # the raw-id splitter handles it
+        if FX_SPLIT and len(fx_by_page.get(s, ())) > MAX_TILES_PER_PAGE:
+            over[s] = fx_by_page[s]
+            fx_split_slots.add(s)
+        else:
             st.refused.append((s, n))
 
     if not over:
@@ -448,6 +866,56 @@ def cap_section9(sec9, src_px=None, max_tiles=MAX_TILES_PER_PAGE,
         # hard 256 while the rest of the field keeps the grandfathered limit;
         # slicing with the scalar here left `rest` empty and split nothing.
         _cap = _cap_for(slot)
+        _byte = T_FX_PAGE if slot in fx_split_slots else T_TEXID
+
+        # TWO CRITERIA, AND THEY MUST NOT BE MIXED.
+        #
+        # A page over by the GRANDFATHERED rule is over on its total count, and
+        # the loop below divides it by total, exactly as it always has.
+        #
+        # A page over by the WINDOW rule is over on tiles submitted per frame.
+        # Its total is allowed to exceed the cap -- vanilla `crater_2` names a
+        # page from 1,912 tiles and is fine -- so dividing by total would be
+        # both wrong and wasteful. `plan_split` divides by the window count and
+        # tries sequential first at every size, so a page that both rules catch
+        # comes out divided the way it already was.
+        if slot in ss_over:
+            _items = [(off,
+                       struct.unpack_from('<h', sec9, off + T_DSTX)[0],
+                       struct.unpack_from('<h', sec9, off + T_DSTY)[0])
+                      for off in over[slot]]
+            # `free` may be empty -- that is exactly when `relocate_cells`
+            # matters, so this block must NOT be gated on it. Gating it there
+            # was the first version and it meant the four fields relocation
+            # was written for never reached the call.
+            groups, strategy = plan_split(
+                _items, MAX_TILES_PER_PAGE, len(free or ()),
+                also_limit_total=len(over[slot]) > max_tiles) \
+                if free else (None, None)
+            if groups:
+                for chunk in groups[1:]:
+                    dst = free.pop(0)
+                    pages[dst] = FN.Page(dst, src.size_flag, src.depth,
+                                         src.data, src.px)
+                    for off in chunk:
+                        buf[off + _byte] = dst
+                    st.pages_added += 1
+                    st.tiles_moved += len(chunk)
+                st.strategy[slot] = strategy
+                continue
+            # No plan fits the free slots. Before giving up, try moving cells
+            # into space that already exists -- see `relocate_cells`. The slot
+            # was never the real constraint in these fields; the packing was.
+            if RELOCATE_CELLS:
+                _n = relocate_cells(sec9, buf, pages, spans, slot, 0,
+                                    FC._slots_in_group(grp) if grp else [],
+                                    d2px)
+                if _n:
+                    st.relocated[slot] = _n
+                    continue
+            # Fall through: the loop below still takes what it can and NAMES
+            # the remainder rather than silently shipping an over-full page.
+
         rest = over[slot][_cap:]
         while rest:
             if not free:
@@ -463,16 +931,35 @@ def cap_section9(sec9, src_px=None, max_tiles=MAX_TILES_PER_PAGE,
             # samples identical texels.
             pages[dst] = FN.Page(dst, src.size_flag, src.depth,
                                  src.data, src.px)
+            # `_byte` is chosen once per slot above: a tile carrying an fx
+            # page binds the fx page, so moving it means offset 34.
             for off in chunk:
-                buf[off + T_TEXID] = dst
+                buf[off + _byte] = dst
             st.pages_added += 1
             st.tiles_moved += len(chunk)
-            # Attribute this page to the single-screen rule only for the part
-            # the grandfathered cap would NOT have split anyway.
-            if slot in ss_over and _cap < max_tiles:
-                _would = max(0, len(over[slot]) - max_tiles)
-                st.ss_pages += 1
-                st.ss_tiles += max(0, len(chunk) - _would)
+
+    # ATTRIBUTION, COMPUTED ONCE FROM THE FIELD'S TOTALS.
+    #
+    # THIS IS THE THIRD TIME THIS COUNTER HAS BEEN WRONG. Build 34 reported the
+    # field's whole `pages_added`; build 35 fixed pages and tiles but left the
+    # FIELD count keyed on "the rule fired at all"; build 39 credited every
+    # page of a `plan_split` to the window rule even when the grandfathered cap
+    # was already splitting that page -- 145 pages claimed against a true rise
+    # of 18. Each time the per-site bookkeeping was patched and each time a site
+    # was missed.
+    #
+    # So it is no longer bookkept per site. What the grandfathered rule alone
+    # would have done is recomputed from `by_page`, and the difference is what
+    # this rule cost. It cannot exceed `pages_added`, whatever the split path
+    # did, because it is derived from it.
+    _would_pages = _would_tiles = 0
+    for _s, _offs in by_page.items():
+        if len(_offs) > max_tiles:
+            _ex = len(_offs) - max_tiles
+            _would_pages += -(-_ex // max_tiles)
+            _would_tiles += _ex
+    st.ss_pages = max(0, st.pages_added - _would_pages)
+    st.ss_tiles = max(0, st.tiles_moved - _would_tiles)
 
     out = FN.replace_texture_block(bytes(buf), pages, tex_start, tex_end)
     return out, st
@@ -480,24 +967,71 @@ def cap_section9(sec9, src_px=None, max_tiles=MAX_TILES_PER_PAGE,
 
 T_PAL = FN.TILE_PALETTE_ID        # 22
 
-# THE PALETTE CLAMP IS OFF, AND IT IS OFF BECAUSE IT CAUSED A CRASH.
+# THE PALETTE CLAMP WAS CONVICTED FOR A CRIME THE PAGE CAP COMMITTED.
 #
-# The observation behind it is real and reproducible: `md8_1` ships fourteen
-# layer-2 tiles at dx -224/-208 and 192/208 naming palette 13 when the field
-# has thirteen, and that coordinate set is exactly the column of black
-# rectangles down both edges of the screen.
+# It was gated off because build 27 turned `md8_1` from black squares into a
+# HARD CRASH -- and the stack was `draw_graphics_object` at +0xADF24C, noted at
+# the time as "the same signature as the tile-counter overrun".
 #
-# Repointing them did not fix it. Build 27 turned that field from "black
-# squares" into a HARD CRASH -- and the stack is `draw_graphics_object` at
-# +0xADF24C, the same signature as the tile-counter overrun. Worse, a second
-# reading of the same archive with the same call reported 0 tiles repointed
-# where the first reported 14, which means my own measurement of this is not
-# stable and I do not understand the tile enumeration well enough to be
-# writing bytes based on it.
+# It was the tile-counter overrun. FINDINGS-122 measured `md8_1` shipping page
+# 1 bound by 269 tiles against a hardware limit of 256; this clamp repoints
+# tiles, which shifts what lands on that page, and the field was already sitting
+# one nudge away from the overrun. The cap now enforces the limit per camera
+# frame across the whole archive, so the ground that crash stood on is gone.
 #
-# So it is gated and off. The observation stays written down because it is
-# almost certainly still the cause of those particular squares -- what is
-# wrong is the fix, not the diagnosis.
+# The second reason given was that "a second reading of the same archive with
+# the same call reported 0 tiles repointed where the first reported 14, which
+# means my own measurement of this is not stable". MEASURED now, three separate
+# processes under PYTHONHASHSEED=random over ten affected fields: 5,153 tiles
+# repointed and a byte-identical result every time. It is stable.
+#
+# WHAT IT FIXES, AND IT IS NOT SUBTLE.
+#
+# Cosmos's own widened section 9 names palettes the field does not have. Not
+# our doing -- MEASURED, the mod's `chunk.9` and our build agree exactly and
+# vanilla has none:
+#
+#     field      vanilla   COSMOS chunk.9              ours
+#     fship_1      0        97  {layer1: 1, layer2: 96}   97   identical
+#     ancnt2       0       320  {layer2: 320}            320   identical
+#     crater_1     0       539  {layer2: 481, ...}       539   identical
+#     las0_2       0       870  {layer1: 240, layer2: 630} 870 identical
+#
+# It is harmless on PC for the reason `ff7nx_marginpal` already documents:
+# FFNx replaces the page with the DDS and never applies the palette, so the
+# index is dead data. The Switch applies it, and an index past the end of the
+# table reads whatever follows -- drawn as a solid tile.
+#
+# 14,292 layer-2 tiles across 103 fields. Layer 2 is the overlay/parallax
+# layer, which is why it reads on screen as a regular grid of squares over the
+# scene, on exactly the layer that scrolls at its own rate: the Highwind
+# bridge, the Northern Crater, the Gold Saucer coaster, Shinra HQ.
+# OFF AGAIN, AND THIS TIME FOR A REASON THAT IS MINE. FINDINGS-133.
+#
+# Enabled in build 44 to fix the grid of squares on the overlay layer. It did
+# not -- 20,902 tiles repointed across 128 fields and the squares are exactly
+# as they were, so the out-of-range palette is NOT that symptom's cause. The
+# correlation was strong (every affected scene was in the list) and the
+# correlation was all it was.
+#
+# It also CAUSED a regression: pale yellow squares in the widened margins of
+# the Sector 7 slums, and the reason is an ordering mistake I did not check.
+#
+#     log line 731    margin art:  519,607 cells written
+#     log line 745    PALETTE CLAMP: 20,902 tiles repointed
+#
+# `ff7nx_marginart` writes a margin cell by QUANTISING the mod's art against
+# the palette THAT TILE NAMES. The clamp then rewrites the palette byte. The
+# indices were chosen to look right through one colour table and are read
+# through another. MEASURED, the clamped tiles in `mds7st32`, `mds7st33`,
+# `mds7plr1`: all layer 2, at x = -224, -208, -192, -176, 160, 176 -- exactly
+# the widened columns where the yellow squares appear.
+#
+# TO DO THIS PROPERLY the clamp has to run BEFORE `ff7nx_marginart`, so the
+# quantiser sees the corrected palette and bakes indices for the table the
+# tile will actually be drawn with. That is a pipeline-ordering change, not a
+# flag, and it should be made only if the out-of-range indices are shown to
+# cause a visible defect -- which build 44 says they do not.
 CLAMP_PALETTES = False
 
 
@@ -588,21 +1122,20 @@ def verify(sec9, src_px=None, max_tiles=MAX_TILES_PER_PAGE,
         # two such sections in the game are skipped by every other pass too,
         # and reporting them here would make the build cry wolf.
         return []
-    ss_over = single_screen_over(sec9, src_px, MAX_TILES_PER_PAGE)
+    ss_over = window_over(sec9, src_px, MAX_TILES_PER_PAGE)
     for slot, n in sorted(main.items()):
         if n > max_tiles:
             bad.append('page %d is named by %d tiles (limit %d) -- '
                        'add_page_tile will overrun into page %d\'s counter'
                        % (slot, n, max_tiles, slot + 1))
-    # FINDINGS-122: the field is one screen, so every tile is submitted every
-    # frame and the binding count is the frame count. Vanilla never exceeds
-    # 256 here, in any of its 200 single-screen fields.
+    # FINDINGS-123: the most tiles binding this page inside one camera window.
+    # Vanilla never exceeds 256 of it in any of its 709 fields.
     for slot, n in sorted(ss_over.items()):
-        if n > max_tiles:
+        if slot in main and main[slot] > max_tiles:
             continue                      # already reported above
-        bad.append('page %d BINDS %d tiles (hard limit %d) in a single-screen '
-                   'field -- add_page_tile will overrun into page %d\'s '
-                   'counter' % (slot, n, MAX_TILES_PER_PAGE, slot + 1))
+        bad.append('page %d BINDS %d tiles IN ONE WINDOW (hard limit %d) -- '
+                   'add_page_tile will overrun into page %d\'s counter'
+                   % (slot, n, MAX_TILES_PER_PAGE, slot + 1))
     for slot, n in sorted(fx.items()):
         if n > max_tiles:
             bad.append('fx page %d is named by %d tiles (limit %d)'

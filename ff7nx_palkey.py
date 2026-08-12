@@ -65,6 +65,17 @@ import ff7nx_marginblack as MB
 
 SECTION9 = 8
 
+# See FINDINGS-135 at the write site. False restores build 46 exactly, for A/B.
+NEVER_BRIGHTEN_KEY = True
+
+
+def _luma(w):
+    """Rec.601 luminance of a 16-bit BGR555 palette entry, 0..255."""
+    r = (w & 31) * 255 // 31
+    g = ((w >> 5) & 31) * 255 // 31
+    b = ((w >> 10) & 31) * 255 // 31
+    return 0.299 * r + 0.587 * g + 0.114 * b
+
 
 def margin_palettes(sec9, npg):
     """{palette page index} named by a layer-1 tile wholly outside 4:3."""
@@ -305,6 +316,26 @@ def _blend_band_palettes(sec9, surv=None):
 def blacken_keys(sec3, sec9):
     """(new_sec3, [(page, old_value), ...]). `sec3` is returned when nothing
     needs changing, so the caller can skip the re-encode."""
+    # RESET THE OUT-PARAMETER FIRST. THIS LINE IS THE WHOLE OF FINDINGS-124.
+    #
+    # `last_skipped` is a function attribute, set at the bottom of this
+    # function and read by `apply_to_flevel` after every call. Both early
+    # returns below exit BEFORE it is set, so a field that bails out left the
+    # PREVIOUS field's number on the attribute and the caller added it a
+    # second time. The total therefore depended on which fields happened to
+    # bail and in what order -- and `lgp.Archive.names()` used to return a
+    # set, whose iteration order Python randomises per process.
+    #
+    # MEASURED, `transparency key ... LEFT ALONE` across five builds:
+    #
+    #     33: 3,796   34: 3,847   35: 3,861   36: 3,883   37: 3,894
+    #
+    # Build 36 changed one line of logging and still moved it by 22.
+    #
+    # MEASURED, 200 fields processed forward and then in reverse: 69 fields
+    # reported a different `last_skipped`, and ALL 200 produced a byte-identical
+    # `new_sec3`. The archive was never affected. Only this counter was.
+    blacken_keys.last_skipped = 0
     hdr, npg, cpp = MB.palette_block(sec3)
     if not npg or not cpp:
         return sec3, []
@@ -477,6 +508,35 @@ def blacken_keys(sec3, sec9):
                 g = int(round(float((((v >> 5) & 31) * w).sum()) / tot))
                 b = int(round(float((((v >> 10) & 31) * w).sum()) / tot))
                 new = (old & 0x8000) | (b << 10) | (g << 5) | r
+        # NEVER BRIGHTEN A KEY. FINDINGS-135.
+        #
+        # This pass exists because a BRIGHT key draws as authored -- the
+        # Sector 6 yellow, `nivl`'s pure green at luminance 149.7. Replacing
+        # those with black or with the neighbouring tone is the fix, and it
+        # works: MEASURED archive-wide, 1,230 keys where vanilla was bright
+        # and we darkened it.
+        #
+        # But the same code also fires the other way. MEASURED, 243 keys where
+        # VANILLA WAS ALREADY DARK and we wrote something visible over it:
+        #
+        #     blin65_1 pal 5   vanilla lum   0.0 -> ours 114.0  rgb(115,115,106)
+        #     niv_ti2  pal 1   vanilla lum   0.0 -> ours 106.1  rgb( 32,139,131)
+        #     nivinn_1 pal 1   vanilla lum   0.0 -> ours  36.9  rgb( 24, 49,  8)
+        #     nmkin_1  pal 1   vanilla lum   0.0 -> ours  32.0  rgb( 32, 32, 32)
+        #
+        # Index-0 pixels sit in the transparent surround of the art, so at a
+        # texture edge they are a one-pixel line. Writing a visible colour
+        # there paints a thin coloured fringe along every edge in the field --
+        # GREEN in Cloud's past, GREY in reactor 1, and it follows the art
+        # because the colour is the mean of the art beside it. Reported as
+        # "thin aliasing pixels", and the per-field colour is the tell: a
+        # constant would look the same everywhere.
+        #
+        # Vanilla ships black keys and looks right, so darkening is safe and
+        # brightening is not. The de-fringe keeps every case it was written
+        # for and loses only the ones that could show.
+        if NEVER_BRIGHTEN_KEY and _luma(new) > _luma(old):
+            continue
         if new == old:
             continue
         struct.pack_into('<H', buf, off, new)

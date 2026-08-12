@@ -231,7 +231,52 @@ BORROW_MAX_DIST_INTERIOR = 32.0
 # writing the black that a zeroed RGB channel pretends is there. See the long
 # note at the write site -- this is the column of black squares at the edges
 # of the 16:9 frame. Set False to restore the old behaviour for an A/B.
+# COVERAGE IS HONOURED. THE DILATION IS NOT. FINDINGS-134.
+#
+# `_extend_into_gap` filled every uncovered texel of a cell by dilating the
+# COVERED art outward, 32 rounds of 4-neighbour growth. It was added because a
+# transparent hole reaches the quantiser as BLACK -- the sources zero RGB where
+# alpha is 0 -- and gets written faithfully as black, which `MAX_QUANT_ERR`
+# can never catch because black is an excellent match for black.
+#
+# The reasoning was right and the remedy overshot. Transparent is a claim about
+# COVERAGE, so black is wrong -- but a smear of the neighbouring art is wrong
+# too, and it is visible:
+#
+#   REPORTED, first reactor and Tifa's bar: a cell holds part of a texture
+#   along a diagonal and the REST of the square, which should be black, is a
+#   triangle of that texture's own colours. Grey where the art is grey, green
+#   where it is green. Not in the widened margin -- anywhere the mod's atlas
+#   is partially covered.
+#
+# That is `_extend_into_gap`'s output described exactly.
+#
+# The write site 800 lines below has always documented the correct rule --
+# "where the mod paints nothing, the mod is saying nothing, so the cell keeps
+# the vanilla index it already had" -- and never implemented it. It does now.
+# The vanilla index is what was there, it is what the mod declined to comment
+# on, and it invents nothing.
 HONOUR_MOD_ALPHA = True
+
+# The dilation. OFF: the gap now keeps its vanilla pixels instead, which is
+# what the write site has always claimed to do. See FINDINGS-134 at the write
+# site. True restores build 45's behaviour exactly, for A/B.
+EXTEND_INTO_GAP = False
+# FIRST before assuming anything." Doing that.
+#
+# False restores the pre-3.5 behaviour: an uncovered texel arrives as black
+# and is written as black. That is the OLD defect, not a fix -- it is the
+# clean A/B that tells us whether the dilation is what is being seen. If the
+# triangles go and black squares come back in their place, the right answer is
+# neither: keep the VANILLA pixels wherever the mod does not cover, which is
+# a change at the write site (`idx = np.where(_cov, idx, was_block)`) and
+# invents nothing.
+HONOUR_MOD_ALPHA = True
+
+# The dilation. OFF: the gap now keeps its vanilla pixels instead, which is
+# what the write site has always claimed to do. See FINDINGS-134 at the write
+# site. True restores build 45's behaviour exactly, for A/B.
+EXTEND_INTO_GAP = False
 
 DARKEN_MARGIN_PLACEHOLDERS = True
 
@@ -895,8 +940,10 @@ def fill_field(name, raw, lgp_mod, art, log=None, scope='margin'):
             # by design. There is no threshold that separates "wrong" from
             # "intended" here, because the shift IS the intent.
             _cov = (cover >= 128) if HONOUR_MOD_ALPHA else np.ones_like(cover, bool)
-            if HONOUR_MOD_ALPHA and not _cov.all() and _cov.any():
+            if EXTEND_INTO_GAP and HONOUR_MOD_ALPHA \
+                    and not _cov.all() and _cov.any():
                 small = _extend_into_gap(small, _cov)
+            if HONOUR_MOD_ALPHA:
                 st['uncovered'] += int((~_cov).sum())
             if (small[_cov].max() if _cov.any() else 0) <= 24:
                 # EMPTY SOURCE.
@@ -1001,6 +1048,22 @@ def fill_field(name, raw, lgp_mod, art, log=None, scope='margin'):
             #
             # This can only ADD art. A covered texel is written exactly as
             # before; an uncovered one stops being overwritten with black.
+            #
+            # AND UNTIL NOW THE CODE DID NOT DO IT. The paragraph above has
+            # been here describing the rule while the loop below wrote `idx`
+            # across the WHOLE cell regardless of coverage; the gap was
+            # handled instead by `_extend_into_gap`, which fills it with a
+            # dilation of the surrounding art. That is why a cell holding part
+            # of a texture along a diagonal comes out with the rest of the
+            # square filled by a triangle of that texture's colours -- grey,
+            # green, whatever the art beside it happens to be -- where it
+            # should be black. Reported from the first reactor and Tifa's bar.
+            #
+            # Neither black nor a smear. The vanilla index is what was there,
+            # it is what the mod declined to comment on, and it invents
+            # nothing. FINDINGS-134.
+            if HONOUR_MOD_ALPHA and not _cov.all():
+                idx = np.where(_cov, idx, was[sy:sy + TILE, sx:sx + TILE])
 
             for r in range(TILE):
                 base = (sy + r) * 256 + sx

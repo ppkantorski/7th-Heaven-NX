@@ -32,6 +32,7 @@ VERSION = '1.0.0'
 sys.path.insert(0, HERE)
 
 import build  # noqa: E402
+import build_guard  # noqa: E402
 import iro  # noqa: E402
 import lgp    # noqa: E402
 import ff7nx_field169  # noqa: E402
@@ -725,6 +726,33 @@ def discover_mods():
 
 def run_build(mods, enabled, settings_by_mod, log, progress,
               fps_60=False):
+    # COUNTER GUARD (HANDOFF-121 3.6). Tee the log, and at the end name every
+    # counter that moved outside the pass this build was meant to change. It
+    # only ever writes extra lines -- no build is ever stopped by it -- and it
+    # is wrapped in try/except at both ends because a diagnostic must not be
+    # able to fail a 20-minute build.
+    _guard = None
+    try:
+        # expect defaults to build_guard.EXPECTED_MOVEMENT, which is declared
+        # per build. Do not pass a set here -- that is how build 36 ended up
+        # told to expect page-cap movement in a logging-only change.
+        _guard = build_guard.CounterGuard(
+            log,
+            label='window cap %s, fx split %s' % (
+                build.field_bg_pagecap.WINDOW_HARD_CAP,
+                build.field_bg_pagecap.FX_SPLIT))
+        log = _guard.log
+    except Exception:                                           # noqa: BLE001
+        _guard = None
+
+    def _finish(result):
+        if _guard is not None:
+            try:
+                _guard.finish()
+            except Exception:                                   # noqa: BLE001
+                pass
+        return result
+
     if DUMP is None or not os.path.isdir(WORKINGDIR):
         log('ERROR: no game dump found.')
         log(f'Put your Switch dump at {os.path.join(HERE, "dump")} so that')
@@ -921,7 +949,7 @@ def run_build(mods, enabled, settings_by_mod, log, progress,
         log('copy the contents of sdout/ onto the root of your SD card.')
     else:
         log('nothing was written.')
-    return bool(produced)
+    return _finish(bool(produced))
 
 
 # ------------------------------------------------------------------- UI
@@ -2084,14 +2112,27 @@ def launch_ui():
                                  # Off/256 ladder, so 256 is never read back
                                  # as the old "off". See initial_fbg_value.
                                  'field_bg_ladder_v2': True,
-                                 # FINDINGS-122. No widget yet, but it MUST be
-                                 # written back: this dict is rebuilt from
-                                 # scratch on every save, so a key that is only
-                                 # read would be silently dropped the next time
-                                 # the user touches any other control.
-                                 'field_bg_single_screen_cap':
+                                 # FINDINGS-122/123. No widget yet, but these
+                                 # MUST be written back: this dict is rebuilt
+                                 # from scratch on every save, so a key that is
+                                 # only read would be silently dropped the next
+                                 # time the user touches any other control.
+                                 'field_bg_window_cap':
                                      bool(_global_setting(
-                                         'field_bg_single_screen_cap', True)),
+                                         'field_bg_window_cap',
+                                         _global_setting(
+                                             'field_bg_single_screen_cap',
+                                             True))),
+                                 'field_bg_fx_split':
+                                     bool(_global_setting(
+                                         'field_bg_fx_split', False)),
+                                 'field_bg_compact_frame_safe':
+                                     bool(_global_setting(
+                                         'field_bg_compact_frame_safe',
+                                         True)),
+                                 'field_bg_clamp_palettes':
+                                     bool(_global_setting(
+                                         'field_bg_clamp_palettes', True)),
                                  'fps_60': bool(fps_var.get()),
                                  'movie_quality': current_movie_quality(),
                                  'movie_fit': current_movie_fit(),
@@ -2831,11 +2872,23 @@ def launch_ui():
         # parser, one number in one place.
         build.field_bg_dense.MAX_TRUECOLOR_PAGES = \
             current_field_bg_truecolor()
-        # FINDINGS-122. Same wiring style as the line above: the value IS the
-        # constant, set here, no variable and no parser. Settings-only for now
-        # -- see _global_setting.
-        build.field_bg_pagecap.SINGLE_SCREEN_HARD_CAP = bool(
-            _global_setting('field_bg_single_screen_cap', True))
+        # FINDINGS-122/123. Same wiring style as the line above: the value IS
+        # the constant, set here, no variable and no parser. Settings-only for
+        # now -- see _global_setting. The old single-screen key is read as a
+        # fallback so a settings.json written by build 34 keeps working.
+        build.field_bg_pagecap.WINDOW_HARD_CAP = bool(
+            _global_setting('field_bg_window_cap',
+                            _global_setting('field_bg_single_screen_cap',
+                                            True)))
+        build.field_bg_pagecap.FX_SPLIT = bool(
+            _global_setting('field_bg_fx_split', False))
+        # FINDINGS-128: refuse a compaction that breaks the frame limit.
+        build.field_bg_compact.WINDOW_SAFE = bool(
+            _global_setting('field_bg_compact_frame_safe', True))
+        # FINDINGS-130: Cosmos ships tiles naming palettes the field has not
+        # got. Harmless on FFNx, garbage on the Switch.
+        build.field_bg_pagecap.CLAMP_PALETTES = bool(
+            _global_setting('field_bg_clamp_palettes', True))
         os.environ[build.field_bg_repack.MAX_TOTAL_PAGES_ENV] = str(
             current_field_bg_max_pages())
         build.field_bg_repack.apply_growth_mode(
@@ -3024,12 +3077,20 @@ def main():
             saved.get('__global__', {}).get(
                 'field_bg_truecolor_pages',
                 build.field_bg_dense.MAX_TRUECOLOR_PAGES))
-        # FINDINGS-122: the hard 256-tile cap on single-screen fields. On by
-        # default; the switch exists so it can be A/B'd against a build without
-        # it rather than argued about.
-        build.field_bg_pagecap.SINGLE_SCREEN_HARD_CAP = bool(
-            saved.get('__global__', {}).get(
-                'field_bg_single_screen_cap', True))
+        # FINDINGS-122/123: the hard 256-tile cap, measured per camera window.
+        # On by default; the switch exists so it can be A/B'd against a build
+        # without it rather than argued about. The fx-byte split is a separate
+        # switch and is OFF -- see the note in field_bg_pagecap.
+        _sg = saved.get('__global__', {})
+        build.field_bg_pagecap.WINDOW_HARD_CAP = bool(
+            _sg.get('field_bg_window_cap',
+                    _sg.get('field_bg_single_screen_cap', True)))
+        build.field_bg_pagecap.FX_SPLIT = bool(
+            _sg.get('field_bg_fx_split', False))
+        build.field_bg_compact.WINDOW_SAFE = bool(
+            _sg.get('field_bg_compact_frame_safe', True))
+        build.field_bg_pagecap.CLAMP_PALETTES = bool(
+            _sg.get('field_bg_clamp_palettes', True))
         if build.field_bg_repack.REPLACE_ONLY_ENV not in os.environ:
             build.field_bg_repack.apply_growth_mode(
                 saved.get('__global__', {}).get('field_bg_replace_only', 2))

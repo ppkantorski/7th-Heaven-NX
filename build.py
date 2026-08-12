@@ -2780,6 +2780,11 @@ def _convert_field_backgrounds(archive, payloads, log, dds_sources=()):
     up_capped = up_dropped = up_wrongpal = 0
     cmp_fields = cmp_saved = cmp_merged = cmp_moved = 0
     cmp_rejected = []
+    # FINDINGS-128: refused on purpose because compacting would have put a page
+    # over the 256-tiles-per-frame limit. NOT a self-check failure, and it must
+    # not be reported as one -- the existing line below says "this is a bug,
+    # please report it", which would be wrong and alarming.
+    cmp_windowed = []
     # NO-GROWTH, ENFORCED RATHER THAN ASSERTED.
     #
     # `field_bg_repack` is no longer called, and the ceiling loop that made
@@ -2790,6 +2795,11 @@ def _convert_field_backgrounds(archive, payloads, log, dds_sources=()):
     # cannot be true. These count what the restored loop actually does.
     ng_retry = 0                      # dense repacks re-run at a lower ceiling
     ng_over = []                      # (field, before, after) still over at 0
+    # FINDINGS-129: fields allowed to keep their pages, and therefore their
+    # truecolor, because the frame guard refused to pack them.
+    ng_frame_kept = []
+    # FINDINGS-131: texels whose green LSB the engine would smear onto blue.
+    green_lsb = {'texels': 0, 'fields': 0, 'names': []}
     ng_margin = 0                     # fields the MARGIN passes grew, reported
                                       # but not charged to the repack
     no_cover = no_fit = 0
@@ -2801,8 +2811,12 @@ def _convert_field_backgrounds(archive, payloads, log, dds_sources=()):
     # FINDINGS-122: pages caught by the single-screen hard 256 that the
     # grandfathered cap let through. Counted separately so the change is one
     # line in the log diff instead of a shift inside an existing number.
-    pagecap_single = {'fields': 0, 'pages': 0, 'tiles': 0, 'names': []}
-    palclamp = {'fields': 0, 'tiles': 0}
+    pagecap_single = {'fields': 0, 'pages': 0, 'tiles': 0, 'names': [],
+                      'strategy': {}}
+    # FINDINGS-126: cells moved into free space on a page that already exists,
+    # where the band had no slot to duplicate into.
+    pagecap_reloc = {'fields': 0, 'cells': 0, 'names': []}
+    palclamp = {'fields': 0, 'tiles': 0, 'names': []}
     pagecap_dropped = []              # (field, pages) the raw cap refused
     pagecap_refused = []              # (field, [(slot, tiles), ...])
     page_cost = []                    # (field, live pages, bytes) for the
@@ -2994,6 +3008,31 @@ def _convert_field_backgrounds(archive, payloads, log, dds_sources=()):
                     break
                 if _live <= before:
                     break
+                # DO NOT PAY FOR THE FRAME GUARD IN TRUECOLOR.
+                #
+                # This loop drops the truecolor ceiling until the field stops
+                # growing. That is right when the growth is the repack's own
+                # doing. It is wrong when the growth is `field_bg_compact`
+                # DECLINING to pack, because packing that field would have put
+                # a page over 256 tiles in one frame -- the field legitimately
+                # needs those pages, and giving up its colour depth does not
+                # make it safer, it only makes it worse-looking.
+                #
+                # MEASURED, build 42, which shipped the guard without this:
+                #
+                #     dense repack cells   287,480 -> 261,320   -26,160
+                #     dense repack fields      607 ->     547   60 fields lost
+                #                                              promotion entirely
+                #
+                # So: when compaction was refused for frame safety, accept the
+                # page count as long as the field is still inside the ceiling
+                # the settings actually enforce. The ceiling is the budget;
+                # no-growth is a heuristic underneath it.
+                if getattr(cst, 'window_refused', None):
+                    _cap = field_bg_repack.max_total_pages()
+                    if not _cap or _live <= _cap:
+                        ng_frame_kept.append((name, before, _live))
+                        break
                 if _tc == 0:
                     # Nothing left to give: the growth is not this pass's.
                     # Name it rather than assert it did not happen.
@@ -3048,6 +3087,7 @@ def _convert_field_backgrounds(archive, payloads, log, dds_sources=()):
             if _npal:
                 palclamp['fields'] += 1
                 palclamp['tiles'] += _npal
+                palclamp['names'].append(name)
         except Exception as exc:                               # noqa: BLE001
             log(f'  ! field background: {name} palette clamp failed -- {exc}')
         try:
@@ -3056,7 +3096,22 @@ def _convert_field_backgrounds(archive, payloads, log, dds_sources=()):
         except Exception as exc:                               # noqa: BLE001
             log(f'  ! field background: {name} page cap failed -- {exc}')
             _cap9, _cst = new9, None
-        if _cst is not None and _cst.pages_added:
+        # ADOPT THE SECTION WHENEVER IT CHANGED, NOT ONLY WHEN A PAGE WAS ADDED.
+        #
+        # This read `if _cst.pages_added:` and threw away any result that did
+        # not grow the page count. Cell relocation (FINDINGS-126) adds NO page
+        # by design -- that is the whole point of it -- so its work was computed
+        # and discarded. MEASURED in build 40: `rckt3` and `spipe_2` kept their
+        # relocation only because they happened to need a split in the same
+        # call, while `junair2` relocated a cell, was reported as capped, left
+        # the un-cappable list, and shipped its page 27 still at 367 in-window.
+        #
+        # The size guard stays: relocation cannot change the section's length
+        # (same pages, same tiles, same bytes moved within them), so it can
+        # never trip it, and a split still has to fit.
+        _changed = _cst is not None and (_cst.pages_added
+                                         or getattr(_cst, 'relocated', None))
+        if _changed:
             # The split duplicates the overloaded page BYTE FOR BYTE into a
             # free slot and repoints the excess tiles, so every moved tile
             # keeps its u, v and palette and samples identical texels. The
@@ -3066,18 +3121,38 @@ def _convert_field_backgrounds(archive, payloads, log, dds_sources=()):
                 pagecap_dropped.append((name, _cst.pages_added))
             else:
                 new9 = _cap9
-                pagecap['fields'] += 1
-                pagecap['pages'] += _cst.pages_added
-                pagecap['tiles'] += _cst.tiles_moved
-                pagecap['worst'] = max(pagecap['worst'],
-                                       max(_cst.over.values()))
-                if getattr(_cst, 'single_screen', None):
-                    # ATTRIBUTABLE ONLY. `pages_added` is the field's total and
-                    # includes work the grandfathered cap was already doing.
+                # COUNTED ONLY ONCE THE SECTION IS ADOPTED. Sitting outside
+                # this branch, it would report relocation for a field whose
+                # section was then dropped by FIELD_BG_RAW_CAP -- claiming work
+                # that did not ship, which is the bug this build exists to fix.
+                if getattr(_cst, 'relocated', None):
+                    pagecap_reloc['fields'] += 1
+                    pagecap_reloc['cells'] += sum(_cst.relocated.values())
+                    pagecap_reloc['names'].append(name)
+                if _cst.pages_added:
+                    pagecap['fields'] += 1
+                    pagecap['pages'] += _cst.pages_added
+                    pagecap['tiles'] += _cst.tiles_moved
+                    if _cst.over:
+                        pagecap['worst'] = max(pagecap['worst'],
+                                               max(_cst.over.values()))
+                # ATTRIBUTABLE ONLY, INCLUDING THE FIELD COUNT.
+                #
+                # Build 34 counted the field's TOTAL pages/tiles here and
+                # overstated the rule's cost 2.5x. Build 35 fixed the pages and
+                # tiles but left the field count keyed on "window_over fired at
+                # all", which reported 86 fields for 37 attributable pages --
+                # in ~49 of them the grandfathered cap was already splitting
+                # and the window rule merely agreed. Same error, one line over.
+                # A field counts only if this rule is why work happened.
+                if getattr(_cst, 'ss_pages', 0):
                     pagecap_single['fields'] += 1
-                    pagecap_single['pages'] += getattr(_cst, 'ss_pages', 0)
-                    pagecap_single['tiles'] += getattr(_cst, 'ss_tiles', 0)
+                    pagecap_single['pages'] += _cst.ss_pages
+                    pagecap_single['tiles'] += _cst.ss_tiles
                     pagecap_single['names'].append(name)
+                    for _v in getattr(_cst, 'strategy', {}).values():
+                        pagecap_single['strategy'][_v] = \
+                            pagecap_single['strategy'].get(_v, 0) + 1
         if _cst is not None and _cst.refused:
             pagecap_refused.append((name, _cst.refused))
         if _dense_ok:
@@ -3089,7 +3164,10 @@ def _convert_field_backgrounds(archive, payloads, log, dds_sources=()):
             dense['from_art_borrow'] += dst.from_art_borrow
             dense['from_vanilla'] += dst.from_vanilla
         if cst is not None and getattr(cst, 'rejected', None):
-            cmp_rejected.append((name, cst.rejected))
+            if getattr(cst, 'window_refused', None):
+                cmp_windowed.append((name, cst.window_refused))
+            else:
+                cmp_rejected.append((name, cst.rejected))
         if cst is not None and cst.saved:
             cmp_fields += 1
             cmp_saved += cst.saved
@@ -3142,6 +3220,23 @@ def _convert_field_backgrounds(archive, payloads, log, dds_sources=()):
             ng_margin += 1
         if not k and not st and not (cst and cst.saved) and not _dense_ok:
             continue
+        # GREEN-LSB BACKSTOP. See field_bg_native.scrub_green_lsb -- the
+        # engine ORs green's low bit onto the top bit of blue on one display
+        # path, vanilla never sets it, and we do on 5 fields. The writer has
+        # not been found; this restores the invariant regardless and reports
+        # how much it had to fix, so the number falls to zero when the real
+        # cause is.
+        try:
+            _gp, _gs, _ge = field_bg_native.parse_texture_block(new9, px)
+            _gn = field_bg_native.scrub_green_lsb(_gp)
+            if _gn:
+                new9 = field_bg_native.replace_texture_block(
+                    new9, _gp, _gs, _ge)
+                green_lsb['texels'] += _gn
+                green_lsb['fields'] += 1
+                green_lsb['names'].append(name)
+        except Exception:                                      # noqa: BLE001
+            pass
         parts[8] = new9
         new_raw = lgp.join_sections(parts)
         if len(new_raw) > FIELD_BG_MAX_RAW:
@@ -3226,6 +3321,27 @@ def _convert_field_backgrounds(archive, payloads, log, dds_sources=()):
             f'copied verbatim -- so this frees textures without changing a '
             f'pixel. Verify with verify_compact.py; turn it off with '
             f'{field_bg_compact.COMPACT_ENV}=0.')
+    if cmp_windowed:
+        _c = sum(len(v) for _n, v in cmp_windowed)
+        log(f'      FRAME-LIMIT GUARD: {len(cmp_windowed)} field(s) left '
+            f'UNCOMPACTED because packing them would have put {_c} page(s) '
+            f'over 256 tiles in one camera frame -- '
+            + ', '.join(n for n, _ in cmp_windowed[:10])
+            + ('' if len(cmp_windowed) <= 10 else ', ...'))
+        log('          Compaction merges BYTE-IDENTICAL cells, so several '
+            'tiles come to share one cell and a page can pass 256 without '
+            'gaining a single cell. add_page_tile (x86 0x6464BA) has room for '
+            'exactly 256 and does not bounds-check, so tile 257 writes into '
+            'the next page\'s counter and the allocator is asked for '
+            'hundreds of megabytes. MEASURED: las0_2, the bottom of the '
+            'Northern Cave, CRASHED the game on hardware the moment the '
+            'camera scrolled up -- Cosmos ships that field with every page at '
+            'most 256 in a frame and 1.00 tiles per cell; compaction made it '
+            '547 and 2.14, saving ZERO pages. FINDINGS-128.')
+        log('          Refusing costs only pages, never quality: the cells '
+            'are byte-identical, so the picture is the same either way. '
+            'MEASURED across the archive, no field goes over the 16-page '
+            'ceiling and none loses a truecolor promotion.')
     if cmp_rejected:
         log(f'      ! {len(cmp_rejected)} field(s) FAILED the compaction '
             f'self-check and were left exactly as they came in. This is a '
@@ -3294,26 +3410,98 @@ def _convert_field_backgrounds(archive, payloads, log, dds_sources=()):
             'SIMULTANEOUSLY VISIBLE tiles and a scrolling field only ever '
             'submits a screenful.')
     if pagecap_single['fields']:
-        log(f"          SINGLE-SCREEN HARD CAP: "
+        log(f"          WINDOW CAP: "
             f"{pagecap_single['fields']} field(s), "
             f"{pagecap_single['pages']} page(s) added, "
             f"{pagecap_single['tiles']} tile(s) repointed -- "
             + ', '.join(pagecap_single['names'][:12])
             + ('' if len(pagecap_single['names']) <= 12 else ', ...'))
-        log('          A field whose whole tile grid fits on one screen '
-            'submits EVERY tile every frame, so its binding count IS its '
-            'frame count and vanilla\'s headroom is not headroom. MEASURED: '
-            'over the 200 single-screen fields of Switch vanilla, ZERO put '
-            'more than 256 BINDING tiles on a page; our build broke that in '
-            '25 fields, 1,280 tiles over. md8_1 shipped page 1 at 269 through '
-            'a grandfathered cap of 671, and slot 2 -- the page straight '
-            'after it in load order -- is where 11 of the 12 black squares on '
-            'that screen sample from. FINDINGS-122.')
+        log('          add_page_tile is called once per tile SUBMITTED THIS '
+            'FRAME, which is the tiles inside the camera window wherever the '
+            'camera is. MEASURED with a sliding window over all 709 fields: '
+            'vanilla NEVER exceeds 256 in a window, at any camera position, '
+            'and reaches exactly 256 -- the original tooling packed right up '
+            'to the limit and never past it. Our build broke that in 27 '
+            'fields, 2,682 tiles over. FINDINGS-123.')
         log('          The count is the BINDING page (the fx page when a tile '
             'carries one), not the raw texture id. By raw id vanilla itself '
             'is "over" constantly -- blue_2 739, hyou5_2 953 -- and has '
             'shipped since 1997, which is how we know the raw id is not what '
             'add_page_tile sees.')
+        log('          Build 34 keyed this on "the field fits on one screen", '
+            'a heuristic that could only ever see 202 of 709 fields. The '
+            'window measure is a strict superset -- a field that fits in the '
+            'window has one window position, so its in-window count IS its '
+            'total. VERIFIED offline: 0 pages the old rule caught that this '
+            'one misses, 0 fields where it does less work. FINDINGS-122 fixed '
+            'md8_1 with it; the 9 fields it could not see are all SCROLLING '
+            'ones -- trnad_3 355, ghotel 349, datiao_8 326, junpb_3 296, '
+            'qd 267, blin63_1 264, games 262, trnad_4 261, delmin1 257.')
+    if pagecap_single['strategy']:
+        log('          split strategy: '
+            + ', '.join(f'{k} {v}' for k, v in
+                        sorted(pagecap_single['strategy'].items()))
+            + ' -- section-9 order is roughly RASTER order, so a sequential '
+            'chunk is a spatially contiguous band and a camera window over it '
+            'still draws nearly all of it. Round-robin over screen position '
+            'spreads each window across the copies and so needs fewer pages: '
+            'nivl_b22 p20 (852 tiles) is 232 in-window after a sequential '
+            'split and 179 after round-robin, which is 3 pages instead of 4 '
+            'in a band with 2 free slots. Sequential is tried first at every '
+            'size, so nothing the cap already handled is divided differently.')
+    if green_lsb['texels']:
+        log(f"      GREEN-LSB BACKSTOP: {green_lsb['texels']:,} truecolor "
+            f"texel(s) in {green_lsb['fields']} field(s) had green's low bit "
+            f"set and were masked -- " + ', '.join(green_lsb['names'][:10]))
+        log('          The engine\'s non-565 display path (x86 0x63F350) ORs '
+            'green\'s low bit onto the TOP BIT OF BLUE, so a texel with '
+            '0x0020 set gains a large blue component there. Vanilla never '
+            'sets it; we do, on whole pages at a time, every value exactly '
+            'vanilla + 0x0020. It is NOT the resize (verified byte-exact). '
+            'THE WRITER HAS NOT BEEN FOUND -- this is a backstop, and this '
+            'number falling to zero is how we will know it was fixed. '
+            'FINDINGS-131.')
+    if ng_frame_kept:
+        log(f'      FRAME GUARD, COLOUR KEPT: {len(ng_frame_kept)} field(s) '
+            f'kept their page count -- and so their truecolor -- because the '
+            f'frame guard declined to pack them, not because the repack grew '
+            f'them: '
+            + ', '.join(n for n, _b, _a in ng_frame_kept[:10])
+            + ('' if len(ng_frame_kept) <= 10 else ', ...'))
+        log('          The no-growth loop drops the truecolor ceiling until a '
+            'field stops growing. That is right when the repack caused the '
+            'growth and wrong when field_bg_compact DECLINED to pack for '
+            'frame safety -- the field needs those pages either way, and '
+            'giving up colour depth does not make it safer. Build 42 shipped '
+            'the guard without this and lost 26,160 truecolor cells across 60 '
+            'fields. Bounded by the page ceiling, which is the real budget.')
+    if pagecap_reloc['fields']:
+        log(f"          CELL RELOCATION: {pagecap_reloc['cells']} cell(s) "
+            f"moved in {pagecap_reloc['fields']} field(s) -- "
+            + ', '.join(pagecap_reloc['names'][:12])
+            + ('' if len(pagecap_reloc['names']) <= 12 else ', ...'))
+        log('          These pages had NO free slot to duplicate into -- the '
+            'opaque truecolor band is three slots (26, 27, 28) and all three '
+            'were in use. But the pages already there were packed unevenly: '
+            'rckt3 held 256 / 272-OVER / 2 with 254 free cells on the third. '
+            'So the cell is copied byte-for-byte into free space on a page of '
+            'the same depth, size flag and blend group that is ALREADY in the '
+            'field, and the tile\'s u/v are rewritten to point at it. No page '
+            'is added. VERIFIED: every tile of every touched field samples '
+            'identical texels and the same palette before and after. '
+            'FINDINGS-126.')
+        log('          Only pages bound by the TEXTURE ID. A tile has one u/v '
+            'pair shared with its fx page, and an fx pair must sit at the same '
+            'grid coordinate, so moving one half would break it. las0_2 page '
+            '21 is bound by 547 fx tiles and 0 by texture id -- it is named '
+            'below rather than half-moved.')
+    if not field_bg_pagecap.FX_SPLIT:
+        log('          fx-byte split is OFF. A tile carrying an fx page BINDS '
+            'the fx page, and this splitter repoints the texture id at offset '
+            '32, so those pages are named below rather than fixed. That set '
+            'holds the worst in the archive -- nivl_b22 p20 716, nivl_b2 p20 '
+            '700, las0_2 p21 547. Enable field_bg_fx_split to split them; it '
+            'writes a byte no pass has written before and gets its own build.')
     if pagecap_dropped:
         log(f'      ! page cap: {len(pagecap_dropped)} field(s) needed a '
             f'split that would cross FIELD_BG_RAW_CAP, so they keep the '

@@ -248,6 +248,8 @@ class CompactStats:
         self.tiles_rewritten = 0
         self.rejected = None         # self_check said no; the field was left
                                      # exactly as it came in
+        self.window_refused = None   # {slot: tiles} this pass would have put
+                                     # over the 256-per-frame limit
 
     @property
     def saved(self):
@@ -255,6 +257,34 @@ class CompactStats:
 
     def __bool__(self):
         return self.saved > 0
+
+
+# Refuse a compaction that puts any page over 256 tiles in one camera frame.
+# See the long note at the end of compact_section9. Off returns the previous
+# behaviour exactly, for A/B.
+#
+# MEASURED over the 683 sections Cosmos ships, compaction alone:
+#
+#     without the guard   114 field(s) left with a page over the frame limit
+#                         166 pages saved
+#     with the guard        0 field(s) over
+#                          29 pages saved      -- gross cost 137 pages
+#
+# The gross cost overstates it: the page cap currently REPAIRS 113 of those
+# 114 by duplicating a page into a free slot, so pages the guard "costs" here
+# are largely pages the cap would have added anyway. And it breaks nothing --
+# the worst field is 15 pages with the guard and 15 without, against a ceiling
+# of 16, so no field loses a truecolor promotion.
+#
+# The merge itself was never a quality question. Cells are merged only when
+# their stored bytes are IDENTICAL, so declining to merge leaves the picture
+# untouched, byte for byte. What it costs is space, and the space is there.
+WINDOW_SAFE = True
+# STRICT refuses every compaction that breaks the frame limit. LENIENT refuses
+# only those the page cap cannot repair -- but the cap's room is judged AFTER
+# compaction, and later passes refill the slots, so lenient never fires. The
+# cost of strict is measured below.
+WINDOW_SAFE_STRICT = True
 
 
 def compact_section9(sec9, src_px=None, page_px=None):
@@ -566,4 +596,86 @@ def compact_section9(sec9, src_px=None, page_px=None):
         st.rejected = why
         st.pages_after = st.pages_before
         return sec9, st
+
+    # THE FRAME LIMIT IS PART OF "CORRECT", NOT SOMEONE ELSE'S PROBLEM.
+    # ------------------------------------------------------------------
+    # This module's own header already names the hazard:
+    #
+    #     "merges byte-identical cells, so several tiles come to share one
+    #      cell and A PAGE CAN PASS 256 WITHOUT GAINING A SINGLE CELL"
+    #
+    # `field_bg_pagecap` was written as the net for it. That works when the
+    # blend group still has a free slot to duplicate into. When it does not,
+    # nothing downstream can help, and the field ships a page that overruns
+    # `add_page_tile` the moment the camera reaches it.
+    #
+    # MEASURED, `las0_2` (bottom of the Northern Cave), which CRASHED the game
+    # on hardware the instant the camera scrolled up:
+    #
+    #     Cosmos ships   13 depth-1 pages, group (d1,1) 9 pages, 2254 cells,
+    #                    EVERY page at most 256 tiles in a frame, 1.00 tiles
+    #                    per cell
+    #     after this     13 depth-1 pages, group (d1,1) 9 pages, 1880 cells,
+    #                    page 21 at 547 in one frame, 2.14 tiles per cell
+    #
+    # 374 cells merged, **ZERO pages saved**, one hard crash. The mod's own
+    # tooling packed to the limit and never past it, exactly as vanilla does,
+    # and this pass undid that for no gain at all.
+    #
+    # So the limit is checked here, and a compaction that breaks it is
+    # refused the same way `self_check` refuses a wrong one. Refusing costs
+    # only the pages this pass would have saved -- for `las0_2` that is none
+    # -- and the merge itself was never a quality question: the cells are
+    # byte-identical, so declining to merge leaves the picture untouched.
+    if WINDOW_SAFE:
+        try:
+            import field_bg_pagecap as PC          # local: PC imports us
+            bad = {s: n for s, n in PC.window_counts(out, d2px).items()
+                   if n > PC.MAX_TILES_PER_PAGE}
+        except Exception:                                        # noqa: BLE001
+            bad = {}
+        if bad:
+            was = {s: n for s, n in PC.window_counts(sec9, d2px).items()
+                   if n > PC.MAX_TILES_PER_PAGE}
+            # Only blame this pass for what this pass caused. A page already
+            # over on the way in is somebody else's, and refusing here would
+            # lose real savings without fixing it.
+            mine = {s: n for s, n in bad.items()
+                    if s not in was or n > was[s]}
+            # AND ONLY REFUSE WHAT THE PAGE CAP CANNOT REPAIR.
+            #
+            # Refusing every unsafe compaction is far too blunt: MEASURED over
+            # the 683 sections the mod ships, it rejects 114 fields and gives
+            # up 137 of the 166 pages this pass saves -- 83% of its value --
+            # to fix a problem `field_bg_pagecap` already solves for 113 of
+            # them by duplicating the page into a free slot.
+            #
+            # The one it cannot solve is a group with NO free slot left. That
+            # is `las0_2`: group (d1,1) is nine slots, compaction filled all
+            # nine, and page 21 shipped at 547 tiles in a frame. The cap had
+            # nowhere to put a copy, and the game crashed the moment the
+            # camera scrolled up to it.
+            #
+            # So: leave the cap its room. Refuse only when this pass would
+            # both break the limit AND take the last slot that could fix it.
+            try:
+                out_pages, _s, _e = FN.parse_texture_block(out, d2px)
+                live = {p.slot for p in out_pages if p is not None}
+            except Exception:                                    # noqa: BLE001
+                live = set()
+            unfixable = dict(mine) if WINDOW_SAFE_STRICT else {}
+            if not WINDOW_SAFE_STRICT:
+                for s, n in mine.items():
+                    g = _group(s)
+                    if g is None:
+                        continue
+                    if not [q for q in _slots_in_group(g) if q not in live]:
+                        unfixable[s] = n
+            if unfixable:
+                st.rejected = ('would put %s over %d tiles in one frame with '
+                               'no free slot left to split into'
+                               % (sorted(unfixable), PC.MAX_TILES_PER_PAGE))
+                st.window_refused = unfixable
+                st.pages_after = st.pages_before
+                return sec9, st
     return out, st
