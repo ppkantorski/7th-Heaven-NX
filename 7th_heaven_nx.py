@@ -329,13 +329,74 @@ FIELD_BG_BUDGET_CHOICES = [
 # The thing it was really guarding against -- field_load_textures giving up
 # part-way and leaving pages on handle 0 -- turned out to be the 256-tiles-
 # per-page overrun, which `field_bg_pagecap` now prevents outright.
-# 3 IS A HARD CEILING NOW, NOT A TUNING CHOICE. The opaque truecolor band is
-# slots 26, 27, 28 -- see field_bg_native.D2_OPAQUE_SLOTS for the measurement
-# (every depth-2 page in the entire vanilla archive is in one of those three,
-# and every build of ours that used slot 29+ produced black squares). Values
-# above 3 are not offered because the repack cannot honour them.
+# NOT A HARD CEILING -- and this paragraph used to claim it was, two lines
+# above another that called 4..7 "the probe". Both cannot be true. What holds
+# is: the opaque truecolor band is slots 26, 27, 28 (field_bg_native.
+# D2_OPAQUE_SLOTS -- every depth-2 page in the vanilla archive sits in one of
+# those three) and slot 29+ never renders. The count above 3 is served from
+# FREE LOW SLOTS instead, which do render, so values above 3 ARE honoured.
+# 4..7 ARE THE PROBE. FINDINGS-141.
+#
+# The old list stopped at 3 and its label said "the opaque band is 3 slots
+# wide". That is `field_bg_native.D2_OPAQUE_SLOTS`, and the reason it is 3 is
+# `field_bg_repack.DEFAULT_D2_SLOTS_PER_GROUP`: "29 does not allocate,
+# measured on mds6_2". That is an ALLOCATION failure -- `field_load_textures`
+# makes one texture per present page and aborts the whole loop on the first
+# one it cannot serve -- and an allocation failure is a function of HEAP SIZE.
+# This build raises FF7's heap from the port's hardcoded 64 MB to 256 MB
+# (`ff7nx_heap.HEAP_MB`). THAT EXPLANATION WAS WRONG AND IS RETRACTED: build
+# 52 reproduced the black squares WITH the 256 MB heap, and neither build
+# crashed -- an allocation failure would. The page simply never becomes a
+# texture at slot 29+. It is placement, not heap size.
+#
+# The engine is not the limit: `field_init_bg_pages` (+0x92D048) does ONE
+# test, `cmp w28, #0x1a; cset lo`, so slots 0x1A..0x29 are ALL depth-2 --
+# sixteen, pre-allocated whether or not the archive fills them.
+#
+# WHY THIS LIST HAD TO CHANGE AT ALL: a value not in it is silently replaced
+# by `MAX_TRUECOLOR_PAGES` when the GUI loads, so setting 4 in settings.json
+# by hand snapped straight back to 3 and the build would have been a no-op.
+# Three separate gates hold this number down -- this list, the dropdown's
+# value, and `d2_slots_per_group()` -- and all three have to agree.
+#
+# 4 is the probe: one slot past the wall, so a failure is small and specific.
+# 7 is where it should land if 4 works, because the dense repack wants 6.18
+# pages per field and is currently given 2.61.
 FIELD_BG_TRUECOLOR_CHOICES = [
-    (3, '3 pages per field \u2014 the opaque band is 3 slots wide'),
+    # THREE. PROVEN ON HARDWARE TWICE, AGAINST THE DISASSEMBLY. FINDINGS-144.
+    #
+    # The original x86 this port recompiles (md5 ca7284c3..., identical to
+    # ff7_en_switch) permits far more, and I read all three functions in the
+    # path:
+    #     field_load_textures       0x640292  loop i < 0x2a, type-2 i < 0x21
+    #                                         -> blend 4 (opaque)
+    #     field_convert_type2_layers 0x63F385  loop i < 0x2a
+    #     read_field_background_data 0x62B6F1  loop i < 0x2a
+    # All three cover slots 0..41. By that reading slots 26..32 are opaque
+    # truecolor and seven pages should work.
+    #
+    # THE PORT DISAGREES, AND HARDWARE IS THE AUTHORITY:
+    #     build 52  slot 29 only        -> black squares
+    #     build 55  slots 29, 30, 31    -> black squares, 124 fields
+    # No crash either time, which rules out an allocation failure -- the page
+    # simply never becomes a texture. MEASURED on the build-55 archive, the
+    # DATA is fine: black-cell rate 4.41% on slots 26-28 and 4.85% on 29+,
+    # i.e. identical and all of it genuine dark art. So the archive is right
+    # and the divergence is in the recompiled port, not in what we write.
+    #
+    # Do not raise this again without runtime evidence from the port itself.
+    # Two builds and a full read of the x86 were not enough to predict it.
+    # STALE LABEL CORRECTED. It read "the only value that renders on this
+    # port", which is not what was measured and is contradicted by the builds
+    # since: this is a BASE cap, and field_bg_dense's LOW-SLOT PROBE lifts it
+    # to LOW_SLOT_MAX_TC wherever the field has free slots below 26. MEASURED
+    # on the shipped archive: 117 field(s) hold 4 truecolor pages, 35 hold 5,
+    # 8 hold 6 and 2 hold 7, with no black squares reported.
+    #
+    # What was actually measured is PLACEMENT, not count: slots 29+ never
+    # become textures on this port (builds 52 and 55, black squares, no
+    # crash). Free LOW slots draw correctly, which is why the probe exists.
+    (3, '3 pages per field \u2014 base cap; free low slots raise it further'),
     (0, 'Off \u2014 no truecolor promotion at all'),
     (2, '2 pages per field'),
     (1, '1 page per field'),
@@ -468,8 +529,13 @@ FIELD_BG_REPLACE_ONLY_AT_256 = FIELD_BG_GROWTH_AT_256   # old name, kept
 FIELD_BG_PRESET_CHOICES = [
     (0, 'Off — as shipped (recommended for now)'),
     (1, 'Uniform — 256px: same size everywhere, colour depth only'),
-    (2, 'Sharper but MIXED — 384px on ~13% of pages, 256px on the rest'),
-    (3, 'Sharpest but MIXED — 512px on ~13% of pages, 256px on the rest'),
+    # THE "~13%" HERE WAS WRONG. That figure is `replace_only` mode (option 1
+    # of the control below), and these presets set replace_only = 2, so it
+    # never applied to them. MEASURED on the current archive, 702 fields:
+    # 69.9% of tiles draw from a truecolor page. The share moves every build,
+    # so the label no longer quotes one -- read DENSE REPACK in the log.
+    (2, 'Sharper but MIXED — 384px truecolor pages beside 256px paletted'),
+    (3, 'Sharpest but MIXED — 512px truecolor pages beside 256px paletted'),
     (9, 'Custom — use the advanced settings below'),
 ]
 
@@ -2132,7 +2198,11 @@ def launch_ui():
                                          True)),
                                  'field_bg_clamp_palettes':
                                      bool(_global_setting(
-                                         'field_bg_clamp_palettes', True)),
+                                         'field_bg_clamp_palettes', False)),
+                                 'field_bg_preserve_cell_coords':
+                                     bool(_global_setting(
+                                         'field_bg_preserve_cell_coords',
+                                         True)),
                                  'fps_60': bool(fps_var.get()),
                                  'movie_quality': current_movie_quality(),
                                  'movie_fit': current_movie_fit(),
@@ -2888,7 +2958,10 @@ def launch_ui():
         # FINDINGS-130: Cosmos ships tiles naming palettes the field has not
         # got. Harmless on FFNx, garbage on the Switch.
         build.field_bg_pagecap.CLAMP_PALETTES = bool(
-            _global_setting('field_bg_clamp_palettes', True))
+            _global_setting('field_bg_clamp_palettes', False))
+        # FINDINGS-136: a promoted cell keeps its grid coordinate.
+        build.field_bg_dense.PRESERVE_CELL_COORDS = bool(
+            _global_setting('field_bg_preserve_cell_coords', True))
         os.environ[build.field_bg_repack.MAX_TOTAL_PAGES_ENV] = str(
             current_field_bg_max_pages())
         build.field_bg_repack.apply_growth_mode(
@@ -3090,7 +3163,9 @@ def main():
         build.field_bg_compact.WINDOW_SAFE = bool(
             _sg.get('field_bg_compact_frame_safe', True))
         build.field_bg_pagecap.CLAMP_PALETTES = bool(
-            _sg.get('field_bg_clamp_palettes', True))
+            _sg.get('field_bg_clamp_palettes', False))
+        build.field_bg_dense.PRESERVE_CELL_COORDS = bool(
+            _sg.get('field_bg_preserve_cell_coords', True))
         if build.field_bg_repack.REPLACE_ONLY_ENV not in os.environ:
             build.field_bg_repack.apply_growth_mode(
                 saved.get('__global__', {}).get('field_bg_replace_only', 2))

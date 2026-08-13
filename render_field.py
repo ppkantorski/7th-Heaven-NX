@@ -51,6 +51,26 @@ UV_SCALE = 10_000_000
 T_DSTX, T_DSTY = 2, 4
 T_PAL = 22
 T_TEX, T_TEX2 = 32, 34
+# THE SECOND TEXTURE HAS ITS OWN SOURCE. FINDINGS-161.
+#
+# This renderer used to draw `fx if fx else slot` and then index whichever it
+# chose with the BASE tile's UV out of `T_SRC_X_BIG`. Both halves were wrong:
+#
+#   * The fx page is not the resting state. FFNx `field/background.cpp`:
+#     `page = tile.use_fx_page ? tile.fx_page : tile.page`, and `use_fx_page`
+#     is set by the animation system, not by the file. Layer 1 never consults
+#     it at all. So the frame a player walks into shows the BASE page.
+#   * The fx page has its OWN source coordinates, `src_x2/src_y2` at 14/16,
+#     which this file never read. MEASURED on vanilla: of 107,677 tiles with
+#     texture_id2 set, 106,970 (99.34%) have src2 != src1. Indexing the fx
+#     page with the base UV therefore drew the wrong cell in ~99% of cases.
+#
+# The consequence was not cosmetic. It made every fx tile's rendering depend
+# on the BASE tile's grid index, so any pass that legitimately relocates a
+# base cell -- which `ff7nx_marginpage` already does to 850 tiles in `md_e1`
+# in the shipped build -- appeared here as the picture falling apart. That
+# very artefact nearly got PROMOTE_FX_BASE written off as a regression.
+T_SRCX2, T_SRCY2 = 14, 16
 T_SRC_X_BIG, T_SRC_Y_BIG = 42, 46
 
 
@@ -71,7 +91,7 @@ def _d2_rgb(buf):
                      ((v & 31) << 3).astype(np.uint8)], -1)
 
 
-def render(raw, layers=(1, 2), px=None):
+def render(raw, layers=(1, 2), px=None, fx_frame=False):
     """
     (H, W, 3) uint8, and the (x0, y0) of the canvas in game units.
 
@@ -123,11 +143,21 @@ def render(raw, layers=(1, 2), px=None):
     for (layer, o), tx, ty in zip(todo, xs, ys):
         slot = sec9[o + T_TEX]
         fx = sec9[o + T_TEX2]
-        eff = fx if (fx and fx in pmap) else slot
+        # See T_SRCX2. `fx_frame` draws the ANIMATED frame -- fx page indexed
+        # by ITS OWN source -- instead of the resting frame. Default is the
+        # resting frame, which is what the engine draws with use_fx_page = 0.
+        use_fx = bool(fx_frame and fx and fx in pmap)
+        eff = fx if use_fx else slot
         p = pmap.get(eff)
         if p is None:
             continue
         grid = 8 if p.size_flag else 16
+        # ONE u,v, TWO PAGES. FINDINGS-164. The fx frame is sampled with the
+        # BASE's uv -- `field_bg_compact` builds its fx reference as
+        # `(fx_slot, cx, cy)` from the base and refuses any compaction that
+        # would separate them. src_x2/src_y2 are in the record but are NOT the
+        # runtime sampling coordinate, and a previous edit here that used them
+        # was wrong in the same way FINDINGS-161 was.
         u, v = struct.unpack_from('<II', sec9, o + T_SRC_X_BIG)
         cx = int(round(u / UV_SCALE * grid))
         cy = int(round(v / UV_SCALE * grid))

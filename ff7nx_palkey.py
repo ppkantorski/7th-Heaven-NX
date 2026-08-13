@@ -405,7 +405,40 @@ def blacken_keys(sec3, sec9):
     # (builds 20-27) to 1,199 across 441 -- 2,068 palettes stopped being
     # touched, 785 of them bright colours left to draw as authored. Reverted
     # to the build-27 behaviour, which is the last state you called good.
-    _leave = set()
+    # RESTORED, WITH THE EVIDENCE THE FIRST ATTEMPT DID NOT HAVE. FINDINGS-153.
+    #
+    # An overlay palette that is ALSO drawn from an opaque page is left exactly
+    # as vanilla shipped it -- neither blacked nor de-fringed. Everything above
+    # this line already argued for it; the branch was simply absent.
+    #
+    # WHY IT COMES BACK. Build 28 added this and it was reverted because the
+    # de-fringe count fell from 3,267 to 1,199 and build 27 was the last state
+    # called good. That revert bundled this set with "the two `continue`s
+    # below" -- two changes, one decision. The artefact it was protecting
+    # against has since been reported from hardware, and it is the one this
+    # branch fixes:
+    #
+    #   desert1 (Corel desert), build 63: a dark jagged fringe along the
+    #   mountain silhouettes. MEASURED -- vanilla carries real colours in
+    #   entry 0 of palettes 1, 4, 5 and 6 (0x3D60, 0x1D6D, 0x4A4F, 0x4E72) and
+    #   this build wrote 0x0000 into ALL SEVEN. Index 0 is DRAWN on this
+    #   console (HANDOFF-78 2.5, and this module's own log line says so), so
+    #   every one of those texels now draws black.
+    #
+    # AND IN THAT FIELD THE BLACK-KEY RULE HAS NO LEGITIMATE TARGET AT ALL:
+    #
+    #   desert1   overlay palettes {1..7}, opaque-band {0..7}
+    #             ONLY on a blend band: NONE
+    #
+    # All seven are also drawn opaque, so all seven were collateral. The
+    # fx/steam case the rule was written for does not occur there.
+    #
+    # THE STEAM FIX IS NOT AFFECTED. MEASURED over 39 fields: 156 palettes are
+    # both overlay AND opaque (these keep vanilla, 59 of them recovering a
+    # real colour), and 63 are blend-band ONLY -- those still get the black
+    # key, unchanged. md8_1 is the worked example: {6,7,8,9,11,12} stay black,
+    # {4,5,10,13} keep vanilla.
+    _leave = _overlay_palettes(sec9) & _opaque_band_palettes(sec9)
     import numpy as np
 
     cols = np.frombuffer(sec3, '<u2', count=cpp * npg,
@@ -599,7 +632,17 @@ def summarise(st):
             'it out removed the Sector 6 yellow and put black speckles '
             'everywhere else), so the key now carries the mean colour of the '
             'art beside it and blends instead of punching a hole. %d '
-            'palette(s) were LEFT ALONE because they are drawn on an additive '
+            'palette(s) were SKIPPED by the de-fringe. That count MIXES TWO '
+            'OUTCOMES and used to say "LEFT ALONE" for both: a blend-band-only '
+            'palette is BLACKENED here (black is the identity for additive and '
+            'average, so a keyed pixel adds nothing), while an overlay palette '
+            'that is ALSO drawn from an opaque page now keeps VANILLA\'s own '
+            'value -- neither blacked nor de-fringed. FINDINGS-153: blacking '
+            'that second group wrote 0x0000 over real colours in 2,035 '
+            'palette(s) across 516 field(s), and index 0 IS DRAWN on this '
+            'console, which is the dark fringe on desert1\'s mountains. '
+            'The first group is unchanged, so the steam fix stands. They are '
+            'drawn on an additive '
             'or average page, where a non-black key is ADDED to the background '
             'across the whole transparent surround of an fx cell -- the '
             'square patches around steam and reactor effects'

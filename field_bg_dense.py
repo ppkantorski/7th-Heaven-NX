@@ -79,11 +79,40 @@ import field_bg_native as FN
 TILE = 16
 GRID = 16                        # 16x16 cells of 16x16 texels on a 256px page
 PER_PAGE = GRID * GRID
+
+# A promoted cell keeps its grid coordinate and only changes page. See the
+# long note at the placement loop. False restores the old dense packing
+# (enumeration order), for A/B.
+# BUILD 48, AND IT WAS A NET LOSS. MEASURED across all 20 build logs, and
+# 47 -> 48 changed nothing else:
+#
+#     dense repack cells   300,513 -> 283,264    -17,249 cells
+#     dense repack pages     1,344 ->   1,607       +263 pages
+#
+# 17,249 cells STOPPED being promoted to truecolor and fell back to the
+# quantised paletted page -- i.e. 17,249 cells of Cosmos art traded for
+# vanilla-derived art, which is the opposite of the point. The user reported
+# it on the build ("this issue is new of not using some textures it feels
+# like") and it was read as a perception problem.
+#
+# It also costs 263 EXTRA PAGES, and pages are the binding resource:
+# `field_load_textures` aborts the whole loop on the first page it cannot
+# allocate (FINDINGS-141 section 7), so this made the black-square ceiling
+# strictly worse in every field it touched.
+#
+# And it did not deliver what it claimed. I reported it as taking cell
+# adjacency 1% -> 89%; MEASURED on the shipped archive, all 631 fields with
+# truecolor pages, it is 5.2%. The 89% was one code path measured in
+# isolation and reported as the archive.
+#
+# True restores build 48 for A/B.
+PRESERVE_CELL_COORDS = False
 SECTION9 = 8
 UV_SCALE = 10_000_000
 STEP = UV_SCALE // GRID
 
 T_SRC_X, T_SRC_Y = 10, 12
+T_SRCX2, T_SRCY2 = 14, 16      # the fx frame's OWN source. FINDINGS-161/163.
 T_PAL = FN.TILE_PALETTE_ID              # 22
 T_TEXID = FN.TILE_TEXTURE_ID            # 32
 T_FX_PAGE = FN.TILE_TEXTURE_ID2         # 34
@@ -147,7 +176,8 @@ BORROW_MAX_DIST = float('inf')
 
 
 class Stats:
-    __slots__ = ('cells', 'pages', 'tiles', 'from_art', 'from_art_borrow',
+    __slots__ = ('hue_kept_art',
+                 'cells', 'pages', 'tiles', 'from_art', 'from_art_borrow',
                  'from_vanilla', 'keyed', 'fx_pairs', 'refused', 'pages_before',
                  'borrow_refused')
 
@@ -157,6 +187,7 @@ class Stats:
         self.keyed = self.fx_pairs = 0
         self.pages_before = 0
         self.borrow_refused = 0
+        self.hue_kept_art = 0
         self.refused = None
 
 
@@ -188,6 +219,140 @@ def _pal_rgb(sec3):
     g6 = (((g << 1) | (g >> 4)) & FN.GREEN_LSB).astype(np.uint16)
     b5 = b.astype(np.uint16)
     return ((r5 << 11) | (g6 << 5) | b5).astype(np.uint16), npg, cpp
+
+
+# PROMOTE THE CELLS QUANTISATION IS PROVABLY FAILING, FIRST. FINDINGS-149.
+#
+# The candidate order was `-len(tiles)` alone -- how many tiles reuse a cell.
+# That is a density heuristic and it never asks whether the paletted version
+# is any good. MEASURED across 38 fields (diag_huebudget.py): 40.5% of margin
+# layer-1 cells are quantisation failures, and 15.8% are ORPHANED -- no
+# palette in the field is within 0.10 of their hue, so no palette choice and
+# no page split can ever fix them. Only a truecolor page can, because it has
+# no palette at all. That is why FFNx has none of these defects: it never
+# applies one (FINDINGS-141).
+#
+# The two routes were priced on the same cells:
+#     split into more paletted pages   5,439 extra page(s) archive-wide
+#     promote to truecolor               538 extra page(s), <= 1 per field
+#
+# And it may cost nothing: the repack already promotes 363,503 cells, and the
+# broken cells are ~40,000 of them, so ordering them first largely fixes the
+# defect inside the budget already being spent.
+HUE_FIRST = True
+# Same units and calibration as ff7nx_marginpal's gates (FINDINGS-148): the
+# known-answer cases sit at 0.000 (right) and 0.048 (wrong).
+HUE_BROKEN_DIST = 0.030
+
+
+def _chroma(rgb):
+    v = np.asarray(rgb, float)
+    s = float(v.sum())
+    return v / s if s > 1e-6 else np.zeros(3)
+
+
+def hue_broken(k, arrays, pal565, art_for, _cache=None, origin=None):
+    """
+    Chromaticity distance between Cosmos's ART for this cell and what the
+    PALETTED page actually renders. 0.0 when it cannot be measured.
+
+    THE DECODE IS R5G6B5 AND THAT IS NOT SECTION 3's LAYOUT. `pal565` packs
+    (v>>11)&31 / (v>>5)&63 / v&31 -- see `_pal_distance`, which is where this
+    is established. Section 3 is BGR555, (v&31)/((v>>5)&31)/((v>>10)&31).
+    Decoding one with the other silently yields a plausible-looking wrong
+    colour, which is exactly the kind of error this project keeps paying for.
+    """
+    if art_for is None:
+        return 0.0
+    slot, sx, sy, pal = k
+    # Clamp, do not bail: an out-of-range palette byte is common (see
+    # black_fraction) and returning 0.0 would score the cell "sound" for a
+    # reason that has nothing to do with its colour.
+    if pal >= len(pal565):
+        pal = len(pal565) - 1
+    if pal < 0:
+        pal = 0
+    if _cache is None:
+        _cache = {}
+    # ASK THE PAGE THE CELL CAME FROM. FINDINGS-150.
+    #
+    # `ff7nx_marginpage` moves margin cells onto pages Cosmos never shipped
+    # and REPACKS their coordinates -- slot 1 (sx, sy) becomes slot 3
+    # (dx, dy). Asking `art_for(3, pal)` returns None, and the first version
+    # of this scored that 0.0, i.e. "sound". It was measured: all 40 of
+    # mds5_5's margin sky cells went from 40/40 BROKEN before the split to
+    # 0/40 after it, which silently un-did the entire build-60 fix.
+    #
+    # The art still exists -- at the ORIGIN page and the ORIGIN coordinates.
+    # The rendered side keeps using the destination, because that is what the
+    # screen actually draws.
+    aslot, asx, asy = slot, sx, sy
+    if origin:
+        _o = origin.get((slot, sx, sy))
+        if _o:
+            aslot, asx, asy = _o
+    ck = (aslot, pal)
+    if ck not in _cache:
+        # FALL BACK TO PALETTE 0 WHEN THE EXACT PALETTE IS NOT SHIPPED.
+        #
+        # THIS IS WHY THE FIRST VERSION MEASURED ZERO ON mds5_5. `marginpal`
+        # had repointed that page to palette 1; Cosmos ships only `_00`, so
+        # `art_for(slot, 1)` returned None and every cell scored 0.0 -- the
+        # detector reported "nothing broken" about the very page whose sky
+        # the user photographed. A missing dump is not evidence of a sound
+        # cell.
+        #
+        # `source_cell` already does this, and quotes FFNx's own rule for it
+        # (saveload.cpp:138, load_normal_texture falls back to palette 0).
+        got = None
+        for _p in (pal, 0) if pal != 0 else (pal,):
+            try:
+                got = art_for(aslot, _p)
+            except Exception:                                  # noqa: BLE001
+                got = None
+            if got is not None:
+                break
+        img = None
+        if got is not None:
+            img = got[0] if isinstance(got, tuple) else got
+        _cache[ck] = img
+    img = _cache[ck]
+    if img is None:
+        # UNMEASURABLE, WHICH IS NOT THE SAME AS SOUND. Counted so the log
+        # can say how often the detector was blind rather than satisfied --
+        # three separate bugs this session were "returned 0.0 because it
+        # could not look" reading as "this cell is fine".
+        hue_broken.unmeasured = getattr(hue_broken, 'unmeasured', 0) + 1
+        return 0.0
+    # `art_for` hands back a PageArt, NOT an ndarray -- its `.buf` is the page
+    # already packed as 565 at `.px`, which is the SAME encoding as `pal565`,
+    # so both sides decode identically below. (The first version of this
+    # indexed `.shape` and died in the harness; that is what the harness is
+    # for.)
+    try:
+        f = img.px // 256
+        page = np.frombuffer(img.buf, '<u2').reshape(img.px, img.px)
+    except Exception:                                          # noqa: BLE001
+        return 0.0
+    if f < 1:
+        return 0.0
+    av = page[asy * f:(asy + TILE) * f, asx * f:(asx + TILE) * f].reshape(-1)
+    av = av.astype(np.int64)
+    b = np.stack([((av >> 11) & 31) << 3,
+                  ((av >> 5) & 63) << 2,
+                  (av & 31) << 3], -1).astype(float)
+    b = b[b.max(1) > 24]
+    if not b.size:
+        return 0.0
+    idx = arrays[slot][sy:sy + TILE, sx:sx + TILE]
+    v = pal565[pal][idx].astype(np.int64).reshape(-1)
+    col = np.stack([((v >> 11) & 31) << 3,
+                    ((v >> 5) & 63) << 2,
+                    (v & 31) << 3], -1).astype(float)
+    col = col[(idx.reshape(-1) != 0) & (col.max(1) > 24)]
+    if not col.size:
+        return 0.0
+    return float(np.linalg.norm(_chroma(b.mean(0)) - _chroma(col.mean(0))))
 
 
 def _pal_distance(pal565, pal, idx):
@@ -433,6 +598,25 @@ def black_fraction(arrays, pal565, k):
     dead black.
     """
     slot, sx, sy, pal = k
+    # CLAMP, FOR THE REASON source_cell ALREADY DOCUMENTS AT LENGTH.
+    #
+    # A tile may name a palette the field does not have -- Cosmos leaves the
+    # palette byte of its widescreen tiles at whatever it was, because FFNx
+    # replaces the page with a DDS and never applies it. `source_cell` clamps
+    # on the read side for exactly this. THIS FUNCTION DID NOT, and it did not
+    # matter while keyed layer-2 cells were vetoed out of `cand` before they
+    # ever reached it.
+    #
+    # PROMOTE_L2_KEY let them in and this raised IndexError on 29+ fields --
+    # "index 8 is out of bounds for axis 0 with size 8". build.py catches that
+    # per field and logs "not repacked", so each one lost its ENTIRE promotion:
+    # a colour-depth change turned into a total loss of truecolor for those
+    # fields. Clamping changes no bytes; it only decides which colour we read
+    # for a cell already rendering off the end of its palette table.
+    if pal >= len(pal565):
+        pal = len(pal565) - 1
+    if pal < 0:
+        pal = 0
     idx = arrays[slot][sy:sy + TILE, sx:sx + TILE]
     col = pal565[pal][idx]
     return float(((col == 0) & (idx != 0)).mean())
@@ -446,7 +630,7 @@ def _up(a, s):
 
 
 def source_cell(k, rec, pages, arrays, pal565, art_for, pals_for, st,
-                scale=1):
+                scale=1, origin=None, hue_broken_cell=False):
     """A (16*scale, 16*scale) uint16 R5G6B5 cell, from the mod's art.
 
     `scale` is `page_px // 256`. AT 256 IT IS 1 AND NOTHING BELOW CHANGES.
@@ -568,7 +752,25 @@ def source_cell(k, rec, pages, arrays, pal565, art_for, pals_for, st,
     # in the build HANDOFF-78 2.7 was written about. If it is brown again, gate
     # this on the palette distance rather than deleting it: distance < 8 was
     # 0.7% of candidates and distance < 32 was 4.6%.
-    art = art_for(slot, pal) if art_for is not None else None
+    # FOLLOW ff7nx_marginpage's SPLIT TO THE ART. FINDINGS-151.
+    #
+    # THE SAME BLINDNESS AS hue_broken, ONE STEP LATER AND MUCH MORE COSTLY.
+    # `marginpage` moved this cell onto a page Cosmos never shipped, so
+    # `art_for(slot, pal)` returns None, the whole art path is skipped, and
+    # the cell is taken FROM THE PALETTED PAGE -- which already holds the
+    # sky quantised through a palette whose bluest entry is 41. Promoting it
+    # then bakes that olive into truecolor permanently.
+    #
+    # MEASURED, mds5_5 build 61: the margin sky reached the truecolor page
+    # (40/40 cells) and its PIXELS were still (79.5, 67.8, 27.8) against the
+    # interior sky's (65.4, 65.4, 58.0). Right depth, wrong colour -- which is
+    # why build 61 looked identical on hardware despite every counter moving.
+    _asl, _asx, _asy = slot, sx, sy
+    if origin:
+        _o = origin.get((slot, sx, sy))
+        if _o:
+            _asl, _asx, _asy = _o
+    art = art_for(_asl, pal) if art_for is not None else None
     src_pal = pal
     if art is not None:
         st.from_art += 1
@@ -579,7 +781,7 @@ def source_cell(k, rec, pages, arrays, pal565, art_for, pals_for, st,
         if BORROW_MAX_DIST == float('inf') or _pal_distance(
                 pal565, pal,
                 arrays[slot][sy:sy + TILE, sx:sx + TILE]) <= BORROW_MAX_DIST:
-            art = art_for(slot, 0)
+            art = art_for(_asl, 0)
             if art is not None:
                 src_pal = 0
                 st.from_art_borrow += 1
@@ -614,21 +816,45 @@ def source_cell(k, rec, pages, arrays, pal565, art_for, pals_for, st,
         # to `art.px`, so the stride is a last resort rather than the filter.
         step = max(1, s // scale)
         t = TILE * scale
-        out = buf[sy * s:sy * s + t * step:step,
-                  sx * s:sx * s + t * step:step].copy()
+        out = buf[_asy * s:_asy * s + t * step:step,
+                  _asx * s:_asx * s + t * step:step].copy()
         if out.shape != (t, t):                       # art smaller than asked
             out = _up(buf[sy * s:(sy + TILE) * s, sx * s:(sx + TILE) * s],
                       scale // max(1, s)).copy()
         pal_ref = _up(pal565[pal][idx], scale)
-        if src_pal != pal:
+        if src_pal != pal and not hue_broken_cell and not KEEP_ART_ON_BORROW:
             # BORROWED. Keep the detail, take the colour from the palette this
             # cell actually names. See _detail_transfer.
             out = _detail_transfer(out, pal_ref)
+        elif src_pal != pal or (KEEP_ART_ON_BORROW and src_pal != pal):
+            # ...EXCEPT WHERE THAT PALETTE PROVABLY CANNOT HOLD THE ART.
+            # FINDINGS-151, and this is the last link in mds5_5's yellow sky.
+            #
+            # The cell is borrowed (art at palette 0, tile names palette 1) and
+            # `_detail_transfer` then takes its COLOUR from pal_ref -- the
+            # paletted page through palette 1, whose bluest entry is 41. So
+            # Cosmos's cool sky (74.8, 78.2, 74.6) was re-dyed olive on the way
+            # onto the truecolor page, which is why promoting it changed
+            # nothing on hardware across builds 60 and 61.
+            #
+            # The module already argues the right rule two hundred lines up:
+            # "depth 2 pixels are FINAL COLOUR, the palette is never applied
+            # -> borrowed art draws exactly as FFNx draws it. CORRECT." It was
+            # simply never applied here.
+            #
+            # SCOPED to hue-broken cells on purpose. The detail transfer exists
+            # because 82.7% of borrows move a pixel by more than 32/255, and
+            # the field that punished removing it was mds6_2/mds6_3/Wall
+            # Market's brown right-hand side. Those cells are not hue-broken,
+            # so they keep the transfer and that risk is untouched.
+            st.hue_kept_art += 1
+            dense_repack.hue_kept_art = (
+                getattr(dense_repack, 'hue_kept_art', 0) + 1)
         # Where the ART is transparent, fall back to the paletted pixel: the
         # mod's alpha is authoritative about its own art, not about what the
         # game draws there.
-        tm = art.tmask[sy * s:sy * s + t * step:step,
-                       sx * s:sx * s + t * step:step]
+        tm = art.tmask[_asy * s:_asy * s + t * step:step,
+                       _asx * s:_asx * s + t * step:step]
         if tm.shape == out.shape and tm.any():
             out[tm] = pal_ref[tm]
     else:
@@ -731,6 +957,220 @@ TRUE_BLACK = 0.25
 
 PROMOTE_LAYER1_KEY = False
 
+# PROMOTE A LAYER-2+ CUT-OUT. FINDINGS-152, and this is the actual ceiling.
+#
+# THE VETO IT REPLACES WAS BUILT ON AN UNTESTED PREMISE. `field_bg_dense`'s own
+# note says so: "Whether a truecolor page can carry a working cut-out at all is
+# the open question (0x0000 on depth 2 -- this project has claims both ways and
+# neither is settled)". It is settled now, from the stock game:
+#
+#     VANILLA, UNMODIFIED: 1,091,741 truecolor texel(s) equal to 0x0000
+#     across 26 field(s) -- cosmo, cosmo2, fr_e, gaiin_6, gaiin_7, blin67_4...
+#
+# If 0x0000 drew opaque on a depth-2 page, the stock game would have black
+# rectangles in all 26. It does not. 0x0000 means TRANSPARENT there, which is
+# exactly what a cut-out needs, so a layer-2 keyed cell means the SAME THING on
+# both page depths and promoting it preserves it byte for byte.
+#
+# WHY THIS AND NOT THE PAGE CAPS. MEASURED over 34 fields at the real pipeline
+# point, every capacity limit is slack: free page slots never run out (~37
+# spare per field), the 16-page ceiling binds 9% of fields, worst-field memory
+# is 11.19 MB, and raising LOW_SLOT_MAX_TC from 7 to 16 changes NOTHING. The
+# candidate filter throws out 69% of all still-paletted cells before any of
+# those numbers is consulted:
+#
+#     key + layer 2 (this flag)   169,706 cells   51% of what is left
+#     key, layer 1 only            60,397 cells   18%   -- HARDER, see below
+#     no key, held by cap/black   102,873 cells   31%
+#
+# LAYER 1 IS NOT THE SAME CASE and stays off. There index 0 is DRAWN as a
+# colour, so preserving 0x0000 turns 23% of the texels in 2,763 cells
+# see-through, and baking entry 0's colour instead breaks the overlap
+# show-through a previous attempt hit. That one needs the overlap test first.
+PROMOTE_L2_KEY = True
+
+# KEEP COSMOS'S OWN COLOUR ON A BORROWED TRUECOLOR CELL. FINDINGS-157.
+#
+# Cosmos ships a DDS per (field, page, palette) but usually only `_00`, so
+# only ~21% of drawn (cell, palette) pairs have EXACT art. The rest BORROW
+# palette 0's art, and `_detail_transfer` then takes the DETAIL from Cosmos
+# and the COLOUR from the palette the tile names -- i.e. it pulls the cell
+# back toward VANILLA's colour table.
+#
+# On a DEPTH-2 page there is no palette. The engine never applies one, and
+# neither does FFNx -- which is what the mod was authored against. This
+# module already argued the right rule 200 lines up: "depth 2 pixels are
+# FINAL COLOUR, the palette is never applied -> borrowed art draws exactly as
+# FFNx draws it. CORRECT." It was applied only to hue-broken cells.
+#
+# MEASURED against Cosmos's own DDS as ground truth (`_fidelity.py`, mean
+# |RGB| per drawn texel, atlas gap excluded, weighted by tiles), 18 fields:
+#
+#     ALL          13.96 -> 11.79
+#     mkt_mens     12.32 ->  3.00     md8_2     4.45 -> 1.07
+#     mds6_2        5.28 ->  2.31     mrkt1    14.49 -> 11.76
+#     mds6_3        3.36 ->  1.40     desert1  36.47 -> 33.81
+#
+# 18 of 18 improved, none worse -- INCLUDING mds6_2/mds6_3/Wall Market, the
+# fields whose brown right-hand side was the stated reason for keeping the
+# transfer. That objection was measured against VANILLA's colour intent; the
+# user's standing rule is the opposite ("do not fix colour by moving it
+# toward vanilla -- the mod's art is the target").
+#
+# This changes PIXELS ONLY. Not one cell changes page, depth or slot.
+KEEP_ART_ON_BORROW = True
+
+# PROMOTE THE BASE CELL OF AN ANIMATED TILE. FINDINGS-161.
+#
+# `collect()` returns `fx_of = {base_key: {partner_key, ...}}`. Until now
+# `fx_cells` was the UNION of both sides and every one of them was vetoed, on
+# this premise from FINDINGS-157 s5:
+#
+#     "A tile and its fx page share ONE (sx,sy), so a pair must move together
+#      AND land on the SAME GRID INDEX of two different pages."
+#
+# THAT PREMISE IS FALSE, and it is the reason the biggest bucket in the
+# archive sat untouched. The tile record carries SEPARATE source coordinates
+# for the second texture -- `src_x2/src_y2` at offsets 14/16, which
+# `ff7nx_marginblack` has named since it was written and which nothing in this
+# module writes. MEASURED on the vanilla archive:
+#
+#     tiles with texture_id2 != 0        107,677
+#       src2 == src1                         707   ( 0.66%)
+#       src2 != src1                     106,970   (99.34%)
+#
+# The two sources are independent in the format and independent in the data.
+# Moving the base cell does not move the fx cell and cannot desynchronise it.
+#
+# THE BUILD ALREADY DOES THIS AND IT SHIPS. In `md_e1`, 850 fx tiles have had
+# their base relocated (slot 0 -> slots 2/6/7/8, new sx,sy) by marginpage
+# while `fx_page` and `(sx2,sy2)` stayed byte-identical -- 0 of 850 changed.
+# That is in build 68, on the SD card, working.
+#
+# WHAT IS ACTUALLY NEW is only the base page's DEPTH. Two things bound that
+# risk:
+#   * UV is NORMALISED. `T_SRC_X_BIG` is `cx * (UV_SCALE//GRID)` -- a fraction
+#     of the page, not a texel count -- so 256px and 512px pages produce the
+#     same UV. Page size was already decoupled; that is why 512px works.
+#   * MIXED DEPTHS ALREADY SHIP IN THE STOCK GAME. Vanilla `md_e1` draws 128
+#     tiles whose base is DEPTH 1 and whose fx page (slot 26) is DEPTH 2. The
+#     engine resolves each page's type from the file independently.
+#
+# INFERRED, and say so: the mirror case -- base depth 2 at 512px with a
+# depth-1 256px fx page -- has never been observed on hardware. Vanilla proves
+# the two are not coupled; it does not prove this direction. That is what the
+# scoped test is for.
+#
+# THE PARTNER SIDE STAYS VETOED. An fx frame lives in the additive/average
+# band (MEASURED: 47,363 of 47,653 partner references in 0x0F-0x17, 290 in
+# 0x18-0x19, ZERO opaque) and depth-2 additive needs slots 33-39, which do not
+# become textures on this port (s2.3). Promoting a partner would silently turn
+# an additive frame opaque. Do not.
+#
+# MEASURED COST of the base side alone, on the build-68 archive:
+#
+#     promotable cells      24,938   carrying 68,282 tiles
+#     coverage              68.8% -> 78.3%   (+9.6 points)
+#     new depth-2 pages       +382   depth-1 pages emptied  -61
+#     memory                +0.78 MB per affected field, mean
+#     fields over 16 pages       0   (max after = 16; md_e1 17 -> 14)
+#
+# 18,250 further base cells are still held by TRUE_BLACK. Separate question.
+#
+# ===================================================================
+# BUILD 69 SHIPPED THIS AND IT BROKE OVERLAY ANIMATIONS ON HARDWARE.
+# TURNED OFF PENDING THE REAL FIX. FINDINGS-162.
+# ===================================================================
+#
+# Reported: rectangular blocks of wrong content wherever an animated overlay
+# draws -- Wall Market (mrkt2, confirmed by match, corr 0.552) and Aerith's
+# house. Coverage went 68.8% -> 84.0% and fidelity improved everywhere, so the
+# RESTING frame is right; what broke is the ANIMATED frame.
+#
+# WHAT IS NOW MEASURED, and it narrows the cause to one thing:
+#   * src2 IS a real runtime coordinate. In vanilla `md_e1`, many tiles share
+#     ONE base cell (0,0) while carrying DISTINCT src2 values on the SAME fx
+#     page -- (32,240), (48,240), (64,240)... If the engine sampled the fx
+#     page with the base UV those tiles would all draw the same cell and the
+#     distinct values would be dead data. So s2 of FINDINGS-161 is right that
+#     the two sources are independent.
+#   * What s4 got WRONG is that it checked DEPTH and never checked SIZE.
+#     Vanilla's one mixed pair (`md_e1` base d1@256 + fx d2@256) matches in
+#     SIZE. Our depth-2 pages are 512px and every fx page in the archive is
+#     depth-1 at 256px, so promoting a base creates a 512/256 pair that
+#     vanilla NEVER ships and that nothing has ever exercised.
+#   * INFERRED, and it is the leading candidate: the engine scales the fx
+#     source by a page width it takes once per tile. With a 512px base the fx
+#     UV lands on a fraction of the intended cell -- which is exactly
+#     "rectangles of flat, wrong content".
+#
+# BUILD 70. The pair now MOVES TOGETHER onto pages of the SAME SIZE, each
+# keeping its own grid coordinate -- so src_x2/src_y2 stay valid as written
+# and only the fx PAGE byte is repointed. A base whose partners cannot all be
+# seated is WITHDRAWN, so the build-69 half-moved pair cannot be constructed.
+#
+# MEASURED, 160 fields, offline chain:
+#     coverage 61.11% -> 69.23%   (+8.11 points, +11,728 tiles)
+#     half-moved (base d2 + fx d1) ....... 0
+#     size-mismatched fx tiles ........... 0
+#     dangling fx references ............. 0
+#     paired fx tiles, both sides 512px .. 11,729
+#     max pages after 16, none over
+#     ANIMATED FRAME RENDERED AND COMPARED: md_e1 mean|d| 0.01, no wrong-
+#     content rectangles, no new black. That is the check build 69 lacked.
+#
+# ONE KNOWN EXCEPTION: `uutai1` 1024 -> 1023 tiles. Understood, not mysterious
+# -- an fx base is seated by tile-count order, then withdrawn when a partner
+# will not fit, and the ordinary cell it displaced does not share its grid
+# coordinate so the freed seat cannot be handed back. The proper fix is to
+# decide seatability BEFORE the main seating pass. See FINDINGS-163 s7.
+# THE MULTI-PALETTE VETO. FINDINGS-165. Leave this ON.
+# A cell drawn through more than one palette carries its variation IN the
+# palette; a depth-2 page has none, so promoting it collapses every tile that
+# shares it to one colour. Only safe when the mod ships exact art per palette.
+MULTI_PALETTE_VETO = True
+
+PROMOTE_FX_BASE = False
+
+# LOW-SLOT PROBE -- put truecolor pages in free slots 0..25 instead of the
+# 29+ range that does not render on this port. Rationale, disassembly and
+# measured headroom are at the use site in `dense_repack`. False restores
+# build 54 exactly.
+LOW_SLOT_PROBE = True
+LOW_SLOT_MAX_TC = 7            # 7 covers the whole archive: pages a field
+                               # needs to be 100% truecolor, MEASURED --
+                               # 1p:46 2p:246 3p:166 4p:179 5p:49 6p:11 7p:4
+# EVERY FIELD. Proven on 18 Wall Market fields in build 56.
+#
+# Those fields ran 4-5 truecolor pages with pages living in slots 6, 8, 9 and
+# 10 and rendered clean on hardware, where build 55 gave the SAME fields the
+# same page count in slots 29/30 and they went black. Same count, different
+# slots, opposite result -- so the ceiling was PLACEMENT, not capacity, and
+# the engine's own rule (type from section 9, any type-2 page below slot 33
+# drawn opaque) is what makes a low slot work.
+#
+#     mrkt1   [9, 10, 26, 27, 28]      mkt_ia  0 -> 99 cells truecolor
+#     mrkt2   [8,  9, 26, 27, 28]      mkt_s1  0 -> 129
+#     onna_2  [6,     26, 27, 28]      mkt_s3  0 -> 91
+#     Wall Market overall: 73.2% -> 76.4% of cells truecolor,
+#     and ZERO pages at slot >= 29.
+#
+# An empty set means every field, which the guard below already handles.
+LOW_SLOT_FIELDS = frozenset()
+
+# PLACEMENT A/B, FINDINGS-156.  'asc' is build 64 exactly (lowest free slot
+# first).  'desc' hands out the HIGHEST free low slot first, which changes
+# only WHICH slot each truecolor page lands in -- same pages, same cells,
+# same coverage, same bytes.  It is a probe for whether the Wall Market
+# black tiles follow the SLOT or follow the CONTENT, and it costs nothing.
+LOW_SLOT_ORDER = 'desc'   # FINDINGS-156 placement probe. 'asc' = build 64.
+# Highest low slot the probe may use.  25 is build 64.  14 keeps every
+# truecolor page inside the depth-1 OPAQUE band (0x00-0x0E), so the probe
+# cannot accidentally test blend mode at the same time as placement --
+# FINDINGS-141 s4 says the depth-2 blend selection was never verified in
+# the ARM64 image, and slots 15-23 are ADDITIVE / 24-25 AVERAGE for depth 1.
+LOW_SLOT_TOP = 14         # FINDINGS-156 placement probe. 25 = build 64.
+
 MAX_TRUECOLOR_PAGES = 3
 _MAX_TOTAL_PAGES_DEFAULT = 12
 
@@ -820,9 +1260,16 @@ def dense_repack(sec3, sec9, field='', art_for=None, pals_for=None, px=256,
         _np = len(pal565)
         rec['pal'] = k[3] if -1 <= k[3] < _np else (k[3] % _np if _np else 0)
         rec['key'] = _uses_key(pages, arrays, k)
-    fx_cells = set(fx_of)
+    # See PROMOTE_FX_BASE. `fx_partners` is the side that must stay paletted
+    # (an fx frame is drawn through the additive/average band, which has no
+    # depth-2 equivalent that renders on this port). `fx_cells` is what the
+    # candidate filter vetoes: both sides when the flag is off, partners only
+    # when it is on. A cell that is BOTH a base and someone else's partner
+    # stays vetoed either way -- it is in `fx_partners`.
+    fx_partners = set()
     for v in fx_of.values():
-        fx_cells |= v
+        fx_partners |= v
+    fx_cells = fx_partners if PROMOTE_FX_BASE else (set(fx_of) | fx_partners)
 
     # PRIORITY: the cells the most tiles draw. Those cover the most screen.
     # A CELL THAT USES THE KEY STAYS PALETTED.
@@ -859,15 +1306,163 @@ def dense_repack(sec3, sec9, field='', art_for=None, pals_for=None, px=256,
     cand = [k for k in keys
             if k not in fx_cells and pages[k[0]].depth == 1
             and not (keys[k]['key']
-                     and (keys[k]['l2'] or not PROMOTE_LAYER1_KEY))]
+                     and ((keys[k]['l2'] and not PROMOTE_L2_KEY)
+                          or (not keys[k]['l2'] and not PROMOTE_LAYER1_KEY)))]
+    # ---- ONE CELL, MANY PALETTES. FINDINGS-165.
+    #
+    # A light beam, a waterfall or a column of smoke is ONE 16x16 source cell
+    # drawn hundreds of times across the screen, and the PALETTE is what makes
+    # each instance different. MEASURED:
+    #
+    #   field     group      cells  tiles  tiles/cell  pals/cell  multi-pal
+    #   mrkt2     fx base        1    406       406.0       4.00     100.0%
+    #   mrkt2     ordinary   1777   1777         1.0       1.00       0.0%
+    #   nivl_b22  fx base        1   2199      2199.0      10.00     100.0%
+    #   ancnt2    fx base        1   1783      1783.0       9.00     100.0%
+    #
+    # A depth-2 page has NO palette. Promote that cell and all those tiles
+    # collapse to ONE colour -- a grid of identical patches where a graded
+    # beam used to be. Reported from hardware as "it repeats the same texture
+    # in various locations", with the beams gone.
+    #
+    # Keying by (slot,sx,sy,PAL) does not save it: Cosmos ships only `_00` for
+    # these pages, so every variant BORROWS palette 0's art and they all come
+    # out identical anyway.
+    #
+    # THIS IS NOT AN FX PROBLEM. Build 68 -- with PROMOTE_FX_BASE off --
+    # already promotes 87 such cells across 351 fields, carrying 23,417 tiles,
+    # and NOT ONE has exact art for every palette it is drawn through. That is
+    # this defect, already shipping.
+    #
+    # The veto is exact: a cell may be promoted if only one palette draws it,
+    # or if the mod ships EXACT art for every palette that does.
+    _bypal = {}
+    for t in tiles:
+        p = pages.get(t.slot)
+        if p is not None and p.depth == 1:
+            _bypal.setdefault((t.slot, t.sx, t.sy), set()).add(t.pal)
+    if MULTI_PALETTE_VETO:
+        _kept = []
+        for k in cand:
+            pals = _bypal.get((k[0], k[1], k[2]), ())
+            if len(pals) > 1:
+                have = set(pals_for(k[0]) or ())
+                if not set(pals) <= have:
+                    dense_repack.multipal_vetoed = (
+                        getattr(dense_repack, 'multipal_vetoed', 0) + 1)
+                    continue
+            _kept.append(k)
+        if len(_kept) != len(cand):
+            dense_repack.multipal_fields = (
+                getattr(dense_repack, 'multipal_fields', 0) + 1)
+        cand = _kept
+
+    # Measured BEFORE the TRUE_BLACK filter, because it is what exempts a
+    # cell from it. See below.
+    _hc = {}
+    _hb = {}
+    # RESOLVED UNCONDITIONALLY. `source_cell` needs it whether or not
+    # HUE_FIRST is on, and scoping it inside that branch made it a NameError
+    # the moment the flag was turned off.
+    try:
+        import ff7nx_marginpage as _MPG
+        _org = _MPG.ORIGIN.get(field) or None
+    except Exception:                                          # noqa: BLE001
+        _org = None
+    if HUE_FIRST and art_for is not None:
+        _hb = {k: hue_broken(k, arrays, pal565, art_for, _hc, _org)
+               for k in cand}
     if TRUE_BLACK > 0.0:
         # See TRUE_BLACK. A mostly-black cell keeps its paletted page so that
         # its black stays exactly black, instead of being lifted to 0x0001 and
         # drawing a blue seam against its unpromoted neighbours.
+        #
+        # ...UNLESS THE PALETTE CANNOT EXPRESS THE CELL AT ALL. FINDINGS-149.
+        #
+        # This filter is why mds5_5's sky is olive, and the counts are exact:
+        #
+        #     mds5_5   13 of 40 sky cells vetoed  ->  27/40 promoted
+        #     mds6_3   35 of 40 sky cells vetoed  ->   5/40 promoted
+        #
+        # A dark sky cell is >=25% opaque black, so it is held on the paletted
+        # page to keep that black exact -- and the page's palette has a bluest
+        # entry of 41, so the cell renders olive. The trade is upside down
+        # here: promoting costs a 0.9/255 lift on black, which is invisible,
+        # and refusing costs the entire hue, which is what the user
+        # photographed. So blackness only wins the argument when the paletted
+        # version is otherwise faithful.
         cand = [k for k in cand
-                if black_fraction(arrays, pal565, k) < TRUE_BLACK]
-    cand.sort(key=lambda k: (-len(keys[k]['tiles']), k))
+                if black_fraction(arrays, pal565, k) < TRUE_BLACK
+                or _hb.get(k, 0.0) > HUE_BROKEN_DIST]
+    # HUE-BROKEN CELLS GO FIRST. FINDINGS-149, and see HUE_FIRST above.
+    # Tile reuse remains the tie-breaker inside each group, so within the
+    # broken set and within the sound set the old ordering is unchanged.
+    if HUE_FIRST and art_for is not None:
+        _nb = sum(1 for k in cand if _hb.get(k, 0.0) > HUE_BROKEN_DIST)
+        if _nb:
+            dense_repack.hue_first_cells = (
+                getattr(dense_repack, 'hue_first_cells', 0) + _nb)
+            dense_repack.hue_first_fields = (
+                getattr(dense_repack, 'hue_first_fields', 0) + 1)
+        cand.sort(key=lambda k: (0 if _hb.get(k, 0.0) > HUE_BROKEN_DIST else 1,
+                                 -len(keys[k]['tiles']), k))
+    else:
+        cand.sort(key=lambda k: (-len(keys[k]['tiles']), k))
     free_slots = [sl for sl in range(*BANDS[4]) if sl not in pages]
+    # ---- LOW-SLOT PROBE. FINDINGS-145.
+    #
+    # Slots 29+ DO NOT RENDER on this port. Measured twice: build 52 used slot
+    # 29 alone, build 55 used 29/30/31 across 124 fields; both gave black
+    # squares with NO CRASH, so the page never becomes a texture rather than
+    # failing to allocate. The archive is not at fault -- black-cell rate was
+    # 4.41% on slots 26-28 and 4.85% on 29+, identical, all genuine dark art.
+    #
+    # A truecolor page does not have to live at 26+. From the ORIGINAL x86
+    # this port recompiles (md5 ca7284c3.., byte-identical to ff7_en_switch):
+    #
+    #   read_field_background_data 0x62B6F1
+    #     0062D13C  add  ecx, 0x1a
+    #     0062D147  call 0x62b5e1     ; ->type is READ FROM THE FILE
+    #     0062D162  cmp  edx, 1
+    #     0062D165  jne  depth2_path  ; allocates a depth-2 buffer instead
+    #
+    #   field_load_textures 0x640292, type-2 path at 0x6403B8
+    #     006403C0  cmp  eax, 0x21    ; 33
+    #     006403C3  jl   0x64042b     ; -> blend 4, OPAQUE
+    #
+    # The type comes from section 9, NOT from the slot index, and any type-2
+    # page below slot 33 draws opaque -- including slots 0..25. So a truecolor
+    # page can sit in a free LOW slot and never touch the 29+ range hardware
+    # has now rejected twice.
+    #
+    # MEASURED headroom over all 701 fields: the tightest has 12 free low
+    # slots, the median 23.
+    #
+    # `_band_of` already returns 4 when `_group_of` finds no band, which is
+    # exactly the engine's rule for a type-2 page below 33 -- so downstream
+    # classification of these pages is already correct.
+    #
+    # SCOPED to Wall Market: the worst area on hardware and the heaviest user
+    # of the broken slots (mrkt1/mrkt2/mrkt4 each took FIVE pages in build 55,
+    # so two per field landed at 29/30 and went black). An empty set would
+    # mean every field; deliberately not that until this is proven.
+    if LOW_SLOT_PROBE and (not LOW_SLOT_FIELDS or field in LOW_SLOT_FIELDS):
+        _low = [sl for sl in range(0, min(LOW_SLOT_TOP + 1, BANDS[4][0]))
+                if sl not in pages]
+        if LOW_SLOT_ORDER == 'desc':
+            _low = list(reversed(_low))
+        free_slots = free_slots + _low
+        # AND LIFT THE CEILING FOR THESE FIELDS ONLY.
+        #
+        # `cap` below is min(max_tc - have_tc, len(free_slots), room), so more
+        # slots alone change nothing while max_tc is 3. Raising it HERE rather
+        # than globally keeps `field_bg_truecolor_pages` honest: a field that
+        # is not in the probe still sees free_slots == the 26..28 range, so
+        # its cap is 3 no matter what the global says. Wall Market's heaviest
+        # field needs 5.
+        max_tc = max(max_tc, LOW_SLOT_MAX_TC)
+        dense_repack.low_slots_offered = (
+            getattr(dense_repack, 'low_slots_offered', 0) + len(_low))
     # COUNT THE ONES ALREADY THERE. 26 vanilla pages across 400 fields are
     # already depth-2; adding `max_tc` on top of those put 4 in one field.
     have_tc = sum(1 for p in pages.values() if p.depth == 2)
@@ -907,7 +1502,148 @@ def dense_repack(sec3, sec9, field='', art_for=None, pals_for=None, px=256,
     if cap == 0:
         st.refused = 'already at the truecolor ceiling'
         return sec9, st
-    chosen = cand[:cap * PER_PAGE]
+    # PLACEMENT: A CELL KEEPS ITS COORDINATE AND ONLY CHANGES PAGE.
+    # ------------------------------------------------------------------
+    # This used to be `pg, idx = divmod(i, PER_PAGE)` -- cells packed into the
+    # destination page in ENUMERATION ORDER, with no reference to where they
+    # came from. Dense, and it destroys neighbourhood.
+    #
+    # MEASURED on the shipped build, asking whether a cell's neighbour ON THE
+    # PAGE is also its neighbour ON SCREEN:
+    #
+    #     mkt_mens slot 26 (truecolor)     3 / 240    1%
+    #     nivinn_1 slot 26                13 / 240    5%
+    #     nivinn_1 slot 27                 0 / 102    0%
+    #     mkt_mens slot  2 (paletted)     35 /  35  100%
+    #
+    # So on a promoted page 99% of cells sit beside a cell from an unrelated
+    # part of the screen. Any filter that samples one texel past a cell edge
+    # pulls that stranger's colour in, which is a one-pixel fringe whose hue is
+    # whatever happens to be packed next door -- BLUE in Men's Hall, GREEN in
+    # Cloud's past. Reported as "thin aliasing pixels", and the per-field
+    # colour is the tell.
+    #
+    # Keeping the coordinate fixes it BY CONSTRUCTION: two cells that were
+    # adjacent either stay adjacent, or land on different pages and never
+    # share a boundary. It is the same rule `field_bg_compact` already applies
+    # to fx-paired cells -- "may change PAGE but not COORDINATE".
+    #
+    # AND IT COSTS NOTHING. MEASURED, pages needed if every cell keeps its
+    # coordinate, against pages actually used now:
+    #
+    #     mkt_mens  d1 needs 3, uses 4      nivinn_1  d1 needs 2, uses 3
+    #     md8_1     d1 needs 3, uses 4      fship_2   d1 needs 11, uses 11
+    #
+    # The arbitrary packing was not even buying density.
+    seats = free_slots[:cap]
+    chosen = []
+    occupancy = {}
+    fx_slot_of = {}
+    _placed_at = {}
+    _grid_order = [(i % GRID, i // GRID) for i in range(PER_PAGE)]
+
+    # ---- FX PAIRS SHARE ONE u,v AND TWO PAGES. FINDINGS-164.
+    #
+    # SETTLED, and it was already settled inside this project -- I just had
+    # not read it. `field_bg_compact` builds the fx reference as
+    # `fxr = (fx_slot, cx, cy)` from the BASE's cx,cy, validates the fx page
+    # with `u,v` out of the BASE's T_SRC_X_BIG, and REFUSES to compact a pair
+    # whose two cells would not land on the same grid index:
+    #
+    #     if (fcx, fcy) != (ncx, ncy):
+    #         return sec9, CompactStats()
+    #     # "The pin guarantees this; assert it rather than trust it,
+    #     #  because a violation is invisible until it is on screen."
+    #
+    # So the engine samples the fx page with the BASE's uv. `src_x2/src_y2`
+    # exist in the record but are NOT the runtime sampling coordinate, and the
+    # "99.34% have src2 != src1" argument in FINDINGS-161 s2 proved nothing
+    # about the runtime. FINDINGS-157 s5 was right the whole time:
+    #
+    #     a pair must move together AND land on the SAME GRID INDEX of two
+    #     different pages.
+    #
+    # Build 69 dense-packed the base to a new index and left the fx page
+    # alone, so the animated frame sampled an arbitrary wrong cell. That is
+    # the blocky smoke, and it is not a size problem at all.
+    #
+    # So: allocate a COLUMN. A group of width w takes one grid index (cx,cy)
+    # on w different pages. If no index has w seats free, the base is not
+    # promoted at all -- a half-placed group is the defect itself.
+    def _col_free(cx, cy, need, avoid=()):
+        got = []
+        for sl in seats:
+            if sl in avoid:
+                continue
+            if (cx, cy) not in occupancy.setdefault(sl, set()):
+                got.append(sl)
+                if len(got) == need:
+                    return got
+        return None
+
+    # SINGLES KEEP THE ORIGINAL PACKING. With the flag OFF there are no
+    # groups, nothing is pre-occupied, and this cursor reproduces the old
+    # `divmod` fill exactly -- verified by the flag-off column of the A/B
+    # being identical to build 68. Only a seated GROUP perturbs it.
+    _cursor = [0]
+
+    def _next_flat():
+        while _cursor[0] < cap * PER_PAGE:
+            pg, idx = divmod(_cursor[0], PER_PAGE)
+            _cursor[0] += 1
+            cy, cx = divmod(idx, GRID)
+            sl = free_slots[pg]
+            if (cx, cy) not in occupancy.setdefault(sl, set()):
+                return sl, cx, cy
+        return None
+
+    # DO NOT TRUNCATE THE CANDIDATE LIST. The old `cand[:cap * PER_PAGE]`
+    # window assumed one seat per candidate; an fx group takes several and a
+    # FAILED group takes none, so truncating pushed ordinary cells out of the
+    # window for no gain -- las0_2 lost 8 tiles and gained a page while seating
+    # zero pairs. `_next_flat` already stops at the real capacity.
+    order = cand
+    for k in order:
+        partners = [fk for fk in (fx_of.get(k) or ())
+                    if fk in keys and fk[0] in pages]
+        if partners and not PROMOTE_FX_BASE:
+            continue
+        done = [fk for fk in partners if fk in fx_slot_of]
+        todo = [fk for fk in partners if fk not in fx_slot_of]
+        if not partners and not PRESERVE_CELL_COORDS:
+            spot = _next_flat()
+            if spot is None:
+                continue
+            sl, cx, cy = spot
+            occupancy[sl].add((cx, cy))
+            chosen.append((k, sl, cx, cy))
+            continue
+        if PRESERVE_CELL_COORDS:
+            spots = [((k[1] // TILE) % GRID, (k[2] // TILE) % GRID)]
+        elif done:
+            # A partner already seated fixes the column for the whole group.
+            spots = [_placed_at[done[0]]]
+        else:
+            spots = _grid_order
+        for cx, cy in spots:
+            if done and _placed_at[done[0]] != (cx, cy):
+                continue
+            avoid = {fx_slot_of[fk] for fk in done}
+            got = _col_free(cx, cy, 1 + len(todo), avoid)
+            if got is None:
+                continue
+            occupancy[got[0]].add((cx, cy))
+            chosen.append((k, got[0], cx, cy))
+            for fk, sl in zip(todo, got[1:]):
+                occupancy[sl].add((cx, cy))
+                chosen.append((fk, sl, cx, cy))
+                fx_slot_of[fk] = sl
+                _placed_at[fk] = (cx, cy)
+            break
+    if fx_slot_of:
+        dense_repack.fx_pairs = getattr(dense_repack, 'fx_pairs', 0) + len(fx_slot_of)
+        dense_repack.fx_pair_fields = getattr(dense_repack, 'fx_pair_fields', 0) + 1
+
     if not chosen:
         st.refused = 'nothing to promote'
         return sec9, st
@@ -929,16 +1665,14 @@ def dense_repack(sec3, sec9, field='', art_for=None, pals_for=None, px=256,
     # so only the pixel buffer scales.
     scale = max(1, px // 256)
     side = GRID * TILE * scale
-    for i, k in enumerate(chosen):
-        pg, idx = divmod(i, PER_PAGE)
-        slot = free_slots[pg]
+    for k, slot, cx, cy in chosen:
         buf = dest.get(slot)
         if buf is None:
             buf = dest[slot] = np.full((side, side), FN.NEAR_BLACK, np.uint16)
-        cy, cx = divmod(idx, GRID)
         try:
             cell = source_cell(k, keys[k], pages, arrays, pal565,
-                               art_for, pals_for, st, scale)
+                               art_for, pals_for, st, scale, _org,
+                               _hb.get(k, 0.0) > HUE_BROKEN_DIST)
         except Exception:                                      # noqa: BLE001
             continue
         t = TILE * scale
@@ -950,6 +1684,18 @@ def dense_repack(sec3, sec9, field='', art_for=None, pals_for=None, px=256,
             out[off + T_SRC_Y] = dy & 0xFF
             struct.pack_into('<II', out, off + T_SRC_X_BIG,
                              cx * STEP, cy * STEP)
+            # Repoint this tile's fx frame at the partner's new page. The
+            # coordinate is preserved, so src_x2/src_y2 stay correct as
+            # written and only the page byte moves. See FINDINGS-163.
+            if fx_slot_of:
+                # The pair shares this tile's u,v -- only the PAGE moves. The
+                # partner key is collect()'s: (fx page, BASE sx, BASE sy, pal).
+                f = out[off + T_FX_PAGE]
+                if f and f in pages:
+                    ns = fx_slot_of.get(
+                        (f, k[1], k[2], k[3] if pages[f].depth == 1 else -1))
+                    if ns is not None:
+                        out[off + T_FX_PAGE] = ns
             st.tiles += 1
         st.cells += 1
 

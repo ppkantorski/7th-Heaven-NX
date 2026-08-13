@@ -60,13 +60,158 @@ import sys
 # Declaring it per build is the point. HANDOFF-121 3.6: "one variable per
 # build, prediction written first". This is that prediction, in a form the
 # build can check itself.
-# Build 47: the transparency key may be darkened, never brightened. That is
-# ff7nx_palkey's write site, so its counters move -- 'transparency key pages'
-# drops by the ~243 keys that were dark in vanilla and were being made
-# visible. Nothing else should.
-EXPECTED_MOVEMENT = frozenset({'transparency key'})
+# Build 62: STOP RE-DYEING BORROWED ART WITH A PALETTE THAT CANNOT HOLD IT.
+# FINDINGS-151, and this is the one that changes pixels.
+#
+# Builds 60 and 61 both "landed" and both looked identical on hardware. 61 got
+# mds5_5's margin sky onto a truecolor page, 40/40 cells -- and the PIXELS were
+# still (79.5, 67.8, 27.8) against the interior sky's (65.4, 65.4, 58.0). Right
+# depth, wrong colour. I had verified DEPTH and never verified COLOUR.
+#
+# Cause: 314 of the 403 cells are BORROWED (art at palette 0, tile names
+# palette 1) and `_detail_transfer` then takes the DETAIL from Cosmos and the
+# COLOUR from pal_ref -- the paletted page through palette 1, bluest entry 41.
+# The module argues the correct rule 200 lines earlier and never applied it:
+# "depth 2 pixels are FINAL COLOUR, the palette is never applied -> borrowed
+# art draws exactly as FFNx draws it. CORRECT."
+#
+# Now skipped for HUE-BROKEN cells only. MEASURED, full pipeline:
+#     mds5_5 margin sky (79.5,67.8,27.8) -> (74.8,78.2,74.6), which is
+#            byte-identical to Cosmos's own art for those cells
+#     mds6_2, mkt_mens unchanged -- they are not hue-broken, so the brown
+#            right-hand side that justified the recolour keeps it
+#
+# READ `hue kept art` FIRST. 0 means the recolour is still running.
+#
+# Build 61 (previous): CARRY THE ART ACROSS ff7nx_marginpage's SPLIT. FINDINGS-150.
+#
+# Build 60's fix landed (21,672 cells flagged) and changed NOTHING on the
+# reported fields, because `marginpage` repacks margin cells onto pages Cosmos
+# never shipped -- slot 1 (sx,sy) -> slot 3 (dx,dy) -- so `art_for` returned
+# None and `hue_broken` scored 0.0, i.e. "sound". Measured: mds5_5's margin sky
+# went 40/40 flagged BEFORE the split to 0/40 after it.
+#
+# `split_section9` already built that mapping and threw it away. It is now
+# recorded as ff7nx_marginpage.ORIGIN and the art is read from the origin page
+# at the origin coordinates, while the rendered side stays at the destination.
+#
+# VERIFIED ON THE FULL PIPELINE THIS TIME (fill_field -> split_section9 ->
+# dense_repack, ceiling 16). Build 60 was verified without the split, which is
+# why it passed here and failed on hardware:
+#     mds5_5  sky 27/40 -> 40/40   cells 388->403   pages 2->2
+#     mds6_3  sky  5/40 -> 32/40   cells 353->397   pages 2->2
+#     ujunon3, mds5_i unchanged;  unmeasurable cells: 0
+#
+# Build 60 (previous): TRUE_BLACK STOPS PINNING CELLS IT CANNOT COLOUR. FINDINGS-149.
+#
+# One mechanism (chromaticity distance between Cosmos's art and what the
+# paletted page renders) applied at three sites. Two of the three MEASURED
+# INERT on the reported fields and are here because they are correct, not
+# because they do anything yet -- they are counted separately so the log
+# attributes the result to the right one:
+#
+#   margin palette : HUE VETO on the final palette choice   (inert: 0 pages
+#                    on mds5_5 and mds6_3 -- a page that is 70% ground has a
+#                    mean hue of ground)
+#   dense repack   : hue-broken cells sorted FIRST          (inert alone:
+#                    every eligible cell already fits the pages allotted)
+#   dense repack   : hue-broken cells EXEMPT from TRUE_BLACK  <-- THE FIX
+#
+# The third is what moves. mds5_5's margin sky is >=25% opaque black, so
+# TRUE_BLACK held it on a paletted page whose bluest palette entry is 41.
+# MEASURED, at NO extra pages in either field:
+#     mds5_5  sky 27/40 -> 40/40 truecolor,  margin  86/120 -> 101/120
+#     mds6_3  sky  5/40 -> 32/40 truecolor,  margin  65/120 -> 103/120
+#     ujunon3, mkt_mens unchanged
+#
+# `dense repack` and `page cap` are therefore EXPECTED to move this time --
+# build 59 flagged them as unexpected for a change that predicted them, which
+# was my error in setting this set, not a defect in the guard.
+#
+# Build 59 (previous): the ESCAPE's TEST changes from quantisation error to HUE.
+# FINDINGS-148. Build 58's error-based escape was inert -- penalty p90 1.33
+# against a threshold of 10, 6 escapes in 335 pages -- because error is a
+# magnitude and mds6_3's dark roof is cheap to approximate in every palette.
+# Chromaticity is scale-free and separates the two known-answer cases by a
+# factor of ten (left 0.0000, right 0.0483). Only the escape's decision moves,
+# so `margin palette` moves; `choose` runs inside marginart, so that moves
+# too; dense repack and page cap consume the result and may follow.
+# transparency key must be IDENTICAL -- it does not read the palette byte.
+#
+# Build 58 (previous): the LAYER-1 CONSTRAINT gets an ESCAPE. Build 54 applied it
+# unconditionally -- right for mds6_3's left margin (olive art wearing a grey
+# palette) and WRONG for its right margin, where the art really is a blue-grey
+# roof and forcing olive turned it brown. Now a page keeps its unrestricted
+# choice when the best layer-1 palette quantises more than LAYER1_MAX_PENALTY
+# worse. `choose` runs inside marginart, so BOTH move; dense repack and page
+# cap consume that and may follow. transparency key must be identical.
+# BUILD 68 PREDICTION, written before the build (HANDOFF-155 s5.2).
+#
+# Fixes the build 67 WALL MARKET REGRESSION. ff7nx_palrange repointed every
+# out-of-range palette byte to palette 0; in mrkt2 that turned 151 vanilla
+# FILLER cells -- which are entirely index 0, and marginart's keep-0 rule
+# protects index 0 so the art never lands -- into flat (224,168,104) tan.
+# The palette is now chosen PER CELL by rendering that cell's actual indices
+# through each valid palette and taking the one closest to Cosmos's art.
+#
+# MEASURED (rendered colour of the out-of-range cells vs Cosmos's art):
+#     mrkt2  err 134.8 -> 11.9, tan cells 151 -> 6
+#     mrkt1  err  76.8 -> 10.3      mrkt4   err 24.3 -> 2.6
+#     mds5_3 err  41.8 -> 12.7      mds5_5  err 39.0 -> 1.3
+# Every out-of-range tile is still fixed: 0 remain in all seven fields tested.
+#
+# Build 67 also moved 'margin page split', which I did not predict -- more
+# filled cells means more margin cells to split. Included now.
+# NOTE: the GROUP for the margin page split counters is 'margin page', not
+# 'margin page split'.  Naming the counter instead of its group is why the
+# guard still cried wolf on build 68 after I "added" it.  Check the third
+# element of the COUNTERS tuple, not the counter's display name.
+# ---------------------------------------------------------------- BUILD 70
+# RECOVERY BUILD. Two things, both SUBTRACTIVE:
+#
+#   field_bg_dense.PROMOTE_FX_BASE  = False   (was True in build 69)
+#   field_bg_dense.MULTI_PALETTE_VETO = True  (new)
+#
+# PROMOTE_FX_BASE False undoes build 69 entirely -- that is what broke the
+# lighting, steam and smoke overlays. FINDINGS-162/164/165.
+#
+# MULTI_PALETTE_VETO stops promoting a cell drawn through more than one
+# palette unless the mod ships exact art for every one of them. A depth-2 page
+# has no palette, so promoting such a cell collapses every tile sharing it to
+# one colour. Build 68 shipped 87 of these. FINDINGS-165.
+#
+# BOTH ONLY EVER REMOVE CELLS FROM PROMOTION. A cell that is not promoted
+# renders exactly as the game drew it before, so neither can introduce content
+# that was not already on screen. That is why this is safe to build.
+#
+# MEASURED, 113 fields, offline chain:
+#   veto OFF reproduces the build-68 baseline with ZERO drift
+#   veto ON:  truecolor -28 tiles, pages +0, memory +0.0 MB, 27 fields touched
+#
+# PREDICTION for the log:
+#   dense repack   moves DOWN slightly (~87 cells archive-wide, ~-2k tiles)
+#   page cap / field background / palette clamp  may move; listed deliberately
+#   everything upstream of dense_repack MUST NOT MOVE:
+#     margin art, margin palette, margin page, palette range, transparency key
+#
+# ON HARDWARE: this should look like build 68 with the build-69 lighting
+# damage gone. Wall Market smoke and lighting, Aerith's house waterfall and
+# light beams, and the bottom of the Northern Cave (las0_2) are the three to
+# check -- the last one for the FINDINGS-128 crash, which the frame guard
+# should already prevent.
+EXPECTED_MOVEMENT = frozenset({'dense repack', 'page cap', 'field background',
+                               'palette clamp'})
 
 COUNTERS = (
+    # FINDINGS-158. Tiles naming a palette past the end of section 3. This
+    # must NEVER be silently zero because the line vanished -- if the regex
+    # stops matching, the counter reads None and the guard says "moved",
+    # which is the trap build 64 fell into.
+    ('palette range tiles',
+     r'PALETTE RANGE -- ([\d,]+) tile\(s\)', 'palette range'),
+    ('palette range fields',
+     r'PALETTE RANGE -- [\d,]+ tile\(s\) across [\d,]+ cell\(s\) in ([\d,]+) field',
+     'palette range'),
     ('margin art cells',
      r'margin art: ([\d,]+) cell\(s\) of Cosmos', 'margin art'),
     ('margin art fields',
@@ -75,8 +220,35 @@ COUNTERS = (
      r'ATLAS GAP: ([\d,]+) texel', 'margin art'),
     ('margin art refused',
      r'([\d,]+) REFUSED as wildly off-colour', 'margin art'),
+    # FINDINGS-140. `keep0 dropped` is the fix landing; `keep0 kept` is the
+    # cut-outs it must NOT have touched. If the second one moves, the layer /
+    # blend-band classification changed and overlays are at risk.
+    ('keep0 dropped',
+     r'KEY DROPPED: ([\d,]+) texel', 'margin art'),
+    ('keep0 cells',
+     r'KEY DROPPED: [\d,]+ texel\(s\) in ([\d,]+) layer-1', 'margin art'),
+    ('keep0 kept',
+     r'([\d,]+) texel\(s\) in genuine cut-outs', 'margin art'),
     ('margin palette pages',
      r'margin palette: ([\d,]+) page\(s\)', 'margin palette'),
+    # FINDINGS-142. The fix landing. If this is absent the change did not
+    # reach the archive; if it is huge the constraint is over-firing.
+    ('margin palette layer1 constrained',
+     r'LAYER-1 CONSTRAINT: ([\d,]+) page', 'margin palette'),
+    # FINDINGS-147. How many pages the restriction let go because the art is
+    # genuinely not layer 1's colour. 0 means the escape never fired.
+    ('margin palette layer1 escaped',
+     r'ESCAPE: ([\d,]+) page', 'margin palette'),
+    # FINDINGS-148. Of the escapes, how many the HUE gate drove. If this is 0
+    # the chromaticity test is inert and the build is build 58 in disguise --
+    # which is exactly what the error-only escape turned out to be.
+    ('margin palette layer1 escaped hue',
+     r'ESCAPE: [\d,]+ page\(s\)[^.]*?-- ([\d,]+) of them on HUE',
+     'margin palette'),
+    # FINDINGS-149. The fix landing. 0 means the final selection is still
+    # pure error and mds5_5's sky is still flat olive.
+    ('margin palette hue vetoed',
+     r'HUE VETO: on ([\d,]+) page', 'margin palette'),
     ('margin page split cells',
      r'margin page split: ([\d,]+) cell\(s\) moved', 'margin page'),
     ('margin page split pages',
@@ -96,7 +268,12 @@ COUNTERS = (
     # additive band is skipped for the same reason its original is -- but
     # "benign" was a judgement made after the fact. Counted from now on.
     ('transparency key left alone',
-     r'([\d,]+) palette\(s\) were LEFT ALONE', 'transparency key'),
+     # FINDINGS-156: the log line was reworded to 'SKIPPED by the
+     # de-fringe' and this regex stopped matching, so build 64 reported
+     # this counter as None -- which reads as a moved counter and hides
+     # a real regression.  Match BOTH wordings.
+     r'([\d,]+) palette\(s\) were (?:LEFT ALONE|SKIPPED by the de-fringe)',
+     'transparency key'),
     ('dense repack cells',
      r'DENSE REPACK .*?: ([\d,]+) cell\(s\) packed', 'dense repack'),
     ('dense repack pages',
@@ -107,6 +284,23 @@ COUNTERS = (
      r'([\d,]+) borrowed,', 'dense repack'),
     ('dense repack exact',
      r'([\d,]+) exact from the mod', 'dense repack'),
+    # FINDINGS-145. Absent means the probe never fired.
+    # FINDINGS-149. The fix landing. 0 means this build is build 59.
+    ('hue broken first cells',
+     r'HUE-BROKEN FIRST: ([\d,]+) cell', 'dense repack'),
+    ('hue broken first fields',
+     r'HUE-BROKEN FIRST: [\d,]+ cell\(s\) across ([\d,]+) field',
+     'dense repack'),
+    # FINDINGS-150. Detector blindness, counted. Large = the origin map is not
+    # reaching the repack and the fix is inert again.
+    # FINDINGS-151. THE one that changes pixels. 0 = the borrow recolour is
+    # still re-dyeing Cosmos's art with a palette that cannot hold it.
+    ('hue kept art',
+     r'KEPT THE ART: ([\d,]+) cell', 'dense repack'),
+    ('hue broken unmeasurable',
+     r'UNMEASURABLE: ([\d,]+) cell', 'dense repack'),
+    ('low slot probe',
+     r'LOW-SLOT PROBE: ([\d,]+) free slot', 'dense repack'),
     ('page cap fields',
      r"PAGE CAP .*?: ([\d,]+) field\(s\) had a page split", 'page cap'),
     ('page cap pages',

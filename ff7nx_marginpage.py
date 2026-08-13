@@ -150,12 +150,27 @@ def movable_cells(tiles, pages, sec9):
     return out
 
 
-def split_section9(sec9, log=None):
+# WHERE EVERY MOVED CELL CAME FROM.  {field: {(dst_slot, dx, dy): (slot, sx, sy)}}
+#
+# FINDINGS-150. This split repacks cells onto pages Cosmos never shipped -- a
+# margin cell at slot 1 (sx, sy) becomes slot 3 (dx, dy) -- so ANY later pass
+# that wants the mod's own art for that cell asks `art_for(3, pal)`, gets None,
+# and has no way to tell "the mod ships nothing here" from "this cell was
+# moved". `field_bg_dense.hue_broken` scored all 40 of mds5_5's margin sky
+# cells 0.0 for exactly this reason, which silently un-did the build-60 fix.
+#
+# The mapping already exists in `order` below and was simply thrown away.
+ORIGIN = {}
+
+
+def split_section9(sec9, log=None, field=''):
     """
     (new_sec9, stats). Returns the section unchanged when there is nothing to
     do or no free low slot.
+
+    `field` is only used to record ORIGIN; the split itself does not need it.
     """
-    st = {'pages': 0, 'cells': 0, 'tiles': 0, 'nofit': 0}
+    st = {'pages': 0, 'cells': 0, 'tiles': 0, 'nofit': 0, 'origin': {}}
     surv = DC.survey(sec9)
     pages = {p.slot: p for p in surv['pages']}
     tiles = MB.read_tiles(sec9, surv, pages)
@@ -196,12 +211,17 @@ def split_section9(sec9, log=None):
             struct.pack_into('<II', buf, off + T_SRC_X_BIG,
                              cx * step, cy * step)
             st['tiles'] += 1
+        # See ORIGIN. Recorded per CELL, not per tile -- several tiles can
+        # share one cell and they all move together.
+        st['origin'][(dst_slot, dx, dy)] = (slot, sx, sy)
         st['cells'] += 1
 
     plist, tex_start, tex_end = FN.parse_texture_block(bytes(buf))
     for slot, arr in newbuf.items():
         plist[slot] = FN.Page(slot, 0, 1, arr.tobytes(), 256)
     out = FN.replace_texture_block(bytes(buf), plist, tex_start, tex_end)
+    if field and st['origin']:
+        ORIGIN[field] = st['origin']
     if log:
         log('    margin page split: %d cell(s) -> %d new page(s), %d tile(s) '
             'repointed' % (st['cells'], st['pages'], st['tiles']))
@@ -230,7 +250,7 @@ def apply_to_flevel(archive, payloads, encode=None, log=print, fields=None):
             raw = (lgp.lzs_decompress(payload[4:]) if name in payloads
                    else archive.decompressed(entry))
             parts = lgp.split_sections(raw)
-            new9, s = split_section9(parts[SECTION9])
+            new9, s = split_section9(parts[SECTION9], field=name)
             st['read'] += 1
             for k in ('pages', 'cells', 'tiles', 'nofit'):
                 st[k] += s[k]

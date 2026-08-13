@@ -231,52 +231,114 @@ BORROW_MAX_DIST_INTERIOR = 32.0
 # writing the black that a zeroed RGB channel pretends is there. See the long
 # note at the write site -- this is the column of black squares at the edges
 # of the 16:9 frame. Set False to restore the old behaviour for an A/B.
-# COVERAGE IS HONOURED. THE DILATION IS NOT. FINDINGS-134.
+# ALPHA IS THE COLOUR KEY, NOT COVERAGE. FINDINGS-137.
 #
-# `_extend_into_gap` filled every uncovered texel of a cell by dilating the
-# COVERED art outward, 32 rounds of 4-neighbour growth. It was added because a
-# transparent hole reaches the quantiser as BLACK -- the sources zero RGB where
-# alpha is 0 -- and gets written faithfully as black, which `MAX_QUANT_ERR`
-# can never catch because black is an excellent match for black.
+# Read this before touching either switch below, because the same mistake has
+# now been made twice in opposite directions.
 #
-# The reasoning was right and the remedy overshot. Transparent is a claim about
-# COVERAGE, so black is wrong -- but a smear of the neighbouring art is wrong
-# too, and it is visible:
+# MEASURED, where the mod's DDS is transparent, what vanilla holds at the same
+# texel:
 #
-#   REPORTED, first reactor and Tifa's bar: a cell holds part of a texture
-#   along a diagonal and the REST of the square, which should be black, is a
-#   triangle of that texture's own colours. Grey where the art is grey, green
-#   where it is green. Not in the widened margin -- anywhere the mod's atlas
-#   is partially covered.
+#     mds6_1  page  2   99.4% vanilla index 0      mkt_mens page 1  99.7%
+#     mds6_1  page 15  100.0%                      nivinn_1 page 3  99.9%
 #
-# That is `_extend_into_gap`'s output described exactly.
+# The mod's page is COMPLETE. Alpha marks the transparency key, which is why
+# it looks correct on FFNx -- there the DDS simply replaces the page and the
+# alpha is the key. There is no missing art to compensate for.
 #
-# The write site 800 lines below has always documented the correct rule --
-# "where the mod paints nothing, the mod is saying nothing, so the cell keeps
-# the vanilla index it already had" -- and never implemented it. It does now.
-# The vanilla index is what was there, it is what the mod declined to comment
-# on, and it invents nothing.
+# TWO ATTEMPTS TO COMPENSATE, BOTH WRONG:
+#
+#   `_extend_into_gap` (on until build 46) dilated the covered art outward to
+#   fill the "gap", 32 rounds of 4-neighbour growth. Where a cell held part of
+#   a texture along a diagonal, the rest of the square came out as a triangle
+#   of that texture's colours -- the grey/green blocks in reactor 1 and Tifa's
+#   bar. It was inventing content to fill something that was never a hole.
+#
+#   The vanilla fallback (build 46 only) wrote the VANILLA index wherever
+#   alpha fell below 128. Redundant where it agreed with `keep0`, and where it
+#   did not it discarded real art: a downsampled ANTIALIASED EDGE lands
+#   between 1 and 127, and on one such edge 80 of 256 texels are partial alpha
+#   that got replaced with vanilla. A vanilla-toned fringe on every edge.
+#
+# `keep0` at the write site is the authority on transparency and always was:
+# it forces index 0 exactly where vanilla had index 0, so occlusion cannot
+# change. Everything else takes the mod's colour. Nothing needs to fill
+# anything.
 HONOUR_MOD_ALPHA = True
 
-# The dilation. OFF: the gap now keeps its vanilla pixels instead, which is
-# what the write site has always claimed to do. See FINDINGS-134 at the write
-# site. True restores build 45's behaviour exactly, for A/B.
+# The dilation. OFF, and it should stay off: there is no gap to fill. See the
+# note above. True restores build 45's behaviour, for A/B only.
 EXTEND_INTO_GAP = False
-# FIRST before assuming anything." Doing that.
-#
-# False restores the pre-3.5 behaviour: an uncovered texel arrives as black
-# and is written as black. That is the OLD defect, not a fix -- it is the
-# clean A/B that tells us whether the dilation is what is being seen. If the
-# triangles go and black squares come back in their place, the right answer is
-# neither: keep the VANILLA pixels wherever the mod does not cover, which is
-# a change at the write site (`idx = np.where(_cov, idx, was_block)`) and
-# invents nothing.
-HONOUR_MOD_ALPHA = True
 
-# The dilation. OFF: the gap now keeps its vanilla pixels instead, which is
-# what the write site has always claimed to do. See FINDINGS-134 at the write
-# site. True restores build 45's behaviour exactly, for A/B.
-EXTEND_INTO_GAP = False
+# FORCE INDEX 0 ONLY WHERE INDEX 0 IS A REAL CUT-OUT. FINDINGS-140.
+#
+# `keep0` at the write site re-inserts vanilla's index 0 over whatever the mod
+# ships, on the reasoning that "index 0 is the colour key" and moving it would
+# change occlusion. That reasoning holds on layer 2+ and on the blend bands,
+# where index 0 IS the transparent surround of an object. It is FALSE on a
+# layer-1 opaque page, and the difference is the whole of this flag.
+#
+#   FFNx `ff7/field/field.cpp:58` sets `tex_header->color_key = 3` only for
+#   `type == 2`. `common.cpp:1728` -- `if(color_key && pixel == 0) return 0`
+#   -- is therefore never taken for a depth-1 page, so index 0 on a paletted
+#   page is DRAWN, through the palette, like any other index.
+#
+# Confirmed on hardware the other way round as well: writing black at entry 0
+# removed the Sector 6 yellow AND put black speckles across Wall Market's
+# interior, which cannot happen if the index is discarded.
+#
+# So on a layer-1 opaque cell, `keep0` does not preserve transparency. It
+# overwrites Cosmos's art with "draw the key colour", and 93% of those keys
+# are 0x0000. MEASURED on the build-50 archive, on-screen cells only:
+#
+#     index-0 px on OPAQUE-band paletted pages   13,966,071
+#        whose palette key is 0x0000             12,990,788  (93.0%)
+#        fields affected                                633
+#        md8_1 16,896   mkt_mens 33,508   kuro_9 56,474
+#
+# That is the residual black, and it is why no key COLOUR can fix it: one
+# palette entry cannot be right for every index-0 pixel on a page. De-fringe
+# it and you get the grey/green wash build 47 removed; black it and you get
+# these. The way out is to stop emitting the index at all where it is not a
+# cut-out, which also stops discarding mod art -- the actual goal.
+#
+# Occlusion moves in the RIGHT direction here. `ff7nx_bgclear`'s header: "A
+# background pixel that is transparent writes no occlusion, so field models
+# draw straight through it -- that is Cloud appearing in FRONT of black
+# scenery he should be behind." These pixels become opaque, not transparent.
+#
+# False restores build 50 exactly, for A/B.
+KEEP0_CUTOUTS_ONLY = False
+
+# Slot at which the ADDITIVE/AVERAGE bands begin (field_bg_native.D1_GROUPS).
+# A depth-1 page at or above this is only ever reached through `fx_page`, and
+# every tile that draws from one is an fx tile -- see ff7nx_palkey.
+BLEND_BAND_FIRST_SLOT = 0x0F
+
+# DOES BEING ON LAYER 2+ MAKE A CELL A CUT-OUT? MEASURED: NO.
+#
+# The first cut of this flag said yes, on the reasoning that layer 2+ is where
+# real cut-outs live. That is true on a BLEND page and false on an OPAQUE one,
+# and the difference is not academic -- it is the whole effect:
+#
+#     texels that actually change (vanilla index 0 AND Cosmos ships art)
+#                        layer rule    blend-band rule
+#         md8_1                   0             14,835
+#         mkt_mens            4,338              6,558
+#
+# md8_1 is the field this whole effort started on and the layer rule does
+# NOTHING to it, because its index-0 pixels are layer-2 tiles drawing from an
+# OPAQUE page. `ff7nx_palkey` calls that case "both branches are wrong for it"
+# and blames it for "the dark blocks on the stairs".
+#
+# On an opaque page index 0 was never transparent -- the engine draws it, so
+# those overlays ALREADY have a solid rectangle of key colour. Nothing is
+# being made opaque that was see-through; a flat key colour is being replaced
+# by the art Cosmos ships for those same texels. Vanilla's own key was picked
+# to be inconspicuous, which is why this never read as broken.
+#
+# Set True to restore the layer rule for A/B.
+KEEP0_LAYER_IS_CUTOUT = False
 
 DARKEN_MARGIN_PLACEHOLDERS = True
 
@@ -338,7 +400,13 @@ _BAYER4 = (np.array([[0, 8, 2, 10],
                      [15, 7, 13, 5]], np.float32) + 0.5) / 16.0 - 0.5
 
 
-def quantise(cell_rgb, pal_rgb, dither=False):
+def dedup_cell(cell_rgb):
+    """(uniq, inv) for `quantise(..., _dedup=)`. See quantise."""
+    flat = cell_rgb.reshape(-1, 3).astype(np.int32)
+    return np.unique(flat, axis=0, return_inverse=True)
+
+
+def quantise(cell_rgb, pal_rgb, dither=False, _dedup=None):
     """
     (16,16,3) -> (16,16) uint8 indices, nearest colour, INDEX 0 EXCLUDED.
 
@@ -386,6 +454,34 @@ def quantise(cell_rgb, pal_rgb, dither=False):
     """
     flat = cell_rgb.reshape(-1, 3).astype(np.int32)
     pal = pal_rgb[1:].astype(np.int32)              # skip index 0
+
+    # SOLVE EACH DISTINCT COLOUR ONCE. Pure speed, bit-identical output.
+    #
+    # This function is 85% of the margin pass, which is 25 minutes of a build.
+    # The distance matrix is (pixels x 255 x 3), and MEASURED over 10,290 real
+    # calls a 256-pixel cell holds a mean of 153 DISTINCT colours -- so 40% of
+    # that matrix re-derives an answer already computed one row above.
+    #
+    # The result cannot change: the same colour rows are compared against the
+    # same palette in the same order, so argmin picks the same entry and ties
+    # break the same way. `_assert_quantise_identical` in test_summarise.py
+    # checks that against the un-deduplicated form on real cells.
+    #
+    # The fast path is skipped for the dither branch, which needs the
+    # per-PIXEL distances rather than the per-colour ones.
+    if not dither:
+        # `_dedup` lets a caller that quantises the SAME cell against several
+        # palettes -- `ff7nx_marginpal.score_slot` does exactly that, once per
+        # palette in the field -- pay for np.unique once instead of npg times.
+        if _dedup is not None:
+            uniq, inv = _dedup
+        else:
+            uniq, inv = np.unique(flat, axis=0, return_inverse=True)
+        if len(uniq) < len(flat):
+            du = ((uniq[:, None, :] - pal[None, :, :]) ** 2).sum(-1)
+            idx = du.argmin(1)[inv]
+            return (idx + 1).astype(np.uint8).reshape(cell_rgb.shape[:2])
+
     d = ((flat[:, None, :] - pal[None, :, :]) ** 2).sum(-1)
     idx = d.argmin(1)
     if not dither:
@@ -775,7 +871,8 @@ def fill_field(name, raw, lgp_mod, art, log=None, scope='margin'):
     """
 
     st = {'cells': 0, 'filled': 0, 'no_dds': 0, 'black': 0, 'tiles': 0,
-          'borrowed': 0, 'wild': 0, 'darkened': 0, 'far_borrow': 0, 'detail': 0, 'uncovered': 0}
+          'borrowed': 0, 'wild': 0, 'darkened': 0, 'far_borrow': 0, 'detail': 0, 'uncovered': 0,
+          'keep0_kept': 0, 'keep0_dropped': 0, 'keep0_cells': 0}
     parts = lgp_mod.split_sections(raw)
     cols, hdr, npg, cpp = MB.palette_colours(parts[SECTION_PALETTE])
     surv = DC.survey(parts[SECTION9])
@@ -806,6 +903,34 @@ def fill_field(name, raw, lgp_mod, art, log=None, scope='margin'):
                          if (t.slot, t.sx, t.sy) not in _out}
         except Exception:                                      # noqa: BLE001
             _inside43 = set()
+
+    # CELLS WHERE INDEX 0 IS A GENUINE CUT-OUT. See KEEP0_CUTOUTS_ONLY.
+    #
+    # A cell qualifies if ANY tile that draws it is layer 2+, or draws from a
+    # depth-1 page in the additive/average band. Both tests are needed and
+    # `ff7nx_palkey` explains why: the walk can miss a layer, and a page can
+    # be in the band without this seeing it. Two cheap tests, union taken.
+    #
+    # THE EFFECTIVE PAGE, NOT `texture_id` -- FFNx background.cpp:113,
+    # `page = tile.use_fx_page ? tile.fx_page : tile.page`. Reading T_TEX
+    # alone finds ZERO tiles in the band across the whole archive, which is
+    # the wrong answer and already cost one pass at this in ff7nx_palkey.
+    #
+    # `None` means "could not determine", and every caller below then behaves
+    # EXACTLY as build 50 did. A parse failure must not silently change what
+    # the pass writes.
+    _cutout = None
+    if KEEP0_CUTOUTS_ONLY:
+        try:
+            _sec9 = parts[SECTION9]
+            _cutout = set()
+            for t in MB.read_tiles(_sec9, surv, pages):
+                eff = _sec9[t.off + MB.T_TEX2] or t.slot
+                if eff >= BLEND_BAND_FIRST_SLOT or KEEP0_LAYER_IS_CUTOUT \
+                        and t.layer != 1:
+                    _cutout.add((t.slot, t.sx, t.sy))
+        except Exception:                                      # noqa: BLE001
+            _cutout = None
 
     # ---------------------------------------------------------------- palette
     # BEFORE anything is quantised, ask whether the palette each margin
@@ -995,8 +1120,16 @@ def fill_field(name, raw, lgp_mod, art, log=None, scope='margin'):
             # transparent block with junk RGB -- and the cell lands on screen
             # as a vivid flat square. `mds6_2` shipped solid YELLOW margin
             # cells this way. Refuse rather than write; the cell keeps its
-            # vanilla content, which is the state we are trying to improve on
-            # and is never worse than a yellow block.
+            # vanilla content.
+            #
+            # "NEVER WORSE THAN A YELLOW BLOCK" IS NOT TRUE IN THE MARGIN, and
+            # the old comment said it was. Inside the 4:3 picture the vanilla
+            # content is real art, so refusing is safe. In the 16:9 margin it
+            # is the widescreen PLACEHOLDER -- the vivid tan filler -- so
+            # refusing there keeps exactly the artefact this pass exists to
+            # remove. It is not what caused mds5_5 (measured: `wild` = 0 for
+            # that field), but the reasoning above should not be trusted for
+            # margin cells without checking what vanilla actually holds.
             _m = _cov
             err = (float(np.abs(prgb[idx].astype(np.int16)
                                 - small.astype(np.int16))[_m].mean())
@@ -1016,7 +1149,61 @@ def fill_field(name, raw, lgp_mod, art, log=None, scope='margin'):
             # hidden by scenery. `--verify` scores this as MASK CHANGED.
             was = np.frombuffer(bytes(buf), np.uint8).reshape(256, 256)
             keep0 = was[sy:sy + TILE, sx:sx + TILE] == 0
-            idx = np.where(keep0, np.uint8(0), idx)
+            # ...BUT ONLY WHERE INDEX 0 IS ACTUALLY A CUT-OUT. FINDINGS-140,
+            # and the reasoning is at KEEP0_CUTOUTS_ONLY. On a layer-1 opaque
+            # cell index 0 is DRAWN, so forcing it here does not preserve
+            # transparency -- it paints the key colour, black 93% of the time,
+            # over art the mod shipped.
+            _is_cut = _cutout is None or (slot, sx, sy) in _cutout
+            if _is_cut:
+                idx = np.where(keep0, np.uint8(0), idx)
+                st['keep0_kept'] += int(keep0.sum())
+            else:
+                # ONLY WHERE THE MOD ACTUALLY SHIPS ART. Where vanilla was
+                # index 0 and Cosmos ships nothing, index 0 still goes back --
+                # that is byte-identical to build 50 and is most of the mask.
+                # The change is confined to texels where we were overwriting
+                # real art with "draw the key colour".
+                _art_here = keep0 & (cover > 0)
+                idx = np.where(keep0 & ~_art_here, np.uint8(0), idx)
+                n = int(_art_here.sum())
+                st['keep0_dropped'] += n
+                st['keep0_kept'] += int(keep0.sum()) - n
+                if n:
+                    st['keep0_cells'] += 1
+            # WHERE THE MOD IS FULLY TRANSPARENT, KEEP VANILLA. FINDINGS-138.
+            #
+            # Three passes have now tried to fill this and all three were
+            # wrong, so here is the whole history in one place:
+            #
+            #   BLACK (to build 45, and again in 49). `dir_source` zeroes RGB
+            #   where alpha is 0, so an uncovered texel arrives black and is
+            #   quantised faithfully. Black squares. MAX_QUANT_ERR cannot
+            #   catch it -- black is an excellent match for black.
+            #
+            #   DILATE (builds up to 45). `_extend_into_gap` grew the covered
+            #   art outward. A cell holding part of a texture along a diagonal
+            #   came out with the rest as a triangle of that texture's
+            #   colours: the grey/green blocks in reactor 1 and Tifa's bar.
+            #
+            #   VANILLA AT alpha < 128 (build 46). Right idea, wrong number.
+            #   Alpha is the COLOUR KEY, and a downsampled ANTIALIASED EDGE
+            #   lands between 1 and 127 -- on one edge, 80 of 256 texels are
+            #   partial alpha, i.e. real art, and they were replaced with
+            #   vanilla. A vanilla-toned fringe on every edge and a patch
+            #   wherever alpha was marginal. That was Sector 6.
+            #
+            # The rule that survives all three: FULLY transparent means the
+            # mod is saying nothing, so keep what was there. ANY alpha at all
+            # is art, however faint, and takes the mod's colour. `keep0` above
+            # has already forced index 0 wherever vanilla was index 0, which
+            # is 99.4% of these texels, so this only decides the remainder --
+            # and the remainder is exactly where the black squares came from.
+            if HONOUR_MOD_ALPHA:
+                _solid = cover > 0
+                if not _solid.all():
+                    idx = np.where(_solid, idx,
+                                   was[sy:sy + TILE, sx:sx + TILE])
             # THE BLACK SQUARES ARE THE ATLAS GAP, AND THIS IS THE FIX.
             #
             # A Cosmos page is a SPARSE ATLAS: art only where the vanilla page
@@ -1049,22 +1236,36 @@ def fill_field(name, raw, lgp_mod, art, log=None, scope='margin'):
             # This can only ADD art. A covered texel is written exactly as
             # before; an uncovered one stops being overwritten with black.
             #
-            # AND UNTIL NOW THE CODE DID NOT DO IT. The paragraph above has
-            # been here describing the rule while the loop below wrote `idx`
-            # across the WHOLE cell regardless of coverage; the gap was
-            # handled instead by `_extend_into_gap`, which fills it with a
-            # dilation of the surrounding art. That is why a cell holding part
-            # of a texture along a diagonal comes out with the rest of the
-            # square filled by a triangle of that texture's colours -- grey,
-            # green, whatever the art beside it happens to be -- where it
-            # should be black. Reported from the first reactor and Tifa's bar.
+            # AND IT MUST NOT BE DONE HERE, WHICH BUILD 46 GOT WRONG.
             #
-            # Neither black nor a smear. The vanilla index is what was there,
-            # it is what the mod declined to comment on, and it invents
-            # nothing. FINDINGS-134.
-            if HONOUR_MOD_ALPHA and not _cov.all():
-                idx = np.where(_cov, idx, was[sy:sy + TILE, sx:sx + TILE])
-
+            # Build 46 added `idx = np.where(_cov, idx, was_block)` -- fall
+            # back to the vanilla index wherever the mod's alpha is below 128.
+            # That was based on reading alpha as COVERAGE. It is not.
+            #
+            # MEASURED, where the mod's DDS is transparent, what vanilla holds
+            # at the same texel:
+            #
+            #     mds6_1  page  2    99.4% vanilla index 0 (the COLOUR KEY)
+            #     mds6_1  page 15   100.0%
+            #     mkt_mens page 1    99.7%
+            #     nivinn_1 page 3    99.9%
+            #
+            # Alpha means "this texel is the transparency key", not "the mod
+            # painted nothing". The mod's page is COMPLETE -- which is why it
+            # looks right on FFNx, where the DDS simply replaces the page.
+            #
+            # So the fallback was wrong twice over. `keep0` below already
+            # forces index 0 wherever VANILLA had index 0, which is 99.4% of
+            # those texels, so it was redundant where it agreed. And where it
+            # did not agree it threw away real art: a downsampled ANTIALIASED
+            # EDGE lands between 1 and 127, and on one such edge 80 of 256
+            # texels are partial alpha -- mod art -- that the fallback
+            # replaced with vanilla. That is a vanilla-toned fringe along
+            # every edge and a vanilla-toned patch wherever alpha is marginal,
+            # which is what appeared in Sector 6 in build 46.
+            #
+            # The vanilla mask is the authority on transparency and always
+            # was. Everything else takes the mod's colour.
             for r in range(TILE):
                 base = (sy + r) * 256 + sx
                 buf[base:base + TILE] = bytes(idx[r])
@@ -1155,9 +1356,20 @@ def apply_to_flevel(archive, payloads, art, encode=None, log=print,
 
     st = {'read': 0, 'changed': 0, 'cells': 0, 'filled': 0, 'black': 0,
           'no_dds': 0, 'borrowed': 0, 'wild': 0, 'darkened': 0, 'far_borrow': 0, 'detail': 0, 'uncovered': 0,
+          'keep0_kept': 0, 'keep0_dropped': 0, 'keep0_cells': 0,
           'refused': [],
           'pal': {'fields': 0, 'slots': 0, 'slots_repointed': 0, 'tiles': 0,
-                  'cells': 0, 'remapped': 0, 'err_before': [],
+                  'cells': 0, 'remapped': 0, 'layer1_constrained': 0,
+                  'layer1_escaped': 0, 'layer1_penalty': [],
+                  # FINDINGS-148. These MUST be declared here. `merge_pal`
+                  # only merges a key that already exists in the aggregate
+                  # (`isinstance(P.get(k), int)` is False for a missing key),
+                  # which is precisely how build 54's `layer1_constrained`
+                  # was computed correctly and then thrown away unlogged.
+                  'layer1_escaped_hue': 0, 'layer1_hue_gap': [],
+                  # FINDINGS-149, and declared here for the same reason.
+                  'hue_vetoed': 0, 'hue_veto_dist': [],
+                  'err_before': [],
                   'err_after': [], 'idx_before': [], 'idx_after': []}}
     encode = encode or (lambda raw: archive.encode_field(raw))
 
@@ -1187,16 +1399,8 @@ def apply_to_flevel(archive, payloads, art, encode=None, log=print,
                         and isinstance(st.get(k), int):
                     st[k] += v
             ps = s.get('pal')
-            if ps and ps.get('slots_repointed'):
-                P = st['pal']
-                P['fields'] += 1
-                P['remapped'] += s.get('pal_remapped', 0)
-                for k in ('slots', 'slots_repointed', 'cells'):
-                    P[k] += ps[k]
-                P['tiles'] += s.get('pal_tiles', 0)
-                for k in ('err_before', 'err_after',
-                          'idx_before', 'idx_after'):
-                    P[k] += ps[k]
+            if ps:
+                merge_pal(st['pal'], ps, s)
             if new is None:
                 continue
             payloads[name] = encode(new)
@@ -1211,6 +1415,46 @@ def apply_to_flevel(archive, payloads, art, encode=None, log=print,
     return st
 
 
+
+def merge_pal(P, ps, s):
+    """
+    Fold one field's `choose()` stats into the archive-wide `pal` aggregate.
+
+    EXTRACTED SO IT CAN BE TESTED. It was inline, and it merged through a
+    HARDCODED key list -- the same bug the outer loop already fixed and
+    documented for `uncovered`:
+
+        "This list was fixed at seven names, so `uncovered` -- the atlas gap
+         counter -- never reached the aggregate and `summarise` never printed
+         its line, which made a build that HAD the fix look identical to one
+         that did not."
+
+    It then did it again to `layer1_constrained` in build 54: the constraint
+    WORKED (margin palette 135 -> 101 pages, margin art refused 1,185 ->
+    1,414, and the reported field was visibly fixed) but its log line never
+    printed, so the only evidence the change had landed was two counters
+    moving for unstated reasons.
+
+    `tiles` is excluded from the generic sweep because it is summed from
+    `s['pal_tiles']`, not from `ps`; taking both double-counts it.
+    """
+    if ps.get('slots_repointed'):
+        P['fields'] += 1
+        P['remapped'] += s.get('pal_remapped', 0)
+        P['tiles'] += s.get('pal_tiles', 0)
+        for k in ('err_before', 'err_after', 'idx_before', 'idx_after'):
+            P[k] += ps[k]
+    # list-valued counters merge by extension, not addition
+    for k, v in ps.items():
+        if isinstance(v, list) and isinstance(P.get(k), list):
+            P[k] = P[k] + v
+    for k, v in ps.items():
+        if (k != 'tiles' and isinstance(v, int) and not isinstance(v, bool)
+                and isinstance(P.get(k), int)):
+            P[k] += v
+    return P
+
+
 def summarise(st):
     if not st or not st.get('read'):
         return ''
@@ -1222,13 +1466,28 @@ def summarise(st):
                ', %d REFUSED as wildly off-colour' % st['wild']
                if st.get('wild') else '',
                ', %d refused' % len(st['refused']) if st['refused'] else '')
-            + (' -- ATLAS GAP: %d texel(s) where Cosmos ships no art were '
-               'extended from the covered art beside them instead of being '
-               'written as BLACK: a page is a sparse atlas, the sources zero '
-               'the RGB where alpha is 0, and the quantiser cannot tell a hole '
-               'from a black pixel (measured error 1.4-4.5 of 255). That is '
-               'the column of black squares at the edges of the 16:9 frame'
-               % st['uncovered'] if st.get('uncovered') else '')
+            # THIS LINE USED TO CLAIM THE DILATION HAD RUN. It said the gap
+            # texels "were extended from the covered art beside them" whether
+            # or not `EXTEND_INTO_GAP` was on, and it has been False since
+            # build 46 -- so five builds of logs asserted an action the build
+            # did not take. The counter is the number of UNCOVERED texels; it
+            # never measured how many were changed. Worded honestly now, both
+            # ways, because a log that describes the wrong build is how three
+            # of the last six regressions got past review.
+            + (' -- ATLAS GAP: %d texel(s) where Cosmos ships no art (a page '
+               'is a sparse atlas and the sources zero the RGB where alpha is '
+               '0, so a hole arrives here as BLACK and the quantiser cannot '
+               'tell it from a black pixel, measured error 1.4-4.5 of 255). '
+               '%s'
+               % (st['uncovered'],
+                  'They were EXTENDED from the covered art beside them '
+                  '(EXTEND_INTO_GAP is on -- this is build 45 behaviour and '
+                  'produced the grey/green triangles).'
+                  if EXTEND_INTO_GAP else
+                  'They were NOT dilated -- EXTEND_INTO_GAP is off. Each one '
+                  'keeps whatever the vanilla page held, which is the rule '
+                  'that survived builds 45, 46 and 49.')
+               if st.get('uncovered') else '')
             + (' -- of the written cells, %d are flat MARGIN PLACEHOLDERS '
                'where the mod authored near-black: those used to keep a vivid '
                'tan/yellow filler and now take the dark art'
@@ -1240,7 +1499,19 @@ def summarise(st):
                'repainting one frame of an animation reads as FLICKER'
                % (f"{getattr(fillable_cells, 'layer2_static', 0):,}",
                   f"{getattr(fillable_cells, 'layer2_animated', 0):,}")
-               if getattr(fillable_cells, 'layer2_static', 0) else ''))
+               if getattr(fillable_cells, 'layer2_static', 0) else '')
+            + (' -- KEY DROPPED: %s texel(s) in %s layer-1 opaque cell(s) kept '
+               "Cosmos's art instead of being forced back to index 0. On a "
+               'depth-1 page index 0 is DRAWN, not discarded (FFNx sets '
+               'color_key only for type 2), and 93%% of those keys are 0x0000, '
+               'so every one of these was a BLACK pixel painted over art the '
+               'mod shipped. %s texel(s) in genuine cut-outs -- layer 2+ or a '
+               'blend-band page -- were left forced, because there index 0 is '
+               'real transparency and dropping it would make an overlay an '
+               'opaque rectangle'
+               % (f"{st['keep0_dropped']:,}", f"{st['keep0_cells']:,}",
+                  f"{st.get('keep0_kept', 0):,}")
+               if st.get('keep0_dropped') else ''))
 
 
 if __name__ == '__main__':

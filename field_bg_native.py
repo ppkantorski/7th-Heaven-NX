@@ -236,6 +236,75 @@ D1_GROUPS = ((0x00, 0x0F, 4), (0x0F, 0x18, 1), (0x18, 0x1A, 0))
 # out to be loadable after all, widening this back is one number -- and the
 # evidence for widening it would have to be a build that puts a page there
 # and draws it, which is exactly the test that keeps failing.
+# PROBE, build 52: 3 -> 4. See FINDINGS-141.
+#
+# The measurement behind 3 is `field_bg_repack.DEFAULT_D2_SLOTS_PER_GROUP`:
+# "29 does not allocate, measured on mds6_2". That is an ALLOCATION failure,
+# not a slot-index or blend-mode limit -- `field_load_textures` makes one
+# texture per present page and aborts the whole loop on the first alloc it
+# cannot serve. An allocation failure is a function of HEAP SIZE, and this
+# build now raises FF7's heap from the port's hardcoded 64 MB to 256 MB
+# (`ff7nx_heap.HEAP_MB = 256`; the log says "heap 64 -> 256 MB"). The
+# measurement almost certainly predates that.
+#
+# The engine's own allocator is not the constraint: field_init_bg_pages
+# (+0x92D048) does ONE test, `cmp w28, #0x1a; cset lo`, so every slot from
+# 0x1A to 0x29 is depth-2 -- sixteen of them, pre-allocated unconditionally.
+# Per-field that is ~9.6 MB; a 4th truecolor page is another 512 KB against
+# a 256 MB pool.
+#
+# ONE SLOT, NOT FOUR. If 29 allocates, 30-32 follow for free and the next
+# build can take the group to 7 -- which is what actually matters, because
+# the dense repack wants 6.18 pages per field and is being given 2.61.
+# If 29 still does not allocate, the failure is loud and specific (black
+# rectangles in the ~303 fields that currently fill slot 28) and this is one
+# number to put back.
+# SEVEN. READ OUT OF THE ORIGINAL x86, NOT INFERRED. FINDINGS-143.
+#
+# `field_load_textures`, x86 0x640292 -- the function the Switch port
+# recompiles, disassembled from game_data_files/ff7_1.02/ff7_en:
+#
+#     006402C1  cmp  ecx, 0x2a      ; the loop runs slots 0..41
+#     006402C4  jge  0x640604
+#     006402D3  mov  eax, [edx*4 + 0xcffc70]    ; field_layers[i]
+#     006402DA  cmp  dword ptr [eax + 0xc], 0   ; ->present
+#     006402DE  je   0x6405ff                   ; absent -> skip, no texture
+#     ...
+#     006403B8  (type == 2 path)
+#     006403C0  cmp  eax, 0x21      ; 33
+#     006403C3  jl   0x64042b       ;   < 33 -> blend 4  OPAQUE
+#     006403CE  cmp  ecx, 0x28      ; 40
+#     006403D1  jl   0x6403dc       ;  33..39 -> blend 1
+#     006403D3  mov  [ebp-8], 0     ;  40..41 -> blend 0
+#
+# and the READER, x86 0x62B6F1, covers the same range:
+#
+#     0062D0CB  cmp  [ebp-0xb4], 0x2a
+#     0062D0E5  add  edx, 0xc       ; &layer->present, READ FROM THE FILE
+#
+# So opaque truecolor is slots 26..32 -- SEVEN -- and the groups below are
+# now an exact mirror of that ladder.
+#
+# WHY THE OLD VALUE WAS 3, AND WHY THAT WAS NEVER AN ENGINE LIMIT
+# ---------------------------------------------------------------
+# It came from "every depth-2 page vanilla ships is in slot 26, 27 or 28"
+# plus "builds that used 29+ produced black squares". Both true; neither is
+# a limit. FFNx's `ff7/field/field.cpp` does say `for(i = 0; i < 29; i++)`,
+# but FFNx REPLACES that function (ff7_opengl.cpp:115 `replace_function`) --
+# it is FFNx's own narrowing, not this engine.
+#
+# MEASURED, cells that would become truecolor at each ceiling:
+#     3 pages -> 62.8% of cells;  the other 37.2% go through the quantiser,
+#     which is where every remaining colour defect in this project lives.
+# Pages a field needs to be 100%% truecolor:
+#     1p:46  2p:246  3p:166  4p:179  5p:49  6p:11  7p:4  fields
+# Seven covers the archive.
+#
+# STILL UNEXPLAINED: build 52 set this to 4 and produced black squares. The
+# engine loop, the blend ladder, and our own section-9 writer (round-trip
+# verified, slot 29 byte-identical) all permit it. If 7 fails the same way
+# the cause is downstream of the archive and needs runtime evidence, not
+# more static reading.
 D2_OPAQUE_SLOTS = 3
 
 D2_GROUPS = ((0x1A, 0x1A + D2_OPAQUE_SLOTS, 4), (0x21, 0x28, 1),

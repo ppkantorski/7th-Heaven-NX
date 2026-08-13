@@ -53,6 +53,7 @@ import field_bg_dense
 import ff7nx_bgclear
 import ff7nx_bgcolor
 import ff7nx_marginart
+import ff7nx_palrange
 import field_bg_native
 import field_bg_repack
 import field_bg_compact
@@ -1837,14 +1838,20 @@ def _log_uniformity(px, log):
             f'Replace-only is the safest setting for MEMORY and the worst '
             f'for APPEARANCE at any size above 256 -- the two goals point in '
             f'opposite directions here.')
-    log(f'      NOT UNIFORM: 95% of fields (677 of 709, measured) carry '
-        f'colour-key pixels, and a truecolor page cannot hold a colour key '
-        f'-- 0x0000 has to mean transparent. Those pages stay 256x256 '
-        f'PALETTED forever, so at {px}px they sit next to {px // 256}x '
-        f'sharper neighbours in the same picture.')
-    log(f'      Only 32 of 709 fields could ever be 100% truecolor. If a '
-        f'uniform look matters more than sharpness, 256px is the only size '
-        f'that delivers it; no budget or ceiling changes this.')
+    log(f'      NOT UNIFORM: some pages stay 256x256 PALETTED, so at {px}px '
+        f'they sit next to {px // 256}x sharper neighbours in the same '
+        f'picture. How many is a moving number -- read DENSE REPACK above '
+        f'for this build rather than trusting a figure quoted here.')
+    log('      CORRECTED, and the old text here was wrong: it claimed a '
+        'truecolor page CANNOT hold a colour key and that only 32 of 709 '
+        'fields could ever be 100% truecolor, "no budget or ceiling changes '
+        'this". MEASURED in the UNMODIFIED game: vanilla ships 1,091,741 '
+        'truecolor texel(s) equal to 0x0000 across 26 field(s) -- cosmo, '
+        'cosmo2, fr_e, gaiin_6, gaiin_7, blin67_4 and others. If 0x0000 drew '
+        'opaque there the stock game would have black rectangles in all 26. '
+        'It does not. 0x0000 means TRANSPARENT on a depth-2 page, which is '
+        'what a cut-out needs, so the key is NOT a barrier to promotion. '
+        'FINDINGS-152.')
 
 
 def _log_render_target_match(px, log):
@@ -3246,8 +3253,17 @@ def _convert_field_backgrounds(archive, payloads, log, dds_sources=()):
         npg += k
         grew += len(new9) - len(parts[8]) + (len(new_raw) - len(raw))
     if dense['fields']:
-        log('  field background DENSE REPACK (capped at %d truecolor page(s) '
-            'per field, the density measured on hardware): %s cell(s) packed '
+        # FORMAT FIRST, CONCATENATE SECOND. `%` binds tighter than `+`, so
+        # `base + suffix % args` folds the suffix INTO the format string and
+        # the outer tuple has nothing left to fill. That killed build 54 in
+        # ff7nx_marginpal.summarise and then killed build 56 HERE, one message
+        # after a test was written for it -- the test only covered module
+        # summarise() functions, not build.py's inline log() calls. There is
+        # now an AST check in test_summarise.py that finds this shape anywhere.
+        _dense_line = (
+            '  field background DENSE REPACK (base cap %d truecolor page(s) '
+            'per field; the LOW-SLOT PROBE below lifts it where free low '
+            'slots exist, so fields DO exceed this): %s cell(s) packed '
             'onto %d page(s) across %d field(s) -- %.2f pages per field '
             'against %.2f before. %s exact from the mod, %s borrowed, %s from '
             'the paletted page. Everything not promoted keeps the Cosmos art '
@@ -3258,6 +3274,69 @@ def _convert_field_backgrounds(archive, payloads, log, dds_sources=()):
                dense['pages_before'] / max(dense['fields'], 1),
                f"{dense['from_art']:,}", f"{dense['from_art_borrow']:,}",
                f"{dense['from_vanilla']:,}"))
+        # FINDINGS-149. The fix landing, and the number to read first.
+        # 0 means the hue detector never fired and this build is build 59.
+        _hbc = getattr(field_bg_dense.dense_repack, 'hue_first_cells', 0)
+        _hbf = getattr(field_bg_dense.dense_repack, 'hue_first_fields', 0)
+        if _hbc:
+            _dense_line += (
+                ' -- HUE-BROKEN FIRST: %s cell(s) across %s field(s) render '
+                'through a palette more than %.3f from their own art in '
+                'chromaticity. They are promoted AHEAD of the tile-reuse '
+                'order, and they are EXEMPT from TRUE_BLACK -- which is what '
+                'was pinning them. MEASURED: mds5_5 (Sector 5 slum outskirts) '
+                'had 13 of 40 margin sky cells held on the paletted page '
+                'because they are >=25%% opaque black, and that page\'s palette '
+                'has a bluest entry of 41, so the sky rendered flat olive. '
+                'Promoting costs a 0.9/255 lift on black; refusing costs the '
+                'entire hue. Sky cells promoted: mds5_5 27/40 -> 40/40, '
+                'mds6_3 5/40 -> 32/40, at NO extra pages in either field. '
+                'WATCH FOR: a dark seam where a promoted dark cell meets an '
+                'unpromoted neighbour -- that is the risk TRUE_BLACK exists '
+                'to avoid and the reason this is scoped to hue-broken cells. '
+                'KEPT THE ART: %s cell(s) skipped the borrow recolour, which '
+                'takes the DETAIL from Cosmos and the COLOUR from the palette '
+                'the tile names -- fatal when that palette cannot hold the '
+                'art. mds5_5 margin sky now renders (74.8, 78.2, 74.6), '
+                'byte-identical to Cosmos\'s own art, where builds 60 and 61 '
+                'gave (79.5, 67.8, 27.8). Scoped to hue-broken cells so the '
+                'mds6_2 / Wall Market brown side keeps the recolour. '
+                'UNMEASURABLE: %s cell(s) had no art to compare against even '
+                'after following ff7nx_marginpage.ORIGIN back to the page they '
+                'were moved from. That is NOT "sound" -- it is the detector '
+                'unable to look, and it reading as 0.0 is what made build 60 '
+                'inert (FINDINGS-150). If this number is large the origin map '
+                'is not reaching this pass.'
+                % (f"{_hbc:,}", f"{_hbf:,}", field_bg_dense.HUE_BROKEN_DIST,
+                   f"{getattr(field_bg_dense.dense_repack, 'hue_kept_art', 0):,}",
+                   f"{getattr(field_bg_dense.hue_broken, 'unmeasured', 0):,}"))
+        _low = getattr(field_bg_dense.dense_repack, 'low_slots_offered', 0)
+        if _low:
+            _dense_line += (
+                ' -- LOW-SLOT PROBE: %s free slot(s) below %d were offered to '
+                '%s (placement %s, FINDINGS-156: \'desc\' + top 14 is the '
+                'build 65 probe, \'asc\' + top 25 is build 64). '
+                'Slots 29+ do not render on this port '
+                '(builds 52 and 55: black squares, no crash), but the engine '
+                'reads a page\'s TYPE from section 9 rather than from its slot '
+                '(x86 0x62D147) and draws any type-2 page below slot 33 opaque '
+                '(x86 0x6403C0), so a truecolor page in a free LOW slot should '
+                'draw. If these fields are clean the ceiling is placement, not '
+                'capacity.'
+                % (f"{_low:,}",
+                   field_bg_dense.LOW_SLOT_TOP + 1,
+                   ('EVERY field (LOW_SLOT_FIELDS is empty, which means no '
+                    'restriction -- the old wording read "0 named field(s)" '
+                    'here and looked like the probe had not fired)')
+                   if not field_bg_dense.LOW_SLOT_FIELDS else
+                   ('%d named field(s) (%s)'
+                    % (len(field_bg_dense.LOW_SLOT_FIELDS),
+                       ', '.join(sorted(field_bg_dense.LOW_SLOT_FIELDS)[:4]))),
+                   '%s (%s free low slot first)'
+                   % (field_bg_dense.LOW_SLOT_ORDER,
+                      'highest' if field_bg_dense.LOW_SLOT_ORDER == 'desc'
+                      else 'lowest')))
+        log(_dense_line)
     if up_fields:
         log(f'  field background: UPSCALED {up_pages} page(s) in {up_fields} '
             f'field(s) -> {up_new} truecolor page(s), {up_cells:,} cell(s) '
@@ -4580,6 +4659,30 @@ def _build_flevel(archive_path, chunks, field_files, romfs, log,
         'BEFORE the margin passes (the mod\'s own page count -- not vanilla, '
         'which is too strict, and not the post-marginpage section, which is '
         'too lax)' % len(_PAGES_BEFORE_MARGIN))
+    # FINDINGS-158. BEFORE the margin passes, and both halves matter:
+    # marginart SKIPS a cell whose palette byte is >= npg, so a tile naming a
+    # palette that does not exist never receives Cosmos's art -- and on this
+    # port the palette IS applied, so the lookup runs off the end of section
+    # 3's palette array. That is the mds5_3 white speckle and the mds5_5
+    # black blobs. Every offline renderer we own decodes with `pal %% npg`,
+    # so this is invisible until it reaches hardware.
+    _pr_art = None
+    if dds_sources:
+        try:
+            _pr_art = field_bg_repack.ArtProvider(
+                dds_sources, ff7nx_fieldbg.page_px(), lambda *_a: None)
+        except Exception:                                      # noqa: BLE001
+            _pr_art = None
+    _pr = ff7nx_palrange.apply_to_flevel(
+        archive, payloads,
+        encode=lambda raw: _encode_field_cached(archive, raw), log=log,
+        art=_pr_art)
+    log(ff7nx_palrange.summarise(_pr['tiles'], _pr['cells'], _pr['fields'],
+                                 _pr['pals']))
+    if _pr['refused']:
+        log('  ! palette range: %d field(s) not changed (%s)'
+            % (len(_pr['refused']),
+               ', '.join('%s: %s' % r for r in _pr['refused'][:2])))
     if dds_sources and ff7nx_marginart.enabled():
         _art = field_bg_repack.ArtProvider(
             dds_sources, ff7nx_fieldbg.page_px(), log)
