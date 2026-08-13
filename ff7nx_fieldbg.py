@@ -301,6 +301,67 @@ SITE_BLEED      = 0xA09680      # movz w22, #0xBAE0, lsl #16
 SITE_FIELD_BUF  = 0x921A4C      # ldr w23, [x0]  <- [0xCFF598], the field
                                 #                   decompression buffer size
 
+# ------------------------------------------------------------- FINDINGS-168
+# THE PORT LOADS 29 PAGE SLOTS. THE x86 LOADS 42.
+#
+# `field_load_textures` is x86 0x640292. Through nxmap that is a recompiler
+# stub at 0x937AE0 which calls the NATIVE reimplementation at 0x10DC370.
+# Identified three ways, all measured, none inferred:
+#
+#     0x10DC39C  mov  w20, #0xfc70
+#     0x10DC3A0  movk w20, #0xcf, lsl #16      ; w20 = 0x00CFFC70, field_layers
+#     0x10DC3CC  ldr  w8, [x24, #0xc]          ; ->present, as the x86 reads it
+#     0x10DC3D4  ldrh w8, [x24, #0x1a]         ; the page TYPE, from the file
+#
+# and its loop terminates at
+#
+#     0x10DC4A0  add  x23, x23, #1
+#     0x10DC4A4  cmp  x23, #0x1d               ; 29  <-- THIS
+#     0x10DC4A8  b.ne #0x10dc3bc
+#
+# against the x86's `cmp ecx, 0x2a` -- 42. It is FFNx's `for(i = 0; i < 29;
+# i++)` (ff7/field/field.cpp) baked into the Switch reimplementation.
+#
+# THIS IS WHY BUILDS 52 AND 55 PRODUCED BLACK SQUARES. A page in slot 29 is
+# never loaded, so it never becomes a texture, so every tile naming it draws
+# nothing. No crash, black squares -- exactly what was reported, and what
+# field_bg_native.py records as "STILL UNEXPLAINED ... needs runtime
+# evidence". It needed static reading of the right binary.
+#
+# NOTHING ELSE IS SIZED 29. Whole-image scan for every site that materialises
+# 0xCFFC70 -- nine of them:
+#
+#     0x92CE94  field_init_bg_pages   cmp w8, #0x2a   42   <- the ALLOCATOR
+#     0x9E9A10                        cmp w8, #0x2a   42   (x2)
+#     0xA02958                        cmp w8, #0x2a   42   (x3)
+#     0xA02BEC                        cmp w8, #0x2a   42
+#     0x9F1FC8 0x9F3108 0xA02450      no slot bound
+#     0x10DC39C/0x10DC580             cmp x23, #0x1d  29   <- THE ONLY OUTLIER
+#
+# The storage for all 42 slots is allocated; only the loader refuses to look
+# past 29. There is no 29-element array to overrun, which is what makes this
+# a bound change rather than a rewrite.
+#
+# WHY 33 AND NOT 42. 33 (0x21) is the end of the depth-2 OPAQUE band
+# (0x1A..0x20), so it covers every slot a page we write can legally occupy.
+# The bands past it -- depth-2 additive 0x21..0x27 and average 0x28..0x29 --
+# are unreachable for a second, independent reason: this same function gives
+# EVERY depth-2 page blend 4 with no slot test at all
+#
+#     0x10DC3D8  cmp   w8, #1
+#     0x10DC3DC  b.ne  #0x10dc410      ; depth 2 ->
+#     0x10DC410  mov   w4, #4          ;   OPAQUE, unconditionally
+#
+# so the x86's depth-2 additive ladder has no counterpart here to switch on.
+# Loading those slots would buy nothing and widen the blast radius. Raise
+# this to 0x2a only alongside a real blend-ladder trampoline.
+SITE_LOAD_SLOTS = 0x10DC4A4     # cmp x23, #0x1d   field_load_textures bound
+
+# The slot the loop must reach to cover the whole depth-2 opaque band. The
+# loop is `cmp / b.ne`, i.e. exclusive, so this is one past slot 0x20.
+LOAD_SLOTS_FOR_D2_OPAQUE = 0x21
+ORIG_LOAD_SLOTS_BOUND = 0x1D            # what the stock module holds
+
 ORIG = {
     SITE_ALLOC_ELEM: 0x321F03F9,
     SITE_READ_BYTES: 0x320F03FB,
@@ -310,6 +371,7 @@ ORIG = {
     SITE_SURF_PITCH: 0x321703E8,
     SITE_BLEED:      0x52B75C16,
     SITE_FIELD_BUF:  0xB9400017,
+    SITE_LOAD_SLOTS: 0xF10076FF,                        # cmp x23, #0x1d
 }
 
 # The one word we deliberately do NOT touch, checked so a future build that
@@ -417,6 +479,23 @@ def _movz_hi16(orig_word, imm16):
     return (orig_word & ~(0xFFFF << 5)) | ((imm16 & 0xFFFF) << 5)
 
 
+def _cmp_imm12(orig_word, imm12):
+    """
+    `cmp xN, #imm` with a new immediate, or None if it does not fit.
+
+    Same imm12 field as `_sub_imm12_lsl12` -- `cmp` IS `subs xzr, xN, #imm`
+    -- but WITHOUT the lsl #12 shift, so the value is used as-is. Kept
+    separate rather than sharing that helper: the shift bit at 22 is part of
+    what distinguishes them, and a bound that silently gained a 4096x factor
+    is exactly the class of error this module exists to avoid.
+    """
+    if not 0 <= imm12 <= 0xFFF:
+        return None
+    if (orig_word >> 22) & 1:                   # sh bit set -> it IS shifted
+        return None
+    return (orig_word & ~(0xFFF << 10)) | (imm12 << 10)
+
+
 # ------------------------------------------------------------------ settings
 def page_px():
     """
@@ -499,7 +578,13 @@ def words(px=None, bleed=None, max_raw=None):
         # goes from 786 KB to 1.57 MB of section 9 and the fixed 2,000,000
         # byte decompression buffer (section E) is suddenly in play. The size
         # did not change; the DEPTH did.
-        return _field_buffer_word(max_raw)
+        #
+        # The loader bound is orthogonal to page SIZE -- it counts slots, not
+        # pixels -- so a 256px truecolor build needs it for the same reason a
+        # 512px one does.
+        out = _field_buffer_word(max_raw)
+        out.update(_load_slots_word())
+        return out
 
     pixels = px * px                                  # 0x40000 at 512
     read = read_bytes(px)                             # 0x80000 at 512
@@ -552,6 +637,7 @@ def words(px=None, bleed=None, max_raw=None):
         'depth-2 surface stride 0x200 -> 0x%X' % (px * 2))
 
     out.update(_field_buffer_word(max_raw))
+    out.update(_load_slots_word())
     if bleed if bleed is not None else halve_bleed():
         # -0.4375/256 -> -0.4375/px, so the tile-edge bleed guard stays the
         # same fraction of a TEXEL. Costs correctness on the depth-1 pages
@@ -596,6 +682,55 @@ def _field_buffer_word(max_raw):
         ORIG[SITE_FIELD_BUF], word,
         'field decompression buffer 2,000,000 -> %d bytes '
         '(largest field in this build is %d)' % (n, max_raw))}
+
+
+def _load_slots_word():
+    """
+    {SITE_LOAD_SLOTS: (orig, new, why)} when the pipeline may use a slot the
+    stock loader will not reach, else {}.
+
+    See the FINDINGS-168 block above SITE_LOAD_SLOTS. The gate is
+    `D2_OPAQUE_SLOTS`, because that constant is the only thing in the
+    pipeline that decides whether a page can land at slot 29 or beyond: the
+    depth-2 opaque band starts at 0x1A, so N slots reach 0x1A+N-1 and the
+    loop must run to 0x1A+N.
+
+    SUBTRACTIVE BY CONSTRUCTION. At the shipped D2_OPAQUE_SLOTS = 3 the
+    highest page is slot 28 and the stock bound of 29 already covers it, so
+    this returns {} and the module is byte-identical to today. The patch only
+    appears when something would otherwise be silently dropped -- it can
+    never remove a page that renders now.
+    """
+    try:
+        import field_bg_native as FN
+        want = 0x1A + int(FN.D2_OPAQUE_SLOTS)
+    except Exception:                                          # noqa: BLE001
+        return {}
+    if want <= ORIG_LOAD_SLOTS_BOUND:
+        return {}
+    if want > LOAD_SLOTS_FOR_D2_OPAQUE:
+        # Past the opaque band the blend ladder is the binding constraint,
+        # not the loop -- a depth-2 page there still draws OPAQUE (see the
+        # FINDINGS-168 block). Refuse rather than load slots whose pages
+        # would render with the wrong blend mode.
+        raise ValueError(
+            'field bg: D2_OPAQUE_SLOTS = %d would need the texture loader to '
+            'reach slot 0x%X, past the depth-2 OPAQUE band that ends at 0x20. '
+            'This port gives every depth-2 page blend 4 regardless of slot, '
+            'so a page above 0x20 would draw opaque instead of additive. '
+            'Raising this needs a blend-ladder trampoline, not a bound change.'
+            % (FN.D2_OPAQUE_SLOTS, want - 1))
+    word = _cmp_imm12(ORIG[SITE_LOAD_SLOTS], want)
+    if word is None:
+        raise ValueError('field bg: cannot encode texture loader bound %d'
+                         % want)
+    return {SITE_LOAD_SLOTS: (
+        ORIG[SITE_LOAD_SLOTS], word,
+        'field_load_textures: slot loop bound %d -> %d, so the %d depth-2 '
+        'OPAQUE slot(s) 0x1A..0x%X all load (FINDINGS-168; the x86 bound is '
+        '42 and this port narrowed it to 29, which is why builds 52 and 55 '
+        'drew black squares at slot 29)'
+        % (ORIG_LOAD_SLOTS_BOUND, want, FN.D2_OPAQUE_SLOTS, want - 1))}
 
 
 def _f32_bits(value):

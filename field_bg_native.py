@@ -300,11 +300,34 @@ D1_GROUPS = ((0x00, 0x0F, 4), (0x0F, 0x18, 1), (0x18, 0x1A, 0))
 #     1p:46  2p:246  3p:166  4p:179  5p:49  6p:11  7p:4  fields
 # Seven covers the archive.
 #
-# STILL UNEXPLAINED: build 52 set this to 4 and produced black squares. The
-# engine loop, the blend ladder, and our own section-9 writer (round-trip
-# verified, slot 29 byte-identical) all permit it. If 7 fails the same way
-# the cause is downstream of the archive and needs runtime evidence, not
-# more static reading.
+# EXPLAINED AT LAST -- FINDINGS-168. The paragraph below used to end "STILL
+# UNEXPLAINED: build 52 set this to 4 and produced black squares. The engine
+# loop, the blend ladder, and our own section-9 writer (round-trip verified,
+# slot 29 byte-identical) all permit it."
+#
+# All three of those DO permit it. None of them is what runs. The Switch port
+# does not execute the x86 loop; it calls a NATIVE reimplementation of
+# `field_load_textures` at module offset 0x10DC370, and that function ends its
+# slot loop at
+#
+#     0x10DC4A4  cmp x23, #0x1d          ; 29, against the x86's 42
+#
+# So a page in slot 29 is never loaded, never becomes a texture, and every
+# tile naming it draws nothing. Black squares, no crash -- build 52 exactly.
+# The reading was right about the archive and looking at the wrong binary.
+#
+# `ff7nx_fieldbg` now patches that bound to 0x21 whenever this constant would
+# put a page past slot 28, which is why 7 is now safe to ask for. The two
+# numbers are ONE fact and must move together; `_load_slots_word()` derives
+# the bound from this constant rather than repeating it, and refuses outright
+# if this goes past 7 -- the depth-2 ADDITIVE band beyond slot 0x20 has no
+# blend ladder on this port (that same function gives every depth-2 page
+# blend 4 with no slot test), so loading those slots would draw an additive
+# effect as an opaque patch.
+#
+# MEASURED, pages a field needs to be 100% truecolor:
+#     1p:46  2p:246  3p:166  4p:179  5p:49  6p:11  7p:4  fields
+# Seven covers the archive. Three covers 62.8% of cells.
 D2_OPAQUE_SLOTS = 3
 
 D2_GROUPS = ((0x1A, 0x1A + D2_OPAQUE_SLOTS, 4), (0x21, 0x28, 1),

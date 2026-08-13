@@ -953,7 +953,61 @@ def source_cell(k, rec, pages, arrays, pal565, art_for, pals_for, st,
 # 25% takes 85% of the benefit for 7.5% of the cells. Rejection is exactly
 # vanilla behaviour for that cell, so it cannot break anything: the cell keeps
 # the page it already had.
-TRUE_BLACK = 0.25
+#
+# ------------------------------------------------------------- FINDINGS-169
+# 0.25 -> 1.0. THE SEAM THIS PREVENTS IS CANCELLED BY THE SHIPPED SHADER.
+#
+# Everything above is correct FOR THE BUILD IT WAS WRITTEN AGAINST, where
+# NEAR_BLACK was 0x0001 -- pure blue, 0.9/255 -- and the HD shaders had no
+# black point. Two things changed since and nobody revisited this number:
+#
+#   field_bg_native.NEAR_BLACK       0x0001 (blue)  ->  0x0841 = RGB(8,8,8)
+#   custom_shaders/hd/*.glsl         HD_BLACK_POINT ->  0.03137 = 8/255
+#
+# and the second was SIZED TO CANCEL THE FIRST. Both shipped background
+# scalers (2xsal_p.glsl, hq4x_p.glsl) end in
+#
+#     rgb = max(rgb - 0.03137, 0.0) / (1.0 - 0.03137)
+#
+# so a promoted cell's lifted black, exactly 8/255, arrives on screen at
+# 0.00067/255 -- zero in an 8-bit framebuffer -- and its unpromoted
+# neighbour's true black arrives at 0. Every value between them is crushed
+# too. FINDINGS-132 said "the grey lift and the 8/255 black point have NEVER
+# been in the same build"; they are both in this one, and have been for
+# several.
+#
+# MEASURED, not reasoned. `_seam.py` renders both sides of every 16-px tile
+# boundary that promotion changes and reports step_AFTER - step_BEFORE, which
+# is the only quantity that matters -- a boundary always has a step, the
+# question is whether promotion made it worse. 18 real fields, 1,112 cells
+# newly promoted, 2,820 boundaries changed:
+#
+#     boundaries worse by     RAW surface        AS SHIPPED (graded)
+#       > 2/255                 649  (23.0%)        8  (0.28%)
+#       > 8/255                   4                 2
+#       worst delta            17.333             10.324
+#
+# The raw column is the artifact the rule was written to stop -- and in
+# mkt_mens its worst boundary is exactly 8.000, the lift's own signature, on
+# 41 of 108 boundaries. Graded, mkt_mens has ZERO over 2/255 and its mean
+# delta is -3.679: promotion makes Men's Hall BETTER. So do sbwy4_3 (-9.29),
+# jun_w (-8.96) and junpb_3 (-6.09).
+#
+# 1.0 AND NOT 0.0 DELIBERATELY. At 1.0 only a 100% opaque black cell keeps
+# its paletted page, and such a cell has no detail to gain from promotion --
+# it is black either way. Keeping it paletted costs nothing visually and
+# leaves the truecolor page space for cells that use it. 0.0 measured +31
+# further tiles over 8 fields and spends pages on solid black.
+#
+# THE TWO THAT DID GET WORSE, so the next reader does not have to find them:
+#   blin59    (2, -160, -64)|(2, -160, -48)   +10.324
+#   blin63_1  (2, 128, 160)|(2, 128, 176)     + 8.754
+# Both are layer-2 boundaries and neither is the black lift (8.000 is that
+# signature and it is gone). They are ordinary art difference at one spot.
+#
+# IF THE BLACK POINT IS EVER TURNED OFF, PUT THIS BACK TO 0.25. The two move
+# together, exactly as NEAR_BLACK and HD_BLACK_POINT do.
+TRUE_BLACK = 1.0
 
 PROMOTE_LAYER1_KEY = False
 

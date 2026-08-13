@@ -199,6 +199,103 @@ import sys
 # light beams, and the bottom of the Northern Cave (las0_2) are the three to
 # check -- the last one for the FINDINGS-128 crash, which the frame guard
 # should already prevent.
+# ------------------------------------------------- NOT BUILD 71. RETRACTED.
+# THE TRUECOLOR PAGE CEILING HAS NOT BEEN THE BINDING CONSTRAINT FOR A LONG
+# TIME, AND I ALMOST SPENT A BUILD PROVING IT. FINDINGS-168 s3.5.
+#
+# FINDINGS-168 is right about the mechanism: the port's texture loader stops
+# at slot 29 (0x10DC4A4, `cmp x23, #0x1d`) where the x86 runs to 42, and that
+# is why builds 52 and 55 drew black squares. `ff7nx_fieldbg._load_slots_word`
+# now patches that bound -- but it DERIVES it from D2_OPAQUE_SLOTS and emits
+# NOTHING while that is 3, so the module this build writes is byte-identical
+# to build 70's. The machinery is insurance, not a change.
+#
+# What was wrong was the payoff. I proposed D2_OPAQUE_SLOTS 3 -> 7 as "the
+# direct route to 512px truecolor everywhere". Then I measured what the page
+# ceiling actually costs, with `_coverage_audit.py` over 162 fields drawn from
+# three separate regions of the archive -- 162,613 tiles, 23% of the game:
+#
+#     truecolor    106,828   65.7%
+#     TRUE_BLACK    20,702   12.7%   >=25% opaque black, kept paletted
+#     FX            20,450   12.6%   carries/is an fx page
+#     KEY_L1        14,592    9.0%   index 0 on layer 1
+#     KEY_L2             0    0.0%   (already promoted)
+#     BUDGET            41    0.025% <-- ran out of pages/slots/room
+#
+# 1,659 free low slots went unused. **BUDGET is 41 tiles.** The low-slot probe
+# (LOW_SLOT_MAX_TC = 7, LOW_SLOT_TOP = 14) already routes around the ceiling
+# wherever it would bind, which is why every field measured had 10-13 free
+# slots below 15. Raising the ceiling would move 0.025% of tiles and would
+# put pages into slots that have never rendered on hardware. Bad trade.
+#
+# THE REAL TARGETS, IN SIZE ORDER, AND ALL THREE ARE OUR RULES OR THE PORT'S
+# BLEND LADDER -- NONE IS CAPACITY:
+#   TRUE_BLACK  12.7%  ours. 0x0000 means transparent on a depth-2 page, so
+#                      solid black takes a 0.9/255 lift and we refuse cells
+#                      that are >=25% opaque black. Biggest single bucket and
+#                      entirely within our control. START HERE.
+#   FX          12.6%  structurally blocked: this port gives EVERY depth-2
+#                      page blend 4 with no slot test, so a promoted animated
+#                      frame draws opaque instead of additive. Needs a blend
+#                      trampoline, not a flag. FINDINGS-168 s3.2.
+#   KEY_L1       9.0%  ours. PROMOTE_LAYER1_KEY.
+#
+# ---------------------------------------------------------------- BUILD 71
+# ONE VARIABLE.  field_bg_dense.TRUE_BLACK = 0.25 -> 1.0.  FINDINGS-169.
+#
+# A cell that is >=25% opaque black kept its paletted page so its black stayed
+# exactly black instead of being lifted to NEAR_BLACK and drawing a seam
+# against an unpromoted neighbour. That reasoning was written when NEAR_BLACK
+# was 0x0001 (pure blue) and the HD shaders had no black point. Both changed:
+# NEAR_BLACK is 0x0841 = RGB(8,8,8), and both shipped background scalers carry
+# HD_BLACK_POINT = 0.03137 = 8/255, sized to cancel exactly that lift.
+#
+# MEASURED with `_seam.py`, which renders both sides of every 16-px tile
+# boundary promotion changes and reports step_AFTER - step_BEFORE -- the pair
+# measurement this tree never had (HANDOFF-167 s0.5). 18 real fields, 1,112
+# newly promoted cells, 2,820 changed boundaries:
+#
+#     boundaries worse by     RAW surface      AS SHIPPED (graded)
+#       > 2/255                 649 (23.0%)       8 (0.28%)
+#       > 8/255                   4                2
+#
+# The raw column IS the artifact the rule was written to stop, and mkt_mens's
+# worst raw boundary is exactly 8.000 -- the lift's signature -- on 41 of 108.
+# Graded, mkt_mens has zero over 2/255 and a mean delta of -3.679: Men's Hall
+# gets BETTER. So do sbwy4_3 (-9.29), jun_w (-8.96), junpb_3 (-6.09).
+#
+# 1.0 not 0.0: a 100% black cell gains nothing from promotion and keeping it
+# paletted leaves truecolor page space for cells that use it.
+#
+# PREDICTION, MEASURED offline over 45 fields (sweep_repack, D2_OPAQUE_SLOTS
+# still 3, nothing else touched):
+#
+#     truecolor tiles   20,715 -> 21,092   (+377, 66.9% -> 68.1%)
+#     fields with truecolor DOWN                0     <- the hard one
+#     fields with truecolor UP                 19
+#     pages                                   -15 across 12 fields
+#     fields that failed to repack        unchanged (astage_b, blackbgb --
+#                                         both pre-existing, identical at 0.25)
+#
+# So: 'dense repack' moves UP, and 'field background' page/memory counters
+# move DOWN. A page count going UP anywhere is NOT expected and should be read
+# as a surprise. Everything upstream of dense_repack MUST NOT MOVE: margin art,
+# margin palette, margin page, palette range, transparency key.
+#
+# WHAT WOULD FALSIFY IT ON HARDWARE: a visible edge between a dark promoted
+# cell and its neighbour. The two boundaries that did get worse are named, so
+# look at them first --
+#     blin59    (2, -160, -64)|(2, -160, -48)   +10.324
+#     blin63_1  (2, 128, 160)|(2, 128, 176)     + 8.754
+# then mkt_mens (Men's Hall), which should look BETTER and is a long-standing
+# open problem; then Wall Market and Aerith's house for regressions.
+#
+# NOT IN THIS BUILD, deliberately: D2_OPAQUE_SLOTS stays 3 (the page ceiling
+# is worth 41 tiles, FINDINGS-168 s3.5), PROMOTE_FX_BASE stays off (it needs a
+# blend trampoline, FINDINGS-168 s3.2), PROMOTE_LAYER1_KEY stays off.
+#
+# RUN `_fxpx.py` ON THE OUTPUT. Expect 0 px-mismatched fx pairs. 90 seconds,
+# and it is the check that would have stopped build 69.
 EXPECTED_MOVEMENT = frozenset({'dense repack', 'page cap', 'field background',
                                'palette clamp'})
 
