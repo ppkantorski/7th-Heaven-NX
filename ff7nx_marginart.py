@@ -91,6 +91,68 @@ import ff7nx_marginblack as MB
 # them is the grey staircase in the No. 1 reactor.
 KEEP_BLACK_SILHOUETTE = False   # post-baseline; reverted with the rest
 
+# ------------------------------------------------------------- FINDINGS-173
+# THE SAME IDEA AS ABOVE, PER PIXEL -- WHICH IS THE UNIT THE DEFECT LIVES IN.
+#
+# `KEEP_BLACK_SILHOUETTE` skips a cell only when the WHOLE cell is black, so
+# it protects the interior of a void and misses its EDGE. The edge cell is
+# part scenery, part void, holds 2..27 black pixels out of 256, and is where
+# a silhouette boundary actually runs -- diagonally, which is why it reads as
+# a staircase. Aerith's house upstairs (`elmin1_2`) and the No. 1 reactor
+# family (`nmkin_*`) are the reported cases.
+#
+# This preserves the BLACK PIXELS THEMSELVES and lets the rest of the cell
+# take Cosmos's art, so nothing is withheld and the boundary stays exactly
+# where the original put it.
+#
+# It can only PRESERVE a black pixel, never create one, so the failure that
+# retired the cell-level guard -- `md1stin`'s widened edges blacked out --
+# cannot occur. See the long note at the write site.
+# OFF, AND RETRACTED BY MEASUREMENT. FINDINGS-173 s5.
+#
+# This looked like it worked and it does not. The "improvement" I measured
+# (elmin1_2 1,245 -> 198 damaged pixels) was an artefact of `_seam._render`,
+# which sampled a 512px depth-2 cell with `cell[::s, ::s]` -- the TOP-LEFT
+# texel of each 4x4 block, discarding 15 of every 16 pixels. On a boundary
+# cell that sample is a coin flip, and every cell in this report is a boundary
+# cell. With the renderer corrected to box-average, the same A/B moves
+# elmin1_2 from 700 damaged pixels to 700. Nothing.
+#
+# The reason is simple once measured: **100% of the damaged cells are
+# TRUECOLOR** (elmin1_2 69 cells, nmkin_2 226, mds6_3 109; paletted: zero).
+# A promoted cell is built by `field_bg_dense.source_cell` from Cosmos's DDS
+# directly and never reads the paletted page this pass writes, so guarding
+# the paletted page cannot reach it.
+#
+# Left in place, off, because the code and the FFNx table above are the
+# groundwork for whatever does fix it -- and because turning it on is
+# measurably a no-op rather than a risk.
+KEEP_BLACK_PIXELS = False
+
+# What counts as black, per channel, in the vanilla page's own palette.
+# 0 is the strict reading and it is what the reported cells use (index 119 in
+# `elmin1_2` palette 1 is exactly RGB(0,0,0)). A small tolerance is allowed
+# because a 5:6:5 palette can hold RGB(0,0,8) and mean black; above ~16 the
+# entry is a colour and the mod is entitled to replace it.
+BLACK_PIXEL_MAX = 8
+
+# ...AND ONLY WHERE THE SOURCE ITSELF IS DARK. See the FFNx table at the write
+# site: a pixel is only protected when the kxk source block that produced it is
+# at least SRC_DARK_FRAC dark, which is the signature of a BOUNDARY BLEND
+# rather than of authored content. Without this the guard suppresses real art
+# in nmkin_2 / md1stin / mds6_3, where the source is 82-96% fully opaque and
+# the reporter confirms the picture is already correct.
+SRC_DARK_MAX = 24        # a source texel this dark is "void", per channel
+SRC_DARK_FRAC = 0.25     # this much of the block must be void to protect it
+
+# ------------------------------------------------------------- FINDINGS-174
+# A CELL THAT IS 100% INDEX 0 ON A PAGE COSMOS ADDED IS AN EMPTY ATLAS SLOT,
+# NOT A CUT-OUT. See the long note at the `_is_cut` site for the measurement.
+# This is what leaves the last olive squares in Wall Market's margin.
+EMPTY_ATLAS_IS_NOT_A_CUTOUT = True
+ATLAS_OPAQUE_FRAC = 0.9    # the mod's art must be this opaque to count as art
+ATLAS_ENTRY0_MIN_LUMA = 40  # and entry 0 must be visible, or it reads as void
+
 
 def _box3_rgb(a):
     """3x3 box mean of an (H, W, 3) image, edge-replicated -- low frequency.
@@ -895,7 +957,7 @@ def fill_field(name, raw, lgp_mod, art, log=None, scope='margin'):
     # was blacked out -- the column of black squares down both edges. Caught in
     # one build, and this is the predicate it should have used from the start.
     _inside43 = set()
-    if KEEP_BLACK_SILHOUETTE:
+    if KEEP_BLACK_SILHOUETTE or KEEP_BLACK_PIXELS:
         try:
             _tl = MB.read_tiles(parts[SECTION9], surv, pages)
             _out = {(t.slot, t.sx, t.sy) for t in _tl if t.outside_43}
@@ -1155,6 +1217,40 @@ def fill_field(name, raw, lgp_mod, art, log=None, scope='margin'):
             # transparency -- it paints the key colour, black 93% of the time,
             # over art the mod shipped.
             _is_cut = _cutout is None or (slot, sx, sy) in _cutout
+            # ---- AN EMPTY ATLAS SLOT IS NOT A CUT-OUT. FINDINGS-174.
+            #
+            # A cell that is 100% index 0 has an all-true `keep0`, so the line
+            # below throws the ENTIRE quantised result away and writes index 0
+            # straight back. The cell can never be filled, by anything, ever.
+            #
+            # That is right for a real cut-out and wrong for the cells Cosmos
+            # ADDS: its chunk.9 ships widescreen pages that are sparse atlases,
+            # empty where the DDS supplies the pixels on FFNx. MEASURED on
+            # `mrkt2` -- vanilla has ONE tile drawing an all-zero cell, Cosmos's
+            # chunk.9 has 152, on pages 5 and 6 which vanilla does not have at
+            # all. The mod ships fully opaque art for them (alpha >= 128 at
+            # 100%, RGB mean 49..140) and this pass discarded every byte of it.
+            #
+            # Archive-wide: 2,815 tiles across 16 fields name an all-zero cell
+            # that had content in vanilla or no vanilla page at all; 875 of
+            # them render a VISIBLE entry-0 colour. Wall Market's two remaining
+            # olive squares are two of those 875.
+            #
+            # SCOPED HARD, because on layer 2 index 0 usually IS a cut-out and
+            # filling one would occlude the scene. All three must hold:
+            #   * the cell is ENTIRELY index 0 -- nothing to preserve;
+            #   * the mod ships essentially OPAQUE art there, so it is not
+            #     describing a hole either;
+            #   * entry 0 of this page's palette is BRIGHT, i.e. the cell is
+            #     already drawing a visible flat block on this port rather than
+            #     behaving as transparency. Where entry 0 is dark the cell
+            #     reads as void either way and is left alone.
+            if EMPTY_ATLAS_IS_NOT_A_CUTOUT and _is_cut:
+                _all0 = bool(keep0.all())
+                if _all0 and float((cover >= 128).mean()) >= ATLAS_OPAQUE_FRAC \
+                        and int(prgb[0].max()) > ATLAS_ENTRY0_MIN_LUMA:
+                    _is_cut = False
+                    st['atlas_filled'] = st.get('atlas_filled', 0) + 1
             if _is_cut:
                 idx = np.where(keep0, np.uint8(0), idx)
                 st['keep0_kept'] += int(keep0.sum())
@@ -1204,6 +1300,83 @@ def fill_field(name, raw, lgp_mod, art, log=None, scope='margin'):
                 if not _solid.all():
                     idx = np.where(_solid, idx,
                                    was[sy:sy + TILE, sx:sx + TILE])
+            # ---- THE SILHOUETTE IS PER-PIXEL, NOT PER-CELL. FINDINGS-173.
+            #
+            # `KEEP_BLACK_SILHOUETTE` above asks `_cur.max() == 0` -- is the
+            # WHOLE cell black -- and skips it if so. That catches a cell
+            # entirely inside the void and misses the one that matters: the
+            # cell ON THE EDGE, part scenery and part void. Those are exactly
+            # the cells a silhouette boundary runs through, and because the
+            # boundary follows a diagonal it reads as a STAIRCASE.
+            #
+            # MEASURED, `elmin1_2` (Aerith's house, upstairs), every damaged
+            # tile after `fill_field`:
+            #
+            #   26 tiles, ALL layer 1, ALL outside_43 = False (interior),
+            #   ALL palette 1, vanilla index 119 -- which is black --
+            #   rewritten to 15, 16, 20, 34, 4, 7, 29, 42, 58, 103...
+            #   worst pixel 102/255, and only 2..27 black pixels per cell.
+            #
+            # Two to twenty-seven pixels out of 256, so `_cur.max()` is nowhere
+            # near 0 and the cell-level guard cannot fire. Cosmos's art is
+            # 4x oversampled and box-filtered back down to 16x16, so at the
+            # boundary the room's brown MIXES with the void and the quantiser
+            # writes that blend faithfully. It is a resampling artefact, not
+            # authored content.
+            #
+            # THE RULE: inside the 4:3 picture, a pixel that is BLACK in the
+            # vanilla page stays black. The original cut it to black on
+            # purpose; the upscale has no standing to fill it in.
+            #
+            # WHY THIS IS SAFER THAN THE CELL GUARD, and it is the whole
+            # reason to prefer it: this can only ever PRESERVE a pixel that
+            # was already black. It cannot create one. The cell-level version
+            # withheld entire cells and blacked out `md1stin`'s widened edges
+            # (the note at `_inside43` records that build); this writes no new
+            # black anywhere, so that failure mode does not exist here.
+            #
+            # Margin cells are untouched -- outside the 4:3 picture there is
+            # no original to protect, which is `_inside43`'s whole point.
+            # AND ONLY WHERE THE BRIGHTNESS IS OURS, NOT THE MOD'S.
+            #
+            # VERIFIED AGAINST FFNx, which is the mod's reference renderer and
+            # draws the DDS at FULL resolution while we box-filter a kxk source
+            # block into ONE destination pixel. At the pixels where vanilla is
+            # black and this pass would write >48/255, the SOURCE block is:
+            #
+            #   field      px     dark frac   >=25% dark   fully opaque
+            #   elmin1_2   302      0.26          68%          41%
+            #   mrkt2      736      0.22          47%          54%
+            #   nmkin_2  7,987      0.09          21%          82%
+            #   md1stin    804      0.03           8%          94%
+            #   mds6_3   3,323      0.03           9%          96%
+            #
+            # `elmin1_2` -- the reported case -- is a BLEND: a quarter of its
+            # source is dark and under half is fully opaque, so the brightness
+            # comes from averaging a boundary. `nmkin_2`, `md1stin` and
+            # `mds6_3` are 82-96% fully opaque with almost no dark source:
+            # Cosmos genuinely PAINTS there and FFNx genuinely shows it.
+            #
+            # That matches hardware. The user reports the No. 1 reactor
+            # (`nmkin_*`) looks CORRECT and Aerith's house does not.
+            #
+            # So a blanket "vanilla was black, keep it black" is wrong -- it
+            # would suppress real art in three fields to fix one. The guard
+            # fires only where the source block is substantially dark, i.e.
+            # where our own downsample invented the colour.
+            if KEEP_BLACK_PIXELS and _interior:
+                _wasc = was[sy:sy + TILE, sx:sx + TILE]
+                _blk = prgb[_wasc].max(-1) <= BLACK_PIXEL_MAX
+                if _blk.any():
+                    _sd = ((np.ascontiguousarray(src[..., :3]).max(-1)
+                            <= SRC_DARK_MAX)
+                           .reshape(TILE, k, TILE, k).mean(axis=(1, 3)))
+                    _blk &= _sd >= SRC_DARK_FRAC
+                if _blk.any():
+                    idx = np.where(_blk, _wasc, idx)
+                    st['silhouette_px'] = st.get('silhouette_px', 0) + int(
+                        _blk.sum())
+                    st['silhouette_cells'] = st.get('silhouette_cells', 0) + 1
             # THE BLACK SQUARES ARE THE ATLAS GAP, AND THIS IS THE FIX.
             #
             # A Cosmos page is a SPARSE ATLAS: art only where the vanilla page

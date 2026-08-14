@@ -296,6 +296,258 @@ import sys
 #
 # RUN `_fxpx.py` ON THE OUTPUT. Expect 0 px-mismatched fx pairs. 90 seconds,
 # and it is the check that would have stopped build 69.
+# ---------------------------------------------------------------- BUILD 74
+# THE LAST WALL MARKET SQUARES. ONE FLAG.
+#   ff7nx_marginart.EMPTY_ATLAS_IS_NOT_A_CUTOUT = True   FINDINGS-174
+#
+# Build 73 took mrkt2's visible flat cells 45 -> 12 and the olive ones 13 -> 2.
+# Those last two are a DIFFERENT defect, and it is old.
+#
+# Cosmos's own `mrkt2.chunk.9` ships pages 5 and 6 -- which vanilla does not
+# have -- as SPARSE ATLASES, 59.5% and 26.1% non-zero. The empty cells are
+# where the DDS supplies pixels on FFNx. This port has no DDS loader, so the
+# tile samples an all-zero cell and draws ENTRY 0's COLOUR, which for these
+# palettes is olive. Traced per pass: vanilla 1 such tile, Cosmos's chunk.9
+# 152. Compaction was the first suspect and is INNOCENT -- it correctly merged
+# 17 already-zero cells into one.
+#
+# `marginart` could not fill them because a 100%-index-0 cell has an all-true
+# `keep0`, so `idx = np.where(keep0, 0, idx)` discards the entire quantised
+# result. Right for a real cut-out, wrong for an empty atlas slot.
+#
+# AND THE FIRST ATTEMPT AT THIS DID NOT FIRE, for a reason worth recording:
+# the offline chain omitted `ff7nx_palrange`, so the cells still carried
+# palette 11 on a field with 11 palettes (0..10) and every art lookup missed.
+# The build runs palrange BEFORE marginart. `_chain.py` now includes it; the
+# old chain in HANDOFF-167 s6.3 does not and should not be trusted for
+# anything palette-dependent.
+#
+# SCOPED HARD, because on layer 2 index 0 is normally a genuine cut-out. All
+# three must hold: the cell is ENTIRELY index 0, the mod's art there is >=90%
+# opaque, and entry 0 is visibly bright (luma > 40) -- i.e. the cell is
+# already drawing a visible flat block on this port rather than behaving as
+# transparency. That last test is what the reporter photographed.
+#
+# MEASURED, full chain incl. palrange and compaction, guard OFF -> ON:
+#
+#     field       cells filled   zero tiles      VISIBLE      truecolor cells
+#     mrkt2                 73    17 ->  10      7 -> 1       1536 -> 1536
+#     crater_1             445   371 ->  63    314 -> 1       1024 -> 1024
+#     gaia_1                77   180 -> 103     77 -> 0        512 ->  512
+#     corel3                96    89 ->   4     85 -> 0        768 ->  768
+#     mrkt1                 33     0 ->   0      0 -> 0       1536 -> 1536
+#     mkt_w/s2/ia/mens/mrkt3/onna_2/elmin1_2:  0 filled, unchanged
+#
+# GATES, all clean:
+#     sweep_repack 45 fields:  truecolor DOWN 0, UP 0, pages +0
+#     _evict.py:               lost 0, gained 696, flat 0
+#     test_summarise.py:       passes
+#
+# So this is additive and inert to the repack: it puts the mod's art where the
+# game was drawing a palette entry, and changes nothing else.
+#
+# NOT FIXED BY THIS, and named so it is not mistaken for a regression:
+#   * `trnad_1` keeps 738 visible zero tiles. All layer 2, all on page 0 --
+#     a VANILLA page -- where the mod ships no coverage, so the opacity test
+#     correctly declines. Separate problem, not reported yet.
+#   * Aerith's house 2nd floor is UNCHANGED and still open (FINDINGS-173 s5).
+#
+# ON HARDWARE: Wall Market's last two olive squares. Then Corel (`corel3`),
+# the Gaea's Cliff family (`gaia_1`) and the Northern Crater (`crater_1`),
+# which gain the most and have never been checked for this.
+#
+# --------- NOT IN BUILD 73. THE SILHOUETTE STAIRCASE IS STILL OPEN.
+# `ff7nx_marginart.KEEP_BLACK_PIXELS` is OFF and the reasoning below is kept
+# because the FFNx measurement in it is sound and is the groundwork. The FIX
+# was wrong and is retracted -- see FINDINGS-173 s5. Two things killed it:
+#
+#   1. `_seam._render` sampled 512px cells with `cell[::s, ::s]`, the top-left
+#      texel of each 4x4 block. Every cell in this report is a BOUNDARY cell,
+#      where that sample is a coin flip. Corrected to box-average, the guard's
+#      apparent gain (elmin1_2 1,245 -> 198) becomes 700 -> 700.
+#   2. 100% of the damaged cells are TRUECOLOR. A promoted cell is built from
+#      Cosmos's DDS by `field_bg_dense.source_cell` and never reads the
+#      paletted page this pass writes, so the guard cannot reach them.
+#
+# BUILD 73 IS THE ORDERING FIX ALONE, verified: 0 of 45 sweep rows differ from
+# the ordering-fix-only baseline.
+#
+# -------------------------------- (retained reasoning) FINDINGS-173.
+# THE SILHOUETTE STAIRCASE. `ff7nx_marginart.KEEP_BLACK_PIXELS`.
+#
+# Reported at Aerith's house: along the room's diagonal edge, pixels that
+# should be pure black render brownish-grey, in a 16px staircase. Same family
+# as the No. 1 reactor grey stair-step -- which the user confirms looks
+# CORRECT today, so this is not a regression there; it is a case the existing
+# guard never covered.
+#
+# ATTRIBUTED BY PASS, cumulative damage to pixels that are pure black in
+# vanilla (after the shader black point):
+#
+#     stage                elmin1_2 >8   nmkin_2 >8
+#     1 Cosmos chunk.9              0            0
+#     2 + marginart              1,245       15,085     <-- HERE
+#     3 + marginpage             1,245       15,085
+#     4 + dense repack           1,362       15,171
+#
+# marginart is ~99% of it. Cosmos's own section 9 does none. So this predates
+# builds 71 and 72 and is NOT the TRUE_BLACK or PROMOTE_LAYER1_KEY work.
+#
+# EVERY damaged tile in elmin1_2: layer 1, `outside_43 = False` (INTERIOR,
+# not margin), palette 1, vanilla index 119 -- exactly RGB(0,0,0) -- rewritten
+# to 15, 16, 20, 34, 4, 7, 29, 42, 58, 103. And only 2..27 black pixels per
+# cell, which is why `KEEP_BLACK_SILHOUETTE`'s `_cur.max() == 0` cell test
+# cannot fire: it protects the INSIDE of a void and misses its EDGE, and the
+# edge is where a silhouette boundary runs.
+#
+# THE UNIT WAS WRONG FOR THE FOURTH TIME THIS SESSION. Per-pair for the seam,
+# per-position for the layer-1 key, per-cell-and-layer for the eviction, and
+# now per-PIXEL for the silhouette.
+#
+# MEASURED, pixels pure black in vanilla, guard off -> on:
+#
+#     field      >8            >48          worst      filled
+#     elmin1_2   1,245 -> 198   51 ->   0   102 -> 26   390 -> 390
+#     elmin1_1   1,142 ->  50    3 ->   0   153 -> 17   339 -> 339
+#     mds6_3     9,164 ->   0  3,137 ->  0  170 ->  0   483 -> 483
+#     mrkt2      1,670 ->   6   219 ->   6  247 -> 230 1623 -> 1623
+#     md1stin    5,574 -> 2,238 644 ->   1  110 -> 51  1019 -> 1019
+#     nmkin_2   15,085 -> 3,527 5,391 -> 824 255 -> 238 1407 -> 1407
+#
+# `filled` is IDENTICAL in every field: no cell is withheld, only pixels
+# inside cells are preserved. That is why this cannot reproduce the failure
+# that retired the cell-level guard (`md1stin`'s widened edges blacked out) --
+# it can only ever KEEP a black pixel, never create one. md1stin improves.
+#
+# THE ONE JUDGEMENT CALL, stated so it can be reversed on evidence: at the
+# preserved pixels Cosmos does sometimes ship BRIGHT art -- nmkin_2 5,598
+# texels over 96/255, mds6_3 3,895, mrkt2 1,408. Only 22% of elmin1_2's damage
+# is at the silhouette EDGE, so this is not all resampling bleed; some of it
+# is content the mod paints into a region the original cut to black. This
+# build sides with the ORIGINAL's framing. If hardware shows lost detail in a
+# dark interior, raise `BLACK_PIXEL_MAX` toward 0 or scope the guard to edge
+# pixels -- both are one line.
+#
+# DOWNSTREAM COST, measured: truecolor 24,239 -> 24,234 over 45 fields (-5
+# tiles, one field: blin60_2 771 -> 766), pages +0, `_evict.py` still reports
+# lost 0. New counters `silhouette px` / `silhouette cells`.
+#
+# ON HARDWARE: Aerith's house upstairs -- the brown staircase along the room's
+# diagonal must be black. Then the No. 1 reactor (`nmkin_*`) must NOT get
+# worse, since it is correct today. Then Wall Market for the margin blocks.
+#
+# ------------------------------------------------- BUILD 73. THE 72 FIX-UP.
+# BUILD 72 SHIPPED FLAT TAN AND OLIVE BLOCKS IN WALL MARKET'S MARGIN.
+# FINDINGS-172. One change, and it is an ORDERING change, not a new rule.
+#
+#   field_bg_dense: cells admitted by PROMOTE_LAYER1_KEY now sort to the BACK
+#   of the candidate queue (`_newly` / `_rank`).
+#
+# The truecolor budget is fixed, so `cand` is a QUEUE and everything past the
+# cut-off stays paletted. Widening eligibility does not only ADD cells, it
+# DISPLACES them. MEASURED on mrkt2, same 1,536 cells promoted and the same 6
+# pages both ways:
+#
+#     flag OFF   layer 1  831 tc / 224 pal     layer 2  637 tc / 105 pal
+#     flag ON    layer 1  958 tc /  97 pal     layer 2  512 tc / 230 pal
+#
+# Layer 1 +127, LAYER 2 -125, field total +2. **The build-72 checklist passed
+# on that +2.** 75 of the evicted cells are in the 16:9 margin and 78 render
+# as ONE colour once evicted -- RGB(231,170,107), the vivid tan of
+# FINDINGS-68. A margin cell that falls back to its paletted page falls back
+# to the authored FILLER, not to softer art.
+#
+# THE CHECKLIST ITEM WAS THE WRONG UNIT. "No field's truecolor tile count
+# goes DOWN" cannot see a swap inside a field. `_evict.py` now measures per
+# CELL and per LAYER and is the gate for any future eligibility change.
+#
+# AFTER THE FIX, MEASURED:
+#   _evict.py over the Wall Market set: lost 0, gained 696, flat 0
+#   135 fields, three regions: 71.4% -> 80.7%, identical to build 72's
+#     headline -- the fix costs no coverage, it only changes WHICH cells
+#   fields losing truecolor 0, gaining 92, pages -117
+#   flag OFF reproduces build 72's flag-OFF baseline: 0 of 45 rows differ,
+#     so the ordering change is inert when the flag is off
+#
+# PREDICTION for build 73 against build 72:
+#   dense repack cells / pages     ~unchanged (same budget, same count)
+#   truecolor tiles                ~unchanged in total
+#   BUT layer-2 cells come back    -- not visible in any log counter, which
+#                                     is the whole point; check the picture
+#   new counter `l1key deferred`   non-zero
+#   everything else                IDENTICAL
+#
+# ON HARDWARE: the flat tan/olive blocks in Wall Market's left and right
+# margins must be GONE. That is the one thing this build is for.
+#
+# ---------------------------------------------------------------- BUILD 72
+# TWO CHANGES. ONE IS A BUG FIX THAT SHOULD HAVE BEEN IN 71.
+#
+#   1. field_bg_dense.PROMOTE_LAYER1_KEY = False -> True, SCOPED by `l1_over`
+#      FINDINGS-171
+#   2. the `pals_for is not None` guard in MULTI_PALETTE_VETO
+#      FINDINGS-170 s3
+#
+# (2) is a straight fix: `build.py:2960` leaves `pals_for` None for any field
+# the mod ships no art for, and the veto called it unguarded. Four fields --
+# crcin_2.xone, games_2.xone, md1_1.xone, nmkin_3.xone -- have been logging
+# "not repacked" since build 70 and losing 3,368 cells between them. The guard
+# changes no decision (no art cannot satisfy "exact art for every palette", so
+# the answer is veto either way); it only stops the crash on the way there.
+#
+# (1) is the real change. The layer-1 colour key was vetoed wholesale because
+# "layer-1 tiles OVERLAP and the key is how an earlier one shows through a
+# later one". `_l1key.py` measures that per POSITION, which is the unit the
+# claim is about and the unit nothing here measured. All 709 vanilla fields:
+#
+#     layer-1 tiles                   346,735
+#     positions with >1 layer-1 tile       69   (0.02%)
+#     KEYED layer-1 tiles              57,599
+#       SAFE     nothing else there    57,588   (99.98%)
+#       COVERED  drawn over                 6
+#       DISPUTED on top, and keyed          5   (0.009%)
+#
+# Five tiles in the game: delpb, niv_ti1 x3, nivinn_3. Worst pixel 255, so the
+# old note is RIGHT and is being scoped, not overridden. Re-measured on build
+# 71's shipped archive in case the margin passes added overlaps: they do not.
+#
+# PREDICTION, MEASURED offline over 135 fields drawn from THREE regions of the
+# archive (indices 0-45, 300-345, 600-645) -- not one alphabetical block, which
+# is the sampling error I made twice this session:
+#
+#     truecolor tiles      82,101 -> 92,812 of 115,002   71.4% -> 80.7%
+#     fields with truecolor DOWN        0      <- the one that matters
+#     fields with truecolor UP         92
+#     pages                          -119, and only 2 fields grow by 1
+#                                    (blin63_t 5->6, sininb41 5->6)
+#     flag OFF reproduces build 71    EXACTLY, 0 of 45 rows differ
+#
+# So `dense repack` moves UP hard and the `field background` page/memory
+# counters move DOWN. This time the instrument is named correctly: watch
+# `pages per field` (mean/max) and `fields that GREW their page count`, NOT
+# `dense repack pages`, which counts allocations and rose in build 71 while
+# every field-level cost fell.
+#
+# A NEW COUNTER: `l1key overlap vetoed` should be small and non-zero -- 5
+# across the vanilla archive. If it is 0, the scope is not firing and the
+# disputed cells are being promoted; if it is large, `l1_over` is matching
+# more than it should.
+#
+# WATCH FOR, and I could not fully explain it: `sky` failed to repack in ONE
+# harness configuration (45 fields x 6 workers, flag ON). It does NOT fail
+# alone, or at jobs=1, or at flag OFF in the same batch, and `spipe_2` fails
+# identically both ways in every configuration. It looks like shared module
+# state across sweep_repack's parallel workers rather than anything the flag
+# does, but it is not proven. **If `sky` appears in the build's not-repacked
+# list, that is the lead** -- and it would cost that field its truecolor, the
+# same way the .xone bug did.
+#
+# ON HARDWARE: this promotes cells that contain index 0 on layer 1, so the
+# symptom of being wrong is a layer-1 tile losing pixels an overlapping
+# neighbour used to show through. The five disputed tiles are excluded by
+# construction, so look at the fields that gained most, plus Wall Market
+# (mrkt2 +123 cells) and Sector 6. Aerith's house and the Northern Cave for
+# regressions.
 EXPECTED_MOVEMENT = frozenset({'dense repack', 'page cap', 'field background',
                                'palette clamp'})
 

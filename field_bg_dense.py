@@ -409,7 +409,30 @@ def collect(sec9, pages, tiles):
     `l2` is True when ANY tile drawing this cell is on layer 2 or above. That
     is the difference between a colour key that is a real cut-out and one that
     is just entry 0's colour -- see the module docstring, constraint 2.
+
+    `l1_over` is True when ANY tile drawing this cell is a LAYER-1 tile that
+    sits ON TOP of another layer-1 tile at the same screen position. That is
+    the one case where the layer-1 colour key is a real cut-out, and it is
+    what `PROMOTE_LAYER1_KEY`'s scope turns on. See FINDINGS-171.
     """
+    # WHICH LAYER-1 TILES ARE ON TOP OF ANOTHER ONE. FINDINGS-171.
+    #
+    # Layer 1 is a single ordered list and later entries draw over earlier
+    # ones, so the LAST tile at a position is the one the player sees. Only
+    # that tile's key can reveal anything, and only when something is under
+    # it.
+    #
+    # MEASURED over all 709 vanilla fields: 346,735 layer-1 tiles at 346,666
+    # distinct positions -- 69 positions (0.02%) carry more than one.
+    _l1_last, _l1_n = {}, {}
+    for t in tiles:
+        if t.layer != 1:
+            continue
+        pos = (t.dx, t.dy)
+        _l1_n[pos] = _l1_n.get(pos, 0) + 1
+        _l1_last[pos] = t.off
+    _on_top = {off for pos, off in _l1_last.items() if _l1_n[pos] > 1}
+
     keys, fx_of = {}, {}
     for t in tiles:
         p = pages.get(t.slot)
@@ -420,16 +443,20 @@ def collect(sec9, pages, tiles):
         rec = keys.get(k)
         if rec is None:
             rec = keys[k] = {'band': _band_of(t.slot, p.depth),
-                             'key': False, 'l2': False, 'tiles': []}
+                             'key': False, 'l2': False, 'l1_over': False,
+                             'tiles': []}
         if t.layer >= 2:
             rec['l2'] = True
+        if t.layer == 1 and t.off in _on_top:
+            rec['l1_over'] = True
         rec['tiles'].append(t.off)
         f = sec9[t.off + T_FX_PAGE]
         if f and f in pages:
             fk = (f, t.sx, t.sy, pal if pages[f].depth == 1 else -1)
             if fk not in keys:
                 keys[fk] = {'band': _band_of(f, pages[f].depth),
-                            'key': rec['key'], 'l2': rec['l2'], 'tiles': []}
+                            'key': rec['key'], 'l2': rec['l2'],
+                            'l1_over': rec['l1_over'], 'tiles': []}
             elif rec['l2']:
                 keys[fk]['l2'] = True
             fx_of.setdefault(k, set()).add(fk)
@@ -879,9 +906,17 @@ def source_cell(k, rec, pages, arrays, pal565, art_for, pals_for, st,
     out = (out & ~np.uint16(0x0020)).astype(np.uint16)
 
     out[out == FN.EMPTY] = FN.NEAR_BLACK      # colour that merely rounds to 0
-    if rec['key'] and (rec.get('l2') or not PROMOTE_LAYER1_KEY):
+    if rec['key'] and (rec.get('l2') or not PROMOTE_LAYER1_KEY
+                       or rec.get('l1_over')):
         # A REAL CUT-OUT: a layer-2+ overlay whose index 0 is meant to show
-        # what is behind it. Put the key back exactly.
+        # what is behind it -- or, with PROMOTE_LAYER1_KEY on, a layer-1 tile
+        # that sits ON TOP of another layer-1 tile, where the key is how the
+        # lower one shows through (FINDINGS-171). Put the key back exactly.
+        #
+        # The `l1_over` arm is belt-and-braces: the candidate filter already
+        # vetoes those cells, so this cannot fire today. It is here so that a
+        # future change which lets them through cannot silently bake a key
+        # that reveals something.
         out[zero] = FN.EMPTY
     # On layer 1 index 0 is NOT a cut-out -- it is drawn, and its colour
     # matters. Proved on hardware: setting entry 0 to black removed the
@@ -1009,7 +1044,43 @@ def source_cell(k, rec, pages, arrays, pal565, art_for, pals_for, st,
 # together, exactly as NEAR_BLACK and HD_BLACK_POINT do.
 TRUE_BLACK = 1.0
 
-PROMOTE_LAYER1_KEY = False
+# ------------------------------------------------------------- FINDINGS-171
+# SETTLED. BOTH NOTES ARE RIGHT, AND THE DISPUTED SET IS FIVE TILES.
+#
+# The two claims above disagree in exactly ONE case: a layer-1 tile drawn at a
+# position where ANOTHER layer-1 tile already drew, where the upper one
+# contains index 0. There, the key IS a cut-out and baking entry 0's colour
+# hides what is underneath. Everywhere else layer 1 has nothing behind it and
+# baking is exactly equivalent, as constraint 2 says.
+#
+# Nobody had measured how big that case is. `_l1key.py` does, per POSITION --
+# the pair unit, not the cell (HANDOFF-167 s0.5). All 709 vanilla fields:
+#
+#     layer-1 tiles                   346,735
+#     distinct positions              346,666
+#     positions with >1 layer-1 tile       69   (0.02%)
+#
+#     KEYED layer-1 tiles              57,599   <- what this flag vetoes
+#       SAFE      nothing else there   57,588   (99.98%)
+#       COVERED   drawn over by another     6
+#       DISPUTED  on top, and keyed         5   (0.009%)
+#
+# FIVE TILES IN THE WHOLE GAME: delpb (192,-144), niv_ti1 x3, nivinn_3
+# (-96,112). Their worst pixel moves 255 -- so the "up to 248 over 26 fields"
+# note is real and I am not overriding it, I am SCOPING it. The 26 fields it
+# names were counting cells that CONTAIN a key, not cells whose key reveals
+# anything.
+#
+# Re-measured on build 71's SHIPPED archive, because the margin passes add
+# layer-1 tiles beyond the 4:3 picture and could have created new overlaps:
+# 123,068 layer-1 tiles, still 5 overlapped positions, still 1 disputed. They
+# do not.
+#
+# So the flag is ON, and `l1_over` (see `collect`) is the scope: a keyed
+# layer-1 cell is promoted unless some tile drawing it is on top of another
+# layer-1 tile. That is 99.98% of the bucket at provably zero cost, and the
+# 0.02% keeps exactly today's behaviour.
+PROMOTE_LAYER1_KEY = True
 
 # PROMOTE A LAYER-2+ CUT-OUT. FINDINGS-152, and this is the actual ceiling.
 #
@@ -1357,11 +1428,24 @@ def dense_repack(sec3, sec9, field='', art_for=None, pals_for=None, px=256,
     # working cut-out at all is the open question (0x0000 on depth 2 -- this
     # project has claims both ways and neither is settled), and answering it
     # is not a prerequisite for the 22,378 cells above.
+    # `l1_over` is the SCOPE on PROMOTE_LAYER1_KEY, not a second switch --
+    # FINDINGS-171. With the flag off this reads exactly as it did before
+    # (`not PROMOTE_LAYER1_KEY` vetoes every keyed layer-1 cell); with it on,
+    # only the cells whose key can actually reveal something are vetoed.
     cand = [k for k in keys
             if k not in fx_cells and pages[k[0]].depth == 1
             and not (keys[k]['key']
                      and ((keys[k]['l2'] and not PROMOTE_L2_KEY)
-                          or (not keys[k]['l2'] and not PROMOTE_LAYER1_KEY)))]
+                          or (not keys[k]['l2']
+                              and (not PROMOTE_LAYER1_KEY
+                                   or keys[k].get('l1_over')))))]
+    if PROMOTE_LAYER1_KEY:
+        _l1o = sum(1 for k in keys
+                   if keys[k]['key'] and not keys[k]['l2']
+                   and keys[k].get('l1_over'))
+        if _l1o:
+            dense_repack.l1key_overlap_vetoed = (
+                getattr(dense_repack, 'l1key_overlap_vetoed', 0) + _l1o)
     # ---- ONE CELL, MANY PALETTES. FINDINGS-165.
     #
     # A light beam, a waterfall or a column of smoke is ONE 16x16 source cell
@@ -1400,7 +1484,34 @@ def dense_repack(sec3, sec9, field='', art_for=None, pals_for=None, px=256,
         for k in cand:
             pals = _bypal.get((k[0], k[1], k[2]), ())
             if len(pals) > 1:
-                have = set(pals_for(k[0]) or ())
+                # `pals_for` IS None FOR ANY FIELD THE MOD SHIPS NO ART FOR.
+                # FINDINGS-170.
+                #
+                # build.py:2960 --
+                #     _af = _pf = None
+                #     if art is not None and name.lower() in art.fields():
+                #         _af, _pf = art.open(name), art.palettes
+                #
+                # so a field outside the mod reaches here with `pals_for`
+                # None, and calling it raised TypeError: 'NoneType' object is
+                # not callable. build.py catches that per field and logs
+                # "not repacked", which means the field lost its ENTIRE
+                # truecolor promotion -- not just the multi-palette cells.
+                # Four fields in builds 70 and 71: crcin_2.xone, games_2.xone,
+                # md1_1.xone, nmkin_3.xone. Builds 66-69 have zero such lines;
+                # this veto introduced it.
+                #
+                # The rest of this function already guards the same way
+                # (`if HUE_FIRST and art_for is not None`). This one did not.
+                #
+                # THE SEMANTICS ARE UNCHANGED BY THE GUARD. The rule is
+                # "promote a multi-palette cell only when the mod ships exact
+                # art for EVERY palette it is drawn through". No art at all is
+                # emphatically not that, so the answer is veto -- which is
+                # exactly what an empty `have` already produces. The guard
+                # only stops the crash on the way to the same decision.
+                have = set((pals_for(k[0]) if pals_for is not None else None)
+                           or ())
                 if not set(pals) <= have:
                     dense_repack.multipal_vetoed = (
                         getattr(dense_repack, 'multipal_vetoed', 0) + 1)
@@ -1451,6 +1562,46 @@ def dense_repack(sec3, sec9, field='', art_for=None, pals_for=None, px=256,
     # HUE-BROKEN CELLS GO FIRST. FINDINGS-149, and see HUE_FIRST above.
     # Tile reuse remains the tie-breaker inside each group, so within the
     # broken set and within the sound set the old ordering is unchanged.
+    # ---- A NEW CANDIDATE MUST NOT EVICT AN OLD ONE. FINDINGS-172.
+    #
+    # The truecolor budget is fixed (`cap` below is min(max_tc - have_tc,
+    # free slots, page room)), so `cand` is a QUEUE and everything past the
+    # cut-off stays paletted. Widening the eligibility rule therefore does not
+    # only add cells -- it PUSHES CELLS OUT, and the ones pushed out are
+    # whatever sorted last.
+    #
+    # Build 72 turned PROMOTE_LAYER1_KEY on and Wall Market grew flat tan and
+    # olive blocks in the widescreen margin. MEASURED on mrkt2, same 1,536
+    # cells promoted and the same 6 pages both ways:
+    #
+    #     flag OFF   layer 1: 831 tc / 224 pal    layer 2: 637 tc / 105 pal
+    #     flag ON    layer 1: 958 tc /  97 pal    layer 2: 512 tc / 230 pal
+    #
+    # Layer 1 gained 127. **Layer 2 lost 125.** 75 of them in the 16:9 margin,
+    # 78 of them rendering as ONE flat colour once evicted -- RGB(231,170,107),
+    # the vivid tan of FINDINGS-68. A margin cell that falls back to its
+    # paletted page falls back to the authored FILLER, not to softer art, so
+    # eviction there is not a loss of sharpness. It is a hole in the picture.
+    #
+    # `DARKEN_MARGIN_PLACEHOLDERS` (FINDINGS-68 s3) does not cover these: it
+    # only reaches cells sampled by layer-1 margin tiles, and every one of
+    # these 125 is layer 2.
+    #
+    # So NEWLY-ELIGIBLE CELLS GO TO THE BACK. A cell that only became a
+    # candidate because PROMOTE_LAYER1_KEY was switched on is a bonus; it may
+    # take space nothing else wants and must never take space something else
+    # already had. That makes this flag monotonic -- no cell can lose
+    # truecolor because of it -- which is the cell-level form of checklist
+    # item 2, "no field's truecolor tile count goes DOWN".
+    _newly = ({k for k in cand
+               if keys[k]['key'] and not keys[k]['l2']} if PROMOTE_LAYER1_KEY
+              else set())
+
+    def _rank(k):
+        return (1 if k in _newly else 0,
+                0 if _hb.get(k, 0.0) > HUE_BROKEN_DIST else 1,
+                -len(keys[k]['tiles']), k)
+
     if HUE_FIRST and art_for is not None:
         _nb = sum(1 for k in cand if _hb.get(k, 0.0) > HUE_BROKEN_DIST)
         if _nb:
@@ -1458,10 +1609,13 @@ def dense_repack(sec3, sec9, field='', art_for=None, pals_for=None, px=256,
                 getattr(dense_repack, 'hue_first_cells', 0) + _nb)
             dense_repack.hue_first_fields = (
                 getattr(dense_repack, 'hue_first_fields', 0) + 1)
-        cand.sort(key=lambda k: (0 if _hb.get(k, 0.0) > HUE_BROKEN_DIST else 1,
-                                 -len(keys[k]['tiles']), k))
+        cand.sort(key=_rank)
     else:
-        cand.sort(key=lambda k: (-len(keys[k]['tiles']), k))
+        cand.sort(key=lambda k: (1 if k in _newly else 0,
+                                 -len(keys[k]['tiles']), k))
+    if _newly:
+        dense_repack.l1key_deferred = (
+            getattr(dense_repack, 'l1key_deferred', 0) + len(_newly))
     free_slots = [sl for sl in range(*BANDS[4]) if sl not in pages]
     # ---- LOW-SLOT PROBE. FINDINGS-145.
     #
