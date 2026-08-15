@@ -80,6 +80,18 @@ TILE = 16
 GRID = 16                        # 16x16 cells of 16x16 texels on a 256px page
 PER_PAGE = GRID * GRID
 
+# THE PARALLAX GRID. A page declares which of the two it uses in `size_flag`.
+#
+# `field_bg_pagecap._grid_step`, `field_bg_compact` and `_hole.py` have all
+# read this flag for a long time; this pass is the one that did not, and
+# FINDINGS-189 is the record of what that cost. A size_flag page is an 8x8
+# grid of 32-texel cells, so a destination page holds SIXTY-FOUR of them
+# rather than 256 -- which is the whole of the budget arithmetic that makes
+# section 5.1 of HANDOFF-192 delicate.
+BIG_TILE = 32
+BIG_GRID = 8
+BIG_PER_PAGE = BIG_GRID * BIG_GRID                 # 64
+
 # A promoted cell keeps its grid coordinate and only changes page. See the
 # long note at the placement loop. False restores the old dense packing
 # (enumeration order), for A/B.
@@ -110,6 +122,7 @@ PRESERVE_CELL_COORDS = False
 SECTION9 = 8
 UV_SCALE = 10_000_000
 STEP = UV_SCALE // GRID
+BIG_STEP = UV_SCALE // BIG_GRID
 
 T_SRC_X, T_SRC_Y = 10, 12
 T_SRCX2, T_SRCY2 = 14, 16      # the fx frame's OWN source. FINDINGS-161/163.
@@ -185,13 +198,42 @@ BORROW_MAX_DIST = float('inf')
 # of the previous tree.
 ATLAS_GAP = os.environ.get('SEVENTH_NX_NO_ATLASGAP') != '1'
 
-# THE 32-UNIT TILE VETO. See the `rec['big']` note in collect().
+# THE 32-UNIT TILE VETO -- NOW OFF BY DEFAULT, BECAUSE THE HANDLING EXISTS.
 #
-# `SEVENTH_NX_NO_BIGTILE_VETO=1` restores build 84's behaviour -- 32-unit
-# parallax tiles promoted as if they were 16-unit cells, i.e. the checkerboard.
-# It exists to A/B the veto's COST (how much colour depth the backdrops lose),
-# not because the veto is optional.
-BIG_TILE_VETO = os.environ.get('SEVENTH_NX_NO_BIGTILE_VETO') != '1'
+# HISTORY, because the default flipping is the whole of HANDOFF-192 5.1.
+#
+# Build 87 added this veto after build 84 promoted 32-unit parallax cells as
+# if they were 16-unit ones: a 16-aligned destination, a 16x16 copy, and a
+# destination page emitted with `size_flag = 0`. Wrong three ways at once, and
+# the result was a checkerboard of art and colour key on the backdrop of 84
+# fields -- Mt. Corel, the Highwind, Honey Bee Inn, the Midgar overlook.
+# Vetoing was the right emergency fix and it cost colour DEPTH and nothing
+# else, because those cells keep Cosmos's art on their own paletted page,
+# which `ff7nx_marginart` has already written.
+#
+# But it left the port a long way from the goal. MEASURED on build 91:
+#
+#     32-unit tiles              16,917  in 83 field(s)
+#       still on a depth-1 page  16,829  in 82 field(s)     99.5%
+#     16-unit tiles             695,693
+#       still on a depth-1 page 139,817                     20.1%
+#
+# Essentially every parallax tile in the game was 8-bit while four fifths of
+# the rest of the screen was truecolor -- and truecolor promotion is this
+# archive's only equivalent of FFNx's per-(page, palette) DDS replacement, so
+# the veto was the single biggest remaining gap.
+#
+# All three of build 84's mistakes are now fixed rather than avoided: a
+# 32-unit cell gets a destination page of its own with `size_flag = 1`, an
+# 8x8 grid, a 32x32 copy, and a uv computed at that grid. `test_bigtile.py`
+# asserts every one of those on the archive and passes on vanilla with zero
+# exceptions, so a regression to build 84's behaviour is now a failing test
+# rather than a photograph from hardware.
+#
+# `SEVENTH_NX_BIGTILE_VETO=1` puts the veto back, i.e. reproduces build 91.
+# That is the A/B, and it is the switch to reach for first if the backdrops
+# come back wrong.
+BIG_TILE_VETO = os.environ.get('SEVENTH_NX_BIGTILE_VETO') == '1'
 
 
 # THE PROMOTION MAP. `{field: {tile_offset: (slot, sx, sy, pal)}}`
@@ -657,8 +699,48 @@ def collect(sec9, pages, tiles):
         #
         # Both tests are kept. The tile's width is what the reported artefact
         # is measured in; the page's flag is what makes the copy wrong.
+        #
+        # ---- AND NOW THEY ARE KEPT SEPARATELY, BECAUSE THEY ANSWER DIFFERENT
+        # QUESTIONS. HANDOFF-192 5.1.
+        #
+        # The page's flag says HOW BIG THIS CELL IS -- 32 texels square, and
+        # therefore how much `source_cell` must copy and what grid the
+        # destination needs. The tile's width says WHAT THE ENGINE WILL READ
+        # from it. When they agree, which is every non-fx tile in the archive
+        # (see below), the cell is simply a 32-unit cell and can be promoted
+        # onto a 32-unit destination page.
+        #
+        # When they DISAGREE the cell is still refused, because a 32-unit read
+        # of a 16-unit cell is the checkerboard from the other side and there
+        # is nothing sensible to place.
+        #
+        # MEASURED on the unmodified archive, over the first 201 fields, using
+        # THE CELL THE ENGINE ACTUALLY SAMPLES -- `(texture_id2, src2)` on a
+        # tile that has a second texture and `(texture_id, src1)` otherwise,
+        # which `test_bigtile.py` establishes at 100.0% of 95,779 non-fx tiles:
+        #
+        #     32-unit tiles                      5,974
+        #       misaligned to a 32 grid              0
+        #       on a page without size_flag          0
+        #
+        # So the disagreement population is EMPTY and this arm cannot fire on
+        # Square's data. It is kept because it is cheap and because the thing
+        # it guards against is a checkerboard on 84 fields.
+        #
+        # This also retires FINDINGS-189 6's note that `las1_1` (299 tiles)
+        # and `onna_5` (16) have 32-unit tiles on pages without the flag, "and
+        # that is Square's arrangement, present in vanilla". They do not.
+        # Those are fx tiles: their BASE page has no flag and is not the page
+        # they draw from, and the fx page they do draw from has the flag and
+        # is 32-aligned. The old note was reading src1 on a tile that samples
+        # src2. There is no exception population.
         _w, _h = struct.unpack_from('<HH', sec9, t.off + 18)
-        if (t.layer >= 2 and (_w > TILE or _h > TILE)) or p.size_flag:
+        _w32 = t.layer >= 2 and (_w > TILE or _h > TILE)
+        if p.size_flag:
+            rec['edge'] = BIG_TILE
+        if _w32 and not p.size_flag:
+            rec['nogrid'] = True
+        if _w32 or p.size_flag:
             rec['big'] = True
         f = sec9[t.off + T_FX_PAGE]
         if f and f in pages:
@@ -867,10 +949,18 @@ def _up(a, s):
 
 
 def source_cell(k, rec, pages, arrays, pal565, art_for, pals_for, st,
-                scale=1, origin=None, hue_broken_cell=False):
-    """A (16*scale, 16*scale) uint16 R5G6B5 cell, from the mod's art.
+                scale=1, origin=None, hue_broken_cell=False, edge=TILE):
+    """An (edge*scale, edge*scale) uint16 R5G6B5 cell, from the mod's art.
 
     `scale` is `page_px // 256`. AT 256 IT IS 1 AND NOTHING BELOW CHANGES.
+
+    `edge` IS 32 ON A size_flag PAGE AND 16 EVERYWHERE ELSE, and it defaults
+    to 16 so that every existing caller is unchanged. It is a parameter rather
+    than a lookup because this function is called by diagnostics as well as by
+    the placement loop, and a silent 16 in one of those is exactly the failure
+    FINDINGS-189 5 describes: `render_field.py` drew 16x16 for a 32-unit tile
+    and therefore showed the same picture for a fixed archive and a broken
+    one. Note `scale = px // 256`, so at 512px a 32-unit cell is 64x64 texels.
 
     THIS FUNCTION USED TO THROW THE EXTRA RESOLUTION AWAY. `ArtProvider` is
     built at the page size, so at 512px `art.px` is 512 -- and the art path
@@ -903,8 +993,8 @@ def source_cell(k, rec, pages, arrays, pal565, art_for, pals_for, st,
         a = arrays[slot]
         st.from_vanilla += 1
         # A depth-2 source page is already at the destination size, so its
-        # cell is (TILE*scale)^2 and needs no upscale.
-        t = TILE * scale
+        # cell is (edge*scale)^2 and needs no upscale.
+        t = edge * scale
         return a[sy * scale:sy * scale + t, sx * scale:sx * scale + t].copy()
 
     pal = rec.get('pal', pal)
@@ -1017,7 +1107,7 @@ def source_cell(k, rec, pages, arrays, pal565, art_for, pals_for, st,
         # table -- a palette can differ wildly in entries the cell never uses.
         if BORROW_MAX_DIST == float('inf') or _pal_distance(
                 pal565, pal,
-                arrays[slot][sy:sy + TILE, sx:sx + TILE]) <= BORROW_MAX_DIST:
+                arrays[slot][sy:sy + edge, sx:sx + edge]) <= BORROW_MAX_DIST:
             art = art_for(_asl, 0)
             if art is not None:
                 src_pal = 0
@@ -1042,7 +1132,7 @@ def source_cell(k, rec, pages, arrays, pal565, art_for, pals_for, st,
     # Cosmos art at the correct palette -- lower colour depth, right colours.
     #
     # Do not re-enable this without the vanilla indices. It has cost one build.
-    idx = arrays[slot][sy:sy + TILE, sx:sx + TILE]
+    idx = arrays[slot][sy:sy + edge, sx:sx + edge]
     zero = _up(idx == 0, scale)
     if art is not None:
         buf = np.frombuffer(art.buf, np.uint16).reshape(art.px, art.px)
@@ -1052,11 +1142,11 @@ def source_cell(k, rec, pages, arrays, pal565, art_for, pals_for, st,
         # page -- and even then PageArt has already box-filtered the DDS down
         # to `art.px`, so the stride is a last resort rather than the filter.
         step = max(1, s // scale)
-        t = TILE * scale
+        t = edge * scale
         out = buf[_asy * s:_asy * s + t * step:step,
                   _asx * s:_asx * s + t * step:step].copy()
         if out.shape != (t, t):                       # art smaller than asked
-            out = _up(buf[sy * s:(sy + TILE) * s, sx * s:(sx + TILE) * s],
+            out = _up(buf[sy * s:(sy + edge) * s, sx * s:(sx + edge) * s],
                       scale // max(1, s)).copy()
         pal_ref = _up(pal565[pal][idx], scale)
         if src_pal != pal and not hue_broken_cell and not KEEP_ART_ON_BORROW:
@@ -1535,6 +1625,28 @@ LOW_SLOT_TOP = 14         # FINDINGS-156 placement probe. 25 = build 64.
 MAX_TRUECOLOR_PAGES = 3
 _MAX_TOTAL_PAGES_DEFAULT = 12
 
+# HOW MUCH OF A FIELD'S TRUECOLOR BUDGET THE 32-UNIT POPULATION MAY TAKE.
+#
+# See the long note at the seat split. A 32-unit page holds 64 cells against a
+# 16-unit page's 256, so the parallax population is expensive per page, and
+# left unbounded a field like `hill` (347 parallax cells, 308 interior ones)
+# would spend six pages on the backdrop and two on everything else.
+#
+# This is a CEILING on the share, not a reservation: a field whose parallax
+# population needs less takes less, and a field with none is untouched. The
+# floor of one page (in the seat split) exists so that rounding cannot refuse
+# an entire backdrop on a field with a small cap.
+#
+# 1.0 -- i.e. NOT A CEILING AT ALL by default, because the two hard
+# constraints at the seat split (the 16-unit half is served first and in full;
+# the 32-unit half is paid for out of the pages it frees) already bound this
+# tightly, and a second overlapping limiter would only make the result harder
+# to attribute. It is kept as an A/B lever: 0.0 keeps the whole classification
+# and the separate grids in place while promoting nothing big, which is a
+# cheaper and more informative comparison than the veto because it isolates
+# the BUDGET from the MECHANISM.
+BIG_PAGE_SHARE = float(os.environ.get('SEVENTH_NX_BIG_PAGE_SHARE', '1'))
+
 
 def max_total_pages():
     """
@@ -1688,6 +1800,7 @@ def dense_repack(sec3, sec9, field='', art_for=None, pals_for=None, px=256,
     cand = [k for k in keys
             if k not in fx_cells and pages[k[0]].depth == 1
             and not (BIG_TILE_VETO and keys[k].get('big'))
+            and not keys[k].get('nogrid')
             and not (keys[k]['key']
                      and ((keys[k]['l2'] and not PROMOTE_L2_KEY)
                           or (not keys[k]['l2']
@@ -1930,6 +2043,27 @@ def dense_repack(sec3, sec9, field='', art_for=None, pals_for=None, px=256,
     have_tc = sum(1 for p in pages.values() if p.depth == 2)
     room = max_total_pages() - len(pages)    # what the field can still afford
     cap = max(0, min(max_tc - have_tc, len(free_slots), room))
+    # THE PAGE-COUNT TERM DOES NOT APPLY TO THE PARALLAX HALF, AND CHARGING IT
+    # THERE WAS COSTING FOUR FIFTHS OF THE POPULATION.
+    #
+    # `room` bounds how many pages the field may GAIN. The 32-unit half is
+    # admitted one whole source page at a time and frees that page, so it does
+    # not gain any -- it CONVERTS a depth-1 page into a depth-2 one. Charging
+    # it against `room` anyway made a conversion look like an addition.
+    #
+    # MEASURED on the shipped build 92, replaying the admission over 18
+    # parallax fields: 55 source slots admitted, 4 refused for having a key
+    # that is not promotable, and TWELVE refused purely for want of budget --
+    # and in every one of those twelve the binding term was this one. `onna_5`
+    # is the clearest: 11 pages already, so `room` is 5, its 16-unit half
+    # needs all 5, and its three parallax slots were left nothing at all. That
+    # is why Honey Bee Inn gained zero tiles in build 92.
+    #
+    # `max_tc` and the byte budget DO still apply and are not relaxed: a
+    # truecolor page is 1.50 MB at runtime against a paletted page's 0.31 MB,
+    # so a conversion is free in pages and costs 1.19 MB in memory. That is
+    # the real price and it is the one still being paid.
+    cap_big = max(0, min(max_tc - have_tc, len(free_slots)))
     # THE PER-FIELD BYTE BUDGET, AND IT WAS DEAD UNTIL NOW.
     #
     # `field_bg_repack.budget_bytes()` was read only by `upgrade()`, which
@@ -1959,6 +2093,7 @@ def dense_repack(sec3, sec9, field='', art_for=None, pals_for=None, px=256,
             # disagree.
             _page = _FR._page_bytes(px, 2)
             cap = max(0, min(cap, int(_bud) // max(1, _page)))
+            cap_big = max(0, min(cap_big, int(_bud) // max(1, _page)))
     except Exception:                                          # noqa: BLE001
         pass
     if cap == 0:
@@ -1997,12 +2132,206 @@ def dense_repack(sec3, sec9, field='', art_for=None, pals_for=None, px=256,
     #     md8_1     d1 needs 3, uses 4      fship_2   d1 needs 11, uses 11
     #
     # The arbitrary packing was not even buying density.
-    seats = free_slots[:cap]
+    # ---- TWO GRIDS, TWO SETS OF PAGES. HANDOFF-192 5.1.
+    #
+    # `size_flag` is a property of the PAGE, not of the cell, so a 16-unit and
+    # a 32-unit cell cannot share a destination however much room is left.
+    # The populations are therefore seated separately, out of disjoint slices
+    # of the same free-slot list, and each page is emitted with the flag its
+    # own population needs.
+    #
+    # HOW THE BUDGET IS SPLIT, AND IT IS NOT A SHARE OF THE CAP.
+    #
+    # THE FIRST ATTEMPT WAS A SHARE, AND THE A/B KILLED IT. Giving the 32-unit
+    # population half the cap took pages away from the 16-unit one, and
+    # `_bigpages.py` reported exactly the build-72 Wall Market shape:
+    #
+    #     mtcrl_5   32-unit +168 tiles     16-UNIT -236 tiles     +1 page
+    #     mtcrl_4   32-unit +154 tiles     16-unit    0           +2 pages
+    #
+    # `cand` is a QUEUE. Widening eligibility does not only add cells, it
+    # PUSHES CELLS OUT, and the ones pushed out are whatever sorted last --
+    # which on a widescreen field is the margin, where a cell that falls back
+    # to its paletted page falls back to authored FILLER rather than to
+    # softer art. That is a hole in the picture, not a loss of sharpness.
+    #
+    # I also claimed in the first draft of this comment that the parallax
+    # pages were "close to page-neutral, because a 32-unit source page holds
+    # 64 cells and its whole population moves together". MEASURED, they were
+    # not: mtcrl_5 went 8 -> 9 pages and mtcrl_4 7 -> 9. A source page is
+    # dropped by the dead-page sweep below only when EVERY key on it has
+    # promoted, and a partly-promoted page stays -- so paying for three
+    # destination pages while freeing two is a net cost, and the claim was an
+    # assumption wearing a measurement's clothes.
+    #
+    # SO THE RULE IS TWO HARD CONSTRAINTS AND NO TUNING:
+    #
+    #   1. THE 16-UNIT POPULATION IS SERVED FIRST AND IN FULL. It gets the
+    #      same `cap` seats it had with the veto on, so no cell that was
+    #      truecolor in build 91 can stop being truecolor because of this
+    #      change. That is the cell-level form of "no field's truecolor tile
+    #      count goes DOWN", and `_bigpages.py` asserts it per field.
+    #
+    #   2. THE 32-UNIT POPULATION IS PAID FOR OUT OF THE PAGES IT FREES. A
+    #      source page is counted as freeable only when every one of its keys
+    #      is in this promotion, which is precisely the dead-page sweep's own
+    #      condition -- so `n_big_pages <= freeable` makes the parallax half
+    #      page-neutral BY CONSTRUCTION rather than by hope. Any slack left in
+    #      `cap` after the 16-unit half is added on top, because that slack was
+    #      already affordable.
+    #
+    # `field_load_textures` (x86 0x640292) ABANDONS THE WHOLE LOOP on the
+    # first page it cannot allocate, so every page after it draws nothing.
+    # That is why this is a constraint and not a preference.
+    _edge_of = {k: (BIG_TILE if keys[k].get('edge') == BIG_TILE else TILE)
+                for k in cand}
+    _big_cand = [k for k in cand if _edge_of[k] == BIG_TILE]
+    _small_cand = [k for k in cand if _edge_of[k] == TILE]
+
+    # THE PARALLAX POPULATION IS ADMITTED ONE WHOLE SOURCE PAGE AT A TIME.
+    #
+    # THE FIRST VERSION OF THIS ADMITTED CELLS AND COUNTED FREEABLE PAGES
+    # SEPARATELY, AND IT DID NOT ADD UP. MEASURED on `mtcrl_4`, whose three
+    # parallax slots hold 64 + 64 + 48 cells and are all fully promotable:
+    #
+    #     3 destination pages added, 1 source page freed, 7 -> 9 pages
+    #
+    # because a page is dropped by the dead-page sweep below only when EVERY
+    # key on it has gone, and a handful of cells left behind on two of the
+    # three slots kept both alive. Nearly-freeing a page is worth nothing;
+    # the sweep does not deal in fractions.
+    #
+    # So the unit of admission is THE SOURCE PAGE, not the cell:
+    #
+    #   * a slot is a candidate only if EVERY key on it is promotable, which
+    #     is the sweep's own condition rather than an approximation of it;
+    #   * admitting it costs `ceil(cells / 64)` destination pages and frees
+    #     exactly ONE, so its NET cost is `ceil(cells / 64) - 1` -- zero for
+    #     the ordinary one-palette parallax page, which is the common case;
+    #   * that net cost is paid out of `_slack`, the part of the truecolor cap
+    #     the 16-unit population does not need, so the field cannot grow.
+    #
+    # A slot that cannot be afforded WHOLE is not promoted at all. Half a
+    # backdrop at two colour depths is worse than one at eight bits, and it is
+    # also the arrangement that costs pages for nothing.
+    #
+    # Biggest first, because a full 64-cell page frees as much as a 3-cell one
+    # and covers twenty times the screen.
+    _keys_on = {}
+    for k in keys:
+        _keys_on[k[0]] = _keys_on.get(k[0], 0) + 1
+    # A PAGE IS ALSO HELD ALIVE BY BEING SOMEONE'S FX FRAME, and the dead-page
+    # sweep below says so in one line: `live.add(f)` for every non-zero
+    # `T_FX_PAGE`. MEASURED on `onna_5`, which is exactly this case -- its
+    # layer-4 population is 80 base tiles and 16 fx ones, the fx tiles name a
+    # parallax slot as their SECOND texture, and promoting every base key on
+    # that slot therefore freed nothing. The field grew a page and the
+    # neutrality guarantee, which is the whole basis for spending `room` on
+    # this half, was quietly false.
+    #
+    # Counting keys was never the right test on its own; the right test is the
+    # sweep's own, which is what this is.
+    _fx_live = set()
+    for t in tiles:
+        f = sec9[t.off + T_FX_PAGE]
+        if f:
+            _fx_live.add(f)
+    _groups = {}
+    for k in _big_cand:
+        _groups.setdefault(k[0], []).append(k)
+    _whole = sorted((sl for sl, ks in _groups.items()
+                     if sl in pages and _keys_on.get(sl) == len(ks)
+                     and sl not in _fx_live),
+                    key=lambda sl: -len(_groups[sl]))
+
+    # THE 16-UNIT HALF RESERVES ONLY WHAT IT CAN FILL, NOT THE WHOLE CAP.
+    #
+    # `seats` used to be `free_slots[:cap]` and the flat cursor then walked
+    # those pages in order and stopped when the candidates ran out -- so a
+    # field with 308 promotable 16-unit cells reserved SIX pages and used TWO.
+    # That is invisible while there is only one population; with two it is
+    # four pages of budget held by a population that provably cannot fill
+    # them. MEASURED on `hill`: cap 6, 308 small cells needing 2 pages, and
+    # the parallax half was left 2 slots for a backdrop that wanted 6.
+    #
+    # Reserving `_small_need` instead is free by construction -- the cursor
+    # could never have reached page `_small_need + 1` -- and it is what makes
+    # the parallax promotion affordable on the fields that have the most of
+    # it.
+    _small_need = -(-len(_small_cand) // PER_PAGE) if _small_cand else 0
+    _small_take = min(cap, _small_need)
+    # Two independent ceilings, and they are not the same quantity:
+    #   `_tc_left`   what is left of the TRUECOLOR budget -- `max_tc`, the free
+    #                slots, `max_total_pages()` and the GUI's byte budget, all
+    #                already folded into `cap`. A truecolor page is 1.50 MB at
+    #                512px against a paletted page's 0.31 MB, so this is a
+    #                memory ceiling and not a bookkeeping one.
+    #   `_room_slots` how many free SLOTS are actually left to put them in.
+    _tc_left = max(0, cap_big - _small_take)
+    _room_slots = min(_tc_left, max(0, len(free_slots) - _small_take))
+
+    # The admission arithmetic, kept for diagnostics. `_bigpages.py` reads it;
+    # a refusal that cannot be attributed to a number is a refusal nobody can
+    # argue with, and this pass has enough of those already.
+    dense_repack.last_split = {
+        'field': field, 'cap': cap, 'free': len(free_slots),
+        'small_cells': len(_small_cand), 'small_need': _small_need,
+        'small_take': _small_take, 'tc_left': _tc_left,
+        'room_slots': _room_slots,
+        'big_cells': len(_big_cand), 'groups': {sl: len(v) for sl, v
+                                                in _groups.items()},
+        'whole': list(_whole),
+        'keys_on': {sl: _keys_on.get(sl) for sl in _groups},
+    }
+
+    # `_net` is the page delta this half would cost the field: `need` pages
+    # added, one freed. Holding it at or below zero is the whole guarantee --
+    # not "roughly neutral", not "within budget", but a field that cannot come
+    # out of this function with more pages than it went in with because of the
+    # parallax half.
+    _admit, n_big_pages, _net = set(), 0, 0
+    for sl in _whole:
+        need = -(-len(_groups[sl]) // BIG_PER_PAGE)
+        if _net + need - 1 > 0 or n_big_pages + need > _room_slots:
+            continue
+        if BIG_PAGE_SHARE < 1.0:              # A/B lever, see the constant
+            if n_big_pages + need > int(round(len(_whole) * BIG_PAGE_SHARE)):
+                continue
+        _net += need - 1
+        n_big_pages += need
+        _admit.add(sl)
+    freeable = len(_admit)
+
+    if len(_admit) < len(_groups):
+        _big_cand = [k for k in _big_cand if k[0] in _admit]
+        _drop = {k for k in cand
+                 if _edge_of[k] == BIG_TILE and k[0] not in _admit}
+        if _drop:
+            cand = [k for k in cand if k not in _drop]
+            dense_repack.big_slots_refused = (
+                getattr(dense_repack, 'big_slots_refused', 0)
+                + len(_groups) - len(_admit))
+
+    # The 16-unit half keeps the LOW slots it has always had -- `LOW_SLOT_ORDER`
+    # and `LOW_SLOT_TOP` are a measured placement probe (FINDINGS-156) and
+    # reordering that population would confound this change with that one. The
+    # parallax pages are taken from the TAIL instead.
+    seats_big = (free_slots[_small_take:_small_take + n_big_pages]
+                 if n_big_pages else [])
+    seats = free_slots[:_small_take]
+    _seats_of = {BIG_TILE: seats_big, TILE: seats}
+    _big_slots = set(seats_big)
+    if n_big_pages:
+        dense_repack.big_pages = getattr(dense_repack, 'big_pages', 0) + n_big_pages
+        dense_repack.big_fields = getattr(dense_repack, 'big_fields', 0) + 1
+
     chosen = []
     occupancy = {}
     fx_slot_of = {}
     _placed_at = {}
     _grid_order = [(i % GRID, i // GRID) for i in range(PER_PAGE)]
+    _grid_order_big = [(i % BIG_GRID, i // BIG_GRID)
+                       for i in range(BIG_PER_PAGE)]
 
     # ---- FX PAIRS SHARE ONE u,v AND TWO PAGES. FINDINGS-164.
     #
@@ -2032,9 +2361,9 @@ def dense_repack(sec3, sec9, field='', art_for=None, pals_for=None, px=256,
     # So: allocate a COLUMN. A group of width w takes one grid index (cx,cy)
     # on w different pages. If no index has w seats free, the base is not
     # promoted at all -- a half-placed group is the defect itself.
-    def _col_free(cx, cy, need, avoid=()):
+    def _col_free(cx, cy, need, avoid=(), edge=TILE):
         got = []
-        for sl in seats:
+        for sl in _seats_of[edge]:
             if sl in avoid:
                 continue
             if (cx, cy) not in occupancy.setdefault(sl, set()):
@@ -2048,13 +2377,23 @@ def dense_repack(sec3, sec9, field='', art_for=None, pals_for=None, px=256,
     # `divmod` fill exactly -- verified by the flag-off column of the A/B
     # being identical to build 68. Only a seated GROUP perturbs it.
     _cursor = [0]
+    _cursor_big = [0]
 
-    def _next_flat():
-        while _cursor[0] < cap * PER_PAGE:
-            pg, idx = divmod(_cursor[0], PER_PAGE)
-            _cursor[0] += 1
-            cy, cx = divmod(idx, GRID)
-            sl = free_slots[pg]
+    def _next_flat(edge=TILE):
+        # ONE CURSOR PER POPULATION, over that population's OWN seats and its
+        # OWN grid. The 16-unit arm is unchanged apart from reading `seats`
+        # instead of `free_slots`, and those are the same list when there is
+        # no parallax population -- which is what keeps a field with no
+        # 32-unit cells byte-identical.
+        if edge == BIG_TILE:
+            cur, per, grid, pool = _cursor_big, BIG_PER_PAGE, BIG_GRID, seats_big
+        else:
+            cur, per, grid, pool = _cursor, PER_PAGE, GRID, seats
+        while cur[0] < len(pool) * per:
+            pg, idx = divmod(cur[0], per)
+            cur[0] += 1
+            cy, cx = divmod(idx, grid)
+            sl = pool[pg]
             if (cx, cy) not in occupancy.setdefault(sl, set()):
                 return sl, cx, cy
         return None
@@ -2066,6 +2405,7 @@ def dense_repack(sec3, sec9, field='', art_for=None, pals_for=None, px=256,
     # zero pairs. `_next_flat` already stops at the real capacity.
     order = cand
     for k in order:
+        _edge = _edge_of[k]
         partners = [fk for fk in (fx_of.get(k) or ())
                     if fk in keys and fk[0] in pages]
         if partners and not PROMOTE_FX_BASE:
@@ -2073,7 +2413,7 @@ def dense_repack(sec3, sec9, field='', art_for=None, pals_for=None, px=256,
         done = [fk for fk in partners if fk in fx_slot_of]
         todo = [fk for fk in partners if fk not in fx_slot_of]
         if not partners and not PRESERVE_CELL_COORDS:
-            spot = _next_flat()
+            spot = _next_flat(_edge)
             if spot is None:
                 continue
             sl, cx, cy = spot
@@ -2081,17 +2421,20 @@ def dense_repack(sec3, sec9, field='', art_for=None, pals_for=None, px=256,
             chosen.append((k, sl, cx, cy))
             continue
         if PRESERVE_CELL_COORDS:
-            spots = [((k[1] // TILE) % GRID, (k[2] // TILE) % GRID)]
+            _g = BIG_GRID if _edge == BIG_TILE else GRID
+            spots = [((k[1] // _edge) % _g, (k[2] // _edge) % _g)]
         elif done:
             # A partner already seated fixes the column for the whole group.
             spots = [_placed_at[done[0]]]
+        elif _edge == BIG_TILE:
+            spots = _grid_order_big
         else:
             spots = _grid_order
         for cx, cy in spots:
             if done and _placed_at[done[0]] != (cx, cy):
                 continue
             avoid = {fx_slot_of[fk] for fk in done}
-            got = _col_free(cx, cy, 1 + len(todo), avoid)
+            got = _col_free(cx, cy, 1 + len(todo), avoid, _edge)
             if got is None:
                 continue
             occupancy[got[0]].add((cx, cy))
@@ -2128,18 +2471,33 @@ def dense_repack(sec3, sec9, field='', art_for=None, pals_for=None, px=256,
     scale = max(1, px // 256)
     side = GRID * TILE * scale
     for k, slot, cx, cy in chosen:
+        # THE THREE THINGS BUILD 84 GOT WRONG, ALL DERIVED FROM ONE NUMBER.
+        # `_edge` is 32 on a size_flag cell and 16 otherwise, and it drives
+        # the copy size, the destination coordinate and the uv step together.
+        # Deriving all three from one place is the point: build 84 fixed the
+        # copy at 16, the coordinate at a 16 grid and the page flag at a
+        # literal 0, and any one of those alone reproduces the checkerboard.
+        _edge = _edge_of[k]
+        _step = BIG_STEP if _edge == BIG_TILE else STEP
         buf = dest.get(slot)
         if buf is None:
             buf = dest[slot] = np.full((side, side), FN.NEAR_BLACK, np.uint16)
         try:
             cell = source_cell(k, keys[k], pages, arrays, pal565,
                                art_for, pals_for, st, scale, _org,
-                               _hb.get(k, 0.0) > HUE_BROKEN_DIST)
+                               _hb.get(k, 0.0) > HUE_BROKEN_DIST, _edge)
         except Exception:                                      # noqa: BLE001
             continue
-        t = TILE * scale
+        t = _edge * scale
+        if cell.shape != (t, t):
+            # A cell that did not come back at the size this seat holds would
+            # otherwise raise inside the assignment and lose the whole field
+            # through build.py's "not repacked" path. Refusing the one cell is
+            # strictly better, and it can only happen if a source page is
+            # short -- which `test_bigtile.py` invariant D also checks for.
+            continue
         buf[cy * t:(cy + 1) * t, cx * t:(cx + 1) * t] = cell
-        dx, dy = cx * TILE, cy * TILE
+        dx, dy = cx * _edge, cy * _edge
         # See ORIGIN. `_org` is marginpage's map, so chaining through it here
         # means what we store is Cosmos's own page whether the cell moved once
         # or twice, and no consumer has to walk the chain itself.
@@ -2154,7 +2512,7 @@ def dense_repack(sec3, sec9, field='', art_for=None, pals_for=None, px=256,
             out[off + T_SRC_X] = dx & 0xFF
             out[off + T_SRC_Y] = dy & 0xFF
             struct.pack_into('<II', out, off + T_SRC_X_BIG,
-                             cx * STEP, cy * STEP)
+                             cx * _step, cy * _step)
             # Repoint this tile's fx frame at the partner's new page. The
             # coordinate is preserved, so src_x2/src_y2 stay correct as
             # written and only the page byte moves. See FINDINGS-163.
@@ -2182,7 +2540,15 @@ def dense_repack(sec3, sec9, field='', art_for=None, pals_for=None, px=256,
         if plist[sl] is not None and sl not in live and sl not in dest:
             plist[sl] = None
     for slot, buf in dest.items():
-        plist[slot] = FN.Page(slot, 0, 2, buf.tobytes(), side)
+        # THE size_flag WAS A LITERAL ZERO HERE, AND THAT IS HALF OF WHY THE
+        # BUILD-84 CHECKERBOARD EXISTED EVEN WHERE THE PLACEMENT WAS RIGHT.
+        # A page that holds 32-unit cells must SAY SO, or the engine reads it
+        # on a 16 grid and every tile samples a quarter of its own cell.
+        # `field_bg_compact` has derived this from the grid since it was
+        # written (`size_flag = 1 if grid == 8 else 0`); this pass now does
+        # the same.
+        plist[slot] = FN.Page(slot, 1 if slot in _big_slots else 0, 2,
+                              buf.tobytes(), side)
     st.pages = len(dest)
     # PUBLISH AFTER THE PAGES ARE FINAL, and only for cells that survived the
     # loop -- a `source_cell` exception `continue`s above without writing the
