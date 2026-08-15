@@ -174,12 +174,66 @@ D1_BANDS = {4: (0x00, 0x0F), 1: (0x0F, 0x18), 0: (0x18, 0x1A)}  # paletted
 # Set to a finite value only to A/B the borrow itself. It should stay off.
 BORROW_MAX_DIST = float('inf')
 
+# THE ATLAS-GAP ARM, and the switch that turns it off for an A/B.
+#
+# `SEVENTH_NX_NO_ATLASGAP=1` restores build 84's behaviour exactly -- every
+# promoted cell whose paletted source is index 0 keeps the colour key, whether
+# or not anything is behind it. See bare_keys() for what this buys and what it
+# risks. The flag exists because this arm is the first thing in the chain that
+# deliberately draws where vanilla drew nothing, and a single environment
+# variable is a cheaper way to answer "was it this?" than a 40-minute rebuild
+# of the previous tree.
+ATLAS_GAP = os.environ.get('SEVENTH_NX_NO_ATLASGAP') != '1'
+
+# THE 32-UNIT TILE VETO. See the `rec['big']` note in collect().
+#
+# `SEVENTH_NX_NO_BIGTILE_VETO=1` restores build 84's behaviour -- 32-unit
+# parallax tiles promoted as if they were 16-unit cells, i.e. the checkerboard.
+# It exists to A/B the veto's COST (how much colour depth the backdrops lose),
+# not because the veto is optional.
+BIG_TILE_VETO = os.environ.get('SEVENTH_NX_NO_BIGTILE_VETO') != '1'
+
+
+# THE PROMOTION MAP. `{field: {tile_offset: (slot, sx, sy, pal)}}`
+#
+# Exactly the same problem `ff7nx_marginpage.ORIGIN` solves, one level down and
+# for a bigger population. This function promotes a cell from its paletted page
+# onto a dense truecolor page: slot 1 (sx, sy) becomes slot 26 (dx, dy). Cosmos
+# names its art `<field>_<page>_<pal>.dds` against the ORIGINAL page, so every
+# later pass that asks `art_for(26, pal)` gets None and cannot tell "the mod
+# ships nothing here" from "this cell moved".
+#
+# MEASURED (HANDOFF-188 3.2): `trnad_3`'s 7 remaining black tiles are on slot
+# 26 and `marginpage.ORIGIN` records nothing for them -- marginpage creates a
+# LOW slot, and slot 26 is reached through this promotion. Same for all of
+# `mtcrl_5`'s visible holes, which sit on slots 13/14.
+#
+# KEYED ON THE TILE, NOT ON THE DESTINATION CELL, and that is the whole reason
+# this map is trustworthy where a cell-keyed one would not be:
+#
+#   * `field_bg_compact` runs AFTER this function, merges byte-identical cells
+#     and renumbers pages -- so (dst_slot, dx, dy) is not stable, but the tile
+#     record it repoints is;
+#   * build.py retries this function with a falling truecolor ceiling and can
+#     DISCARD the result (`raw_capped`) -- in which case the tile still points
+#     at its original page, and a per-tile entry saying "your art is at the
+#     original page" is then simply true rather than stale;
+#   * a tile record's byte offset inside section 9 does not move: the layer
+#     block is before the texture block and neither pass adds or removes
+#     tiles.
+#
+# The entries are CHAINED THROUGH marginpage: if the cell this promoted was
+# itself already moved by the margin split, what is recorded here is the page
+# Cosmos actually shipped, not the intermediate one. A consumer therefore never
+# has to know how many hops happened.
+ORIGIN = {}
+
 
 class Stats:
     __slots__ = ('hue_kept_art',
                  'cells', 'pages', 'tiles', 'from_art', 'from_art_borrow',
                  'from_vanilla', 'keyed', 'fx_pairs', 'refused', 'pages_before',
-                 'borrow_refused')
+                 'borrow_refused', 'origin', 'atlas_gap', 'bare')
 
     def __init__(self):
         self.cells = self.pages = self.tiles = 0
@@ -189,6 +243,9 @@ class Stats:
         self.borrow_refused = 0
         self.hue_kept_art = 0
         self.refused = None
+        self.origin = {}
+        self.atlas_gap = 0        # cells whose atlas gap took the mod's art
+        self.bare = 0             # cells with nothing behind them at all
 
 
 def _pal_rgb(sec3):
@@ -401,6 +458,98 @@ def _uses_key(pages, arrays, k):
     return bool((arrays[slot][sy:sy + TILE, sx:sx + TILE] == 0).any())
 
 
+# ---------------------------------------------------------------- coverage
+# ATLAS GAPS, AND WHY "WHICH LAYER" WAS THE WRONG QUESTION. HANDOFF-188 3.1.
+#
+# `out[zero] = FN.EMPTY` below puts the colour key back on any promoted cell
+# whose paletted source is index 0, on the reasoning that a layer-2+ key is a
+# real cut-out meant to show what is behind it. That reasoning has a premise
+# nobody checked: THAT SOMETHING IS BEHIND IT.
+#
+# MEASURED on `mtcrl_5` (Mt. Corel, the roller coaster) at build 84:
+#
+#     layer 1     22 tiles          <- the scenery is NOT on layer 1
+#     layer 2   1238 tiles, 358 empty
+#     308 of those empties sit where NO other tile draws anything
+#
+# The camera there scrolls the track past a sky, so Cosmos put the whole
+# background on layer 2 and layer 1 holds almost nothing. An empty layer-2
+# cell is transparent, and transparent over nothing is the cleared framebuffer
+# -- black. That is the grid of black squares reported from hardware, and it
+# is the same defect on the Highwind and everywhere else "the background moves
+# at a different pace", because those are exactly the fields that put their
+# scenery on 2/3/4.
+#
+# AND THE ART EXISTS. Following the promotion map back to Cosmos's own page
+# (see ORIGIN) and asking the mod what it holds at each of those 308 cells:
+#
+#     mod is PARTIAL here -- fillable, honour alpha    302
+#     mod is TRANSPARENT here -- leave alone             6
+#     mean coverage 0.529
+#
+# So this is FINDINGS-174's lesson -- "AN EMPTY ATLAS SLOT IS NOT A CUT-OUT"
+# -- one pass later than where it was learned. Cosmos ships sparse atlas pages
+# whose empty cells are supplied by the .dds on FFNx; this port read the empty
+# 8-bit cell, called it a cut-out, and threw the mod's art away.
+#
+# THE PREDICATE IS COVERAGE, NOT LAYER, and it is computed here.
+def _draws(arr, page, sx, sy):
+    """True if this cell has ANY texel that is not the key / not empty."""
+    if page.depth == 2:
+        s = page.px // 256
+        b = arr[sy * s:(sy + TILE) * s, sx * s:(sx + TILE) * s]
+        return bool((b != FN.EMPTY).any())
+    b = arr[sy:sy + TILE, sx:sx + TILE]
+    return bool(b.any())
+
+
+def bare_keys(pages, arrays, tiles, keys):
+    """
+    The subset of `keys` whose tiles ALL sit where nothing else draws.
+
+    LAYERS 3 AND 4 DO NOT COUNT AS COVER. They are the parallax backdrops --
+    `ff7nx_ws` moves their clip and wrap points precisely because they scroll
+    at their own rate -- so a layer-3 tile that happens to share a destination
+    with a layer-2 hole is only over that hole at one camera position. Trusting
+    it would mean the square is filled when the camera is still and black when
+    it moves, which is exactly what "squares pop into existence as I move
+    right" describes.
+
+    Layer 1 is counted as cover only where it DRAWS: index 0 on layer 1 is
+    rendered, but rendered BLACK, and a black square behind a hole is still a
+    black square.
+    """
+    covered = set()
+    for t in tiles:
+        if t.layer > 2:
+            continue
+        p = pages.get(t.slot)
+        a = arrays.get(t.slot)
+        if p is None or a is None:
+            continue
+        try:
+            if _draws(a, p, t.sx, t.sy):
+                covered.add((t.dx, t.dy))
+        except Exception:                                      # noqa: BLE001
+            covered.add((t.dx, t.dy))          # unreadable -- assume covered
+    where = {}
+    for t in tiles:
+        where.setdefault(t.off, (t.dx, t.dy, t.layer))
+    out = set()
+    for k, rec in keys.items():
+        got = [where.get(off) for off in rec['tiles']]
+        if not got or any(g is None for g in got):
+            continue
+        # A parallax tile's own destination is meaningless as a fixed screen
+        # position, so a cell any of whose tiles is on layer 3/4 is not judged
+        # here at all -- it keeps today's behaviour.
+        if any(g[2] > 2 for g in got):
+            continue
+        if all((g[0], g[1]) not in covered for g in got):
+            out.add(k)
+    return out
+
+
 def collect(sec9, pages, tiles):
     """
     keys      {(slot, sx, sy, pal): {'band', 'key', 'l2', 'tiles': [...]}}
@@ -450,6 +599,67 @@ def collect(sec9, pages, tiles):
         if t.layer == 1 and t.off in _on_top:
             rec['l1_over'] = True
         rec['tiles'].append(t.off)
+        # A 32-UNIT TILE IS NOT FOUR 16-UNIT CELLS. HANDOFF-189.
+        #
+        # Offsets 18 and 20 of a tile record are its WIDTH and HEIGHT, and on
+        # the parallax layers they are 32. MEASURED over all 709 VANILLA
+        # fields, which is the format's own ground truth:
+        #
+        #     (layer, width)      tiles        aligned to width?
+        #     (1, 0)            346,161        n/a -- layer 1 never sets it
+        #     (2, 16)           294,518        yes
+        #     (3, 32)             7,062        yes
+        #     (4, 32)             6,965        yes, bar 2 tiles
+        #
+        # So 14,027 of Square's own tiles are 32 units wide and 14,025 of them
+        # sit on a 32 grid. Alignment to the tile's own width is an invariant
+        # of the format, not an accident of authoring.
+        #
+        # Every relocation in this file works in 16-unit cells, so promoting
+        # one of these writes its top-left QUADRANT to a 16-aligned
+        # destination and the tile then samples 32x32 from there -- one
+        # quarter its own art, three quarters whatever the neighbouring grid
+        # slots hold.
+        #
+        # That is the black-and-sky checkerboard photographed behind the Mt.
+        # Corel track, and the archive-wide count is exactly the fields that
+        # were reported: 4,186 tiles in 40 fields whose source is no longer on
+        # a 32 grid -- `mtcrl_5`, `mtcrl_4`, `fship_1`, `fship_12` (the
+        # Highwind), `onna_5` (Honey Bee Inn), `hill`, `hill2`, `midgal`,
+        # `zcoal_1..3`, `bwhlin`. Staged through the chain, Cosmos's own
+        # section is aligned and palrange, marginart and marginpage all leave
+        # it aligned; `dense_repack` misaligns 125 of `mtcrl_5`'s 168.
+        #
+        # VETOED RATHER THAN HANDLED, deliberately: promoting these correctly
+        # needs a 32-aligned destination and a 32x32 copy through the whole
+        # placement path, and the cost of getting that wrong is a checkerboard
+        # on the backdrop of 84 fields. Vetoing costs them truecolor DEPTH and
+        # nothing else -- they keep Cosmos's art at their own page, which
+        # `ff7nx_marginart` has already written, exactly as an unpromoted cell
+        # does everywhere else in this pipeline.
+        #
+        # SCOPED TO LAYER 2 AND ABOVE. Layer 1 leaves width at 0 on 346,161 of
+        # its 346,175 vanilla tiles, so the engine cannot be reading it there
+        # -- and the 14 layer-1 tiles that hold something else hold garbage
+        # (2839, 6664, 31080, 257, 17). Testing width alone would veto those
+        # 14 for no reason; testing the layer as well keeps the rule to the
+        # tiles the field format actually applies it to.
+        #
+        # AND THE PAGE SAYS IT TOO, WHICH IS THE MECHANISM RATHER THAN THE
+        # SYMPTOM. `Page.size_flag` means an 8x8 grid of 32px cells instead of
+        # 16x16 of 16px -- `field_bg_pagecap._grid_step` and this file's own
+        # `_grid_step` both already read it. MEASURED on `mtcrl_5`: vanilla
+        # puts layer 3 on slots 4 and 5, BOTH size_flag=1, and Cosmos keeps
+        # that on its slots 5/6/7. Our build ships every page size_flag=0,
+        # because the promotion writes `FN.Page(slot, 0, 2, ...)` -- a literal
+        # zero. So a promoted parallax cell is wrong twice over: placed on a
+        # 16 grid, and landed on a page that no longer declares 32px cells.
+        #
+        # Both tests are kept. The tile's width is what the reported artefact
+        # is measured in; the page's flag is what makes the copy wrong.
+        _w, _h = struct.unpack_from('<HH', sec9, t.off + 18)
+        if (t.layer >= 2 and (_w > TILE or _h > TILE)) or p.size_flag:
+            rec['big'] = True
         f = sec9[t.off + T_FX_PAGE]
         if f and f in pages:
             fk = (f, t.sx, t.sy, pal if pages[f].depth == 1 else -1)
@@ -917,7 +1127,33 @@ def source_cell(k, rec, pages, arrays, pal565, art_for, pals_for, st,
         # vetoes those cells, so this cannot fire today. It is here so that a
         # future change which lets them through cannot silently bake a key
         # that reveals something.
-        out[zero] = FN.EMPTY
+        #
+        # ...UNLESS THE CELL IS AN ATLAS GAP WITH NOTHING BEHIND IT. See
+        # bare_keys() above for the measurement. All FOUR conditions hold
+        # together or this arm does not run:
+        #
+        #   1. the paletted source cell is ENTIRELY index 0. A cell with any
+        #      real index is a shape cut out of art, and that shape is not
+        #      ours to close. `zero.all()` -- not "mostly", not "flat".
+        #   2. nothing else draws at any destination its tiles occupy, judged
+        #      over layers 1 and 2 only, because 3 and 4 move (`rec['bare']`).
+        #   3. the mod's own alpha says it PAINTS here. `art.tmask` is the
+        #      mod's coverage and it is authoritative about the mod's art.
+        #   4. we have art at all -- `art is not None`.
+        #
+        # And even then the key is put back everywhere the mod's alpha is
+        # transparent, so the 6 of `mtcrl_5`'s 308 that Cosmos genuinely
+        # leaves empty stay empty. The tile currently draws NOTHING -- it is
+        # a fully-keyed cell over bare framebuffer -- so this can only add
+        # pixels the reference renderer already shows, never hide any.
+        _atlas = (ATLAS_GAP and art is not None and rec.get('bare')
+                  and bool(zero.all()))
+        if _atlas and tm.shape == out.shape and not tm.all():
+            out[zero & tm] = FN.EMPTY
+            st.atlas_gap += 1
+            dense_repack.atlas_gap = getattr(dense_repack, 'atlas_gap', 0) + 1
+        else:
+            out[zero] = FN.EMPTY
     # On layer 1 index 0 is NOT a cut-out -- it is drawn, and its colour
     # matters. Proved on hardware: setting entry 0 to black removed the
     # Sector 6 yellow and put black speckles across Wall Market, which cannot
@@ -1354,6 +1590,13 @@ def dense_repack(sec3, sec9, field='', art_for=None, pals_for=None, px=256,
     pair has to move together or not at all, and "not at all" is free.
     """
     st = Stats()
+    # build.py RETRIES this function with a falling truecolor ceiling, so drop
+    # any map an earlier attempt on this same field left behind before we start
+    # writing a new one. Without this a field that promoted 200 cells at
+    # max_tc=3 and 40 at max_tc=1 would keep 160 entries describing cells that
+    # the accepted section never moved.
+    if field:
+        ORIGIN.pop(field, None)
     try:
         surv = DC.survey(sec9)
     except Exception as exc:                                   # noqa: BLE001
@@ -1385,6 +1628,16 @@ def dense_repack(sec3, sec9, field='', art_for=None, pals_for=None, px=256,
         _np = len(pal565)
         rec['pal'] = k[3] if -1 <= k[3] < _np else (k[3] % _np if _np else 0)
         rec['key'] = _uses_key(pages, arrays, k)
+    # See bare_keys() and the atlas-gap arm in source_cell. Computed once per
+    # field over tiles already read, not per cell.
+    if ATLAS_GAP:
+        try:
+            _bare = bare_keys(pages, arrays, tiles, keys)
+        except Exception:                                      # noqa: BLE001
+            _bare = set()
+        for k in _bare:
+            keys[k]['bare'] = True
+        st.bare = len(_bare)
     # See PROMOTE_FX_BASE. `fx_partners` is the side that must stay paletted
     # (an fx frame is drawn through the additive/average band, which has no
     # depth-2 equivalent that renders on this port). `fx_cells` is what the
@@ -1434,6 +1687,7 @@ def dense_repack(sec3, sec9, field='', art_for=None, pals_for=None, px=256,
     # only the cells whose key can actually reveal something are vetoed.
     cand = [k for k in keys
             if k not in fx_cells and pages[k[0]].depth == 1
+            and not (BIG_TILE_VETO and keys[k].get('big'))
             and not (keys[k]['key']
                      and ((keys[k]['l2'] and not PROMOTE_L2_KEY)
                           or (not keys[k]['l2']
@@ -1886,6 +2140,15 @@ def dense_repack(sec3, sec9, field='', art_for=None, pals_for=None, px=256,
         t = TILE * scale
         buf[cy * t:(cy + 1) * t, cx * t:(cx + 1) * t] = cell
         dx, dy = cx * TILE, cy * TILE
+        # See ORIGIN. `_org` is marginpage's map, so chaining through it here
+        # means what we store is Cosmos's own page whether the cell moved once
+        # or twice, and no consumer has to walk the chain itself.
+        _src = (k[0], k[1], k[2])
+        if _org:
+            _src = _org.get(_src, _src)
+        _src = (_src[0], _src[1], _src[2], k[3])
+        for off in keys[k]['tiles']:
+            st.origin[off] = _src
         for off in keys[k]['tiles']:
             out[off + T_TEXID] = slot
             out[off + T_SRC_X] = dx & 0xFF
@@ -1921,6 +2184,12 @@ def dense_repack(sec3, sec9, field='', art_for=None, pals_for=None, px=256,
     for slot, buf in dest.items():
         plist[slot] = FN.Page(slot, 0, 2, buf.tobytes(), side)
     st.pages = len(dest)
+    # PUBLISH AFTER THE PAGES ARE FINAL, and only for cells that survived the
+    # loop -- a `source_cell` exception `continue`s above without writing the
+    # cell, and an entry for a cell that was never promoted would point a
+    # consumer at art for a page the tile no longer names.
+    if field and st.origin:
+        ORIGIN[field] = dict(st.origin)
     return FN.replace_texture_block(bytes(out), plist, tex_start, tex_end), st
 
 

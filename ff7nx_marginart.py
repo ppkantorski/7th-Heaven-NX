@@ -152,6 +152,10 @@ SRC_DARK_FRAC = 0.25     # this much of the block must be void to protect it
 EMPTY_ATLAS_IS_NOT_A_CUTOUT = True
 ATLAS_OPAQUE_FRAC = 0.9    # the mod's art must be this opaque to count as art
 ATLAS_ENTRY0_MIN_LUMA = 40  # and entry 0 must be visible, or it reads as void
+# ...EXCEPT ON A PARALLAX PAGE, WHERE THERE IS NOTHING BEHIND IT TO READ AS.
+# See the waiver in fill_field. SEVENTH_NX_NO_ATLAS_PARALLAX=1 restores the
+# build-88 behaviour, i.e. the black square in Mt. Corel's top-left corner.
+ATLAS_PARALLAX_VOID = os.environ.get('SEVENTH_NX_NO_ATLAS_PARALLAX') != '1'
 
 
 def _box3_rgb(a):
@@ -236,6 +240,13 @@ MARGIN_ART_ENV = 'SEVENTH_NX_MARGIN_ART'
 DEFAULT_ON = False        # settings.json owns it: `margin_art: 1`
 
 TILE = 16
+# THE 32-UNIT CELL. See the `_edge` note in fill_field.
+#
+# `SEVENTH_NX_NO_BIGCELL=1` restores the 16x16 write on size_flag pages,
+# i.e. build 84's quarter-filled parallax cells. It exists so the change
+# can be proved a no-op everywhere else: with it set, every field whose
+# pages all have size_flag 0 must come out byte-identical.
+BIG_CELL = os.environ.get('SEVENTH_NX_NO_BIGCELL') != '1'
 SECTION_PALETTE = 3
 SECTION9 = 8
 
@@ -1064,22 +1075,42 @@ def fill_field(name, raw, lgp_mod, art, log=None, scope='margin'):
         if buf is None:
             buf = bytearray(pages[slot].data)
             newdata[slot] = buf
+        # A CELL ON A size_flag PAGE IS 32 UNITS, NOT 16. HANDOFF-189.
+        #
+        # `Page.size_flag` means an 8x8 grid of 32px cells instead of 16x16 of
+        # 16px. The parallax layers use those pages -- MEASURED on `mtcrl_5`,
+        # vanilla puts layer 3 on slots 4 and 5 and BOTH have the flag, with
+        # layer-3 tiles 32 units wide (offset 18) and their `src_x` stepping by
+        # 32 to match. Archive-wide, 14,027 vanilla tiles are 32 units wide,
+        # all on layers 3 and 4.
+        #
+        # THIS LOOP WROTE 16x16 INTO THEM. That fills the top-left QUADRANT of
+        # each cell and leaves the other three at index 0, so a 32-unit tile
+        # draws a quarter of Cosmos's art and three quarters of the colour key
+        # -- the checkerboard of sky-and-black photographed behind the Mt.
+        # Corel track. Staged through the chain, Cosmos's own section is clean,
+        # `ff7nx_palrange` leaves it clean, and the margins break HERE.
+        #
+        # `edge` replaces the literal 16 everywhere below. `quantise` is
+        # shape-agnostic (verified on a 32x32 block), and `k` is the DDS
+        # oversample factor, which is per-page and unaffected.
+        _edge = 32 if (BIG_CELL and pages[slot].size_flag) else TILE
         for sx, sy in sorted(cs):
             # A repointed placeholder is quantised against the palette it will
             # ACTUALLY be drawn through, not the one the mod left behind.
             eff_pal = _pal_for(slot, sx, sy, pal)
             prgb = prgbs[eff_pal]
-            src = img[sy * k:(sy + TILE) * k, sx * k:(sx + TILE) * k]
-            if src.shape[:2] != (TILE * k, TILE * k):
+            src = img[sy * k:(sy + _edge) * k, sx * k:(sx + _edge) * k]
+            if src.shape[:2] != (_edge * k, _edge * k):
                 st['no_dds'] += 1
                 continue
-            # box filter 64x64 -> 16x16
+            # box filter (edge*k)^2 -> edge^2
             small = (np.ascontiguousarray(src[..., :3])
-                     .reshape(TILE, k, TILE, k, 3).mean(axis=(1, 3)))
+                     .reshape(_edge, k, _edge, k, 3).mean(axis=(1, 3)))
             # HOW MUCH OF EACH DESTINATION PIXEL THE MOD ACTUALLY COVERS.
             # 0 = the mod paints nothing here; 255 = fully painted.
             cover = (np.ascontiguousarray(src[..., 3])
-                     .reshape(TILE, k, TILE, k).mean(axis=(1, 3)))
+                     .reshape(_edge, k, _edge, k).mean(axis=(1, 3)))
             # A CELL THE ORIGINAL DREW AS PURE BLACK IS A SILHOUETTE, NOT A
             # GAP, AND IT IS NOT OURS TO FILL.
             #
@@ -1210,7 +1241,7 @@ def fill_field(name, raw, lgp_mod, art, log=None, scope='margin'):
             # occlusion, and a field model can neither start nor stop being
             # hidden by scenery. `--verify` scores this as MASK CHANGED.
             was = np.frombuffer(bytes(buf), np.uint8).reshape(256, 256)
-            keep0 = was[sy:sy + TILE, sx:sx + TILE] == 0
+            keep0 = was[sy:sy + _edge, sx:sx + _edge] == 0
             # ...BUT ONLY WHERE INDEX 0 IS ACTUALLY A CUT-OUT. FINDINGS-140,
             # and the reasoning is at KEEP0_CUTOUTS_ONLY. On a layer-1 opaque
             # cell index 0 is DRAWN, so forcing it here does not preserve
@@ -1245,12 +1276,52 @@ def fill_field(name, raw, lgp_mod, art, log=None, scope='margin'):
             #     already drawing a visible flat block on this port rather than
             #     behaving as transparency. Where entry 0 is dark the cell
             #     reads as void either way and is left alone.
+            #
+            # ...AND THE THIRD CONDITION HAS THE SAME FALSE PREMISE AS EVERY
+            # OTHER "IT READS AS VOID" TEST IN THIS PROJECT. FINDINGS-189 E.
+            #
+            # "Where entry 0 is dark the cell reads as void either way" is true
+            # only if SOMETHING IS BEHIND IT. On a PARALLAX page there is not:
+            # layer 3 is the backdrop, and void there is the cleared
+            # framebuffer -- a black square.
+            #
+            # MEASURED on `mtcrl_4` (Mt. Corel, build 88), the last defect
+            # reported from hardware. Three layer-3 tiles, all on slot 5 at
+            # palette 0 while the whole rest of the sky is slot 4 at palette
+            # 10:
+            #
+            #   dst(-288,-136)  dst(-288, 88)  dst(384,-136)   32-unit tiles
+            #   cell            1024 of 1024 texels are index 0
+            #   palette 0       EVERY entry is (0, 0, 0)
+            #   Cosmos's DDS    100.0% opaque, mean RGB (121,118,110),
+            #                   (33,8,4) and (102,82,71) -- real sky and rock
+            #
+            # So conditions 1 and 2 both pass and condition 3 vetoes it:
+            # `prgb[0].max()` is 0, which is not > 40. The art is thrown away
+            # and index 0 written back, and on layer 3 that is drawn BLACK.
+            # dst(-288,-136) is the top-left corner of the field, which is
+            # exactly where the square appears.
+            #
+            # Cosmos leaves the palette byte alone because FFNx replaces the
+            # page with the .dds and never applies the palette -- that is
+            # `ff7nx_marginpal`'s whole subject. So palette 0 being black is
+            # not a statement about this cell at all.
+            #
+            # WAIVED ONLY ON A size_flag PAGE, which is the parallax backdrop
+            # and the one place "nothing is behind it" is true by
+            # construction. Conditions 1 and 2 still both apply, so the mod
+            # must be saying it paints there, opaquely, into a cell that holds
+            # nothing.
             if EMPTY_ATLAS_IS_NOT_A_CUTOUT and _is_cut:
                 _all0 = bool(keep0.all())
+                _bright = int(prgb[0].max()) > ATLAS_ENTRY0_MIN_LUMA
+                _backdrop = ATLAS_PARALLAX_VOID and bool(pages[slot].size_flag)
                 if _all0 and float((cover >= 128).mean()) >= ATLAS_OPAQUE_FRAC \
-                        and int(prgb[0].max()) > ATLAS_ENTRY0_MIN_LUMA:
+                        and (_bright or _backdrop):
                     _is_cut = False
                     st['atlas_filled'] = st.get('atlas_filled', 0) + 1
+                    if not _bright:
+                        st['atlas_parallax'] = st.get('atlas_parallax', 0) + 1
             if _is_cut:
                 idx = np.where(keep0, np.uint8(0), idx)
                 st['keep0_kept'] += int(keep0.sum())
@@ -1299,7 +1370,7 @@ def fill_field(name, raw, lgp_mod, art, log=None, scope='margin'):
                 _solid = cover > 0
                 if not _solid.all():
                     idx = np.where(_solid, idx,
-                                   was[sy:sy + TILE, sx:sx + TILE])
+                                   was[sy:sy + _edge, sx:sx + _edge])
             # ---- THE SILHOUETTE IS PER-PIXEL, NOT PER-CELL. FINDINGS-173.
             #
             # `KEEP_BLACK_SILHOUETTE` above asks `_cur.max() == 0` -- is the
@@ -1365,12 +1436,12 @@ def fill_field(name, raw, lgp_mod, art, log=None, scope='margin'):
             # fires only where the source block is substantially dark, i.e.
             # where our own downsample invented the colour.
             if KEEP_BLACK_PIXELS and _interior:
-                _wasc = was[sy:sy + TILE, sx:sx + TILE]
+                _wasc = was[sy:sy + _edge, sx:sx + _edge]
                 _blk = prgb[_wasc].max(-1) <= BLACK_PIXEL_MAX
                 if _blk.any():
                     _sd = ((np.ascontiguousarray(src[..., :3]).max(-1)
                             <= SRC_DARK_MAX)
-                           .reshape(TILE, k, TILE, k).mean(axis=(1, 3)))
+                           .reshape(_edge, k, _edge, k).mean(axis=(1, 3)))
                     _blk &= _sd >= SRC_DARK_FRAC
                 if _blk.any():
                     idx = np.where(_blk, _wasc, idx)
@@ -1439,9 +1510,9 @@ def fill_field(name, raw, lgp_mod, art, log=None, scope='margin'):
             #
             # The vanilla mask is the authority on transparency and always
             # was. Everything else takes the mod's colour.
-            for r in range(TILE):
+            for r in range(_edge):
                 base = (sy + r) * 256 + sx
-                buf[base:base + TILE] = bytes(idx[r])
+                buf[base:base + _edge] = bytes(idx[r])
             st['filled'] += 1
             wrote.add((slot, sx, sy))
             if dark:
@@ -1475,11 +1546,12 @@ def fill_field(name, raw, lgp_mod, art, log=None, scope='margin'):
                            .reshape(16, 16, 3).astype(np.uint8),
                            prgbs[newpal]).reshape(256)
             lut[0] = 0
+            _e2 = 32 if (BIG_CELL and pages[slot].size_flag) else TILE
             for _s, sx, sy in strand:
-                blk = lut[page[sy:sy + TILE, sx:sx + TILE]]
-                for r in range(TILE):
+                blk = lut[page[sy:sy + _e2, sx:sx + _e2]]
+                for r in range(_e2):
                     base = (sy + r) * 256 + sx
-                    buf[base:base + TILE] = bytes(blk[r])
+                    buf[base:base + _e2] = bytes(blk[r])
                 st['pal_remapped'] = st.get('pal_remapped', 0) + 1
         parts[SECTION9], nt = MP.apply_repoint(parts[SECTION9], surv, pages,
                                                chosen, placeholder)

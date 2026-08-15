@@ -1230,12 +1230,16 @@ def apply_module(sdout, dump, log=lambda *_: None, produced=()):
         if parallax():
             pr = ff7nx_wsclamp.parallax_right(scale)
             knobs = list(ff7nx_wsclamp.PARALLAX_RIGHT_KNOBS)
-            if _flag('SEVENTH_NX_WS_PARALLAX_SHIFT'):
-                knobs += list(ff7nx_wsclamp.PARALLAX_SHIFT_KNOBS)
-                log('  ! parallax SHIFT helpers included '
-                    '(SEVENTH_NX_WS_PARALLAX_SHIFT=1) -- these two sites are '
-                    'a WRAP, not a cull, and the emulator says this bias '
-                    'moves them the wrong way. Experiment only.')
+            if _flag('SEVENTH_NX_WS_PARALLAX_NO_SHIFT'):
+                # The A/B, and it reproduces every build up to 86: the layer-3
+                # and layer-4 WRAP points stay at the 4:3 edge while the layer-4
+                # cull moves, so the right margin of every parallax layer is
+                # shifted a whole layer width back inside the 4:3 picture.
+                knobs = [k for k in knobs
+                         if k not in ff7nx_wsclamp.PARALLAX_SHIFT_KNOBS]
+                log('  ! parallax SHIFT helpers EXCLUDED '
+                    '(SEVENTH_NX_WS_PARALLAX_NO_SHIFT=1) -- the sky will pop '
+                    'in and out along the right edge. A/B only.')
             for knob in knobs:
                 clamp_values[knob] = pr
             log('  parallax right edge 0 -> %d units  (%s)'

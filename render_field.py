@@ -49,6 +49,21 @@ import lgp
 TILE = 16
 UV_SCALE = 10_000_000
 T_DSTX, T_DSTY = 2, 4
+# A TILE IS NOT ALWAYS 16 UNITS, AND THIS FILE USED TO ASSUME IT WAS.
+#
+# Offsets 18 and 20 are the tile's WIDTH and HEIGHT. MEASURED over all 709
+# vanilla fields: layer 1 leaves them at 0 (346,161 tiles), layer 2 writes 16
+# (294,518), and LAYERS 3 AND 4 WRITE 32 (14,027). Those pages carry
+# `size_flag = 1`, an 8x8 grid of 32px cells, and the tiles' destinations step
+# by 32 to match.
+#
+# Drawing them 16x16 puts a quarter-size patch at every other position, i.e. a
+# regular checkerboard of art and background. That is exactly the artefact
+# HANDOFF-189 is about -- so this renderer reproduced the bug it was being
+# used to diagnose, from its own code, and showed the SAME checkerboard for a
+# fixed archive and a broken one. Being unable to tell those apart is the
+# worst thing a verification tool can do.
+T_W, T_H = 18, 20
 T_PAL = 22
 T_TEX, T_TEX2 = 32, 34
 # THE SECOND TEXTURE HAS ITS OWN SOURCE. FINDINGS-161.
@@ -136,11 +151,22 @@ def render(raw, layers=(1, 2), px=None, fx_frame=False):
 
     xs = [struct.unpack_from('<h', sec9, o + T_DSTX)[0] for _, o in todo]
     ys = [struct.unpack_from('<h', sec9, o + T_DSTY)[0] for _, o in todo]
+
+    def _size(layer, o):
+        """The tile's own edge in game units. See T_W."""
+        if layer == 1:
+            return TILE          # layer 1 never sets it; 346,161 vanilla zeros
+        w, h = struct.unpack_from('<HH', sec9, o + T_W)
+        n = max(w, h)
+        return n if n in (16, 32) else TILE
+
+    sizes = [_size(layer, o) for layer, o in todo]
     x0, y0 = min(xs), min(ys)
-    W, H = max(xs) - x0 + TILE, max(ys) - y0 + TILE
+    W = max(x + n for x, n in zip(xs, sizes)) - x0
+    H = max(y + n for y, n in zip(ys, sizes)) - y0
     canvas = np.zeros((H, W, 3), np.int32)
 
-    for (layer, o), tx, ty in zip(todo, xs, ys):
+    for (layer, o), tx, ty, tn in zip(todo, xs, ys, sizes):
         slot = sec9[o + T_TEX]
         fx = sec9[o + T_TEX2]
         # See T_SRCX2. `fx_frame` draws the ANIMATED frame -- fx page indexed
@@ -176,9 +202,22 @@ def render(raw, layers=(1, 2), px=None, fx_frame=False):
             rgbblk = a[sy:sy + step, sx:sx + step]
             if rgbblk.shape[:2] != (step, step):
                 continue
-        if step != TILE:
-            k = step // TILE
-            rgbblk = rgbblk[::k, ::k][:TILE, :TILE]
+        # RESAMPLE TO THE TILE'S OWN EDGE, NOT TO 16.
+        #
+        # `step` is how many page texels the cell holds; `tn` is how many game
+        # units the tile covers. They are independent: a 512px depth-2 page has
+        # step 32 for a 16-unit tile, and a size_flag page has step 32 for a
+        # 32-unit tile. Collapsing both to 16 drew a 512px build's layer 2 at
+        # the right size by luck and every parallax tile at a quarter of its.
+        if step != tn:
+            if step > tn and step % tn == 0:
+                k = step // tn
+                rgbblk = rgbblk[::k, ::k][:tn, :tn]
+            else:
+                k = max(1, tn // max(1, step))
+                rgbblk = np.repeat(np.repeat(rgbblk, k, 0), k, 1)[:tn, :tn]
+            if rgbblk.shape[:2] != (tn, tn):
+                continue
         dy, dx = ty - y0, tx - x0
         # LAYER 1 OVERWRITES. EVERY OVERLAY ADDS.
         #
@@ -196,9 +235,9 @@ def render(raw, layers=(1, 2), px=None, fx_frame=False):
         # drawn in average or opaque mode will be too bright here.
         if layer != 1 or (0x0F <= eff < 0x1A and p.depth == 1) \
                 or (0x21 <= eff < 0x2A and p.depth == 2):
-            canvas[dy:dy + TILE, dx:dx + TILE] += rgbblk
+            canvas[dy:dy + tn, dx:dx + tn] += rgbblk
         else:
-            canvas[dy:dy + TILE, dx:dx + TILE] = rgbblk
+            canvas[dy:dy + tn, dx:dx + tn] = rgbblk
     return np.clip(canvas, 0, 255).astype(np.uint8), (x0, y0)
 
 

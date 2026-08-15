@@ -71,6 +71,18 @@ other, never to "no fix".
 """
 from __future__ import annotations
 from collections import Counter, defaultdict
+import os as _os
+
+# THE CELL IS 32 UNITS ON A size_flag PAGE. See _best_palette.
+#
+# SEVENTH_NX_NO_PALRANGE_BIGCELL=1 restores the 16-unit read, i.e. build 88's
+# black square in Mt. Corel's top-left corner.
+BIG_CELL = _os.environ.get('SEVENTH_NX_NO_PALRANGE_BIGCELL') != '1'
+
+# SCORE AN ALL-INDEX-0 CELL BY WHAT THE PALETTE CAN HOLD. See _best_palette.
+# SEVENTH_NX_NO_PALRANGE_QUANT=1 restores the entry-0 score, i.e. the flat
+# pale block in Mt. Corel's top-left corner.
+ATLAS_BY_QUANTISE = _os.environ.get('SEVENTH_NX_NO_PALRANGE_QUANT') != '1'
 
 import diag_common as DC
 import ff7nx_marginblack as MB
@@ -130,13 +142,36 @@ def _covered(art_for, slot, sx, sy):
     return bool((~blk).any())
 
 
-def _best_palette(arrays, pal565, art_for, rows, slot, sx, sy):
-    """The valid palette that renders this cell closest to Cosmos's art."""
+def _best_palette(arrays, pal565, art_for, rows, slot, sx, sy, edge=16):
+    """The valid palette that renders this cell closest to Cosmos's art.
+
+    `edge` IS THE CELL'S OWN SIZE AND IT IS NOT ALWAYS 16. FINDINGS-189 E.
+
+    A `size_flag` page is an 8x8 grid of 32-unit cells and the parallax layers
+    use those pages. Reading a 16-unit window of one samples its TOP-LEFT
+    QUADRANT, and this function then answers a question about a quarter of the
+    cell as though it were the whole.
+
+    MEASURED on `mtcrl_4`, slot 5 cell (0, 128) -- the tile in the top-left
+    corner of Mt. Corel, reported from hardware as a black square:
+
+        Cosmos's art over the full 32-unit cell   mean RGB (121, 118, 110)
+        Cosmos's art over the 16-unit quadrant    mean RGB (6.5, 6.5, 8.0)
+
+    The quadrant is black, so every all-black palette scored err 6.99 and the
+    bright ones scored 25 to 158. This function dutifully picked palette 0 --
+    whose every entry is (0, 0, 0) -- and was right about the data it was
+    given and wrong about the cell.
+
+    The rest follows on its own: `ff7nx_marginart` then cannot quantise sky
+    into an all-black table, refuses the cell as wildly off-colour, and the
+    tile is left drawing index 0 through palette 0. Black square.
+    """
     import numpy as np
     idx = arrays.get(slot)
     if idx is None or art_for is None or not rows:
         return 0
-    blk = idx[sy:sy + 16, sx:sx + 16]
+    blk = idx[sy:sy + edge, sx:sx + edge]
     got = None
     try:
         got = art_for(slot, 0)
@@ -148,13 +183,81 @@ def _best_palette(arrays, pal565, art_for, rows, slot, sx, sy):
     try:
         f = img.px // 256
         page = np.frombuffer(img.buf, '<u2').reshape(img.px, img.px)
-        a = page[sy * f:(sy + 16) * f, sx * f:(sx + 16) * f].astype(np.int64)
+        a = page[sy * f:(sy + edge) * f,
+                 sx * f:(sx + edge) * f].astype(np.int64)
         tru = np.stack([((a >> 11) & 31) << 3, ((a >> 5) & 63) << 2,
                         (a & 31) << 3], -1).astype(float)
         if f > 1:
-            tru = tru.reshape(16, f, 16, f, 3).mean((1, 3))
+            tru = tru.reshape(edge, f, edge, f, 3).mean((1, 3))
     except Exception:                                          # noqa: BLE001
         return 0
+    # AN ATLAS GAP IS SCORED BY WHAT THE PALETTE CAN HOLD, NOT BY ITS ENTRY 0.
+    #
+    # The docstring above says an all-index-0 cell "reduces to the palette whose
+    # entry 0 matches the art, which is exactly the question". That was true
+    # when such a cell STAYED FLAT. It no longer does: with the size_flag fixes
+    # in `ff7nx_marginart`, an atlas gap on a parallax page now receives
+    # Cosmos's art, quantised through whatever palette THIS function names. So
+    # the question became "which table can represent this art", and scoring
+    # entry 0 answers a question nobody is asking any more.
+    #
+    # MEASURED on `mtcrl_4` slot 5 cell (0,128) -- the tile in Mt. Corel's
+    # top-left corner, reported from hardware as "jarring, discontinuous ...
+    # that square just stands out". Cosmos's art there is mean RGB
+    # (121,118,110) with a per-channel std of (115,112,106): a high-contrast
+    # cloud edge, not a flat patch.
+    #
+    #     palette   entry-0 score (old rule)   quantise score (this rule)
+    #        7            116.83                       4.61
+    #        1            116.83                       9.44
+    #       12             35.93                      10.42
+    #        8             53.17                      17.00
+    #        9             78.83                      20.75   <- old rule chose
+    #        0            116.83                     116.83
+    #
+    # The old rule cannot see past entry 0, so it ranked eight palettes as
+    # identically hopeless and picked among the rest by a colour the cell will
+    # not end up drawing. The new rule picks palette 7 and the cell comes out
+    # 4.5x closer to the art -- detail instead of a flat block.
+    #
+    # SCOPED TO THE ALL-ZERO CELL. A cell with real indices keeps the old
+    # score, because there the rendering of those indices IS what ships and
+    # quantising art the cell will never receive would be the wrong question in
+    # the other direction.
+    #
+    # SCOPED TO THE PARALLAX PAGE, AND THAT SCOPE IS LOAD-BEARING. A cell only
+    # RECEIVES art if `ff7nx_marginart`'s atlas arm fires on it, and outside a
+    # `size_flag` page that arm still requires a bright entry 0. So on an
+    # ordinary page an all-index-0 cell STAYS FLAT, its rendered colour is
+    # entry 0, and scoring by quantisation would choose a table for detail the
+    # cell never gets while ignoring the one colour it does draw.
+    #
+    # That is precisely the BUILD 67 WALL MARKET REGRESSION this module's
+    # docstring opens with -- 151 flat tan squares in `mrkt2` from a palette
+    # chosen on the wrong criterion. `edge > 16` is true only on a size_flag
+    # page, so mrkt2, mds5_3, mds5_5 and every other 16-unit field keeps the
+    # entry-0 rule exactly as measured there.
+    _all0 = not bool(blk.any())
+    if _all0 and ATLAS_BY_QUANTISE and edge > 16:
+        try:
+            import ff7nx_marginart as _MA
+            best, bestp = None, 0
+            for p in range(min(rows, len(pal565))):
+                prgb = _MA.palette_rgb_565(pal565[p]) if hasattr(
+                    _MA, 'palette_rgb_565') else None
+                if prgb is None:
+                    v = pal565[p].astype(np.int64)
+                    prgb = np.stack([((v >> 11) & 31) << 3,
+                                     ((v >> 5) & 63) << 2,
+                                     (v & 31) << 3], -1).astype(np.uint8)
+                q = _MA.quantise(tru.astype(np.float32), prgb)
+                e = float(np.abs(prgb[q].astype(float) - tru).mean())
+                if best is None or e < best:
+                    best, bestp = e, p
+            if best is not None:
+                return bestp
+        except Exception:                                      # noqa: BLE001
+            pass                    # fall through to the entry-0 rule
     best, bestp = None, 0
     for p in range(min(rows, len(pal565))):
         v = pal565[p][blk].astype(np.int64)
@@ -224,9 +327,11 @@ def fix_field(sec3, sec9, name='', log=None, art_for=None):
     for t in bad:
         key = (t.slot, t.sx, t.sy)
         if key not in choice:
+            _pg = pages.get(t.slot)
+            _edge = 32 if (BIG_CELL and _pg is not None and _pg.size_flag) else 16
             choice[key] = (0 if pal565 is None else
                            _best_palette(arrays, pal565, art_for, rows,
-                                         t.slot, t.sx, t.sy))
+                                         t.slot, t.sx, t.sy, _edge))
     for t in bad:
         new = choice[(t.slot, t.sx, t.sy)]
         st['pals'][t.pal] += 1

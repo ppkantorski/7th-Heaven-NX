@@ -467,11 +467,57 @@ CAVE_SITES = {
 # analysed on its own terms before a bias direction can be chosen. Shipping
 # them on the strength of the algebra is exactly the mistake HANDOFF-56 §4A
 # and HANDOFF-57 §2 both record.
-PARALLAX_RIGHT_KNOBS = ('pright4b',)
+# ...AND THAT REASONING WAS WRONG. ALL THREE SHIP. FINDINGS-189 C.
+#
+# The paragraph above is kept because it records a real hazard, but its
+# conclusion was drawn from the wrong oracle. `verdict()` models a CULL --
+# "taken means skip this tile" -- so its gained/lost count is meaningless at a
+# WRAP site, which this file already says two paragraphs up. Measuring a wrap
+# with a cull metric and then declining to ship on the result is not caution,
+# it is a category error with a safety label on it.
+#
+# THE RIGHT ORACLE IS FFNx'S SOURCE, AND IT IS UNAMBIGUOUS.
+# `repos/FFNx-master/src/ff7/field/background.cpp`, both layer 3 and layer 4:
+#
+#   field_layer3_shift_tile_position:
+#       const int right_offset = is_fieldmap_wide() ? abs(wide_viewport_x) : 0;
+#       if (tile_position->x <= bg_position->x - left_offset ||
+#           tile_position->x >= bg_position->x + right_offset)
+#           tile_position->x += (...) ? -layer3_width : layer3_width;
+#
+#   field_layer3_pick_tiles:
+#       const int right_offset = is_fieldmap_wide() ? abs(wide_viewport_x) : 0;
+#       if (tile_position.x <= bg_position.x - left_offset ||
+#           tile_position.x >= bg_position.x + right_offset || ...) continue;
+#
+# ONE `right_offset`, 0 -> 107, used identically by the wrap and by the cull.
+# FFNx moves all four. Shipping only the cull is what leaves the wrap putting
+# every tile of the right margin back inside the 4:3 picture -- which is the
+# defect reported from hardware on Mt. Corel:
+#
+#   "as i move, the background that scrolls at a diff pace pops into view and
+#    out of view as i move left to right to left"
+#
+# `ff7nx_ws.py` part E has described this exact mechanism since it was written.
+#
+# AND THE EMULATOR AGREES ONCE IT IS ASKED THE RIGHT QUESTION. Sweeping tile.x
+# at cam = 1000 and reading where the branch flips:
+#
+#       site        stock boundary     with bias +107
+#       pright4b    tile.x >= cam      tile.x >= cam+107     (cull)
+#       pright3     tile.x <  cam      tile.x <  cam+107     (wrap)
+#       pright4a    tile.x <  cam      tile.x <  cam+107     (wrap)
+#
+# All three move by exactly the bias, in the same direction, which is the
+# transformation the C above performs. There was never a disagreement to
+# resolve -- only a metric that could not express the answer.
+PARALLAX_RIGHT_KNOBS = ('pright4b', 'pright3', 'pright4a')
 
-# Defined, signature-verified, NOT shipped. See above. Set
-# SEVENTH_NX_WS_PARALLAX_SHIFT=1 to include them in a build that is
-# deliberately testing them.
+# STILL LISTED, AND STILL MEANINGFUL: these two are WRAPS, not culls. The name
+# is what keeps `CULL_CAVE_SITES` from asserting cull semantics against them in
+# the test suite. It no longer means "not shipped".
+#
+# SEVENTH_NX_WS_PARALLAX_NO_SHIFT=1 drops them back out for an A/B.
 PARALLAX_SHIFT_KNOBS = ('pright3', 'pright4a')
 
 

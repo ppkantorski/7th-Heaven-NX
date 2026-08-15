@@ -156,12 +156,72 @@ def survey_tiles(sec9, surv):
     return tiles, by_cell
 
 
-def black_cells(sec9, surv):
-    """
-    {(slot, sx, sy): [tile, ...]} -- empty cells that a LAYER-1 tile samples.
+# EMPTY IS NOT THE QUESTION. BLACK IS. FINDINGS-189 G.
+#
+# This pass asked "is the cell EMPTY", because an empty cell on layer 1 draws
+# entry 0, which is black 93% of the time. That is a proxy, and it misses the
+# cell that is uniformly some OTHER index whose palette entry is also black.
+# The player cannot tell those apart; only the file can.
+#
+# MEASURED on `woa_3` (Whirlwind Maze, the ridge with the wind that pushes you
+# back) -- the black square reported from hardware at the top-left:
+#
+#   L1 dst(-160,-120)  slot 0  palette 0  cell (0,0)   every texel index 251
+#   palette 0 entry 251 = (0, 0, 0)                    in VANILLA too
+#   Cosmos's DDS at that cell: 100% opaque, mean RGB (146, 251, 255)
+#
+# Square put a flat black filler in the corner because the 4:3 frame never
+# showed it. The 16:9 frame does. Cosmos paints the sky there and FFNx renders
+# it; this port drew index 251.
+#
+# `ff7nx_marginart` cannot take it either: the cell is SHARED by a layer-3 tile
+# at palette 5, and a depth-1 page is one index array, so art quantised for
+# palette 0 would be read back through palette 5. `fillable_cells` refuses it,
+# correctly. Giving the layer-1 tile its own copy of the cell -- which is
+# exactly what this module exists to do -- is the only route.
+#
+# THE GATE IS WHAT MAKES THIS SAFE, and it is measured, not asserted. Over 70
+# fields:
+#
+#   layer-1 tiles drawing a fully BLACK cell         16,463 in 27 fields
+#     of those, the cell is entirely index 0 (old)        0
+#     NON-zero indices AND the mod ships bright art       6
+#
+# 16,463 -> 6. Every dark cave, night scene and silhouette in the game draws a
+# black cell on purpose and the mod agrees with it; the six are the ones where
+# Cosmos explicitly paints something bright and opaque over Square's filler.
+# SEVENTH_NX_NO_BLACKART=1 restores the EMPTY-only selection, i.e. build 90's
+# black square in the corner of woa_3.
+BLACK_ART = os.environ.get('SEVENTH_NX_NO_BLACKART') != '1'
+BLACK_ART_MIN_LUMA = 25     # the mod's art must be this bright to count
+BLACK_ART_MIN_COVER = 0.9   # and this opaque
 
-    These are the black squares. Cells sampled only by layer 2+ are excluded:
-    there index 0 is the transparency key and an empty cell draws nothing.
+
+def _cell_is_black(arr, page, sx, sy, grid, prgb):
+    """Every texel of this cell renders below the visible floor."""
+    ys, xs = PC._cell_slice(page, sx, sy, grid)
+    block = arr[ys, xs]
+    if page.depth == 2:
+        v = block.astype(np.uint32)
+        lum = np.maximum(np.maximum(((v >> 11) & 31) << 3,
+                                    ((v >> 5) & 63) << 2), (v & 31) << 3)
+        return not bool((lum > 10).any())
+    if prgb is None:
+        return False
+    return not bool((prgb[block].max(-1) > 10).any())
+
+
+def black_cells(sec9, surv, prgbs=None):
+    """
+    {(slot, sx, sy): [tile, ...]} -- cells a LAYER-1 tile draws as BLACK.
+
+    Empty cells qualify (index 0 is drawn on layer 1 and is almost always
+    black). So do cells that are uniformly some other index whose palette
+    entry is black -- see the note above. Cells sampled only by layer 2+ are
+    excluded: there index 0 is the transparency key and draws nothing.
+
+    `prgbs` is the field's palettes; without them only the empty test runs, so
+    every existing caller keeps its exact behaviour.
     """
     pages = {p.slot: p for p in surv['pages']}
     tiles, by_cell = survey_tiles(sec9, surv)
@@ -169,7 +229,8 @@ def black_cells(sec9, surv):
     out = {}
     for key, idxs in by_cell.items():
         slot, sx, sy = key
-        if not any(tiles[i]['layer'] == 1 for i in idxs):
+        l1 = [tiles[i] for i in idxs if tiles[i]['layer'] == 1]
+        if not l1:
             continue
         page = pages[slot]
         arr = arrays.get(slot)
@@ -181,6 +242,45 @@ def black_cells(sec9, surv):
         grid, _ = _grid_step(page)
         if _cell_is_empty(arr, page, sx, sy, grid):
             out[key] = [tiles[i] for i in idxs]
+            continue
+        if prgbs is None or not BLACK_ART:
+            continue
+        # Black through the palette the LAYER-1 tile is actually drawn with.
+        # A cell that is black through one palette and not another is not a
+        # black square for every tile that names it, so all of them must agree.
+        # ONLY ON THE BORDER THE 4:3 FRAME CROPPED. FINDINGS-173 IS RIGHT
+        # ABOUT THE INTERIOR AND THIS MUST NOT ARGUE WITH IT.
+        #
+        # `ff7nx_marginart` keeps a vanilla-black pixel black inside the 4:3
+        # picture, because "the original cut it to black on purpose; the
+        # upscale has no standing to fill it in", and because Cosmos's DDS has
+        # BLEED off its own wider canvas there. That reasoning holds here too.
+        #
+        # MEASURED over 90 fields, the newly-selected tiles by destination:
+        #
+        #     inside the 4:3 box   10,467   dominated by blackbg1..6 at 640
+        #                                   each -- fields whose whole point
+        #                                   is to be black
+        #     on the border / outside 7,379
+        #
+        # What Square left black is the RING the 4:3 frame never showed --
+        # `woa_3`'s tile is at dst(-160,-120), the top-left CORNER of the
+        # 320x240 box, cropped by every CRT this game shipped on. A 16:9 frame
+        # shows it. The interior is not this defect and is not touched.
+        _edge = any(t['dst'][0] <= -160 + TILE or t['dst'][0] >= 160 - TILE
+                    or t['dst'][1] <= -120 + TILE or t['dst'][1] >= 120 - TILE
+                    for t in l1)
+        if not _edge:
+            continue
+        pals = {t['pal'] for t in l1}
+        if any(p >= len(prgbs) for p in pals):
+            continue
+        if all(_cell_is_black(arr, page, sx, sy, grid, prgbs[p])
+               for p in pals):
+            got = [tiles[i] for i in idxs]
+            for t in got:
+                t['was_black'] = True     # never fill this one IN PLACE
+            out[key] = got
     return out
 
 
@@ -274,15 +374,54 @@ def _art_block(img, page, sx, sy, grid):
     k = img.shape[1] // 256
     if k < 1:
         return None
-    src = img[sy * k:(sy + TILE) * k, sx * k:(sx + TILE) * k]
-    if src.shape[:2] != (TILE * k, TILE * k):
+    # THE CELL IS NOT ALWAYS 16 UNITS. HANDOFF-189.
+    #
+    # `grid` is 8 on a `size_flag` page -- an 8x8 grid of 32-unit cells, which
+    # is what the parallax layers use. Taking a TILE-wide window there reads
+    # the top-left QUADRANT of the cell and fills only that, leaving three
+    # quarters at index 0. That is the checkerboard `ff7nx_marginart` was
+    # producing on Mt. Corel's mountain until the same literal was replaced
+    # there.
+    #
+    # It cannot fire today, because `black_cells()` selects layer-1 tiles only
+    # and layer 1 never uses a 32-unit tile (346,161 of 346,175 vanilla
+    # layer-1 records leave width at 0). It is corrected here anyway, because
+    # HANDOFF-188 3.1 plans to widen this pass to layers 2/3/4 -- which is
+    # precisely where the 32-unit tiles are.
+    #
+    # `edge == TILE` on every non-size_flag page, so this is a no-op there.
+    edge = 256 // grid
+    src = img[sy * k:(sy + edge) * k, sx * k:(sx + edge) * k]
+    if src.shape[:2] != (edge * k, edge * k):
         return None
     side = page.px // grid
-    f = (TILE * k) // side
-    if f < 1 or side * f != TILE * k:
+    f = (edge * k) // side
+    if f < 1 or side * f != edge * k:
         return None
     rgb = np.ascontiguousarray(src[..., :3])
     return rgb.reshape(side, f, side, f, 3).mean(axis=(1, 3))
+
+
+def _art_cover(img, page, sx, sy, grid):
+    """`_art_block`'s alpha twin -- which texels of the cell the mod PAINTS.
+
+    Same window and same reduction, so a texel counted here is the texel whose
+    colour `_art_block` returned. `provider_source` puts `PageArt.tmask` in
+    channel 3, so 255 means the mod paints and 0 means it does not.
+    """
+    k = img.shape[1] // 256
+    if k < 1 or img.shape[-1] < 4:
+        return None
+    edge = 256 // grid
+    src = img[sy * k:(sy + edge) * k, sx * k:(sx + edge) * k]
+    if src.shape[:2] != (edge * k, edge * k):
+        return None
+    side = page.px // grid
+    f = (edge * k) // side
+    if f < 1 or side * f != edge * k:
+        return None
+    a = np.ascontiguousarray(src[..., 3]).reshape(side, f, side, f)
+    return a.mean(axis=(1, 3)) >= 128
 
 
 def fill_field(name, raw, art, log=lambda *_: None):
@@ -300,7 +439,9 @@ def fill_field(name, raw, art, log=lambda *_: None):
     sec9 = parts[SECTION9]
     surv = DC.survey(sec9)
     pages = {p.slot: p for p in surv['pages']}
-    bad = black_cells(sec9, surv)
+    cols, _hdr, npg, _cpp = MB.palette_colours(parts[SECTION_PALETTE])
+    prgbs = [MA.palette_rgb(cols[i]) for i in range(npg)]
+    bad = black_cells(sec9, surv, prgbs)
     st['black'] = sum(len([t for t in v if t['layer'] == 1])
                       for v in bad.values())
     if not bad:
@@ -308,8 +449,6 @@ def fill_field(name, raw, art, log=lambda *_: None):
 
     buf = bytearray(sec9)
     arrays, touched = {}, set()
-    cols, _hdr, npg, _cpp = MB.palette_colours(parts[SECTION_PALETTE])
-    prgbs = [MA.palette_rgb(cols[i]) for i in range(npg)]
     _tiles, by_cell = survey_tiles(sec9, surv)
 
     for key in sorted(bad):
@@ -329,7 +468,14 @@ def fill_field(name, raw, art, log=lambda *_: None):
             by_pal[t['pal']].append(t)
         # In place only when nothing else reads this cell and every layer-1
         # tile agrees on the palette -- then no index can be misread.
-        in_place = not others and len(by_pal) == 1
+        # A CELL THAT MERELY RENDERS BLACK IS NOT EMPTY, SO IT IS NEVER
+        # FILLED IN PLACE. The module's first safety property -- "it only ever
+        # writes into a cell that is ENTIRELY EMPTY, so it cannot overwrite
+        # art" -- is what makes this pass safe to run on 709 fields, and the
+        # new population would break it. A private copy costs one free cell
+        # and keeps the original bytes untouched.
+        _was_black = any(t.get('was_black') for t in here)
+        in_place = not others and len(by_pal) == 1 and not _was_black
         for pal, group in sorted(by_pal.items()):
             got = None
             for want in (pal, 0):
@@ -348,6 +494,23 @@ def fill_field(name, raw, art, log=lambda *_: None):
             if block is None:
                 st['no_art'] += len(group)
                 continue
+            # THE MOD HAS TO DISAGREE WITH THE BLACK, OPAQUELY. See
+            # BLACK_ART_MIN_LUMA. This is the whole safety of the widened
+            # selection: 16,463 layer-1 tiles across 70 fields draw a black
+            # cell, and all but SIX of them are dark caves, night scenes and
+            # silhouettes that Cosmos draws dark as well. Where the mod agrees
+            # the cell is black, it stays black -- the filler is only replaced
+            # where Cosmos explicitly paints over it.
+            #
+            # Only the newly-selected cells are gated. A cell that is EMPTY is
+            # this pass's original population and keeps its original rule.
+            if _was_black:
+                _cov = _art_cover(got[0], page, sx, sy, grid)
+                if _cov is None or float(_cov.mean()) < BLACK_ART_MIN_COVER \
+                        or float(block[_cov].mean() if _cov.any()
+                                 else 0.0) < BLACK_ART_MIN_LUMA:
+                    st['no_art'] += len(group)
+                    continue
             side = page.px // grid
             if block.shape[0] != TILE:
                 # quantise() is written for a 16x16 cell. A larger page cell
@@ -449,16 +612,41 @@ def fill_field(name, raw, art, log=lambda *_: None):
     # REFUSE OUR OWN WORK IF IT DID NOT HELP. Cheap, and it turns any bug in
     # the arithmetic above into "the field is unchanged" instead of "the
     # field is now wrong in a new way".
+    # THE REFUSAL COUNTS EMPTY CELLS, NOT BLACK ONES, AND THAT IS DELIBERATE.
+    #
+    # "No improvement" was a valid inference while the population was EMPTY
+    # cells: fill one and it stops being empty. It is NOT valid for a cell that
+    # merely renders black, because the mod's art for it can itself be dark --
+    # `bugin1a` (Bugenhagen's observatory) is exactly that, and the check
+    # refused a fill that had worked:
+    #
+    #     before  2 layer-1 tiles, 0 of them the black-cell kind
+    #     after   2 layer-1 tiles, 2 of them the black-cell kind
+    #
+    # The art landed; it is dark art. Measuring "is it still dark" and calling
+    # that failure loses the fix for the whole field.
+    #
+    # So the guard keeps build 90's exact test -- the EMPTY-cell count, no
+    # palettes -- and asks only that it did not get WORSE. That is the property
+    # it was written to protect: "a bug here costs the fix, not the field." A
+    # copy that lands somewhere it should not still shows up as a new empty
+    # cell and is still caught.
+    try:
+        _before = black_cells(sec9, surv)
+        n_before = sum(len([t for t in v if t['layer'] == 1])
+                       for v in _before.values())
+    except Exception:                                          # noqa: BLE001
+        n_before = 0
     try:
         after = black_cells(new9, DC.survey(new9))
         n_after = sum(len([t for t in v if t['layer'] == 1])
                       for v in after.values())
     except Exception:                                          # noqa: BLE001
-        n_after = st['black'] + 1
-    if n_after >= st['black']:
+        n_after = n_before + 1
+    if n_after > n_before:
         st['reverted'] = 1
-        log('  ! blackcell: %s went %d -> %d black cell(s); left unchanged'
-            % (name, st['black'], n_after))
+        log('  ! blackcell: %s went %d -> %d EMPTY cell(s); left unchanged'
+            % (name, n_before, n_after))
         return None, st
     st['after'] = n_after
     return lgp.join_sections(parts), st

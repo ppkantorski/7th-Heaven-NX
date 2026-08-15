@@ -126,6 +126,34 @@ def disabled():
 # that merely sits beside black is never dropped.
 LIT_FLOOR = 10.0
 
+# THE 2-D LIT COVERAGE CONSTRAINT -- OFF. IT SHIPPED IN BUILD 86 AND WAS A
+# REGRESSION. Opt in with SEVENTH_NX_LITCOVER=1; do not turn it on by default
+# again without reading the next paragraph.
+#
+# `lit_travel` rasterises every layer AT ITS HOME OFFSET and calls a texel
+# unlit if no layer draws there. That is right for layers 1 and 2 and WRONG
+# for 3 and 4, and the code comment that justified it had the mechanism
+# backwards. It said "as the camera moves away the backdrop LAGS and covers
+# LESS, never more", so measuring at home was conservative.
+#
+# Layers 3 and 4 WRAP RATHER THAN CULL -- `ff7nx_ws` line 167 and
+# `ff7nx_fieldwide` say so explicitly, and it is why `parallax_right` exists.
+# A wrapping backdrop is ALWAYS covering the screen; what changes with the
+# camera is which part of it you see, not whether it is there. So the far left
+# and right of the field canvas read as "unlit" here while at runtime the sky
+# is on screen the whole time.
+#
+# MEASURED, build 86, on hardware: `mtcrl_4`'s camera range went -490..490 to
+# -246..374, i.e. travel -330..330 to -86..214. The camera sat at a boundary,
+# the player started off screen, and Mt. Corel stopped scrolling. Reported as
+# "the camera doesnt even move ... i cant even see myself when the page loads".
+#
+# The vertical arm (`mtcrl_5` -240..224 -> -100..80) rests on the same faulty
+# measurement and goes with it. If this is ever revived it must ask the
+# parallax layers where they are AT THAT CAMERA POSITION, not at home -- or
+# restrict itself to layers 1 and 2, which do cull and do stay put.
+LIT_COVER = os.environ.get('SEVENTH_NX_LITCOVER') == '1'
+
 # Below this much camera travel, pin instead. See `fit`.
 PIN_SLACK = 24
 
@@ -423,6 +451,180 @@ def bare(lo, hi, art):
                for c in (lo, hi, (lo + hi) // 2))
 
 
+# ------------------------------------------------------- lit COVERAGE, 2-D
+# `art_run` IS A UNION OF TILE SPANS ON LAYERS 1 AND 2. THAT IS NOT COVERAGE,
+# AND ON A FIELD WHOSE BACKDROP IS LAYER 3 IT IS THE WRONG POPULATION.
+#
+# MEASURED on build 85, the two defects reported from hardware:
+#
+#   mtcrl_5   art_run_y (layers 1/2)   -360..360   the trestle, full height
+#             layer 3 (the sky)        -200..184
+#             shipped camera_y         -240..224
+#             frame unlit at cam_y -240: 27.9%   at +224: 29.1%
+#
+#   mtcrl_4   art_run   (layers 1/2)   -544..544   the trestle again
+#             shipped camera_x         -330..330
+#             frame unlit at cam_x +330: 21.0%, and 5,205 of the 7,680 texels
+#             in the RIGHTMOST 32 COLUMNS are unlit -- the black vertical bar
+#             at the right of the screen, with tiles appearing as the camera
+#             crosses back into the covered region.
+#
+# The trestle spans the whole field on both axes, so `art_run` reported plenty
+# of art and the fit left the range alone. What decides whether the player sees
+# black is whether ANY layer draws something LIT at that texel.
+#
+# HANDOFF-188 6 lists this mistake three times -- margin_blank until it was
+# split by layer, the art run until it was split by pixel, layer 2 until it was
+# split by coverage. This is the fourth, in the camera fit.
+#
+# PARALLAX IS A FLOOR, NOT A PROMISE. Layers 3 and 4 scroll at their own rate,
+# so their contribution is exact only at the home offset; as the camera moves
+# away the backdrop LAGS and covers LESS, never more. A limit derived here is
+# therefore an upper bound on safe travel, which is the direction that cannot
+# introduce a bar.
+LIT_TOL = 0.02          # of the frame; 2% of 428x240 is 2054 texels
+LIT_STEP = 4            # rasterise at 4-unit granularity -- 16x cheaper, and
+                        # the bands this exists for are 32 units and up
+
+
+def lit_travel(parts, tol=LIT_TOL):
+    """
+    ((cx_lo, cx_hi), (cy_lo, cy_hi)) -- camera positions whose whole frame is
+    lit to within `tol`. None on failure; an axis with no acceptable position
+    returns (None, None) for that axis and the caller leaves it alone.
+    """
+    import numpy as np
+
+    import diag_common as DC
+    import field_bg_native as FN
+    import field_bg_repack as RP
+
+    sec9 = parts[SECTION_BACKGROUND]
+    surv = DC.survey(sec9)
+    pages = {p.slot: p for p in surv['pages']}
+    try:
+        import ff7nx_marginart as MA
+        import ff7nx_marginblack as MB
+        cols, _hdr, npg, _cpp = MB.palette_colours(parts[3])
+        prgbs = [MA.palette_rgb(cols[i]) for i in range(npg)]
+    except Exception:                                          # noqa: BLE001
+        return None
+
+    todo, xs, ys = [], [], []
+    for layer, offs in DC.walk_layers(sec9, surv['back_start'],
+                                      surv['tex_start']):
+        for o in offs:
+            w, h = struct.unpack_from('<HH', sec9, o + 18)
+            n = max(w, h) if layer > 1 else TILE
+            if n not in (16, 32):
+                n = TILE
+            x, y = struct.unpack_from('<hh', sec9, o + DC.TILE_DST_X)
+            todo.append((o, x, y, n))
+            xs += [x, x + n]
+            ys += [y, y + n]
+    if not todo:
+        return None
+    S = LIT_STEP
+    x0, y0 = min(xs), min(ys)
+    W = -(-(max(xs) - x0) // S)
+    H = -(-(max(ys) - y0) // S)
+    if W <= 0 or H <= 0 or W * H > 8_000_000:
+        return None
+    grid_lit = np.zeros((H, W), bool)
+    arrays = {}
+    for o, x, y, n in todo:
+        slot = sec9[o + RP.T_TEXID]
+        p = pages.get(slot)
+        if p is None:
+            continue
+        if slot not in arrays:
+            try:
+                import field_bg_pagecap as PC
+                arrays[slot] = PC._page_array(p)
+            except Exception:                                  # noqa: BLE001
+                continue
+        g = 8 if p.size_flag else 16
+        step = (256 if p.depth == 1 else p.px) // g
+        u, v = struct.unpack_from('<II', sec9, o + RP.T_SRC_X_BIG)
+        cx = int(round(u / 1e7 * g))
+        cy = int(round(v / 1e7 * g))
+        blk = arrays[slot][cy * step:(cy + 1) * step,
+                           cx * step:(cx + 1) * step]
+        if blk.shape != (step, step):
+            continue
+        if p.depth == 2:
+            r = ((blk >> 11) & 31) << 3
+            g2 = ((blk >> 5) & 63) << 2
+            b = (blk & 31) << 3
+            live = np.maximum(np.maximum(r, g2), b) > LIT_FLOOR
+        else:
+            pi = sec9[o + RP.T_PALETTE]
+            if pi >= npg:
+                pi = npg - 1
+            live = (prgbs[pi][blk].max(-1) > LIT_FLOOR) & (blk != 0)
+        # to the tile's own destination edge, then to the S-unit grid
+        m = n // S
+        if live.shape[0] >= m and m:
+            f = live.shape[0] // m
+            live = live[:m * f, :m * f].reshape(m, f, m, f).any(axis=(1, 3))
+        else:
+            live = np.ones((max(1, m), max(1, m)), bool)
+        gy, gx = (y - y0) // S, (x - x0) // S
+        if gy < 0 or gx < 0 or gy + live.shape[0] > H \
+                or gx + live.shape[1] > W:
+            continue
+        grid_lit[gy:gy + live.shape[0], gx:gx + live.shape[1]] |= live
+
+    vw, vh = NEEDED // S, (VIEW_HALF_Y * 2) // S
+    if W < vw or H < vh:
+        return None
+    ii = np.pad(grid_lit.cumsum(0).cumsum(1), ((1, 0), (1, 0)))
+
+    def unlit(px, py):
+        s = (ii[py + vh, px + vw] - ii[py, px + vw]
+             - ii[py + vh, px] + ii[py, px])
+        return vw * vh - int(s)
+
+    lim = tol * vw * vh
+    # Each axis is swept with the other held at the position that is most
+    # likely to be legitimate -- the middle of the canvas. Sweeping the full
+    # 2-D product would be the honest thing and is not affordable per build;
+    # the middle is where the art is by construction, since Cosmos centres on
+    # 0 (HANDOFF-188 2.2b).
+    py_mid = max(0, min(H - vh, (H - vh) // 2))
+    px_mid = max(0, min(W - vw, (W - vw) // 2))
+    okx = [px for px in range(W - vw + 1) if unlit(px, py_mid) <= lim]
+    oky = [py for py in range(H - vh + 1) if unlit(px_mid, py) <= lim]
+    cx_lo = (okx[0] * S + x0 + NEEDED // 2) if okx else None
+    cx_hi = (okx[-1] * S + x0 + NEEDED // 2) if okx else None
+    cy_lo = (oky[0] * S + y0 + VIEW_HALF_Y) if oky else None
+    cy_hi = (oky[-1] * S + y0 + VIEW_HALF_Y) if oky else None
+    return (cx_lo, cx_hi), (cy_lo, cy_hi)
+
+
+def narrow(run, lo, hi, half):
+    """
+    `run` intersected with the art run a camera travel of [lo, hi] implies.
+
+    Expressing the coverage limit AS AN ART RUN is what makes this safe: every
+    guard in `fit`/`fit_y` -- art-shorter-than-the-window, the scripted-range
+    refusal, PIN_SLACK, the int16 bounds -- then applies to it unchanged, and a
+    field this cannot measure keeps exactly the behaviour it has today.
+
+    `half` IS PER AXIS AND SO IS THE MINIMUM. The window is 428 units wide and
+    240 tall; testing the vertical run against 428 refused every vertical
+    narrowing there was, silently, and `mtcrl_5` came out unchanged on the axis
+    the defect is on. `2 * half` is the window on whichever axis this is.
+    """
+    if run is None or lo is None or hi is None:
+        return run
+    a0, a1 = run
+    n0, n1 = max(a0, lo - half), min(a1, hi + half)
+    if n1 - n0 < 2 * half:               # never hand `fit` a shorter run than
+        return run                       # it would refuse anyway -- say
+    return (n0, n1)                      # nothing rather than something wrong
+
+
 def fit(rng, art):
     """
     A tightened copy of `rng`, or None to leave it exactly as it is.
@@ -518,6 +720,31 @@ def fit_plan(raw_of, ranges, log=lambda *_: None):
                              parts)
         except Exception:                                      # noqa: BLE001
             arty = None
+        # ---- and both narrowed by what is actually LIT. See lit_travel().
+        #
+        # The layer-1/2 run says where TILES are; this says where the player
+        # sees PICTURE. Where they agree nothing changes, which is every field
+        # whose backdrop is layer 1 -- most of the game. Where they disagree it
+        # is because the backdrop is on a layer `art_run` does not read, and
+        # the disagreement is the black band.
+        if LIT_COVER:
+            try:
+                lt = lit_travel(parts)
+            except Exception:                                  # noqa: BLE001
+                lt = None
+            if lt is not None:
+                (cxl, cxh), (cyl, cyh) = lt
+                _a2 = narrow(art, cxl, cxh, VIEW_HALF)
+                if _a2 != art:
+                    stats['lit_x'] = stats.get('lit_x', 0) + 1
+                    stats.setdefault('lit_fields', []).append(name)
+                art = _a2
+                _y2 = narrow(arty, cyl, cyh, VIEW_HALF_Y)
+                if arty is not None and _y2 != arty:
+                    stats['lit_y'] = stats.get('lit_y', 0) + 1
+                    if name not in stats.get('lit_fields', []):
+                        stats.setdefault('lit_fields', []).append(name)
+                arty = _y2
         if arty is not None:
             vbefore = bare_y(*clamp_of_y(rng), arty)
             inverted = clamp_of_y(rng)[0] > clamp_of_y(rng)[1]
