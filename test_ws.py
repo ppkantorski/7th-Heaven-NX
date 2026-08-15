@@ -163,6 +163,18 @@ def test_clamp_identity_synthetic():
                 # `clamped_range` returns None when it refuses; the refusal
                 # is only allowed where applying it would be degenerate.
                 if new is None and WS.clamp_delta(rng, wide) != 0:
+                    # Back to `>= 320`: FINDINGS-187 retracted FINDINGS-177,
+                    # so a delta that lands on exactly 320 is APPLIED again.
+                    # The note below is kept for the record.
+                    # `> 320`, not `>= 320`. FINDINGS-177 made
+                    # `clamped_range` refuse a result of EXACTLY 320 -- that
+                    # is a clamp of `0 .. 0`, a camera pinned to a point --
+                    # and this line was left at `>=`, so the suite has been
+                    # red on 684 sizes ever since and nobody could tell a new
+                    # break from the old one. The refusal at exactly 320 is
+                    # the intended behaviour; keeping the window on the art
+                    # for those fields is `ff7nx_camfit`'s job, not this
+                    # identity's. See FINDINGS-184.
                     if size - 2 * WS.clamp_delta(rng, wide) >= 320:
                         bad += 1
                         print('    refused a legal delta at size=%d' % size)
@@ -211,13 +223,43 @@ def test_gate_is_mode_not_range():
     plan_on, res_on, _ = WS.plan_ranges(before, cfg, {}, clamp=True)
     check(res_on['narrowfld']['mode'] != W.WM_DISABLED,
           'an explicit `mode` switches it on WITHOUT widening the range')
+
+    # THIS ASSERTION USED TO READ `'narrowfld' in plan_on`, AND IT HAD BEEN
+    # FAILING SINCE FINDINGS-177.
+    #
+    # FFNx's identity collapses a 400-unit range to 320, which pins the
+    # camera to a point. FINDINGS-177 decided that was worse than keeping
+    # the travel the field shipped with, and added the `<= 2 * 160` guard
+    # that makes `clamped_range` return None here. The test was not updated,
+    # so the tree carried a red test that hid real ones.
+    #
+    # Neither answer was complete, because both were arguing about the clamp
+    # while the real quantity -- how wide the VIEW is -- lives in section 9.
+    # `ff7nx_camfit` measures it and tightens the clamp until the window
+    # cannot leave the art, which is a stronger guarantee than either: 108
+    # fields on build 79 were scrolling into black with the guard in place,
+    # including `las4_1`, and none are now.
+    #
+    # So the contract this test defends is the GATE -- mode, not range --
+    # and the clamp's own behaviour on a collapsing range is FINDINGS-177's
+    # to state. See FINDINGS-184.
     check('narrowfld' in plan_on,
-          'and the clamp then applies -- this is the 306-field case a '
-          'range-based gate silently skips')
+          'and the clamp then applies -- FINDINGS-177 refused a range that '
+          'collapses to 320 and that is RETRACTED (FINDINGS-187): the pin IS '
+          'the answer, and 88 fields were showing black pillars without it')
     got = plan_on['narrowfld']
     want = ffnx_bounds(-200, 200, True)
     check((got['left'] + 160, got['right'] - 160) == want,
-          'and it lands on FFNx’s bounds %s' % (want,))
+          'and it lands on FFNx bounds %s -- a pinned camera' % (want,))
+
+    wide = {'widefld': {'left': -400, 'right': 400, 'top': -120,
+                        'bottom': 120, 'width': 800, 'height': 240}}
+    plan_w, _res_w, _ = WS.plan_ranges(wide, {}, {}, clamp=True)
+    got = plan_w['widefld']
+    want = ffnx_bounds(-400, 400, True)
+    check((got['left'] + 160, got['right'] - 160) == want,
+          'a range that does NOT collapse still lands on FFNx’s bounds %s'
+          % (want,))
 
 
 def test_2d_projection():

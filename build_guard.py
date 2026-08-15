@@ -296,6 +296,110 @@ import sys
 #
 # RUN `_fxpx.py` ON THE OUTPUT. Expect 0 px-mismatched fx pairs. 90 seconds,
 # and it is the check that would have stopped build 69.
+# ------------------------------- BUILD 78. DIAGNOSTIC, NOT A SHIPPING BUILD.
+# `settings.json __global__.field_frame : true -> false`.  FINDINGS-181.
+#
+# THE STOCK CONTROL IS WHAT SETTLED THIS. With every mod off, `las4_1` renders
+#
+#     content 960 x 672  at x 160..1120, y 24..696
+#     -> 160px bars BOTH sides, 24px top and bottom -- CENTRED
+#     -> 960 = 320*3, 672 = 224*3 -- a 4:3 field, pillarboxed, models visible
+#
+# and our build renders
+#
+#     content 802 x 589  at x 0..802, y 0..589
+#     -> 0px left, 478px right, 0px top, 131px bottom -- AT THE ORIGIN
+#
+# `las4_1` is a 4:3 field. Its camera range is 384, below FFNx's 427 gate, and
+# it has no widescreen art. The stock game pillarboxes it and so would FFNx.
+#
+# Our framing stage removes the bars from EVERY field unconditionally:
+#
+#     letterbox quads      OFF   @ +0x10F3DDC
+#     layer 1/2/3/4 origin 224 -> 232
+#     sprite origin        224 -> 240
+#     viewport y             0 -> 16
+#
+# Take the pillarbox away from a field that needs it, without re-centring, and
+# the picture sits at the origin -- which is exactly the 0/478 asymmetry
+# measured above. The origin shifts then put the models outside the drawn rect,
+# which is why no character is visible.
+#
+# FFNx does not do this globally: `ff7nx_letterbox.enabled()`'s own docstring
+# says "its uncrop helpers are all reached through `is_fieldmap_wide()`".
+#
+# PREDICTION, and it is falsifiable: `las4_1` comes back CENTRED with 160px
+# bars and the party visible. If it does not, the letterbox set is not the
+# cause and the next suspect is `widescreen = 'ws-3d'`.
+#
+# COST: the whole game reverts to letterboxed 4:3 framing for this build, and
+# `_ff` also drives MOVIE_ALIGN_ENV, so FMV framing reverts with it. This is a
+# DIAGNOSTIC. Restore from settings.json.bak-field_frame afterwards.
+#
+# IF CONFIRMED, the fix is NOT to leave it off -- it is to gate the letterbox
+# removal per field on `is_fieldmap_wide()`, using `widescreen_fields.py`,
+# which is already emitted (default WIDE, 61 exceptions) and which these
+# patches currently never consult.
+#
+# NOTHING ELSE CHANGED: widescreen 'ws-3d', field_buffer 3, page_px 512,
+# truecolor 3, fps_60, margin_art 2 all as build 76.
+#
+# ---------------------------------------------------------------- BUILD 75
+# THE NORTHERN CAVE FIELD WAS MISIDENTIFIED, AND WE PIN ITS CAMERA.
+# One character: `ff7nx_ws.clamped_range`, `<` -> `<=`. FINDINGS-177.
+#
+# THE FIELD IS `las4_1`, NOT `las0_2`. The reporter's screenshot is the round
+# pit with the green glow; rendering the candidates identifies it as `las4_1`.
+# HANDOFF-166 and HANDOFF-167 s5.1 named `las0_2`, and every measurement since
+# -- the camera range, the 256 array, the page cap, the window width -- was
+# aimed at a field that was never the one on screen.
+#
+# `las4_1` differs from `las0_2` in exactly the way that matters:
+#
+#     las0_2   section 7 (camera range) BYTE-IDENTICAL to vanilla
+#     las4_1   section 7 CHANGED:  -192..192 (384)  ->  -160..160 (320)
+#
+# The stock functions use the range only as `left + 160 .. right - 160`, so:
+#
+#     vanilla  -192..192  ->  -32..32     64 units of camera travel
+#     ours     -160..160  ->    0..0      THE CAMERA CANNOT MOVE
+#
+# and the field holds 448 units of art it can no longer reach.
+#
+# `clamped_range` already documents the hazard -- "less than the stock 320
+# units of view, which would clamp the camera to a point" -- and then tests
+# `< 2 * HALF_WIDTH_43`. Exactly 320 is not less than 320, so it passes, and
+# exactly 320 IS the point.
+#
+# MEASURED over all 709 vanilla fields: **81 fields were being written to a
+# range that pins the camera**, by vanilla range --
+#     336:2  352:10  368:6  376:1  384:30  400:26  416:6
+# `las4_1` is one of the thirty at 384. `las0_2` is not affected at all (its
+# range is the stock 320, so nothing was ever written for it).
+#
+# AND THE IDENTITY WAS NEVER ACHIEVABLE FOR THESE FIELDS. FFNx widens the VIEW
+# with a larger `half_width` (191 for a 384 range); the stock port's viewport
+# is hardwired to +/-160 and no edit to section 8 can change it. Writing a
+# narrower range does not widen the view, it only moves the clamp -- and here
+# it deletes travel the game shipped with.
+#
+# AFTER THE FIX, MEASURED:
+#     fields still clamped        341   identity EXACT in all 341
+#     fields left at vanilla      370   (289 that were never written + the 81)
+#     tests/test_fieldwide.py     89,057 checks passed
+#     tests/test_wsdata.py        all good
+#     test_summarise.py           passes
+#
+# So where the identity CAN be reproduced it still is, exactly; where it
+# cannot, the field is left as the game shipped it -- not widened, but whole.
+#
+# PREDICTION: `widescreen: N camera range(s)` drops by 81. The field
+# background counters MUST NOT MOVE AT ALL -- this touches section 8 only.
+#
+# ON HARDWARE: the bottom of the Northern Cave (`las4_1`) -- the save file
+# goes straight there. The camera should move again and the frame should fill.
+# Then any of the other 80: `ancnt*`, `anfrst_*` and the 384/400 group.
+#
 # ---------------------------------------------------------------- BUILD 74
 # THE LAST WALL MARKET SQUARES. ONE FLAG.
 #   ff7nx_marginart.EMPTY_ATLAS_IS_NOT_A_CUTOUT = True   FINDINGS-174

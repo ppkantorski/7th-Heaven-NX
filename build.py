@@ -46,6 +46,7 @@ import ff7nx_uiclip
 import ff7nx_credits
 import ff7nx_uncrop
 import ff7nx_marginblack
+import ff7nx_blackcell
 import ff7nx_marginpage
 import ff7nx_marginpal
 import ff7nx_palkey
@@ -100,6 +101,19 @@ FIELD_BG_MAX_RAW = 0
 # one unlucky field away from dropping something again.
 FIELD_BG_BUFFER_MAX = 16 * 1024 * 1024
 FIELD_BG_RAW_CAP = FIELD_BG_BUFFER_MAX * 4 // 5
+
+# Fields whose BACKGROUND is left at stock -- no Cosmos section 9, no margin
+# passes, no repack. A DIAGNOSTIC, not a setting: see the long note at the use
+# site in `_convert_field_backgrounds`. Empty in a shipping build.
+#
+#   FIELD_BG_SKIP_FIELDS = frozenset({'las0_2'})   <- the isolation experiment
+#   RESULT, build 77: `las4_1` came out BYTE-IDENTICAL TO VANILLA in all nine
+#   sections -- confirmed against the shipped archive -- and the field looked
+#   "lower resolution but 100% the same". Lower resolution proves the skip
+#   worked; identical proves THE FIELD BACKGROUND IS NOT THE CAUSE.
+#   Emptied again: it costs the field its upscale and buys nothing.
+#   FINDINGS-179.
+FIELD_BG_SKIP_FIELDS = frozenset()
 import dds_decode
 from PIL import Image
 
@@ -2832,6 +2846,48 @@ def _convert_field_backgrounds(archive, payloads, log, dds_sources=()):
         entry = archive.index[name]
         if not archive.is_field(entry):
             continue
+        # ---- ONE FIELD BACK TO STOCK, DELIBERATELY. FINDINGS-176.
+        #
+        # `las0_2` (bottom of the Northern Cave) has been broken for many
+        # sessions -- image skewed to the top-left, no character, crash on
+        # movement -- and every hypothesis so far has died:
+        #
+        #   camera range      its section 8 is byte-identical to vanilla and
+        #                     its range is the stock 320, so the camera cannot
+        #                     travel at all           (FINDINGS-168 s1)
+        #   the 256 array     Cosmos's own chunk.9 measures the same 256 in
+        #                     window and runs on PC   (FINDINGS-168 s1.4)
+        #   page count        "the build that crashed and the build that did
+        #                     not had IDENTICAL page counts in the fields that
+        #                     crashed" -- the note 100 lines below
+        #   our own data      it renders CORRECTLY offline, whole scene, not
+        #                     skewed (render_field, build 74 vs vanilla)
+        #   field logic       sections 0,1,2,4,5,6,7 are BYTE-IDENTICAL to
+        #                     vanilla; we touch only section 3 (5 entry-0
+        #                     bytes) and section 9
+        #
+        # So the next question is the one nobody has asked: is it the
+        # background at all? Naming a field here reverts its background to
+        # STOCK -- no Cosmos section 9, no margin passes, no repack -- while
+        # the rest of the archive builds normally.
+        #
+        #   still broken  ->  it is NOT the field background. Stop looking
+        #                     here and look at the texture pool, the exefs
+        #                     patches, or the field's own model/script load.
+        #   fixed         ->  it IS the background, and bisecting is then
+        #                     cheap: put it back and drop MAX_TRUECOLOR_PAGES
+        #                     for this field, then the margin passes, and so
+        #                     on.
+        #
+        # EMPTY IN A SHIPPING BUILD. This costs the named field its upscale,
+        # so it is a diagnostic, not a fix -- although leaving `las0_2` stock
+        # would be a defensible workaround if the background turns out to be
+        # the cause and nothing cheaper helps.
+        if name.lower().split('.')[0] in FIELD_BG_SKIP_FIELDS:
+            log(f'  field background: {name} left at STOCK '
+                f'(FIELD_BG_SKIP_FIELDS -- diagnostic, FINDINGS-176)')
+            payloads.pop(name, None)
+            continue
         blob = payloads.get(name)
         if blob is not None:
             if not _is_lzs_wrapped(blob):
@@ -4176,6 +4232,73 @@ def _field_model_report(name, mod_files, van, log):
             'textured models)')
 
 
+def _lookup_cell(filename):
+    """
+    FF7's lookup-table cell for an LGP entry name, 0..899.
+
+    Reproduces `char_to_lookup_value` from PyFF7 (itself taken from the
+    reference lgp.c), which is VERIFIED against Square's own tables: it
+    regenerates the stored 3600-byte table byte-exactly for vanilla char.lgp,
+    battle.lgp, magic.lgp, flevel.lgp, world_us.lgp and disc_us.lgp.
+
+    The collisions are real and deliberate: digits share values with 'a'-'j',
+    '_' with 'k', '-' with 'l', and a '.' second character folds an entry into
+    its first character's "no second character" cell.
+    """
+    def value(c):
+        if c == '.':
+            return -1
+        if c == '_':
+            return 10
+        if c == '-':
+            return 11
+        if c.isdigit():
+            return ord(c) - ord('0')
+        if c.isalpha():
+            return ord(c.lower()) - ord('a')
+        raise ValueError(f'invalid LGP filename character {c!r}')
+    base = filename.split('/')[-1]
+    return value(base[0]) * 30 + (value(base[1]) if len(base) > 1 else -1) + 1
+
+
+def _lookup_unreachable(path):
+    """
+    Entry names present in an LGP's TOC that the GAME cannot find.
+
+    Walks the archive the way the engine does -- name -> cell -> (first index,
+    count) run -> linear scan of that run -- and returns every name the scan
+    misses. Returns [] for a healthy archive; every vanilla archive scores 0.
+    """
+    with open(path, 'rb') as f:
+        data = f.read()
+    count = struct.unpack('<i', data[12:16])[0]
+    off = lgp.CREATOR_LEN + 4
+    names = []
+    for _ in range(count):
+        names.append(data[off:off + 20].split(b'\0')[0]
+                     .decode('latin1').lower())
+        off += lgp.TOC_ENTRY_LEN
+    table = [struct.unpack('<HH', data[off + i * 4:off + i * 4 + 4])
+             for i in range(900)]
+    bad = []
+    for nm in names:
+        try:
+            cell = _lookup_cell(nm)
+        except (ValueError, IndexError):
+            bad.append(nm)
+            continue
+        if not 0 <= cell < 900:
+            bad.append(nm)
+            continue
+        start, n = table[cell]
+        if n == 0 or not 0 < start <= len(names):
+            bad.append(nm)
+            continue
+        if nm not in names[start - 1:start - 1 + n]:
+            bad.append(nm)
+    return bad
+
+
 def _build_model_archive(name, archive_path, mod_files, romfs, pack_lgp,
                          log, folder_of=None, battle_bg_native_names=None):
     """
@@ -4272,10 +4395,35 @@ def _build_model_archive(name, archive_path, mod_files, romfs, pack_lgp,
     os.makedirs(os.path.dirname(dest), exist_ok=True)
     if os.path.exists(dest):
         os.remove(dest)
-    # Sort entries by lowercased name, exactly as PyFF7's lgp_pack command
-    # does, so the archive is byte-identical to a hand-built one (pack_lgp
-    # itself does not sort -- it packs in the order it is given).
-    files = sorted(filemap.items(), key=lambda kv: kv[0])
+    # Sort entries by LOOKUP CELL first, then by lowercased name.
+    #
+    # THIS ORDER IS NOT COSMETIC AND A PLAIN NAME SORT CORRUPTS THE ARCHIVE.
+    #
+    # An LGP's 3600-byte lookup table stores, per (first char, second char)
+    # cell, a (first TOC index, count) PAIR -- a RUN. Every entry that maps to
+    # a cell must therefore be CONTIGUOUS in the TOC, or the run covers the
+    # wrong entries and the game cannot find the ones that fell outside it.
+    #
+    # FF7's char_to_lookup_value maps '0'-'9' to 0-9 -- the SAME values as
+    # 'a'-'j' (and '_' to 10 = 'k', '-' to 11 = 'l'). So `h3.tex` shares a cell
+    # with every `hd*` name. Sorted by name, `h3` lands before `haaa` while
+    # `hd*` lands after `hc*`: not contiguous. pack_lgp then writes
+    # (start = h3.tex, count = 62), a run of ha*/hb*/hc* files, and ALL 61
+    # `hd*` entries become unreachable by the game's own lookup.
+    #
+    # MEASURED, build 79: Ninostyle ships `h3.tex` and `p3.tex`. `hd*` held
+    # `hdaf.a` -- Yuffie's field animation -- and 22 fields load it, including
+    # las4_1, las4_0 and las4_4, the bottom of the Northern Cave. Loading one
+    # crashed in field_upd_single_model (x86 0x636C41). Deleting char.lgp
+    # "fixed" it because the base game's archive has a correct table.
+    # See FINDINGS-183.
+    #
+    # For names whose first two characters are both letters, the cell index is
+    # monotonic in those characters, so this key is IDENTICAL to a name sort.
+    # Only names with a digit/underscore/period in the first two characters
+    # move -- battle.lgp, magic.lgp and world_us.lgp come out byte-identical.
+    files = sorted(filemap.items(),
+                   key=lambda kv: (_lookup_cell(kv[0]), kv[0]))
     pack_lgp(files, dest)
 
     # Verify: reopen and confirm every entry we asked for is present.
@@ -4285,6 +4433,19 @@ def _build_model_archive(name, archive_path, mod_files, romfs, pack_lgp,
         os.remove(dest)
         log(f'  ! {name}: {len(missing)} entries missing after pack; '
             'output rejected (please report)')
+        return None
+
+    # Verify HARDER: being present in the TOC is not enough. Simulate the
+    # game's own lookup -- cell -> run -> linear scan -- for every entry. This
+    # is the gate that would have caught the h3.tex collision in seconds.
+    unreachable = _lookup_unreachable(dest)
+    if unreachable:
+        os.remove(dest)
+        log(f'  ! {name}: {len(unreachable)} entries are in the TOC but '
+            f'UNREACHABLE through the lookup table '
+            f'(e.g. {", ".join(unreachable[:5])}); output rejected. '
+            'The TOC ordering and the lookup table disagree -- see the '
+            'sort key above.')
         return None
     out_size = os.path.getsize(dest)
     van_size = os.path.getsize(archive_path)
@@ -4667,6 +4828,7 @@ def _build_flevel(archive_path, chunks, field_files, romfs, log,
     # black blobs. Every offline renderer we own decodes with `pal %% npg`,
     # so this is invisible until it reaches hardware.
     _pr_art = None
+    _bc_art = None      # the DDS provider ff7nx_blackcell needs, set below
     if dds_sources:
         try:
             _pr_art = field_bg_repack.ArtProvider(
@@ -4692,6 +4854,7 @@ def _build_flevel(archive_path, chunks, field_files, romfs, log,
                 'MARGIN + INTERIOR -- Cosmos art replaces vanilla inside the '
                 '4:3 picture too, on layer 1' if _ma_scope == 'all'
                 else 'MARGIN ONLY -- the 4:3 picture is not touched'))
+            _bc_art = ff7nx_marginart.provider_source(_art)
             ma_stats = ff7nx_marginart.apply_to_flevel(
                 archive, payloads, ff7nx_marginart.provider_source(_art),
                 encode=lambda raw: _encode_field_cached(archive, raw), log=log,
@@ -4706,6 +4869,15 @@ def _build_flevel(archive_path, chunks, field_files, romfs, log,
             mpal_line = ff7nx_marginpal.summarise(ma_stats.get('pal'))
             if mpal_line:
                 log('  ' + mpal_line)
+
+            if not ff7nx_blackcell.disabled():
+                bc0 = ff7nx_blackcell.apply_to_flevel(
+                    archive, payloads, _bc_art,
+                    encode=lambda raw: _encode_field_cached(archive, raw),
+                    log=log)
+                bc0_line = ff7nx_blackcell.summarise(bc0)
+                if bc0_line:
+                    log(bc0_line)
 
             # AFTER the fill and BEFORE the repack, and both halves of that
             # matter.
@@ -4756,6 +4928,44 @@ def _build_flevel(archive_path, chunks, field_files, romfs, log,
 
     if ff7nx_fieldbg.enabled():
         _convert_field_backgrounds(archive, payloads, log, dds_sources)
+
+    # RUN TWICE, BEFORE AND AFTER THE REPACK, AND BOTH ARE NEEDED.
+    #
+    # BEFORE (in the margin block above): Cosmos names its art
+    # `<field>_<page>_<pal>.dds` against the page the cell is on THEN, so that
+    # is the only point at which the lookup resolves. It fixed 3312 tiles in
+    # 77 fields on build 81.
+    #
+    # AFTER (here): the repack renumbers and promotes, and it CREATES empty
+    # cells of its own. MEASURED on build 81's shipped archive -- `trnad_3`
+    # went from ONE black tile on depth-1 slot 0 to SEVEN on depth-2 slot 26,
+    # and 1309 tiles survived a log line that said "3312 fixed". This second
+    # pass catches the ones whose DDS still resolves against the new page
+    # number: cosmo, fr_e and qc, 280 tiles, all depth-2.
+    #
+    # Neither call can regress anything -- both only ever write a cell that is
+    # entirely empty, and both discard their own work on a field if the black
+    # count does not fall. See FINDINGS-186.
+    #
+    # Layer 1 is not colour-keyed -- FFNx sets color_key only for type 2
+    # (ff7/field/field.cpp:56) -- so a layer-1 tile sampling an all-zero cell
+    # is drawn as a BLACK SQUARE. `ff7nx_marginart` is RIGHT to refuse those
+    # cells: a depth-1 page is one index array and the cell is shared with
+    # layer-2+ tiles at other palettes.
+    #
+    # This pass ran BEFORE the repack in build 81 and the repack undid it.
+    # MEASURED: `trnad_3` went from ONE black tile on depth-1 slot 0 to SEVEN
+    # on depth-2 slot 26, because the repack promoted those cells onto a
+    # truecolor page and left them empty there. The log said "3312 fixed" and
+    # the shipped archive still had 1309. Running after the repack is the only
+    # point at which the pages are final. See FINDINGS-186.
+    if _bc_art is not None and not ff7nx_blackcell.disabled():
+        bc_stats = ff7nx_blackcell.apply_to_flevel(
+            archive, payloads, _bc_art,
+            encode=lambda raw: _encode_field_cached(archive, raw), log=log)
+        bc_line = ff7nx_blackcell.summarise(bc_stats)
+        if bc_line:
+            log(bc_line)
 
     # AFTER the background conversion, and that ordering is not cosmetic: the
     # repack builds one truecolor texture per (page, cell, PALETTE) actually

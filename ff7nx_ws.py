@@ -108,6 +108,7 @@ if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
 import ff7nx_wsdata as W                                       # noqa: E402
+import ff7nx_camfit as CF                                      # noqa: E402
 
 WIDESCREEN_ENV = 'SEVENTH_NX_WIDESCREEN'
 
@@ -483,6 +484,61 @@ def clamped_range(rng, wide):
     if not (-0x8000 <= out['left'] <= 0x7FFF
             and -0x8000 <= out['right'] <= 0x7FFF):
         return None
+    # `<=`, NOT `<`. FINDINGS-177, and the docstring above already said why.
+    #
+    # "less than the stock 320 units of view, which would clamp the camera to
+    # a point" -- but the stock functions use the range ONLY as
+    # `left + 160 .. right - 160`, so a range of EXACTLY 320 gives
+    # `0 .. 0`. That is the point, and `< 320` let it through.
+    #
+    # MEASURED on build 74's archive, first 400 fields: 36 fields are written
+    # to exactly 320 and therefore have NO camera travel at all --
+    #
+    #     vanilla range -> written    count
+    #        336 -> 320                 1
+    #        368 -> 320                 3
+    #        376 -> 320                 1
+    #        384 -> 320                14     <- las4_1 is here
+    #        400 -> 320                11
+    #        416 -> 320                 3
+    #
+    # `las4_1` (bottom of the Northern Cave) is one of the 384s: vanilla
+    # -192..192 gives the stock code -32..32, i.e. 64 units of travel, and we
+    # replace it with -160..160, which gives 0..0. The field holds 448 units
+    # of art and the camera can no longer reach any of it.
+    #
+    # AND THE IDENTITY CANNOT BE ACHIEVED FOR THESE FIELDS ANYWAY. FFNx widens
+    # the VIEW by using a larger `half_width` (191 for a 384 range); the stock
+    # port's viewport is hardwired to +/-160 and editing section 8 cannot
+    # change it. Writing a narrower range does not widen the view -- it only
+    # moves the clamp, and here it removes the travel vanilla had.
+    #
+    # So leave them exactly as the game shipped them: not widened, but whole.
+    # `<`, NOT `<=`. FINDINGS-177 IS RETRACTED, AND IT COST TWO REGRESSIONS.
+    #
+    # FINDINGS-177 changed this to `<=` so that a range collapsing to exactly
+    # 320 -- a camera pinned to a point -- was refused, on the reasoning that
+    # pinning "removes the travel vanilla had". That reasoning assumed the
+    # port's view is the 320 units its `#0xa0` code believes. It is not: the
+    # framing stage shows 426.67. Every unit of "travel" it preserved is a
+    # unit of scrolling into art that does not exist.
+    #
+    # MEASURED on Cosmos's config, all 649 wide fields:
+    #
+    #     clamp written normally      561
+    #     REFUSED by the guard         88     <- every one of them
+    #     of those, FFNx would PIN     88        pinned by FFNx
+    #
+    # `md8_1` (Sector 8, before Aerith) and `las4_1` (bottom of the Northern
+    # Cave) are two of the 88, and both were reported from hardware as black
+    # pillars that appear as soon as the camera moves. Their config says
+    # -192..192, FFNx's `half_width` is then 191, and FFNx clamps them to
+    # 0..0. The mod told us exactly what to do and this line discarded it.
+    #
+    # PINNING IS NOT A LOSS HERE, IT IS THE ANSWER. background.cpp:433's own
+    # comment on that formula reads "This centers the background if
+    # necessary", and `md8_1`'s own script scrolls to (0, 0) -- the framing
+    # the reporter describes as correct. See FINDINGS-187.
     if out['right'] - out['left'] < 2 * HALF_WIDTH_43:
         return None
     out['width'] = out['right'] - out['left']
@@ -599,6 +655,71 @@ def apply_to_flevel(archive, payloads, config, movie_config=None,
                                         clamp=clamp)
     stats['read'] = len(before)
     stats['written'] = 0
+
+    # ------------------------------------------------------------ camfit
+    # The clamp identity above is exact about the ARITHMETIC and blind about
+    # the VIEW. `clamped_range` reproduces FFNx's bounds, but FFNx's bounds
+    # were computed for FFNx's view; this build's framing stage shows 426.67
+    # field units where the port's `#0xa0` code assumes 320. Fields whose art
+    # stops inside that extra 106.67 show a black bar at the ends of the
+    # scroll -- 108 of them on build 79, `las4_1` among them, reported from
+    # hardware as "a black bar on the left, and on the right when I run
+    # right". ff7nx_camfit measures the art in section 9 and tightens the
+    # clamp until the window cannot leave it. It only ever tightens, so a
+    # field that renders correctly today comes out a no-op.
+    if clamp and not CF.disabled():
+        final = dict(before)
+        final.update(plan)
+        wide = {n: r for n, r in final.items()
+                if resolved.get(n, {}).get('mode') != W.WM_DISABLED}
+
+        def _raw_of(name, _c={}):
+            if name in _c:
+                return _c[name]
+            entry = archive.index.get(name)
+            raw = None
+            if entry is not None:
+                try:
+                    payload = payloads.get(name)
+                    raw = (lgp.lzs_decompress(payload[4:]) if payload
+                           else archive.decompressed(entry))
+                except Exception:                              # noqa: BLE001
+                    raw = None
+            _c.clear()          # one field at a time; these are megabytes
+            _c[name] = raw
+            return raw
+
+        try:
+            fitted, fstats = CF.fit_plan(_raw_of, wide, log=log)
+        except Exception as exc:                               # noqa: BLE001
+            fitted, fstats = {}, None
+            log('  ! widescreen: camera fit skipped (%s)' % exc)
+        if fstats is not None:
+            plan.update(fitted)
+            stats['camfit'] = fstats
+            log('  widescreen: camera fit -- %d field(s) tightened so the '
+                '16:9 window cannot scroll off the art (worst bare band '
+                '%d -> %d units); %d field(s) have less than %d units of art '
+                'and were left alone (set SEVENTH_NX_NO_CAMFIT=1 to disable)'
+                % (fstats['fitted'], fstats['worst_before'],
+                   fstats['worst_after'], fstats['short'], CF.NEEDED))
+            if fstats.get('fitted_y'):
+                log('  widescreen: camera fit (VERTICAL) -- %d field(s) '
+                    'fitted so the 240-unit frame cannot scroll off the art '
+                    '(worst bare band %d -> %d units)'
+                    % (fstats['fitted_y'], fstats['worst_y_before'],
+                       fstats['worst_y_after']))
+            if fstats.get('inverted'):
+                log('    %d field(s) had INVERTED vertical bounds -- '
+                    'top+120 > bottom-120, so the camera landed on whichever '
+                    'of the two clamps ran last and the picture lost 8 units '
+                    'at one edge or the other: %s'
+                    % (len(fstats['inverted']),
+                       ', '.join(sorted(fstats['inverted']))))
+            for nm, band in fstats['scripted']:
+                log('    %s: range is far wider than its art (%d units bare) '
+                    '-- left alone, that range is not describing this '
+                    'background' % (nm, band))
 
     # The wide/not-wide table the FRAMING stage will need. Emitted here
     # because `resolved` exists here and nowhere else, and having it on disk
