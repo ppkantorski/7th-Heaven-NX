@@ -948,12 +948,51 @@ def _detail_transfer(art565, tgt565):
     return (((r << 11) | (g << 5) | b) & ~np.uint16(0x0020)).astype(np.uint16)
 
 
-def black_fraction(arrays, pal565, k):
+def black_fraction(pages, arrays, pal565, k):
     """How much of this cell is OPAQUE BLACK on its paletted page.
 
     Index 0 is the colour key and is excluded: it is not black, it is the
     key. Any other index whose palette colour is 0x0000 is real, opaque,
     dead black.
+
+    THE CELL IS NOT ALWAYS 16 UNITS -- FINDINGS-215, and this is the SAME
+    LITERAL `_uses_key` carried until build 103 (FINDINGS-213). HANDOFF-214
+    s6 listed this site as known-bad and untested; it is neither now.
+
+    A `size_flag` page is an 8x8 grid of 32-unit cells, so a TILE-wide window
+    reads only the cell's TOP-LEFT QUADRANT. A cell whose quadrant is
+    entirely black but whose other three quadrants carry art scores 1.0 and
+    is vetoed by the `TRUE_BLACK` filter as "wholly black" when it is not.
+
+    MEASURED on `mtcrl_4` -- the Mt. Corel coaster, whose railroad track the
+    user reported as jagged against its parallax backdrop:
+
+        source slot   vetoed by the 16x16 quadrant   by the true 32x32 cell
+            3               20 / 64                        0 / 64
+            5                2 / 48                        0 / 48
+            4                0 / 64                        0 / 64
+
+    Those false vetoes are not merely 22 lost cells. The parallax half admits
+    a source page only when EVERY key on it promotes ("a slot that cannot be
+    afforded WHOLE is not promoted at all", see the seat split), so 20 false
+    vetoes on slot 3 and 2 on slot 5 REFUSE BOTH PAGES ENTIRELY -- 112 of
+    `mtcrl_4`'s 176 parallax cells, left at 256px 8-bit directly against the
+    64 that promoted to 512px truecolor. That resolution seam is the jagged
+    track.
+
+    WHY THIS CANNOT COST A CELL, STRUCTURALLY AND NOT JUST EMPIRICALLY.
+    `TRUE_BLACK` is 1.0, and the filter keeps a cell when the fraction is
+    STRICTLY BELOW it -- so the veto fires only when EVERY texel in the
+    window is opaque black. The corrected window is a SUPERSET of the
+    quadrant, and "every texel is black" over a superset is strictly harder
+    to satisfy. The corrected function can therefore veto FEWER cells and
+    never more, so no field can lose a promotion because of this.
+    THAT GUARANTEE IS TIED TO `TRUE_BLACK == 1.0`: at any lower threshold the
+    mean over a wider window may rise as well as fall, and this argument does
+    not hold. Re-derive it before changing that constant.
+
+    On a non-`size_flag` page `edge` evaluates to 16 and this is a literal
+    no-op, which is what bounds the change.
     """
     slot, sx, sy, pal = k
     # CLAMP, FOR THE REASON source_cell ALREADY DOCUMENTS AT LENGTH.
@@ -975,7 +1014,14 @@ def black_fraction(arrays, pal565, k):
         pal = len(pal565) - 1
     if pal < 0:
         pal = 0
-    idx = arrays[slot][sy:sy + TILE, sx:sx + TILE]
+    # The edge comes from the ARRAY'S OWN SIZE, exactly as `_uses_key` takes
+    # it, so it is right at 256px and at 512px with no second literal to keep
+    # in step.
+    p = pages[slot]
+    arr = arrays[slot]
+    grid = 8 if p.size_flag else 16
+    edge = arr.shape[0] // grid or TILE
+    idx = arr[sy:sy + edge, sx:sx + edge]
     col = pal565[pal][idx]
     return float(((col == 0) & (idx != 0)).mean())
 
@@ -1661,7 +1707,22 @@ LOW_SLOT_ORDER = 'desc'   # FINDINGS-156 placement probe. 'asc' = build 64.
 # the ARM64 image, and slots 15-23 are ADDITIVE / 24-25 AVERAGE for depth 1.
 LOW_SLOT_TOP = 14         # FINDINGS-156 placement probe. 25 = build 64.
 
-MAX_TRUECOLOR_PAGES = 3
+# RAISED 3 -> 7 WITH `field_bg_native.D2_OPAQUE_SLOTS`, BUILD 106.
+#
+# THESE TWO MUST MOVE TOGETHER AND NEITHER IS SUFFICIENT ALONE.
+# `D2_OPAQUE_SLOTS` decides how many free truecolor SLOTS exist (it is what
+# `BANDS[4]` is built from); this decides how many of them a field may SPEND.
+# Raising only the slot count leaves `cap_big = min(max_tc - have_tc, ...)`
+# at 3 and the change is inert; raising only this leaves `free_slots` at 3
+# and it is equally inert.
+#
+# AND THE SETTINGS FILE OVERRIDES THIS CONSTANT. Both build paths do
+#     MAX_TRUECOLOR_PAGES = saved['__global__']['field_bg_truecolor_pages']
+# (7th_heaven_nx.py:2943 and :3149), so `settings.json` must say 7 as well or
+# this edit does nothing at all. That is not hypothetical -- it is the same
+# shape as the dead "Field background budget (MB)" control this module's
+# byte-budget note describes.
+MAX_TRUECOLOR_PAGES = 3   # REVERTED with D2_OPAQUE_SLOTS, FINDINGS-218
 _MAX_TOTAL_PAGES_DEFAULT = 12
 
 # HOW MUCH OF A FIELD'S TRUECOLOR BUDGET THE 32-UNIT POPULATION MAY TAKE.
@@ -1963,7 +2024,7 @@ def dense_repack(sec3, sec9, field='', art_for=None, pals_for=None, px=256,
         # photographed. So blackness only wins the argument when the paletted
         # version is otherwise faithful.
         cand = [k for k in cand
-                if black_fraction(arrays, pal565, k) < TRUE_BLACK
+                if black_fraction(pages, arrays, pal565, k) < TRUE_BLACK
                 or _hb.get(k, 0.0) > HUE_BROKEN_DIST]
     # HUE-BROKEN CELLS GO FIRST. FINDINGS-149, and see HUE_FIRST above.
     # Tile reuse remains the tie-breaker inside each group, so within the
@@ -2077,6 +2138,27 @@ def dense_repack(sec3, sec9, field='', art_for=None, pals_for=None, px=256,
         max_tc = max(max_tc, LOW_SLOT_MAX_TC)
         dense_repack.low_slots_offered = (
             getattr(dense_repack, 'low_slots_offered', 0) + len(_low))
+    # HIGH SLOTS LAST. FINDINGS-217.
+    #
+    # Slots 29..32 only became available at all when D2_OPAQUE_SLOTS went to
+    # 7, and they are the ONLY slots on this port with no runtime evidence
+    # behind them -- builds 52 and 55 drew black squares there, and the fix
+    # for that (FINDINGS-168's loader bound) has never been on hardware.
+    #
+    # Left in their natural position they are handed out FIRST, because
+    # `BANDS[4]` is the head of this list. MEASURED at 7 slots: 345 of 699
+    # fields put a page in 29..32, and 339 of them gain NOTHING by it -- the
+    # low-slot probe already gave them the pages they needed, in slots that
+    # are known to render. That is 339 fields taking an unproven risk for no
+    # benefit, which is the opposite of a probe.
+    #
+    # Moving them behind the low slots makes the exposure match the benefit:
+    # a field only reaches 29..32 after it has exhausted 26..28 AND every
+    # free slot below 15, which is exactly the condition `fship_2` is in (it
+    # occupies all of 0..14) and exactly why it was stuck at 3 pages.
+    _HIGH_FIRST = 0x1D            # the STOCK loader bound, from FINDINGS-168
+    free_slots = ([s for s in free_slots if s < _HIGH_FIRST]
+                  + [s for s in free_slots if s >= _HIGH_FIRST])
     # COUNT THE ONES ALREADY THERE. 26 vanilla pages across 400 fields are
     # already depth-2; adding `max_tc` on top of those put 4 in one field.
     have_tc = sum(1 for p in pages.values() if p.depth == 2)

@@ -396,6 +396,7 @@ FIELD_BG_TRUECOLOR_CHOICES = [
     # What was actually measured is PLACEMENT, not count: slots 29+ never
     # become textures on this port (builds 52 and 55, black squares, no
     # crash). Free LOW slots draw correctly, which is why the probe exists.
+    (7, '7 pages per field — slots 26..32, needs the loader-bound patch'),
     (3, '3 pages per field \u2014 base cap; free low slots raise it further'),
     (0, 'Off \u2014 no truecolor promotion at all'),
     (2, '2 pages per field'),

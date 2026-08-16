@@ -328,6 +328,73 @@ D1_GROUPS = ((0x00, 0x0F, 4), (0x0F, 0x18, 1), (0x18, 0x1A, 0))
 # MEASURED, pages a field needs to be 100% truecolor:
 #     1p:46  2p:246  3p:166  4p:179  5p:49  6p:11  7p:4  fields
 # Seven covers the archive. Three covers 62.8% of cells.
+    # RAISED 3 -> 7, BUILD 106, FINDINGS-216.
+    #
+    # The "3" above is the record of builds 52 and 55, and the paragraph that
+    # explains them (FINDINGS-168) is the reason this can now move: the black
+    # squares were the NATIVE `field_load_textures` ending its slot loop at
+    # `cmp x23, #0x1d`, not an allocation failure and not the archive.
+    # `ff7nx_fieldbg._load_slots_word()` patches that bound, derives it from
+    # THIS constant so the two cannot drift, and refuses outright past 7
+    # because slot 0x21+ has no blend ladder on this port.
+    #
+    # The other two numbers that argued for 3 were also stale: the heap is
+    # `ff7nx_heap.HEAP_MB` = 256, not the 64 FINDINGS-106 measured, and
+    # `max_total_pages()` is 16, not 12.
+    #
+    # MEASURED, all 741 entries, `_kslotcensus.py`: 0 fields lose a promoted
+    # cell, 0 gain a page, 0 exceed the 16-page ceiling, 0 put a depth-2 page
+    # above slot 0x20. Six fields gain -- all five Highwind bridge variants
+    # (+256 cells each) and crater_1 (+64). Heaviest field background goes
+    # 11.75 -> 13.31 MB against a 256 MB heap.
+    #
+    # ---- REVERTED TO 3 AFTER BUILD 106 CRASHED ON HARDWARE. FINDINGS-218.
+    #
+    # BUILD 106 RAISED THIS TO 7 AND THE GAME ABORTS LOADING ANY SAVE.
+    # The evidence is a clean A/B and it is not arguable:
+    #
+    #   * every Rocket Town field (where the save was) is BYTE-IDENTICAL in
+    #     section 9 between the working build 105 and the crashing 106;
+    #   * the ONLY difference between the two `exefs/main` is ONE WORD --
+    #     0x10DC4A4, `cmp x23, #0x1d` -> `cmp x23, #0x21`;
+    #   * so raising the loader bound, on its own, is what crashes.
+    #
+    # WHY, FROM THE DISASSEMBLY OF THE LOOP THE BOUND TERMINATES:
+    #
+    #     0x10DC39C  mov  w20, #0xFC70 ; movk w20, #0xCF, lsl #16
+    #     0x10DC3AC  bl   #0x10FC3A0          guest -> host
+    #     0x10DC3B0  mov  x22, x0             x22 = the PAGE POINTER TABLE
+    #     0x10DC3BC  ldr  w0, [x22, x23, lsl #2]   table[slot], u32 each
+    #     0x10DC3C0  cbz  w0, skip
+    #     0x10DC3C4  bl   #0x10FC3A0          guest -> host  ON THAT POINTER
+    #     0x10DC4A4  cmp  x23, #0x1d          <- THE BOUND
+    #     0x10DC4A8  b.ne loop
+    #
+    # The bound is the ONLY thing keeping this walk inside the populated part
+    # of the table. Past it the entries are not valid guest pointers, and
+    # handing one to the guest->host translation aborts -- which is exactly
+    # the crash: `nn::diag::detail::Abort` reached through 0x10FC3A0 and
+    # map_region, with no field data involved.
+    #
+    # SO FINDINGS-168 WAS WRONG, AND SO WAS I. It read the `cmp` and
+    # concluded 29 was "this port's own narrowing" of the x86's 42. The
+    # instruction tells you the bound; it does NOT tell you what the table
+    # holds beyond it. Builds 52 and 55 (black squares) and build 106 (abort)
+    # are the SAME defect seen at two severities.
+    #
+    # The comment in `7th_heaven_nx.FIELD_BG_TRUECOLOR_CHOICES` said it
+    # already, and I talked myself past it: "Do not raise this again without
+    # runtime evidence FROM THE PORT ITSELF. Two builds and a full read of
+    # the x86 were not enough to predict it." Reading one more instruction is
+    # not runtime evidence either. That now costs three builds.
+    #
+    # WHAT WOULD ACTUALLY BE NEEDED: populate table[29..32] with valid page
+    # records before the loader runs -- i.e. patch `field_init_bg_pages`
+    # (+0x92CE70..+0x92D3A0), not just the loop bound. Until that is
+    # understood and MEASURED, this constant stays at 3.
+    #
+    # `_load_slots_word()` is subtractive at 3, so this single line also
+    # removes the module patch and restores build 105 exactly.
 D2_OPAQUE_SLOTS = 3
 
 D2_GROUPS = ((0x1A, 0x1A + D2_OPAQUE_SLOTS, 4), (0x21, 0x28, 1),
