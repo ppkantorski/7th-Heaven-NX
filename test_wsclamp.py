@@ -202,10 +202,164 @@ class TestOperandRoles(unittest.TestCase):
                                  '%s at negative camera %d' % (name, cam))
 
 
+def flip(img, name, cam=1000, lo=-400, hi=400):
+    """
+    Every `tile` offset from `cam` at which this site's branch changes answer.
+
+    THE ONLY HONEST ORACLE FOR A WRAP. `verdict()` reports KEEP/SKIP, which is
+    a CULL's vocabulary -- at a wrap site "taken" means "apply the wrap", not
+    "skip this tile", so counting gained/lost tiles there measures nothing.
+    This file already records shipping a decision made on that mistake. WHERE
+    the answer flips is well-defined at both kinds of site, so that is all
+    this reads.
+    """
+    out, prev = [], verdict(img, name, cam + lo, cam)
+    for d in range(lo + 1, hi):
+        cur = verdict(img, name, cam + d, cam)
+        if cur != prev:
+            out.append(d)
+            prev = cur
+    return out
+
+
+class TestParallaxVertical(unittest.TestCase):
+    """
+    FINDINGS-205. The vertical twin of the Mt Corel fix.
+
+    `bottom_offset` is 0 in stock and the picture runs to bg.y+16, so every
+    parallax tile in that band tests as outside the wrap window and is
+    teleported a whole layer height away. These three sites are the constant.
+    """
+
+    def test_stock_wraps_at_the_camera(self):
+        img = module()
+        for name in C.PARALLAX_BOTTOM_KNOBS:
+            with self.subTest(name):
+                self.assertEqual(
+                    flip(img, name), [0],
+                    '%s should have exactly one boundary, at the camera' % name)
+
+    def test_bias_moves_the_wrap_point_by_exactly_the_bias(self):
+        want = C.parallax_bottom()
+        img = module(C.shipped_values())
+        for name in C.PARALLAX_BOTTOM_KNOBS:
+            with self.subTest(name):
+                self.assertEqual(
+                    flip(img, name), [want],
+                    '%s must wrap at cam+%d, the same number bottom1/bottom2 '
+                    'already ship on this axis' % (name, want))
+
+    def test_all_three_move_together(self):
+        """
+        It is ONE `bottom_offset` in the C -- FFNx background.cpp:138 and :260,
+        and :261 uses it a second time as layer 4's wrap DIRECTION test. Moving
+        some and not others is the mistake that left Mt Corel half fixed.
+        """
+        v = C.shipped_values()
+        self.assertEqual({v[k] for k in C.PARALLAX_BOTTOM_KNOBS},
+                         {C.parallax_bottom()})
+
+    def test_the_x_axis_is_undisturbed(self):
+        """Adding the y set must not move where the shipped x set wraps."""
+        img = module(C.shipped_values())
+        want = C.parallax_right(C.WS_SCALE)
+        for name in C.PARALLAX_RIGHT_KNOBS:
+            with self.subTest(name):
+                self.assertEqual(flip(img, name), [want])
+
+    def test_there_is_no_vertical_cull_to_pair_these_with(self):
+        """
+        The premise HANDOFF-204 s3.3 blocked on, tested rather than asserted.
+
+        Every branch -- conditional or unconditional -- reaching either
+        pick-loop head, on the stock module. If a y-axis one ever appears here
+        the fix above is incomplete and this test is how that gets noticed.
+        """
+        img = module()
+
+        def word(va):
+            return struct.unpack_from('<I', img, va)[0]
+
+        def target(va):
+            w = word(va)
+            if (w & 0xFF000010) == 0x54000000 or (w & 0x7E000000) == 0x34000000:
+                imm = (w >> 5) & 0x7FFFF
+                return va + (imm - 0x80000 if imm & 0x40000 else imm) * 4
+            if (w & 0xFC000000) == 0x14000000:
+                imm = w & 0x3FFFFFF
+                return va + (imm - 0x4000000 if imm & 0x2000000 else imm) * 4
+            return None
+
+        # The loop's own back edge is in each set; every OTHER entry is a
+        # `continue`, i.e. a cull, and not one of them is on the y axis.
+        for head, lo, hi, want in (
+                (0xA079E0, 0xA07780, 0xA08624,
+                 {0xA07F80,          # anim_group
+                  0xA085B0}),        # back edge
+                (0xA0882C, 0xA08630, 0xA095AC,
+                 {0xA08D10, 0xA08D14,   # x <= bg.x - 352
+                  0xA08D68,             # x >= bg.x + 0   (pright4b)
+                  0xA08E80,             # anim_group
+                  0xA09000,             # palette_index
+                  0xA09538})):          # back edge
+            got = {va for va in range(lo, hi, 4) if target(va) == head}
+            self.assertEqual(got, want,
+                             'the set of branches reaching pick-loop head '
+                             '%#x changed; re-run _ycull2.py before trusting '
+                             'the parallax vertical fix' % head)
+
+
 class TestSites(unittest.TestCase):
 
     def test_every_signature_matches_the_stock_module(self):
         C.check_all(module())
+
+    def test_optional_sites_are_verified_without_raising(self):
+        """
+        Build 97 lost the ENTIRE 16:9 stage -- viewport, scissor, fade quad,
+        every camera cave -- because one optional extra could raise inside
+        `apply_module`'s transaction. HANDOFF-204 s4b.
+        """
+        img = module()
+        self.assertEqual(C.verified_optional(img, C.PARALLAX_BOTTOM_KNOBS),
+                         list(C.PARALLAX_BOTTOM_KNOBS))
+        broken = bytearray(img)
+        struct.pack_into('<I', broken, 0xA07BC4, 0xD503201F)    # nop the ldr
+        self.assertNotIn('pbottom3',
+                         C.verified_optional(bytes(broken),
+                                             C.PARALLAX_BOTTOM_KNOBS))
+        # ...and check_all, which DOES raise, must not see them at all.
+        C.check_all(bytes(broken))
+
+    def test_the_parallax_vertical_immediates_are_the_derived_values(self):
+        """
+        FINDINGS-208 corrected these. `ff7nx_uncrop` moves all four layers'
+        tile origin 224 -> 232 -- it is in every build log -- so the parallax
+        picture is `bg.y-232 .. bg.y+8`, and FFNx's own constants (256+8, 8,
+        120) were right from the start.
+
+        FINDINGS-205 s4 derived them against `ORIGIN_Y` = 224 instead and got
+        `half_height` right BY COINCIDENCE: (224+16)/2 and (232+8)/2 are both
+        120. That coincidence is what made three "independent" derivations
+        look like they agreed, and it is asserted here so it cannot pass for
+        agreement again.
+        """
+        v = C.shipped_values()
+        self.assertEqual(C.PARALLAX_ORIGIN_Y, 232)
+        self.assertEqual(v['ptop3'], C.STOCK_TOP + C.PARALLAX_UNCROP)
+        self.assertEqual(v['ptop4'], C.STOCK_TOP + C.PARALLAX_UNCROP)
+        self.assertEqual(v['ptop3'], 264)
+        self.assertEqual(v['phalf3'], 120)
+        self.assertEqual(
+            (C.PARALLAX_ORIGIN_Y + C.PARALLAX_UNCROP) // 2, 120,
+            'the parallax half_height is half the CENTRED picture')
+        self.assertEqual((C.ORIGIN_Y + C.parallax_bottom()) // 2, 120,
+                         'and the layer-1/2 arithmetic lands on the same '
+                         'number, which is the coincidence FINDINGS-205 read '
+                         'as corroboration')
+        img = module(v)
+        for name in ('ptop3', 'phalf3', 'ptop4'):
+            self.assertEqual(C.read_value(img, name), v[name])
 
     def test_a_wrong_module_is_refused(self):
         img = bytearray(module())

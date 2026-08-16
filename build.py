@@ -48,6 +48,7 @@ import ff7nx_uncrop
 import ff7nx_marginblack
 import ff7nx_blackcell
 import ff7nx_marginpage
+import ff7nx_parallaxfill
 import ff7nx_marginpal
 import ff7nx_palkey
 import field_bg_dense
@@ -4871,10 +4872,17 @@ def _build_flevel(archive_path, chunks, field_files, romfs, log,
                 log('  ' + mpal_line)
 
             if not ff7nx_blackcell.disabled():
+                # `overlay=True` ONLY HERE, and the ordering is the reason.
+                # The overlay-margin fill reads Cosmos's art by PAGE NUMBER,
+                # and Cosmos names its DDS against the page the cell is on
+                # now. The second call site below runs AFTER the repack, the
+                # compactor and the page cap have renumbered the pages, so the
+                # same lookup would return a different page's picture there.
+                # See ff7nx_blackcell.overlay_cells and FINDINGS-197.
                 bc0 = ff7nx_blackcell.apply_to_flevel(
                     archive, payloads, _bc_art,
                     encode=lambda raw: _encode_field_cached(archive, raw),
-                    log=log)
+                    log=log, overlay=True)
                 bc0_line = ff7nx_blackcell.summarise(bc0)
                 if bc0_line:
                     log(bc0_line)
@@ -4979,6 +4987,38 @@ def _build_flevel(archive_path, chunks, field_files, romfs, log,
     mb_line = ff7nx_marginblack.summarise(mb_stats)
     if mb_line:
         log('  ' + mb_line)
+
+    # LAST of the section-9 passes, and deliberately so. FINDINGS-207.
+    #
+    # Layers 3 and 4 do not cull vertically (FINDINGS-205), so what puts a
+    # parallax tile on screen is the WRAP, whose period is the trigger
+    # header's bg3/bg4_height -- a field that reads 1024 in 55 of the 96
+    # parallax layers and matches the art in only 39. Where it is wrong the
+    # layer runs out at the top of the picture instead of repeating. This
+    # copies rows at +/- the layer's own measured span, which is the repeat
+    # the wrap would have made.
+    #
+    # WHY LAST: it only ever COPIES a tile record byte for byte, changing
+    # `dst_y` and nothing else, so the copy names whatever page, uv, palette
+    # and blend its source ended up with after every pass above. Running it
+    # earlier would put tiles into the repack, the page cap and the no-growth
+    # accounting that none of those passes have a reason to see.
+    #
+    # MEASURED before it was wired in, whole archive: 62 gapped parallax
+    # layers -> 2, none made worse, 9,108 tiles added across 80 fields, and
+    # the worst per-page IN-FRAME tile count -- FINDINGS-110's real cap --
+    # grew on ZERO fields. It cannot, because only one copy of a repeated row
+    # is inside a 240-unit window at a time.
+    pf_stats = ff7nx_parallaxfill.apply_to_flevel(
+        archive, payloads, encode=lambda raw: _encode_field_cached(archive, raw),
+        log=log)
+    pf_line = ff7nx_parallaxfill.summarise(pf_stats)
+    if pf_line:
+        log(pf_line)
+    if pf_stats['refused']:
+        log('  ! parallax fill: %d field(s) not changed (%s)'
+            % (len(pf_stats['refused']),
+               ', '.join('%s: %s' % r for r in pf_stats['refused'][:3])))
 
     # AFTER that, so the camera range is the last thing written into section
     # 8 and cannot be reverted by a field the background pass rebuilt. The

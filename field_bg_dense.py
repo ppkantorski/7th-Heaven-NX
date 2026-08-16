@@ -493,11 +493,50 @@ def _band_of(slot, depth):
 
 
 def _uses_key(pages, arrays, k):
+    """
+    Does this cell use the colour key anywhere?
+
+    THE CELL IS NOT ALWAYS 16 UNITS -- FINDINGS-189, AND THIS IS THE THIRD
+    PLACE THE SAME LITERAL HAS BEEN WRONG. `source_cell` takes an explicit
+    `edge` for exactly this reason and documents it; `ff7nx_blackcell._art_block`
+    was corrected for it in anticipation of the overlay work. This function was
+    missed, and because it decides whether the key is RESTORED after promotion
+    (line ~1209, `if rec['key'] and ...`), getting it wrong does not blur a
+    cell -- it DELETES A CUT-OUT.
+
+    A `size_flag` page is an 8x8 grid of 32-unit cells. Reading a TILE-wide
+    window there inspects only the cell's TOP-LEFT QUADRANT, so a cell whose
+    keyed texels all lie outside that quadrant reports "no key", the promotion
+    does not put the key back, and the cell lands fully opaque.
+
+    MEASURED on `onna_5` layer 4 -- the Honey Bee Inn keyhole mask, and the
+    defect the user reported as a flattened circle with a rectangle cut into
+    its upper right:
+
+        dst          keyed in top-left 16x16   keyed in the full 32x32
+        (-64,-32)          0 / 256                 142 / 1024   KEY THROWN AWAY
+        (-64,-64)          0 / 256                  12 / 1024   KEY THROWN AWAY
+        ( 32,-64)          0 / 256                   6 / 1024   KEY THROWN AWAY
+        (-64, 64)          0 / 256                   5 / 1024   KEY THROWN AWAY
+        ( 32,-32)         70 / 256                 111 / 1024   kept
+        (-32,-32)        256 / 256                1024 / 1024   kept
+
+    Every cell that lost its key has NOTHING keyed in the quadrant and
+    something keyed outside it. That is the whole rule, and it is why three
+    cells of one page lost the key while their neighbours on the same page
+    kept it.
+
+    The edge is taken from the ARRAY'S OWN SIZE rather than from a constant,
+    so it is right at 256px and at 512px without a second literal to keep in
+    step. On a non-`size_flag` page it evaluates to 16 and this is a no-op --
+    which is what bounds the change.
+    """
     slot, sx, sy, pal = k
     p = pages[slot]
-    if p.depth == 2:
-        return bool((arrays[slot][sy:sy + TILE, sx:sx + TILE] == 0).any())
-    return bool((arrays[slot][sy:sy + TILE, sx:sx + TILE] == 0).any())
+    arr = arrays[slot]
+    grid = 8 if p.size_flag else 16
+    edge = arr.shape[0] // grid or TILE
+    return bool((arr[sy:sy + edge, sx:sx + edge] == 0).any())
 
 
 # ---------------------------------------------------------------- coverage

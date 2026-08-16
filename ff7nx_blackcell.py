@@ -104,6 +104,8 @@ import ff7nx_marginblack as MB                                 # noqa: E402
 SECTION9 = 8
 SECTION_PALETTE = 3
 TILE = 16
+# Layers 3 and 4 set a tile's width to 32 (offsets 18/20). FINDINGS-189.
+BIG_TILE = 32
 
 
 def disabled():
@@ -147,8 +149,16 @@ def survey_tiles(sec9, surv):
             sx = int(round(u / PC.UV_SCALE * grid)) * step
             sy = int(round(v / PC.UV_SCALE * grid)) * step
             dx, dy = struct.unpack_from('<hh', sec9, off + DC.TILE_DST_X)
+            # `n` IS THE TILE'S OWN WIDTH, not 16. Layers 3 and 4 set offsets
+            # 18/20 to 32 and five separate passes have assumed otherwise --
+            # FINDINGS-189. Nothing in this module needed it until the overlay
+            # margin did, and a 32-unit tile tested as 16 straddles the 4:3
+            # edge invisibly.
+            _w, _h = struct.unpack_from('<HH', sec9, off + 18)
+            _n = max(_w, _h) if layer > 1 else TILE
             tiles.append({'off': off, 'layer': layer, 'slot': slot,
                           'sx': sx, 'sy': sy,
+                          'n': _n if _n in (TILE, BIG_TILE) else TILE,
                           'pal': sec9[off + RP.T_PALETTE],
                           'fx': bool(sec9[off + RP.T_FX_PAGE]),
                           'dst': (dx, dy)})
@@ -195,6 +205,45 @@ def survey_tiles(sec9, surv):
 BLACK_ART = os.environ.get('SEVENTH_NX_NO_BLACKART') != '1'
 BLACK_ART_MIN_LUMA = 25     # the mod's art must be this bright to count
 BLACK_ART_MIN_COVER = 0.9   # and this opaque
+
+# ONE CELL, ONE DESTINATION. THE BUILD-91 REGRESSION AND ITS GATE.
+# FINDINGS-195.
+#
+# The art this pass writes is addressed by PAGE CELL -- Cosmos upscales the
+# PAGE, not the field, so `art(field, slot, pal)` yields exactly one block for
+# `(sx, sy)`. A tile's DESTINATION does not enter the lookup and cannot: there
+# is nothing to look it up in.
+#
+# That is sound while a cell is drawn in one place. Square's flat FILLER cells
+# are not: one 16x16 cell of a single index is named by dozens of layer-1
+# tiles scattered across the field, because a flat colour is the same
+# everywhere and reusing it is free. Give that cell Cosmos's art and every one
+# of those destinations draws the same block -- right for at most one of them,
+# wrong for the rest, and visible as a repeated square of unrelated picture.
+#
+# MEASURED on the shipped build-93 archive (`_bcaudit.py`), every layer-1 tile
+# whose byte and uv name different cells, i.e. every repoint this pass made:
+#
+#     private copies                       290   in 28 field(s)
+#       drawn at ONE destination           280   correct, and kept
+#       drawn at MANY destinations          10   101 tile(s)  <- the defect
+#
+#     subin_3 36, md0 19/6/4/2, fship_3 16/8, cos_btm 4, blin60_1 4, smkin_1 2
+#
+# ALL TEN are `was_black` cells -- uniform, NON-empty filler, means 6, 123,
+# 103, 253, 7, 26, 171, 24, 221, 5. The ORIGINAL empty-cell population
+# contributes ZERO multi-destination copies, which is why builds 88-90 show
+# `0 given a private copy` at the second call site and builds 91-93 show 204.
+# So this gate is scoped to the WIDENED population and cannot change anything
+# that shipped before build 91.
+#
+# WHY NOT ONE COPY PER DESTINATION INSTEAD. Because every copy would be filled
+# from the same single block. Per-destination copies would spend N free cells
+# to draw the identical wrong picture N times.
+#
+# `woa_3`, the case this widening was written for, is untouched: its cell has
+# exactly one layer-1 tile at dst(-160,-120).
+BLACK_ART_ONE_DST = os.environ.get('SEVENTH_NX_BLACKART_ANY_DST') != '1'
 
 
 def _cell_is_black(arr, page, sx, sy, grid, prgb):
@@ -272,6 +321,17 @@ def black_cells(sec9, surv, prgbs=None):
                     for t in l1)
         if not _edge:
             continue
+        # ONE CELL, ONE DESTINATION -- see BLACK_ART_ONE_DST above. Note that
+        # the `_edge` test right above is an `any`, so a single border tile
+        # admits every interior tile that happens to share its filler cell;
+        # this is the test that makes that safe rather than a way of avoiding
+        # it, because the ambiguity is in the ART LOOKUP and not in the edge.
+        if BLACK_ART_ONE_DST and len({t['dst'] for t in l1}) > 1:
+            black_cells.ambiguous_cells = \
+                getattr(black_cells, 'ambiguous_cells', 0) + 1
+            black_cells.ambiguous_tiles = \
+                getattr(black_cells, 'ambiguous_tiles', 0) + len(l1)
+            continue
         pals = {t['pal'] for t in l1}
         if any(p >= len(prgbs) for p in pals):
             continue
@@ -285,6 +345,130 @@ def black_cells(sec9, surv, prgbs=None):
 
 
 # ------------------------------------------------------------------ writing
+# ------------------------------------------------- THE OVERLAY MARGIN. F-197
+# LAYER 1 GOT ITS MARGIN IN BUILD 30. LAYERS 2/3/4 NEVER DID.
+#
+# `ff7nx_marginart` fills Cosmos's widescreen placeholder cells from the DDS,
+# and its own scope line says how far it reaches: "Cosmos art replaces vanilla
+# inside the 4:3 picture too, ON LAYER 1". Cosmos widened the OVERLAYS as well,
+# and nothing has ever filled those.
+#
+# `onna_5` -- the Honey Bee Inn keyhole -- is the clean demonstration:
+#
+#     vanilla   layer 4   96 tiles   opaque x -160..159
+#     Cosmos    layer 4  156 tiles   opaque x -160..159, tiles out to +/-224
+#
+# The 60 extra tiles are 100% TRANSPARENT in the paletted page, and Cosmos's
+# own DDS is FULLY OPAQUE and near-black at exactly those cells -- mean RGB
+# (8.7, 8.6, 7.9) at alpha 255. That black is the keyhole mask. On layer 1 an
+# empty cell is a black square; on layers 2+ index 0 is the colour key, so an
+# empty cell is a HOLE, and the hole is the room showing through the mask in
+# the 16:9 reveal.
+#
+# WHY THIS IS SAFE TO DO HERE AND NOT SOMEWHERE ELSE. This module already
+# writes art into an empty cell, picks a palette, and refuses when the cell is
+# shared -- and `_art_block` was corrected for 32-unit cells in anticipation of
+# exactly this (HANDOFF-188 3.1). The selection below adds no new machinery.
+#
+# MEASURED, 220 fields, `_ovmargin.py`:
+#
+#     layer>=2 tiles outside the 4:3 box            41,574
+#       already carry art                           35,820
+#       cell entirely keyed                          5,754
+#         the mod ships no art for it                    0
+#         the art is transparent there too           2,070   left alone
+#         FILLABLE -- art opaque at that cell        3,684
+#           and dark (a mask)                          773
+#           and bright (real widened scenery)        2,911
+#
+# And the ambiguity that cost build 91 does not exist in this population.
+# MEASURED on `onna_5`, all 908 outside-box overlay cells:
+#
+#     shared by more than one destination     0
+#     also sampled by a tile INSIDE the box   0
+#     sampled at more than one palette        0
+#
+# Every palette they name carries at least two non-zero entries at or below
+# luma 12, so black is expressible without index 0 -- which `MA.quantise`
+# guarantees anyway ("INDEX 0 EXCLUDED", and it says why).
+#
+# THE ORDERING CONSTRAINT, AND IT IS THE SHARP EDGE HERE. Cosmos names its art
+# `<field>_<page>_<pal>.dds` against the page the cell is on NOW, so this may
+# only run at the FIRST call site -- after `marginart`, before `marginpage` and
+# the repack. At the second call site the pages have been renumbered and
+# compacted, and `art(field, slot, pal)` would return a different page's
+# picture. That is not hypothetical: it is exactly how FINDINGS-195's olive
+# blocks were filled. `apply_to_flevel(..., overlay=True)` is therefore opt-in
+# and build.py sets it on the first call only.
+OVERLAY_MARGIN = os.environ.get('SEVENTH_NX_NO_OVERLAY_MARGIN') != '1'
+OVERLAY_MIN_COVER = 0.90    # the art must be this opaque to be a mask at all
+BOX_X, BOX_Y = 160, 120     # the 4:3 picture, in destination units
+
+
+def _outside_43(t):
+    """True when a tile is not wholly inside the 4:3 picture."""
+    x, y = t['dst']
+    n = t.get('n', TILE)
+    return x < -BOX_X or x + n > BOX_X or y < -BOX_Y or y + n > BOX_Y
+
+
+def overlay_cells(sec9, surv):
+    """
+    {(slot, sx, sy): [tile, ...]} -- EMPTY cells that only widescreen overlay
+    placeholders sample.
+
+    Deliberately narrow, and every clause is a refusal this pass has paid for
+    before:
+
+      * layer >= 2 only              layer 1 is `black_cells`' population and
+                                     is already handled
+      * the cell is entirely keyed   so writing into it cannot overwrite art
+      * NOTHING inside the 4:3 box   samples it -- the interior is not this
+                                     defect (FINDINGS-173) and must not move
+      * ONE destination              FINDINGS-195: the art is addressed by page
+                                     cell, so a cell drawn in two places has no
+                                     unambiguous art
+      * ONE palette                  a depth-1 page is one index array
+      * no fx tile                   an fx tile draws its SECOND texture, so
+                                     this cell is not what it samples
+    """
+    if not OVERLAY_MARGIN:
+        return {}
+    pages = {p.slot: p for p in surv['pages']}
+    tiles, by_cell = survey_tiles(sec9, surv)
+    arrays = {}
+    out = {}
+    for key, idxs in by_cell.items():
+        here = [tiles[i] for i in idxs]
+        if any(t['layer'] < 2 or t['fx'] for t in here):
+            continue
+        if not all(_outside_43(t) for t in here):
+            continue
+        if len({t['dst'] for t in here}) > 1:
+            continue
+        if len({t['pal'] for t in here}) > 1:
+            continue
+        slot = key[0]
+        page = pages.get(slot)
+        if page is None or page.depth != 1:
+            # A truecolor page has no index channel and its key is 0x0000.
+            # Refusing is one line; getting it wrong is a transparent mask.
+            continue
+        arr = arrays.get(slot)
+        if arr is None:
+            try:
+                arr = arrays[slot] = PC._page_array(page)
+            except Exception:                                  # noqa: BLE001
+                continue
+        grid, _ = _grid_step(page)
+        if not _cell_is_empty(arr, page, key[1], key[2], grid):
+            continue
+        for t in here:
+            t['overlay'] = True
+        out[key] = here
+    return out
+
+
 def _free_cells(page, by_cell, arr, grid, step):
     """Cells of `page` that NO tile samples and that are entirely empty."""
     taken = {(sx, sy) for (slot, sx, sy) in by_cell if slot == page.slot}
@@ -424,17 +608,23 @@ def _art_cover(img, page, sx, sy, grid):
     return a.mean(axis=(1, 3)) >= 128
 
 
-def fill_field(name, raw, art, log=lambda *_: None):
+def fill_field(name, raw, art, log=lambda *_: None, overlay=False):
     """
     (new raw bytes, stats) for one field, or (None, stats) if nothing changed.
 
     `art(field, page, palette) -> (image, src_pal) | None` is the same provider
     `ff7nx_marginart` is given.
+
+    `overlay=True` also fills the WIDESCREEN OVERLAY MARGIN -- see
+    `overlay_cells`. It is off by default because it is only correct while the
+    page numbering is still Cosmos's, i.e. at the first of build.py's two call
+    sites.
     """
     import lgp
 
     st = {'black': 0, 'fixed': 0, 'in_place': 0, 'copied': 0,
-          'no_art': 0, 'no_room': 0, 'depth2': 0, 'reverted': 0}
+          'no_art': 0, 'no_room': 0, 'depth2': 0, 'reverted': 0,
+          'ov_cells': 0, 'ov_filled': 0, 'ov_no_art': 0}
     parts = lgp.split_sections(raw)
     sec9 = parts[SECTION9]
     surv = DC.survey(sec9)
@@ -444,6 +634,15 @@ def fill_field(name, raw, art, log=lambda *_: None):
     bad = black_cells(sec9, surv, prgbs)
     st['black'] = sum(len([t for t in v if t['layer'] == 1])
                       for v in bad.values())
+    if overlay:
+        # DISJOINT BY CONSTRUCTION -- `black_cells` selects cells with a
+        # layer-1 tile, `overlay_cells` refuses any cell that has one. The
+        # assert is cheap and this is the kind of thing that silently
+        # double-writes a cell two builds from now.
+        _ov = overlay_cells(sec9, surv)
+        assert not (set(_ov) & set(bad)), 'overlay and black populations met'
+        st['ov_cells'] = len(_ov)
+        bad.update(_ov)
     if not bad:
         return None, st
 
@@ -459,10 +658,18 @@ def fill_field(name, raw, art, log=lambda *_: None):
             arrays[slot] = PC._page_array(page)
         arr = arrays[slot]
         here = bad[key]
-        l1 = [t for t in here if t['layer'] == 1 and not t['fx']]
+        # THE OVERLAY MARGIN IS THE SAME WRITE WITH A DIFFERENT POPULATION.
+        # `overlay_cells` has already guaranteed one destination, one palette,
+        # no layer-1 tile, no fx tile and an empty cell -- so `others` is empty
+        # and the fill is in place, by construction rather than by test.
+        _ov = bool(here) and all(t.get('overlay') for t in here)
+        if _ov:
+            l1 = [t for t in here if not t['fx']]
+        else:
+            l1 = [t for t in here if t['layer'] == 1 and not t['fx']]
         if not l1:
             continue
-        others = [t for t in here if t['layer'] != 1]
+        others = [] if _ov else [t for t in here if t['layer'] != 1]
         by_pal = defaultdict(list)
         for t in l1:
             by_pal[t['pal']].append(t)
@@ -504,7 +711,19 @@ def fill_field(name, raw, art, log=lambda *_: None):
             #
             # Only the newly-selected cells are gated. A cell that is EMPTY is
             # this pass's original population and keeps its original rule.
-            if _was_black:
+            if _ov:
+                # OPACITY ONLY, AND NO LUMA TEST. The whole point of this
+                # population is that the art IS black -- it is a mask. Asking
+                # it to be bright, as the `was_black` gate does, would refuse
+                # exactly the cells worth filling. What must be true is that
+                # Cosmos PAINTED there rather than leaving the placeholder
+                # transparent, and that is what the alpha says.
+                _cov = _art_cover(got[0], page, sx, sy, grid)
+                if _cov is None or float(_cov.mean()) < OVERLAY_MIN_COVER:
+                    st['ov_no_art'] += len(group)
+                    st['no_art'] += len(group)
+                    continue
+            elif _was_black:
                 _cov = _art_cover(got[0], page, sx, sy, grid)
                 if _cov is None or float(_cov.mean()) < BLACK_ART_MIN_COVER \
                         or float(block[_cov].mean() if _cov.any()
@@ -574,6 +793,8 @@ def fill_field(name, raw, art, log=lambda *_: None):
             touched.add(tslot)
             if in_place:
                 st['in_place'] += len(group)
+                if _ov:
+                    st['ov_filled'] += len(group)
             else:
                 eu, ev = PC._uv_encode(tx, ty)
                 for t in group:
@@ -582,6 +803,24 @@ def fill_field(name, raw, art, log=lambda *_: None):
                         buf[t['off'] + RP.T_PALETTE] = use_pal
                     struct.pack_into('<II', buf, t['off'] + PC.T_SRC_UV,
                                      eu, ev)
+                    # WRITE THE BYTE TOO. FINDINGS-193 4.1, which found this
+                    # pass leaving offsets 10/12 stale and measured 162 uv
+                    # disagreements in the shipped build-91 archive -- every
+                    # one of them ours, every one on layer 1.
+                    #
+                    # The ENGINE reads the uv, so the stale byte drew nothing
+                    # wrong. `ff7nx_marginblack.read_tiles` reads the BYTE,
+                    # and `collect()` and most of this pipeline are built on
+                    # it, so the disagreement is a trap for any pass ordered
+                    # after this one -- and `_bcaudit.py` only found the
+                    # build-91 regression BECAUSE the two disagreed.
+                    #
+                    # `tx`/`ty` are already in 256-space (survey_tiles: "the
+                    # same units `_uv_encode` takes"), which is what offsets
+                    # 10/12 hold, so this is the identical coordinate in the
+                    # other representation and cannot move a tile.
+                    buf[t['off'] + RP.T_SRC_X] = tx & 0xFF
+                    buf[t['off'] + RP.T_SRC_Y] = ty & 0xFF
                 # the copy is now occupied; do not hand it out twice
                 by_cell[(tslot, tx, ty)] = []
                 st['copied'] += len(group)
@@ -654,13 +893,14 @@ def fill_field(name, raw, art, log=lambda *_: None):
 
 # --------------------------------------------------------------- the build
 def apply_to_flevel(archive, payloads, art, encode=None, log=print,
-                    fields=None):
+                    fields=None, overlay=False):
     """Fill the black cells of every field in `archive`. Returns stats."""
     import lgp
 
     encode = encode or (lambda raw: archive.encode_field(raw))
     st = {'fields': 0, 'black': 0, 'fixed': 0, 'in_place': 0, 'copied': 0,
           'no_art': 0, 'no_room': 0, 'depth2': 0, 'reverted': 0,
+          'ov_cells': 0, 'ov_filled': 0, 'ov_no_art': 0, 'ov_fields': 0,
           'depth2_fields': [], 'done': []}
     for nm in archive.names():
         if fields and nm not in fields:
@@ -675,13 +915,16 @@ def apply_to_flevel(archive, payloads, art, encode=None, log=print,
         except Exception:                                      # noqa: BLE001
             continue
         try:
-            new, one = fill_field(nm, raw, art, log=log)
+            new, one = fill_field(nm, raw, art, log=log, overlay=overlay)
         except Exception as exc:                               # noqa: BLE001
             log('  ! blackcell: %s skipped (%s)' % (nm, exc))
             continue
         for k in ('black', 'fixed', 'in_place', 'copied', 'no_art',
-                  'no_room', 'depth2', 'reverted'):
+                  'no_room', 'depth2', 'reverted',
+                  'ov_cells', 'ov_filled', 'ov_no_art'):
             st[k] += one.get(k, 0)
+        if one.get('ov_filled'):
+            st['ov_fields'] += 1
         if one.get('depth2'):
             st['depth2_fields'].append(nm)
         if new is not None:
@@ -691,7 +934,25 @@ def apply_to_flevel(archive, payloads, art, encode=None, log=print,
     return st
 
 
+def _summarise_overlay(st):
+    if not st.get('ov_filled'):
+        return []
+    return ['  field background OVERLAY MARGIN: %d cell(s) on layers 2/3/4 in '
+            '%d field(s) were Cosmos widescreen placeholders sampled ONLY '
+            'outside the 4:3 picture and entirely COLOUR-KEYED -- on those '
+            'layers index 0 is transparency, so an empty placeholder is a '
+            'HOLE, not a black square. Filled from the mod\'s own art, which '
+            'is opaque there. %d refused because the art is transparent too '
+            '(a placeholder Cosmos left genuinely empty). onna_5, the Honey '
+            'Bee Inn keyhole, is the case this was built from: its mask '
+            'stopped at x +/-160 and the room showed through the 16:9 reveal '
+            'around it. Turn off with SEVENTH_NX_NO_OVERLAY_MARGIN=1.'
+            % (st['ov_filled'], st['ov_fields'], st['ov_no_art'])]
+
+
 def summarise(st):
+    if st and st.get('ov_filled') and not st.get('black'):
+        return '\n'.join(_summarise_overlay(st))
     if not st or not st.get('black'):
         return '  field background: no layer-1 tile draws an empty cell'
     out = ['  field background: %d layer-1 tile(s) in %d field(s) were drawing '
@@ -713,6 +974,7 @@ def summarise(st):
     if st['reverted']:
         out.append('      %d field(s) refused their own edit (no improvement)'
                    % st['reverted'])
+    out.extend(_summarise_overlay(st))
     return '\n'.join(out)
 
 

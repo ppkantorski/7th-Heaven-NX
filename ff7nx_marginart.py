@@ -918,6 +918,54 @@ def provider_source(provider):
         rgb = np.stack([(r << 3) | (r >> 2),
                         (g << 2) | (g >> 4),
                         (b << 3) | (b >> 2)], -1).astype(np.uint8)
+        # UNDO THE NEAR_BLACK LIFT. FINDINGS-211.
+        #
+        # `PageArt` packs its buffer with `black_ok=False`, so every texel the
+        # mod painted TRUE BLACK comes back as NEAR_BLACK = 0x0841 = RGB(8,8,8)
+        # rather than as 0. That is right for `PageArt`'s own consumer -- a
+        # TRUECOLOR page, where 0x0000 means transparent to the engine
+        # (x86 0x6470E0), so black genuinely cannot be stored as black.
+        #
+        # It is WRONG here. This provider feeds `ff7nx_marginart` and
+        # `ff7nx_blackcell`, whose destination is a PALETTED page: there the
+        # key is INDEX 0, not the colour, and `quantise` excludes index 0 by
+        # construction -- so nothing can accidentally become transparent and
+        # the lift buys nothing. What it costs is measured, on the `onna_5`
+        # keyhole mask (HANDOFF-210 s3.2's candidate A):
+        #
+        #     the mod's margin art there is darker than one 565 step, so
+        #     almost every texel rounds to 0x0000, is lifted to RGB(8,8,8),
+        #     and a 98-colour gradient arrives here as a FLAT BLOCK.
+        #
+        #     written cell, 12 cells of onna_5 layer 4    n colours    std
+        #       art as this function returns it today       2.8        0.80
+        #       art with the lift undone                    4.0        3.88
+        #       the raw DDS ceiling, for reference          4.0        3.90
+        #
+        # 3.88 of an available 3.90. Those 12 cells are the entire bottom row
+        # of the keyhole's overlay margin and they render as one flat black
+        # bar 384 destination units wide.
+        #
+        # `bmask` is EXACTLY the set that was lifted -- `PageArt` defines it as
+        # "opaque AND rgb == 0" on the DECODED art, before packing -- so this
+        # restores those texels and touches nothing else. No threshold, no
+        # guess about which greys "were probably black".
+        #
+        # The depth-2 write path in `ff7nx_blackcell` re-packs through
+        # `rgba_bytes_to_565`, which applies the lift again on the way out, so
+        # truecolor destinations are unaffected by this.
+        # `bmask` is a numpy bool array when numpy built the page and a bytes
+        # object on `PageArt`'s fallback path. Handle both rather than let the
+        # bytes case become a silent no-op -- a fix that quietly does nothing
+        # on one path is worse than one that is absent, because the log and
+        # the counters both still say it ran.
+        bm = getattr(art, 'bmask', None)
+        if isinstance(bm, (bytes, bytearray)):
+            bm = np.frombuffer(bm, np.uint8).astype(bool)
+        if bm is not None:
+            bm = np.asarray(bm)
+            if bm.size == art.px * art.px:
+                rgb[bm.reshape(art.px, art.px)] = 0
         # RGBA, NOT RGB. The 4th channel is the mod's own COVERAGE, and it is
         # the whole point of `black_squares_are_the_atlas_gap` below: 20.1% of
         # the texels in a Cosmos page are transparent, `PageArt` records that

@@ -1244,6 +1244,46 @@ def apply_module(sdout, dump, log=lambda *_: None, produced=()):
                 clamp_values[knob] = pr
             log('  parallax right edge 0 -> %d units  (%s)'
                 % (pr, ', '.join(knobs)))
+            # F. THE PARALLAX BOTTOM EDGE -- the vertical twin of E, and the
+            #    last piece of the Mt Corel fix. `bottom_offset` is 0 in
+            #    stock while the picture runs to bg.y+16, so every parallax
+            #    tile in that band tests as outside the wrap window and is
+            #    TELEPORTED a whole layer height away. That is the "pops in
+            #    and out as I move up and down" report, and the Honey Bee Inn
+            #    keyhole mask stopping short at the bottom. FINDINGS-205.
+            #
+            #    There is no vertical CULL to pair these with and that is
+            #    measured, not assumed: layer 3's pick loop has no position
+            #    test at all and layer 4's tests x only. See the `pbottom3`
+            #    block in ff7nx_wsclamp for the branch enumeration.
+            #
+            #    The three bottom knobs are OPTIONAL and verified separately,
+            #    so a signature that stops matching costs the vertical fix and
+            #    NOT the 16:9 stage. Build 97 lost viewport, scissor, fade
+            #    quad and every camera cave to one extra that could raise
+            #    inside this transaction; HANDOFF-204 s4b.
+            if not _flag('SEVENTH_NX_WS_PARALLAX_NO_VERTICAL'):
+                vvals = ff7nx_wsclamp.parallax_vertical_values(scale)
+                ok = ff7nx_wsclamp.verified_optional(
+                    m.img, ff7nx_wsclamp.PARALLAX_BOTTOM_KNOBS, log=log)
+                for knob in ff7nx_wsclamp.PARALLAX_VERTICAL_KNOBS:
+                    if (knob in ff7nx_wsclamp.PARALLAX_BOTTOM_KNOBS
+                            and knob not in ok):
+                        continue
+                    clamp_values[knob] = vvals[knob]
+                log('  parallax bottom edge 0 -> %d units  (%s)'
+                    % (ff7nx_wsclamp.parallax_bottom(scale), ', '.join(ok)))
+                log('    half_height 112 -> %d, top_offset %d (stock 256 + the 8 the centred origin moved)'
+                    % (ff7nx_wsclamp.parallax_half_height(scale),
+                       ff7nx_wsclamp.parallax_top(scale)))
+                log('    (build 96 shipped top_offset 272 out of '
+                    'ff7nx_fieldwide; that word is WITHDRAWN here -- the '
+                    'extra 16 units are at the bottom, not the top.)')
+            else:
+                log('  ! parallax VERTICAL knobs EXCLUDED '
+                    '(SEVENTH_NX_WS_PARALLAX_NO_VERTICAL=1) -- the sky and '
+                    'the Honey Bee Inn keyhole will pop in and out along the '
+                    'bottom edge. A/B only.')
         applied += nso_patcher.apply_spec(
             nso, ff7nx_wsclamp.spec(m.img, clamp_values,
                                     starts=set(m.arm_starts), log=log))

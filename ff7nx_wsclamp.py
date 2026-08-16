@@ -294,6 +294,67 @@ IMMEDIATE_SITES = {
                 (0xA05CF4, 0x51040109),
                 (0xA05CF8, 0x6B090148)],
         'why': 'layer2 TOP extent.'},
+
+    # ------------------------------------------------------------------
+    # THE PARALLAX VERTICAL IMMEDIATES -- moved here from
+    # `ff7nx_fieldwide.VERTICAL_PATCHES`. FINDINGS-205.
+    # ------------------------------------------------------------------
+    # These three words shipped in build 96 out of `ff7nx_fieldwide`, with
+    # hand-picked constants and no signature. They are the layer-3/4 twins of
+    # `top1`/`top2`, so they belong in this table -- two mechanisms owning one
+    # axis is what HANDOFF-204 s3.6 said to close before building again.
+    #
+    # `ptop3` and `ptop4` now ship at their STOCK 256, which WITHDRAWS build
+    # 96's 272. See FINDINGS-205 s4: the extra 16 is at the BOTTOM, not the
+    # top, so raising top_offset admitted nothing the frame could show. It was
+    # inert, not wrong -- but it is not the derived value and it would collide
+    # with this entry.
+    #
+    # `phalf3` KEEPS build 96's 120. That word was right, and it is the one
+    # value on this axis that three independent derivations agree on:
+    #
+    #     vanilla        (224 + 0)  / 2 = 112   <- the stock word
+    #     FFNx uncrop    (232 + 8)  / 2 = 120   <- background.cpp:133
+    #     this port      (224 + 16) / 2 = 120   <- ORIGIN_Y + defaults()['bottom']
+    #
+    # LAYER 4 HAS NO half_height AND THAT IS NOT AN OVERSIGHT. Its wrap-
+    # direction test is `tile.y >= bg.y + bottom_offset`, not
+    # `tile.y >= bg.y - half_height` -- FFNx background.cpp:261 against :139,
+    # and confirmed word-for-word in the module at 0xA08A68, which subtracts a
+    # bare register with no immediate in front of it. So layer 4's
+    # discriminator moves automatically when `pbottom4b` moves, which is
+    # exactly the single-constant behaviour the C has.
+    'ptop3': {
+        'va': 0xA07B64, 'stock': 256, 'axis': 'y', 'layer': 3,
+        'word': lambda v: A.sub_imm(9, 8, v),
+        'sig': [(0xA07B54, A.add_imm(0, 8, 0xc)),   # add w0, w8, #0xc  cam_y
+                (0xA07B5C, 0x79C00008),             # ldrsh w8, [x0]
+                (0xA07B60, 0xB940032A),             # ldr  w10, [x25]  tile.y
+                (0xA07B64, 0x51040109),             # sub  w9, w8, #0x100
+                (0xA07B68, 0x6B090148)],            # subs w8, w10, w9
+        'why': 'layer3 parallax top_offset. Stock 256 already clears the '
+               'frame (needs 224); here so the sweep can prove it and so no '
+               'second mechanism can claim this word.'},
+    'phalf3': {
+        'va': 0xA07C1C, 'stock': 112, 'axis': 'y', 'layer': 3,
+        'word': lambda v: A.sub_imm(8, 8, v),
+        'sig': [(0xA07C0C, A.add_imm(0, 8, 0xc)),
+                (0xA07C14, 0x79C00008),
+                (0xA07C18, 0xB9400729),             # ldr w9, [x25,#4]
+                (0xA07C1C, 0x5101C108),             # sub w8, w8, #0x70
+                (0xA07C20, SUB_W10_W9_W8)],
+        'why': 'layer3 parallax half_height -- the WRAP DIRECTION midpoint, '
+               'not a bound. 112 is half a 224-unit picture; the port shows '
+               '240, so 120. Same word build 96 shipped.'},
+    'ptop4': {
+        'va': 0xA089B0, 'stock': 256, 'axis': 'y', 'layer': 4,
+        'word': lambda v: A.sub_imm(9, 8, v),
+        'sig': [(0xA089A0, A.add_imm(0, 8, 0xc)),
+                (0xA089A8, 0x79C00008),
+                (0xA089AC, 0xB9400AEA),             # ldr w10, [x23,#8]
+                (0xA089B0, 0x51040109),
+                (0xA089B4, 0x6B090148)],
+        'why': 'layer4 parallax top_offset. Twin of ptop3.'},
 }
 
 # The high side. `arg` is the `add w0, w8, #imm` that selects which stack
@@ -439,6 +500,118 @@ CAVE_SITES = {
                 (0xA08D58, 0x531F7D08),
                 (0xA08D5C, 0x6B0B011F)],
         'why': 'layer4 parallax RIGHT wrap point (pick loop).'},
+
+    # ------------------------------------------------------------------
+    # THE PARALLAX BOTTOM EDGE -- the vertical twin of pright3/4a/4b.
+    # FINDINGS-205. THIS IS THE FIX.
+    # ------------------------------------------------------------------
+    # THE REPORT, twice from hardware: the Honey Bee Inn keyhole mask stops
+    # short at the BOTTOM of the frame, and on any field with a vertically
+    # scrolling parallax background the tiles pop in and out as the camera
+    # moves up and down -- the same defect the Mt Corel fix closed sideways.
+    #
+    # THE MECHANISM, and it is a WRAP, not a cull. FFNx background.cpp,
+    # layer 3 at :138 and layer 4 at :260, both reproduced word-for-word in
+    # this module:
+    #
+    #     if (tile.y <= bg.y - top_offset || tile.y >= bg.y + bottom_offset)
+    #         tile.y += (...) ? -layer_height : +layer_height;
+    #
+    # `bottom_offset` is 0 in stock. The port's picture runs to bg.y + 16.
+    # So every tile in that 16-unit band tests as OUTSIDE the window and is
+    # TELEPORTED a whole layer height away -- it does not fail to draw, it
+    # draws somewhere else. That is precisely "pops in and out", and it is
+    # why the keyhole mask ends where it does.
+    #
+    # THERE IS NO VERTICAL CULL TO PAIR THESE WITH, AND THAT IS MEASURED.
+    # HANDOFF-204 s3.3 and FINDINGS-203 s2.3 both stop here, refusing to ship
+    # three wraps without the cull that "admits tiles", on the strength of the
+    # x axis having `pright4b`. The premise was wrong. Enumerating EVERY
+    # branch -- conditional and unconditional -- that reaches either pick-loop
+    # head, on the stock module:
+    #
+    #     layer 3 head 0xA079E0   1 branch    0xA07F80  anim_group
+    #     layer 4 head 0xA0882C   4 branches  0xA08D10 \ x <= bg.x - 352
+    #                                         0xA08D14 /
+    #                                         0xA08D68   x >= bg.x + 0  (pright4b)
+    #                                         0xA08E80   anim_group
+    #                                         0xA09000   palette_index
+    #
+    # Layer 3's pick loop has no position test at all; layer 4's culls on x
+    # only. There is no y site to find because the recompiled original does
+    # not test y in the pick loop -- vertical visibility on the parallax
+    # layers is decided ENTIRELY by the wrap above. So the three wraps are not
+    # "half the fix waiting for a cull"; they are the whole of it, exactly as
+    # `pright3`/`pright4a` are two thirds of the horizontal one.
+    #
+    # WHY LAYER 4 HAS TWO AND LAYER 3 HAS ONE. `bottom_offset` appears once in
+    # layer 3's helper (the bound; the direction test uses `half_height`) and
+    # TWICE in layer 4's (the bound, then again as the direction test -- FFNx
+    # :261 uses `bg->y + bottom_offset` where :139 uses `- half_height`). It
+    # is ONE constant in the C, so all three move together or none do. That is
+    # the same lesson `PARALLAX_RIGHT_KNOBS` records: FFNx moves all of them.
+    #
+    # THE VALUE IS 16 AND IT IS NOT A GUESS. `defaults()['bottom']` is 16 from
+    # this file's own frame arithmetic, and `bottom1`/`bottom2` -- the same
+    # axis, the same ORIGIN_Y, the same MULT, already shipping and confirmed
+    # on hardware -- run it. FFNx's 8 is not a contradiction: it splits the
+    # revealed 32 screen units evenly around origin 232, and this port keeps
+    # origin 224 and reveals downward. Both agree the picture is 240 units
+    # tall, which is why both land on half_height 120.
+    #
+    # MARKED OPTIONAL. `check_all` skips optional sites and `ff7nx_ws`
+    # verifies them separately, so a signature that stops matching drops these
+    # three knobs and leaves the 16:9 stage standing. Build 97 aborted the
+    # ENTIRE framing stage -- viewport, scissor, fade quad, every camera cave
+    # -- because one unproven extra was allowed to raise inside the
+    # transaction. HANDOFF-204 s4(b).
+    'pbottom3': {
+        'va': 0xA07BC8, 'axis': 'y', 'layer': 3, 'optional': True,
+        'sig': [(0xA07BB8, A.add_imm(0, 8, 0xc)),  # add w0, w8, #0xc  cam_y
+                (0xA07BC0, 0x79C00008),            # ldrsh w8, [x0]
+                (0xA07BC4, 0xB9400B29),            # ldr  w9, [x25,#8] tile.y
+                (0xA07BC8, SUB_W10_W9_W8),         # HOOK
+                (0xA07BCC, 0xB9000328),            # str  w8, [x25]
+                (0xA07BD0, 0x4A080128),
+                (0xA07BD4, 0x531F7D4B),
+                (0xA07BD8, 0x4A09014A),
+                (0xA07BDC, 0x0A080148),
+                (0xA07BE0, 0x531F7D08),
+                (0xA07BE4, 0x6B0B011F)],
+        'why': 'layer3 parallax BOTTOM wrap point, 0 -> 16. Vertical twin of '
+               'pright3, same eleven-word block.'},
+    'pbottom4a': {
+        'va': 0xA08A14, 'axis': 'y', 'layer': 4, 'optional': True,
+        'sig': [(0xA08A04, A.add_imm(0, 8, 0xc)),
+                (0xA08A0C, 0x79C00008),
+                (0xA08A10, 0xB94006E9),            # ldr w9, [x23,#4]
+                (0xA08A14, SUB_W10_W9_W8),
+                (0xA08A18, 0xB9000AE8),            # str w8, [x23,#8]
+                (0xA08A1C, 0x4A080128),
+                (0xA08A20, 0x531F7D4B),
+                (0xA08A24, 0x4A09014A),
+                (0xA08A28, 0x0A080148),
+                (0xA08A2C, 0x531F7D08),
+                (0xA08A30, 0x6B0B011F)],
+        'why': 'layer4 parallax BOTTOM bound. Twin of pright4a.'},
+    'pbottom4b': {
+        'va': 0xA08A68, 'axis': 'y', 'layer': 4, 'optional': True,
+        'sig': [(0xA08A58, A.add_imm(0, 8, 0xc)),
+                (0xA08A60, 0x79C00008),
+                (0xA08A64, 0xB94002E9),            # ldr w9, [x23]
+                (0xA08A68, SUB_W10_W9_W8),         # HOOK
+                (0xA08A6C, 0xB90006E8),            # str w8, [x23,#4]
+                (0xA08A70, 0x4A080128),            # eor w8, w9, w8
+                (0xA08A74, 0x51290260),            # sub w0, w19, #0xa40 <- NOT
+                (0xA08A78, 0x531F7D5C),            #    part of the pattern
+                (0xA08A7C, 0x4A09014A),
+                (0xA08A80, 0x0A080148),
+                (0xA08A84, 0x531F7D14)],
+        'why': 'layer4 parallax BOTTOM wrap DIRECTION test -- the second use '
+               'of the same bottom_offset constant, which is why it moves '
+               'with pbottom4a. Its flag emulation is scheduled differently '
+               '-- w28/w20, and an unrelated sub interleaved -- so it carries '
+               'its own signature rather than the shared tail.'},
 }
 
 # WHICH OF THE THREE ARE SAFE TO SHIP, AND WHY IT IS ONLY ONE
@@ -520,6 +693,21 @@ PARALLAX_RIGHT_KNOBS = ('pright4b', 'pright3', 'pright4a')
 # SEVENTH_NX_WS_PARALLAX_NO_SHIFT=1 drops them back out for an A/B.
 PARALLAX_SHIFT_KNOBS = ('pright3', 'pright4a')
 
+# The vertical set. All three are WRAPS -- see the block on `pbottom3` for why
+# there is no cull to pair them with, and why that is a measurement and not an
+# assumption. Named here so `CULL_CAVE_SITES` keeps `verdict()`'s cull oracle
+# away from them, exactly as PARALLAX_SHIFT_KNOBS does on the x axis.
+PARALLAX_BOTTOM_KNOBS = ('pbottom3', 'pbottom4a', 'pbottom4b')
+
+# The two in-place immediates that come with them. `ptop3`/`ptop4` ship at
+# STOCK, which is what withdraws build 96's 272; `phalf3` keeps build 96's 120.
+PARALLAX_TOP_KNOBS = ('ptop3', 'ptop4')
+PARALLAX_HALF_KNOBS = ('phalf3',)
+
+# Every knob the parallax VERTICAL fix touches, in one name.
+PARALLAX_VERTICAL_KNOBS = (PARALLAX_BOTTOM_KNOBS + PARALLAX_TOP_KNOBS
+                           + PARALLAX_HALF_KNOBS)
+
 
 def parallax_right(scale):
     """
@@ -535,20 +723,90 @@ def parallax_right(scale):
     return int(math.ceil((640.0 / scale - 640.0) / 2.0))
 
 
+def parallax_bottom(scale=WS_SCALE):
+    """
+    `bottom_offset` for the parallax wrap, in game units.
+
+    The same number `bottom1`/`bottom2` already ship on this axis, and for the
+    same reason: the picture runs to `(ORIGIN_Y + R) * MULT >= GAME_H`, so
+    R >= 16. Vertical is not scaled, so this does not depend on `scale` -- the
+    argument is taken anyway so every knob in this file has one shape.
+    """
+    return defaults(scale)['bottom']
+
+
+# THE PARALLAX LAYERS DO NOT USE ORIGIN_Y. FINDINGS-208.
+#
+# `ff7nx_uncrop` moves all four layers' tile origin 224 -> 232 -- it is in
+# every build log as "layer 3 tile origin 224 -> 232 @ +0x0A07878" -- which is
+# FFNx's `ff7_field_center ? 232 : 224`. So for layers 3 and 4:
+#
+#     dst_y = (232 - bg.y + tile.y) * MULT      picture = bg.y-232 .. bg.y+8
+#
+# not `bg.y-224 .. bg.y+16`. FINDINGS-205 s4 derived this file's parallax
+# numbers against ORIGIN_Y and got `half_height` right BY COINCIDENCE --
+# (224+16)/2 and (232+8)/2 are both 120 -- which is exactly why three
+# "independent" derivations appeared to agree. They were the same mistake
+# twice. FFNx's own constants were right from the start: top 256+8, bottom 8,
+# half 120.
+PARALLAX_ORIGIN_Y = 232
+PARALLAX_UNCROP = PARALLAX_ORIGIN_Y - ORIGIN_Y          # 8
+
+
+def parallax_top(scale=WS_SCALE):
+    """
+    `top_offset` for the parallax wrap: stock 256 plus the 8 units the
+    centred origin moved, which is FFNx background.cpp:176 exactly.
+
+    256 alone does cover a picture top of 232, so this is margin rather than a
+    fix -- but it is the value FFNx ships and there is no reason to run 8
+    units tighter than the source this whole subsystem was modelled on.
+    """
+    return STOCK_TOP + PARALLAX_UNCROP
+
+
+def parallax_half_height(scale=WS_SCALE):
+    """
+    `half_height` -- the midpoint that picks which way a wrapped tile goes.
+
+    Half the PICTURE, which is `ORIGIN_Y` above the camera plus whatever the
+    bottom extent adds below it. Checks out against all three known cases:
+
+        vanilla      (224 +  0) / 2 = 112   the stock word
+        FFNx uncrop  (232 +  8) / 2 = 120   background.cpp:133
+        this port    (224 + 16) / 2 = 120   and build 96 shipped 120
+    """
+    return (ORIGIN_Y + parallax_bottom(scale)) // 2
+
+
 # Cave sites whose branch is a CULL (taken -> skip this tile). Every one of
 # these answers to "bias the camera up, admit more tiles", which is what the
-# test suite's `verdict()` models. The two shift-helper sites are excluded:
-# their branch applies a WRAP, so "gained/lost tiles" is not the right frame
-# for them and asserting it would be asserting the wrong thing.
+# test suite's `verdict()` models. The shift-helper and parallax-bottom sites
+# are excluded: their branch applies a WRAP, so "gained/lost tiles" is not the
+# right frame for them and asserting it would be asserting the wrong thing.
 CULL_CAVE_SITES = {k: v for k, v in CAVE_SITES.items()
-                   if k not in PARALLAX_SHIFT_KNOBS}
+                   if k not in PARALLAX_SHIFT_KNOBS
+                   and k not in PARALLAX_BOTTOM_KNOBS}
 
 
-def shipped_values(scale=WS_SCALE, shift_helpers=False):
+def parallax_vertical_values(scale=WS_SCALE):
+    """The parallax VERTICAL knobs and their derived values. FINDINGS-205."""
+    out = {}
+    for knob in PARALLAX_BOTTOM_KNOBS:
+        out[knob] = parallax_bottom(scale)
+    for knob in PARALLAX_TOP_KNOBS:
+        out[knob] = parallax_top(scale)
+    for knob in PARALLAX_HALF_KNOBS:
+        out[knob] = parallax_half_height(scale)
+    return out
+
+
+def shipped_values(scale=WS_SCALE, shift_helpers=False, vertical=True):
     """
-    Every knob a real build sets: the four axis extents plus the parallax
-    right edge. This is what ff7nx_ws passes to spec(), so a test that uses
-    it is testing the shipping configuration rather than a subset of it.
+    Every knob a real build sets: the four axis extents, the parallax right
+    edge, and the parallax bottom edge. This is what ff7nx_ws passes to
+    spec(), so a test that uses it is testing the shipping configuration
+    rather than a subset of it.
     """
     out = defaults(scale)
     pr = parallax_right(scale)
@@ -557,6 +815,8 @@ def shipped_values(scale=WS_SCALE, shift_helpers=False):
     if shift_helpers:
         for knob in PARALLAX_SHIFT_KNOBS:
             out[knob] = pr
+    if vertical:
+        out.update(parallax_vertical_values(scale))
     return out
 
 ALL_SITES = dict(IMMEDIATE_SITES, **CAVE_SITES)
@@ -603,8 +863,41 @@ def check_site(img, name, patched_ok=True):
 
 
 def check_all(img):
-    """Verify every site. Raises on the first mismatch."""
-    return {n: check_site(img, n) for n in ALL_SITES}
+    """
+    Verify every LOAD-BEARING site. Raises on the first mismatch.
+
+    Sites carrying `optional` are skipped on purpose. `check_all` is called
+    from inside `ff7nx_ws.apply_module`'s one transaction, whose `except`
+    logs a line and writes NO module at all -- so anything raising here takes
+    the viewport, the uncrop scissor, the fade quad and every camera cave down
+    with it. That is build 97, exactly: one unproven extra inside the `try`
+    aborted the whole 16:9 stage (HANDOFF-204 s4b). Optional sites are checked
+    by `verified_optional()` instead, which returns names rather than raising.
+    """
+    return {n: check_site(img, n) for n, s in ALL_SITES.items()
+            if not s.get('optional')}
+
+
+def verified_optional(img, names, log=lambda *_: None):
+    """
+    The subset of `names` whose signature matches -- never raises.
+
+    This is how an optional knob is allowed to fail: the caller drops it from
+    `values` and ships everything else, instead of the build losing its 16:9.
+    """
+    out = []
+    for name in names:
+        if name not in ALL_SITES:
+            log('  ! parallax vertical: no such site %r; skipped' % name)
+            continue
+        try:
+            check_site(img, name)
+        except SiteMismatch as exc:                            # noqa: PERF203
+            log('  ! parallax vertical: %s -- knob dropped, the rest of the '
+                '16:9 stage is unaffected' % exc)
+            continue
+        out.append(name)
+    return out
 
 
 # --------------------------------------------------------------------------

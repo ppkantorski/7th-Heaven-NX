@@ -147,11 +147,181 @@ PARALLAX_PATCHES = [
 RIGHT_OFFSET_NOT_PATCHED = True
 
 
+# ======================================================================
+# THE VERTICAL TWIN. FINDINGS-199.
+# ======================================================================
+#
+# THE REPORT. The Honey Bee Inn keyhole mask reaches the LEFT and RIGHT edges
+# of the 16:9 frame and still stops short at the TOP and BOTTOM, leaving the
+# room visible in the two letterbox bands.
+#
+# IT IS NOT THE ARCHIVE. MEASURED on the shipped build-95 flevel, `onna_5`
+# layer 4 -- the mask -- across the full 16:9 width:
+#
+#     tiles present   y -128..191    opaque   y -128..191
+#     every row from y -128 to +136 is 100.0% opaque over x -214..214
+#
+# The art is there and it is opaque. The visible frame needs y -120..+120 and
+# the archive supplies -128..+136 on both sides of it.
+#
+# IT IS THIS FILE, AND THE COMMENT ABOVE SAYS SO. `PARALLAX_PATCHES` widens
+# the layer-3/4 pick loop horizontally -- `left_offset` 352 -> 459 and
+# `half_width` 160 -> 213 -- and the block above it reads:
+#
+#     NOT PATCHED, deliberately:
+#       #0x100 (256, top_offset)  and  #0x70 (112, half_height)
+#
+# **112 field units is exactly where the black stops in the photograph.** The
+# pick loop culls every layer-3/4 tile outside +/-112 vertically, so the mask
+# rows the archive supplies at -128..-112 and +112..+136 are never submitted.
+# The horizontal twins of these very words are what fixed the left and right
+# sides, which is as direct a piece of evidence as this project gets.
+#
+# THE VALUES, derived the same way the horizontal ones were:
+#
+#     half_height   112 -> 120     half of the 240-unit view, as 213 is half
+#                                  of the 427-unit one (448/2 -> 480/2)
+#     top_offset    256 -> 272     offset += |viewport offset|, exactly as
+#                                  352 + 107 = 459 horizontally; the viewport
+#                                  y moves 16 -> 0, so +16
+#
+# VERIFIED IN THE SHIPPED MODULE. build 95, read back with capstone:
+#
+#     0xA07CFC  sub w9, w8, #0x1cb   459   horizontal, APPLIED
+#     0xA07DB4  sub w8, w8, #0xd5    213   horizontal, APPLIED
+#     0xA07B64  sub w9, w8, #0x100   256   vertical,   STOCK
+#     0xA07C1C  sub w8, w8, #0x70    112   vertical,   STOCK
+#     0xA089B0  sub w9, w8, #0x100   256   vertical,   STOCK
+#
+# LAYER 4's SECOND VERTICAL BOUND IS A BARE-REGISTER COMPARE. ANSWERED.
+#
+# Layer 3 carries BOTH vertical immediates; layer 4 carries only `#0x100`. A
+# whole-function disassembly of `field_layer4_pick_tiles` (0xA08630..0xA08E00)
+# finds no `#0x70` at all. Reading the two sites side by side says why, and it
+# is not "layer 4 wraps where layer 3 clips":
+#
+#     LAYER 3, the pair                    LAYER 4, the same two comparisons
+#     0xA07B64 sub w9, w8, #0x100          0xA089B0 sub w9, w8, #0x100
+#              str w9, [x25, #4]                    str w9, [x23]
+#     0xA07C1C sub w8, w8, #0x70           0xA08A14 sub w10, w9, w8   <- NO
+#              str w8, [x25, #8]                    str w8, [x23, #8]    IMMEDIATE
+#
+# Same `ldrsh` / subtract / overflow-check / `strb` shape at all four sites.
+# Layer 4's second comparison subtracts a REGISTER, so its bound is already
+# effectively zero and there is no immediate to rewrite.
+#
+# **That is the vertical twin of this file's own KNOWN GAP**, stated below for
+# `right_offset`: "At zero there is no immediate to rewrite -- the test is
+# against the bare register -- so matching it needs an inserted instruction,
+# i.e. a cave." Same sentence, other axis, and it means:
+#
+#     layer 3 vertical    BOTH bounds move          two words, in place
+#     layer 4 vertical    ONE bound moves           one word, in place
+#                         the other needs a cave    NOT DONE
+#
+# So this is expected to fix the vertical pop-in on layer 3 outright and on
+# one of layer 4's two edges. If a residual asymmetry survives on hardware --
+# tiles popping on one vertical edge and not the other, layer 4 only -- that
+# is this gap and not a mistake in the three words. It is the same shape the
+# horizontal half shipped with and it did not stop that half being worth
+# having.
+# ======================================================================
+# WITHDRAWN -- THE VERTICAL WORDS NOW LIVE IN ff7nx_wsclamp. FINDINGS-205.
+# ======================================================================
+#
+# `VERTICAL_PATCHES` shipped three words in build 96 out of THIS file:
+#
+#     0xA07B64  layer3 top_offset   256 -> 272
+#     0xA07C1C  layer3 half_height  112 -> 120
+#     0xA089B0  layer4 top_offset   256 -> 272
+#
+# It is gone from here, and this is not a revert -- it is a MOVE. All three
+# addresses are now signature-verified entries in `ff7nx_wsclamp`
+# (`ptop3`, `phalf3`, `ptop4`), which is where their layer-1/2 twins `top1`
+# and `top2` have always lived. Two mechanisms owning one axis is what
+# HANDOFF-204 s3.6 required closing before anything else was built, and it is
+# the same rule FINDINGS-203 s6 earned the hard way: before adding a
+# mechanism, grep for the one already there.
+#
+# WHAT CHANGES IN THE MODULE, precisely:
+#
+#     0xA07C1C   half_height 120       SAME WORD, still shipped. It was right.
+#     0xA07B64   top_offset  256       back to STOCK
+#     0xA089B0   top_offset  256       back to STOCK
+#
+# The two 272s are withdrawn because the analysis under them was wrong, even
+# though the words were harmless. This file reasoned "the viewport y moves
+# 16 -> 0, so +16" by analogy with 352 + 107. But the 16 units the port
+# reveals are at the BOTTOM: the picture runs from bg.y-224 to bg.y+16, and
+# `top_offset` 256 already covers 224 with room to spare. Raising it to 272
+# stopped a 16-unit band of tiles being wrapped at the TOP, where nothing can
+# be seen -- inert, which is why build 96 shipped clean, and not the derived
+# value.
+#
+# THE COMMENT THIS FILE CARRIED ABOUT WHY IS ALSO WITHDRAWN. It said "the
+# pick loop culls every layer-3/4 tile outside +/-112 vertically". There is no
+# vertical cull in either pick loop -- enumerated branch by branch on the
+# stock module; see the `pbottom3` block in ff7nx_wsclamp. 112 is the WRAP
+# DIRECTION midpoint, and the keyhole mask stopped where it did because
+# `bottom_offset` is 0: the bottom rows were not culled, they were teleported
+# a whole layer height. That is what `pbottom3`/`pbottom4a`/`pbottom4b` fix,
+# and this file never had a way to reach them because they are bare-register
+# compares needing caves -- the vertical twin of its own KNOWN GAP, stated
+# above for `right_offset` and closed the same way.
+#
+# The names are kept as empty/False so anything still importing them fails
+# loudly on use rather than silently patching nothing.
+VERTICAL_PATCHES = []
+VERTICAL_MOVED_TO = 'ff7nx_wsclamp: ptop3, phalf3, ptop4, pbottom3/4a/4b'
+VERTICAL_OFF_ENV = 'SEVENTH_NX_WS_PARALLAX_NO_VERTICAL'   # now ff7nx_ws's
+
+# The other half of the vertical story, and it is NOT in this file's gift.
+# `ff7nx_ws.UNCROP_PATCHES` holds the mode-2 viewport words:
+#
+#     0x9298BC  viewport height 448 -> 480    STOCK in build 95
+#     0x929964  half-height     224 -> 240    ALREADY APPLIED, by
+#                                             ff7nx_ws's own vertical leg --
+#                                             the build log calls it
+#                                             "sprite origin 224 -> 240"
+#
+# So `SEVENTH_NX_WS_UNCROP=1` would now FAIL its own expect check on the
+# second word. Whoever turns the viewport half on has to drop that patch from
+# the spec, not re-apply it. Stated here because the two halves are one
+# feature and finding this out from a failed build is a wasted hour.
+VIEWPORT_HEIGHT_VA = 0x9298BC
+SPRITE_HALF_ALREADY_APPLIED_VA = 0x929964
+
+
+def vertical_enabled():
+    """
+    ALWAYS FALSE HERE NOW. The vertical words moved to `ff7nx_wsclamp` and are
+    gated by `SEVENTH_NX_WS_PARALLAX_NO_VERTICAL` in `ff7nx_ws.apply_module`.
+    Kept so an old caller gets "off", not an AttributeError.
+    """
+    return False
+
+
+def vertical_spec():
+    """WITHDRAWN -- see the VERTICAL_PATCHES block. Emits nothing."""
+    return {
+        'name': 'field parallax vertical (moved to ff7nx_wsclamp)',
+        'patches': [],
+    }
+
+
 def parallax_spec():
-    """A patch spec for nso_patcher, which verifies every original byte."""
+    """
+    A patch spec for nso_patcher, which verifies every original byte.
+
+    HORIZONTAL ONLY. The vertical words are `ff7nx_wsclamp`'s, and they are
+    applied in the SAME transaction a few lines earlier in
+    `ff7nx_ws.apply_module` -- so if both ever claimed 0xA07B64 the second
+    would fail its `expect` check and take the whole 16:9 stage with it.
+    """
+    patches = [dict(p) for p in PARALLAX_PATCHES]
     return {
         'name': 'field parallax 4:3 -> 16:9 clip/wrap points',
-        'patches': [dict(p) for p in PARALLAX_PATCHES],
+        'patches': patches,
     }
 
 
@@ -372,7 +542,12 @@ def apply_to_nso(src, dest, log=lambda *_: None):
         log('  ' + line)
     log('  parallax: %d words (clip/wrap 352->459, 160->213)'
         % len(PARALLAX_PATCHES))
-    log('  right_offset 0 -> 107 NOT applied (needs a cave; see module docs)')
+    log('  right_offset 0 -> 107 applied by ff7nx_wsclamp (pright3/4a/4b '
+        'caves) -- the "NOT patched" note this module used to print here was '
+        'stale and misled a whole session. HANDOFF-204 s7.')
+    log('  parallax VERTICAL is no longer this module\'s: top_offset, '
+        'half_height and the bottom_offset caves are ff7nx_wsclamp\'s '
+        'ptop3/phalf3/ptop4/pbottom3/pbottom4a/pbottom4b. FINDINGS-205.')
     return True
 
 
