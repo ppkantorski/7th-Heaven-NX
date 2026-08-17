@@ -2204,6 +2204,19 @@ def launch_ui():
                                      bool(_global_setting(
                                          'field_bg_preserve_cell_coords',
                                          True)),
+                                 # FINDINGS-223. Same reason as the block
+                                 # above, and it caught me: the key was
+                                 # written into settings.json by hand, the
+                                 # user pressed Build, and this dict -- which
+                                 # does not know the key exists -- rebuilt
+                                 # __global__ without it. The setting had
+                                 # already been read into the environment by
+                                 # then, so the build ran at 512 and the file
+                                 # came back saying 256.
+                                 'field_bg_d1_px':
+                                     int(_global_setting(
+                                         'field_bg_d1_px',
+                                         build.ff7nx_fieldbg.VANILLA_D1_PX)),
                                  'fps_60': bool(fps_var.get()),
                                  'movie_quality': current_movie_quality(),
                                  'movie_fit': current_movie_fit(),
@@ -2935,6 +2948,22 @@ def launch_ui():
         cap_value = current_field_tex_cap()
         bg_cap_value = current_battle_bg_tex_cap()
         fbg_px_value = current_field_bg_page_px()
+        # DEPTH-1 PAGE SIZE -- settings.json only, deliberately no dialog
+        # control. FINDINGS-223.
+        #
+        # Every other field-background option composes with the rest: they
+        # move budgets, slot counts and page ceilings around inside a format
+        # that does not change. This one changes the ARCHIVE FORMAT and needs
+        # eight extra module words to match, so a dropdown next to the others
+        # would imply a freedom it does not have. Wrong value here and the
+        # loader reads 0x40000 bytes per paletted page out of a file holding
+        # 0x10000 -- not a worse picture, a desynchronised TEXTURE walk.
+        #
+        # An env var set before launch still wins, so an A/B needs no edit.
+        if build.ff7nx_fieldbg.D1_PX_ENV not in os.environ:
+            os.environ[build.ff7nx_fieldbg.D1_PX_ENV] = str(
+                build.load_settings(SETTINGS).get('__global__', {}).get(
+                    'field_bg_d1_px', build.ff7nx_fieldbg.VANILLA_D1_PX))
         os.environ[build.field_bg_repack.BUDGET_ENV] = str(
             current_field_bg_budget_mb())
         # The value IS the constant. build.py reads
@@ -3139,6 +3168,11 @@ def main():
             if _px == 256 and not _g.get('field_bg_ladder_v2'):
                 _px = build.ff7nx_fieldbg.OFF_PAGE_PX
             os.environ[build.ff7nx_fieldbg.PAGE_PX_ENV] = str(_px)
+        # The headless half of the depth-1 wiring; see the note in `start()`.
+        if build.ff7nx_fieldbg.D1_PX_ENV not in os.environ:
+            os.environ[build.ff7nx_fieldbg.D1_PX_ENV] = str(
+                saved.get('__global__', {}).get(
+                    'field_bg_d1_px', build.ff7nx_fieldbg.VANILLA_D1_PX))
         if build.field_bg_repack.BUDGET_ENV not in os.environ:
             os.environ[build.field_bg_repack.BUDGET_ENV] = str(
                 saved.get('__global__', {}).get(

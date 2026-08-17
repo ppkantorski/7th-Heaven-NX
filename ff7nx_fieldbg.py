@@ -379,6 +379,148 @@ ORIG = {
 SITE_W23_KEEP = 0x9370C0
 ORIG_W23 = 0x321003F7                                   # mov w23, #0x10000
 
+# ------------------------------------------------------------- FINDINGS-223
+# DEPTH-1 AT 512px. THE OTHER HALF OF THE WELD.
+#
+# Everything above this line deliberately left depth-1 at 256 and said so:
+# "LEAVE +0x9370C0 ... depth-1 stays 256". That was right for a depth-2-only
+# change. This is the leg that moves it, and it is a bigger set than
+# FINDINGS-221 predicted -- ten words, not three, and two of the three it did
+# name were wrong.
+#
+# WHY THERE IS NO PROBE. `w23` is the depth-1 alloc count AND the depth-1
+# READ LENGTH, and the read consumes the stream: `+0x9BCF30` is a recompiled
+# `rep movsb` whose source cursor is advanced by exactly the byte count
+# (`add w8, w8, w20 ; str w8, [x22, #0x18]` at +0x9BD040). Section 9's TEXTURE
+# block is a strictly sequential walk with no per-page offset, so this number
+# and `field_bg_native.D1_PAGE_PX` are the SAME NUMBER seen from two sides.
+# Raise one without the other and the walk desynchronises on the first
+# depth-1 page of every field. HANDOFF-222 s6.3 proposed exactly that as a
+# no-op probe; it is not one.
+#
+# THE ALLOCATION ARITHMETIC IS EXACT, NOT WASTEFUL. FINDINGS-221 s2.2
+# accepted a 4x depth-2 over-allocation as the price of sharing `w23`. It is
+# not the price: the allocator is `count * size` and `size` is a separate
+# depth-2-only register, so `w25` goes BACK TO ITS STOCK VALUE OF 2 and
+# 0x40000 * 2 is exactly the 0x80000 it is today. `elem` below computes this
+# from the count rather than from a hardcoded 0x10000, which is the only
+# reason it comes out right at both settings.
+#
+#     w23 = 0x40000   d1 alloc 0x40000*1   d1 read 0x40000
+#                     d2 alloc 0x40000*2 = 0x80000   d2 read w27 = 0x80000
+#
+# AND `+0xA040D8` IS NOT THE DEPTH-1 TWIN OF `+0xA03C44`. Section D above
+# already warned that its `mov w23, #0x100` "feeds four stores, two of which
+# are palette entry counts". That warning is correct and FINDINGS-221 s2.6
+# argued past it. Read out of the module, the depth-1 surface struct carries
+# five fields the depth-2 one does not:
+#
+#     +0x00  width       w23   0xA0413C     <- must become 512
+#     +0x04  height      w23   0xA0415C     <- must become 512
+#     +0x08  stride      w8    0xA0417C     <- must become 0x400
+#     +0x10  1           w21   0xA041A0
+#     +0x14  8           w20   0xA041C0        bits per index
+#     +0x1c  (pal<<8)+0x200   0xA04228
+#     +0x20  0x100       w23   0xA04248     <- PALETTE ENTRY COUNT. 256.
+#   texhdr +0x34  0x100  w23   0xA040DC     <- PALETTE ENTRY COUNT. 256.
+#
+# So `w23` must NOT move here. The two dimensions get their own register
+# instead. `+0x10FC3A0` is a twelve-instruction leaf that clobbers only
+# x0/x8/x9/x10, and this function uses only w19..w23 of the callee-saved set,
+# so w11 survives every `bl` between the sites. The word to set it in comes
+# from `+0xA040D0 str w8, [x22]`, a recompiler spill into scratch slot 0
+# whose value is never reloaded -- slot 0 is next WRITTEN at +0xA04134 with
+# no read in between. THAT IS THE ONE PIECE OF THIS THAT IS SURGERY RATHER
+# THAN A CONSTANT, and `verify_module` checks the exact original word so a
+# module that moved fails loudly instead of being patched half-way.
+#
+# AND TWO SITES NOBODY HAD FOUND, in the NATIVE reimplementation rather than
+# the recompiled code. `field_load_textures` registers the +14 / +18 ALIAS
+# pages for slots 15..20 by allocating and copying a hardcoded 0x10000:
+#
+#     0x10DC624  mov w2, #0x10000    ; alloc size  -> 256*256*1
+#     0x10DC688  mov w2, #0x10000    ; memcpy len  -> 256*256*1
+#
+# Both alias arms test `ldrh w8,[x24,#0x1a] ; cmp w8,#1 ; b.ne` at +0x10DC444
+# and +0x10DC484, so this path fires for DEPTH-1 PAGES ONLY -- which is
+# precisely why a hardcoded 256x256x1 has been correct until now, and why
+# FINDINGS-194 could leave it alone. At 512 the alias would get a 64 KB
+# buffer for a 256 KB page and a texture header claiming 512x512 over it.
+D1_PX_ENV = 'SEVENTH_NX_FIELD_BG_D1_PX'
+VANILLA_D1_PX = 256
+SUPPORTED_D1_PX = (256, 512)
+
+# The build-wide depth-1 page side. build.py sets this from
+# `field_bg_native.D1_PAGE_PX` so the module and the archive cannot disagree;
+# `d1_page_px()` lets the env var override it for an A/B.
+D1_PAGE_PX = VANILLA_D1_PX
+
+SITE_D1_COUNT      = 0x9370C0   # mov w23, #0x10000  d1 alloc count AND read
+SITE_D1_PRECOUNT   = 0x92CF24   # mov w26, #0x10000  init, shared page count
+SITE_D1_SCRATCH    = 0xA040D0   # str w8, [x22]      dead spill -> w11 = px
+SITE_D1_SURF_W     = 0xA0413C   # str w23, [x0]      d1 surface width
+SITE_D1_SURF_H     = 0xA0415C   # str w23, [x0]      d1 surface height
+SITE_D1_SURF_PITCH = 0xA0417C   # mov w8, #0x200     d1 surface stride
+SITE_D1_ALIAS_SIZE = 0x10DC624  # mov w2, #0x10000   alias page alloc size
+SITE_D1_ALIAS_COPY = 0x10DC688  # mov w2, #0x10000   alias page memcpy length
+
+# THE WORD THAT MUST NOT MOVE, and it gets a name because writing its
+# encoding by hand once already produced the WRONG ONE: `mov w19, #0x100` is
+# 0x321803F3 and `mov w23, #0x100` is 0x321803F7, the register is the last
+# nibble, and the depth-2 site three lines up uses w19. The pre-flight caught
+# it; a named constant checked against the real module means the next reader
+# does not have to.
+SITE_D1_PAL_COUNT = 0xA040D8
+ORIG_D1_PAL_COUNT = 0x321803F7                          # mov w23, #0x100
+
+ORIG_D1 = {
+    SITE_D1_COUNT:      0x321003F7,                     # mov w23, #0x10000
+    SITE_D1_PRECOUNT:   0x321003FA,                     # mov w26, #0x10000
+    SITE_D1_SCRATCH:    0xB90002C8,                     # str w8, [x22]
+    SITE_D1_SURF_W:     0xB9000017,                     # str w23, [x0]
+    SITE_D1_SURF_H:     0xB9000017,                     # str w23, [x0]
+    SITE_D1_SURF_PITCH: 0x321703E8,                     # mov w8, #0x200
+    SITE_D1_ALIAS_SIZE: 0x321003E2,                     # mov w2, #0x10000
+    SITE_D1_ALIAS_COPY: 0x321003E2,                     # mov w2, #0x10000
+}
+
+# `str w11, [x0]` -- STR (immediate, unsigned offset), 32-bit, imm12 0, Rn 0.
+# Round-tripped through capstone rather than derived on paper, per the note
+# at the top of this file.
+STR_W11_X0 = 0xB900000B
+
+# The register the two depth-1 dimension stores are repointed at. Caller-
+# saved, but the only calls between the write and the reads are
+# `bl #0x10FC3A0`, which touches x0/x8/x9/x10 and nothing else.
+D1_SCRATCH_REG = 11
+
+
+def d1_page_px():
+    """The depth-1 page side this build writes. Must match the archive."""
+    raw = os.environ.get(D1_PX_ENV)
+    if raw is None:
+        return D1_PAGE_PX
+    try:
+        val = int(raw, 0)
+    except ValueError:
+        return D1_PAGE_PX
+    return val if val in SUPPORTED_D1_PX else D1_PAGE_PX
+
+
+def d1_read_bytes(d1_px=None):
+    """Bytes the loader must allocate for, and read into, one depth-1 page.
+
+    This is `field_bg_native.d1_stored_bytes()` seen from the module side and
+    the two must agree exactly -- see the note above."""
+    px = d1_page_px() if d1_px is None else px_or(d1_px)
+    return px * px
+
+
+def px_or(val):
+    if val not in SUPPORTED_D1_PX:
+        raise ValueError('unsupported depth-1 page size %r' % (val,))
+    return val
+
 # Dead-code sites: x86 addresses that must stay unreferenced.
 DEAD_X86 = {
     0x62A0E7: 'write_field_background_data',
@@ -584,6 +726,7 @@ def words(px=None, bleed=None, max_raw=None):
         # 512px one does.
         out = _field_buffer_word(max_raw)
         out.update(_load_slots_word())
+        out.update(_d1_words())
         return out
 
     pixels = px * px                                  # 0x40000 at 512
@@ -595,8 +738,15 @@ def words(px=None, bleed=None, max_raw=None):
     # sizes that are not multiples of 256 possible at all -- HANDOFF-52 3.1
     # required it to divide exactly and concluded, wrongly, that only
     # multiples of 256 exist.
-    elem = -(-read // 0x10000)                        # ceil; 8 at 512, 1 at 128
-    alloc_bytes = elem * 0x10000
+    #
+    # FINDINGS-223: the count is `w23`/`w26`, which is NO LONGER always
+    # 0x10000 -- the depth-1 leg raises it to 0x40000. Deriving `elem` from
+    # the live count rather than from the literal is what makes the depth-2
+    # allocation stay exact instead of over-allocating 4x: at a 0x40000 count
+    # a 512px depth-2 page needs elem 2, which is the module's STOCK value.
+    count = d1_read_bytes()                           # 0x10000 or 0x40000
+    elem = -(-read // count)                          # ceil; 8 at 512/256, 2 at 512/512
+    alloc_bytes = elem * count
 
     # The pixel-fixup loop bound is `sub w9, w8, #imm12, lsl #12`, so it can
     # only express multiples of 0x1000. Round UP: every real pixel must be
@@ -638,6 +788,7 @@ def words(px=None, bleed=None, max_raw=None):
 
     out.update(_field_buffer_word(max_raw))
     out.update(_load_slots_word())
+    out.update(_d1_words())
     if bleed if bleed is not None else halve_bleed():
         # -0.4375/256 -> -0.4375/px, so the tile-edge bleed guard stays the
         # same fraction of a TEXEL. Costs correctness on the depth-1 pages
@@ -659,6 +810,58 @@ def words(px=None, bleed=None, max_raw=None):
                    HALVE_BLEED_ENV))
         put(SITE_BLEED, _movz_hi16(ORIG[SITE_BLEED], hi),
             'tile bleed guard -0.4375/256 -> -0.4375/%d' % px)
+    return out
+
+
+def _d1_words(d1_px=None):
+    """
+    {offset: (orig, new, why)} for the depth-1 page size. {} at 256.
+
+    All eight or none. There is no partial state that renders: the loader's
+    read length, the file's stored size and the surface dimensions are one
+    decision seen from three places, and any two of them disagreeing
+    desynchronises the TEXTURE walk rather than degrading the picture.
+    """
+    px = d1_page_px() if d1_px is None else px_or(d1_px)
+    if px == VANILLA_D1_PX:
+        return {}
+    n = px * px
+
+    out = {}
+
+    def put(off, word, why):
+        if word is None:
+            raise ValueError('field bg d1 %dpx: cannot encode %s' % (px, why))
+        out[off] = (ORIG_D1[off], word, why)
+
+    put(SITE_D1_COUNT, mov_imm_word(23, n),
+        'loader: depth-1 alloc count AND read length 0x10000 -> 0x%X '
+        '(shared with the depth-2 alloc count, which `elem` compensates '
+        'for exactly)' % n)
+    put(SITE_D1_PRECOUNT, mov_imm_word(26, n),
+        'init_bg_pages: shared page count 0x10000 -> 0x%X (the depth-1 '
+        'element size at +0x92D0A0 stays 1, so depth-1 pre-allocates 0x%X)'
+        % (n, n))
+    put(SITE_D1_SCRATCH, mov_imm_word(D1_SCRATCH_REG, px),
+        'make_field_tex_header_pal: a DEAD recompiler spill (scratch slot 0, '
+        'never reloaded before +0xA04134 overwrites it) becomes w%d = %d, '
+        'because w23 cannot move -- it also feeds two palette entry counts'
+        % (D1_SCRATCH_REG, px))
+    put(SITE_D1_SURF_W, STR_W11_X0,
+        'depth-1 surface WIDTH now comes from w%d (%d), not w23'
+        % (D1_SCRATCH_REG, px))
+    put(SITE_D1_SURF_H, STR_W11_X0,
+        'depth-1 surface HEIGHT now comes from w%d (%d), not w23'
+        % (D1_SCRATCH_REG, px))
+    put(SITE_D1_SURF_PITCH, mov_imm_word(8, px * 2),
+        'depth-1 surface stride 0x200 -> 0x%X (the engine builds a 2-byte '
+        'surface for a paletted page too, expanding the palette on the way)'
+        % (px * 2))
+    put(SITE_D1_ALIAS_SIZE, mov_imm_word(2, n),
+        'field_load_textures: +14/+18 ALIAS page alloc 0x10000 -> 0x%X '
+        '(depth-1 only path, guarded at +0x10DC444 / +0x10DC484)' % n)
+    put(SITE_D1_ALIAS_COPY, mov_imm_word(2, n),
+        'field_load_textures: +14/+18 ALIAS page memcpy 0x10000 -> 0x%X' % n)
     return out
 
 
@@ -801,11 +1004,29 @@ def verify_module(nso_path, log=lambda *_: None, px=None):
             log('! field bg: +0x%08X holds %08X, expected %08X  (%s)'
                 % (off, got, orig, why))
             ok = False
-    got = struct.unpack_from('<I', m.text, SITE_W23_KEEP)[0]
-    if got != ORIG_W23:
-        log('! field bg: +0x%08X (the depth-1 constant that must NOT move) '
-            'holds %08X, expected %08X' % (SITE_W23_KEEP, got, ORIG_W23))
-        ok = False
+    # +0x9370C0 is the depth-1 constant. At 256 it MUST NOT MOVE and this is
+    # the check that says so. At 512 it is `SITE_D1_COUNT` and the loop above
+    # has already checked it against the same original word, so asserting it
+    # is unpatched here would contradict the patch set rather than guard it.
+    if d1_page_px() == VANILLA_D1_PX:
+        got = struct.unpack_from('<I', m.text, SITE_W23_KEEP)[0]
+        if got != ORIG_W23:
+            log('! field bg: +0x%08X (the depth-1 constant that must NOT '
+                'move) holds %08X, expected %08X'
+                % (SITE_W23_KEEP, got, ORIG_W23))
+            ok = False
+    else:
+        # The palette-entry-count constant. FINDINGS-223 s2: `mov w23, #0x100`
+        # at +0xA040D8 feeds the depth-1 surface dimensions AND two palette
+        # entry counts, so the depth-1 leg routes the dimensions through w11
+        # and leaves this alone. If a future module merged those stores this
+        # patch set is wrong, and this is what says so.
+        got = struct.unpack_from('<I', m.text, SITE_D1_PAL_COUNT)[0]
+        if got != ORIG_D1_PAL_COUNT:
+            log('! field bg: +0x%08X (the depth-1 PALETTE ENTRY COUNT, which '
+                'must stay 256) holds %08X, expected %08X'
+                % (SITE_D1_PAL_COUNT, got, ORIG_D1_PAL_COUNT))
+            ok = False
 
     # Order matters: a body is only allowed to be referenced from a body
     # already proven dead, so prove them outermost-first.

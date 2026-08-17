@@ -232,6 +232,7 @@
   "field_bg_compact_frame_safe": true,
   "field_bg_clamp_palettes": false,
   "field_bg_preserve_cell_coords": false,
+  "field_bg_d1_px": 256,
   "fps_60": true,
   "movie_quality": "maximum",
   "movie_fit": "native",

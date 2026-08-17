@@ -1545,7 +1545,7 @@ def repack_section9(sec9, field, art_for, page_px=512, log=None,
                 continue                      # fully evacuated -> freed
             kept += 1
             total += _page_bytes(
-                FN.VANILLA_PX if p.depth == 1 else page_px, p.depth)
+                FN.D1_PAGE_PX if p.depth == 1 else page_px, p.depth)
         return total + n_new * _page_bytes(page_px, 2), kept + n_new
 
     # `need[blend]` is the SET of distinct cells that group has taken, not a

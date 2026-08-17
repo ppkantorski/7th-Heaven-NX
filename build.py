@@ -103,6 +103,11 @@ FIELD_BG_MAX_RAW = 0
 FIELD_BG_BUFFER_MAX = 16 * 1024 * 1024
 FIELD_BG_RAW_CAP = FIELD_BG_BUFFER_MAX * 4 // 5
 
+# The depth-1 page side this build INTENDS to end up with. Distinct from
+# `field_bg_native.D1_PAGE_PX`, which is the size a section currently HOLDS
+# and stays at 256 until the very last pass. FINDINGS-223.
+FIELD_BG_D1_TARGET_PX = 256
+
 # Fields whose BACKGROUND is left at stock -- no Cosmos section 9, no margin
 # passes, no repack. A DIAGNOSTIC, not a setting: see the long note at the use
 # site in `_convert_field_backgrounds`. Empty in a shipping build.
@@ -711,6 +716,43 @@ def build_plan(mods, settings_by_mod, catalogs, log=lambda *_: None,
     # "FFNx textures : N (skipped, no Switch loader)" line honest.
     for mod in mods:
         plan.skipped_ffnx += getattr(mod, 'skipped_images', 0)
+
+    # THE DEPTH-1 PAGE SIZE, RESOLVED ONCE AND SHARED. FINDINGS-223.
+    #
+    # The module's read length and the file's stored size are the same number
+    # seen from two sides, and if they disagree the TEXTURE walk desynchronises
+    # rather than degrading. So it is resolved in exactly one place and pushed
+    # into both modules, and `_field_bg_d1_guard` below re-checks that they
+    # still agree right before `main` is written.
+    # THE TARGET IS NOT THE CURRENT SIZE, AND CONFLATING THEM DESTROYED A BUILD.
+    #
+    # `field_bg_native.D1_PAGE_PX` means "the size the section in my hands
+    # HOLDS RIGHT NOW". For the whole pipeline that is 256, because the lift
+    # is the last pass and has not run yet. Setting it to 512 here made
+    # `parse_texture_block` read every 64 KB paletted page as a 256 KB one:
+    # marginart, both blackcells, marginpage, the transparency key and the
+    # repack all desynchronised at once, which is what "cannot reshape array
+    # of size 262144 into shape (256,256)" and 557 sections "did not parse as
+    # a background" were. The lift then failed on the wreckage.
+    #
+    # So the BUILD INTENT lives in its own name, and `D1_PAGE_PX` is flipped
+    # only inside `field_bg_native.lift_depth1`, for the length of one
+    # serialise.
+    global FIELD_BG_D1_TARGET_PX
+    FIELD_BG_D1_TARGET_PX = ff7nx_fieldbg.d1_page_px()
+    ff7nx_fieldbg.D1_PAGE_PX = FIELD_BG_D1_TARGET_PX
+    if field_bg_native.D1_PAGE_PX != field_bg_native.VANILLA_PX:
+        raise RuntimeError(
+            'field_bg_native.D1_PAGE_PX is %d at the start of the build; it '
+            'must be %d until lift_depth1 runs'
+            % (field_bg_native.D1_PAGE_PX, field_bg_native.VANILLA_PX))
+    if FIELD_BG_D1_TARGET_PX != field_bg_native.VANILLA_PX:
+        log('  field background: DEPTH-1 PAGES AT %dpx (%s). Every paletted '
+            'page in the archive is lifted and %d extra module word(s) are '
+            'written. Build 108 lifts by 2x REPLICATION, so the picture is '
+            'expected to be IDENTICAL -- see FINDINGS-223.'
+            % (FIELD_BG_D1_TARGET_PX, ff7nx_fieldbg.D1_PX_ENV,
+               len(ff7nx_fieldbg._d1_words())))
 
     # Upscaled field background art. These .dds are NOT extracted -- there
     # are 18,270 of them in Cosmos Limit Break and they are 3 GB -- so all
@@ -3271,7 +3313,7 @@ def _convert_field_backgrounds(archive, payloads, log, dds_sources=()):
             page_cost.append((
                 name, len(live),
                 sum(field_bg_repack._page_bytes(
-                    field_bg_native.VANILLA_PX if p.depth == 1 else px,
+                    field_bg_native.D1_PAGE_PX if p.depth == 1 else px,
                     p.depth) for p in live),
                 before))
         except Exception:                                      # noqa: BLE001
@@ -3717,6 +3759,110 @@ def _convert_field_backgrounds(archive, payloads, log, dds_sources=()):
         if len(skipped) > 6:
             log(f'      ... and {len(skipped) - 6} more')
     return nf, npg, grew
+
+
+def _lift_depth1_payloads(archive, payloads, log=lambda *_: None):
+    """
+    Rewrite every depth-1 page in every payload at `field_bg_native.D1_PAGE_PX`.
+
+    FINDINGS-223. No-op unless the depth-1 size has been raised.
+
+    WHY THE CAP CHECK IS HERE AND NOT IN THE CAP PASS. `cap_section9` decides
+    its budget while depth-1 pages are still 256, so its arithmetic is 1.21x
+    optimistic once this runs. Rather than teach it a size it cannot see yet,
+    this refuses outright: a field that would cross FIELD_BG_RAW_CAP keeps its
+    UNLIFTED payload and is named, because half a lift is not a smaller
+    picture, it is a desynchronised TEXTURE walk.
+
+    MEASURED before this shipped (`_k512gate.py`, all 741 entries off the
+    build-107 archive): the largest field lands at 5,878,431 against a
+    13,421,772 cap, so `refused` should be empty and a non-empty one is worth
+    stopping for.
+    """
+    dst = FIELD_BG_D1_TARGET_PX
+    if dst == field_bg_native.VANILLA_PX:
+        return
+    if field_bg_native.D1_PAGE_PX != field_bg_native.VANILLA_PX:
+        raise RuntimeError(
+            'the depth-1 lift was reached with D1_PAGE_PX already at %d; '
+            'some pass upstream has been parsing paletted pages at the wrong '
+            'size' % field_bg_native.D1_PAGE_PX)
+    px = ff7nx_fieldbg.page_px()
+    if px == ff7nx_fieldbg.OFF_PAGE_PX:
+        px = field_bg_native.VANILLA_PX
+    n_fields = n_pages = 0
+    refused, failed, untouched = [], [], 0
+    biggest = 0
+    # EVERY FIELD IN THE ARCHIVE, not just the ones this build changed.
+    #
+    # `payloads` holds only modified fields. The ~30 fields no pass touched
+    # would ship straight from the source archive with 256px paletted pages
+    # while the module reads 512 -- so they are exactly the fields that would
+    # break, and iterating `payloads` would have missed all of them. Same
+    # loop shape as `ff7nx_marginblack.apply_to_flevel`, which is the
+    # established contract for a late pass.
+    for name in archive.names():
+        entry = archive.index.get(name)
+        if entry is None or not archive.is_field(entry):
+            continue
+        payload = payloads.get(name)
+        try:
+            raw = (lgp.lzs_decompress(payload[4:]) if payload
+                   else archive.decompressed(entry))
+        except Exception as exc:                               # noqa: BLE001
+            failed.append((name, '%s: %s' % (type(exc).__name__, exc)))
+            continue
+        if payload is None:
+            untouched += 1
+        try:
+            parts = lgp.split_sections(raw)
+            new9, k = field_bg_native.lift_depth1(
+                parts[8], px, field_bg_native.VANILLA_PX, dst)
+            if not k:
+                continue
+            parts[8] = new9
+            new_raw = lgp.join_sections(parts)
+        except Exception as exc:                               # noqa: BLE001
+            failed.append((name, '%s: %s' % (type(exc).__name__, exc)))
+            continue
+        if len(new_raw) > FIELD_BG_RAW_CAP:
+            refused.append((name, len(new_raw)))
+            continue
+        biggest = max(biggest, len(new_raw))
+        payloads[name] = _encode_field_cached(archive, new_raw)
+        n_fields += 1
+        n_pages += k
+    if untouched:
+        log('    (%d field(s) had no payload before this pass and were lifted '
+            'straight from the source archive -- they carry paletted pages '
+            'too, so leaving them alone was never an option here)' % untouched)
+    log('  field background DEPTH-1 LIFT: %s paletted page(s) taken from '
+        '%dx%d to %dx%d across %s field(s). The INDICES are unchanged -- this '
+        'is 2x replication, so the picture is expected to be identical and '
+        'any visible difference is the module patch, not the art. Largest '
+        'field now %s bytes against a %s cap.'
+        % (f'{n_pages:,}', field_bg_native.VANILLA_PX,
+           field_bg_native.VANILLA_PX, dst, dst, f'{n_fields:,}',
+           f'{biggest:,}', f'{FIELD_BG_RAW_CAP:,}'))
+    # A PARTIAL LIFT IS NOT A DEGRADED BUILD, IT IS A BROKEN ONE, so this
+    # raises rather than logging and carrying on. A field left at 256 while
+    # the module reads 0x40000 per paletted page desynchronises its TEXTURE
+    # walk on the first one; the failure is not confined to that field's
+    # appearance and there is no partial credit to bank.
+    if refused or failed:
+        for name, size in refused:
+            log('  ! field background DEPTH-1 LIFT: %s would be %s bytes, '
+                'over FIELD_BG_RAW_CAP' % (name, f'{size:,}'))
+        for name, err in failed:
+            log('  ! field background DEPTH-1 LIFT: %s -- %s' % (name, err))
+        raise RuntimeError(
+            'the depth-1 lift could not cover %d field(s) (%d refused for '
+            'size, %d failed to parse). Every paletted page in the archive '
+            'has to move together with the module, so this build is not '
+            'shippable and nothing further will be written. Set '
+            '%s=256 to build without the lift.'
+            % (len(refused) + len(failed), len(refused), len(failed),
+               ff7nx_fieldbg.D1_PX_ENV))
 
 
 def _encode_field_cached(archive, raw):
@@ -4987,6 +5133,19 @@ def _build_flevel(archive_path, chunks, field_files, romfs, log,
     mb_line = ff7nx_marginblack.summarise(mb_stats)
     if mb_line:
         log('  ' + mb_line)
+
+    # ------------------------------------------ DEPTH-1 RESOLUTION LIFT
+    # FINDINGS-223. DEAD LAST, and that is the design rather than a
+    # convenience: every pass above -- marginart, both blackcells,
+    # marginblack, the repack, the cap -- reads and writes paletted art in
+    # 256-unit coordinates, and none of them has to learn about this. The
+    # lift is a pure format change applied once the pages are final.
+    #
+    # It is also all-or-nothing per BUILD, not per field. Section 9 has no
+    # per-page size field, so the engine infers a depth-1 page's dimension
+    # from a patched constant; a single 256px page left behind would be read
+    # as 512px and desynchronise the whole TEXTURE walk from that slot on.
+    _lift_depth1_payloads(archive, payloads, log)
 
     # LAST of the section-9 passes, and deliberately so. FINDINGS-207.
     #

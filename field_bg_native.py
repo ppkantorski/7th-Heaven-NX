@@ -108,10 +108,54 @@ PAGE_STORED_BYTES = {
 }
 
 
+# THE DEPTH-1 PAGE SIDE. FINDINGS-223.
+#
+# Until now this was welded to VANILLA_PX by a derivation rather than by the
+# data: section 9 stores NO size field per page, so both we and the engine
+# INFER a page's dimension from its depth. That is why colour depth and
+# resolution have been the same decision, and why the 26% of tiles that never
+# promote are also the only ones still at 256px.
+#
+# THIS NUMBER IS THE LOADER'S READ LENGTH. `read_field_background_data` reads
+# `w23` bytes per depth-1 page from a strictly sequential stream and advances
+# its source cursor by exactly that many (traced to the `rep movsb` at
+# +0x9BD038..+0x9BD04C). So a mismatch between this constant and the module's
+# `w23` does not degrade the picture -- it desynchronises the TEXTURE walk on
+# the FIRST depth-1 page and reads every later page's header out of the
+# previous page's pixels.
+#
+# Raising it to 512 therefore REQUIRES the ten module words in FINDINGS-223
+# s4, all of them, in the same build. There is no half-way state and no
+# module-only probe. `ff7nx_fieldbg` derives its words from this value so the
+# two cannot drift.
+D1_PAGE_PX = VANILLA_PX
+
+# The legal values. 512 is the only one asked for; the list exists so a typo
+# fails loudly rather than producing a section 9 the engine walks off the end
+# of. Each must be a size `PAGE_STORED_BYTES` can express as one ARM64
+# immediate, because the read length is a `mov wN, #imm`.
+D1_PAGE_PX_CHOICES = (256, 512)
+
+
+def d1_stored_bytes(px=None):
+    """Bytes one depth-1 page occupies in section 9, and the read length."""
+    px = D1_PAGE_PX if px is None else px
+    if px not in D1_PAGE_PX_CHOICES:
+        raise ValueError('depth-1 page side %r is not one of %r'
+                         % (px, D1_PAGE_PX_CHOICES))
+    return px * px
+
+
 def stored_bytes(px, depth):
     """Bytes one page of this size and depth occupies in section 9."""
     if depth != 2:
-        return VANILLA_PX * VANILLA_PX
+        # `px` is DELIBERATELY IGNORED here, exactly as it was when this
+        # returned VANILLA_PX**2. A depth-1 page's side is a property of the
+        # BUILD, not of the page -- there is no per-page size field and the
+        # loader reads one fixed length -- so callers that pass the depth-2
+        # px alongside depth 1 (test_tex_caps does) keep getting the right
+        # answer instead of a plausible wrong one.
+        return d1_stored_bytes()
     return PAGE_STORED_BYTES.get(px, px * px * 2)
 
 
@@ -432,7 +476,7 @@ class Page:
 END_MARKER = b'ENDFINAL FANTASY7'
 
 
-def parse_texture_block(sec9, px=VANILLA_PX):
+def parse_texture_block(sec9, px=VANILLA_PX, strict_tail=True):
     """
     (pages, tex_start, tex_end) where `pages` has BG_MAX_PAGES entries, each
     a Page or None.
@@ -462,7 +506,7 @@ def parse_texture_block(sec9, px=VANILLA_PX):
         o += 4
         if depth not in (1, 2):
             raise Section9Error('slot %d has depth %d' % (slot, depth))
-        side = px if depth == 2 else VANILLA_PX
+        side = px if depth == 2 else D1_PAGE_PX
         nbytes = side * side * depth
         nstored = stored_bytes(side, depth)
         if o + nstored > n:
@@ -508,7 +552,9 @@ def parse_texture_block(sec9, px=VANILLA_PX):
     # fields before it ships -- both of my attempts passed the two fields I was
     # looking at and failed the archive.
     if not 0 <= n - o <= 64:
-        raise Section9Error('TEXTURE block leaves %d trailing bytes' % (n - o))
+        if strict_tail:
+            raise Section9Error(
+                'TEXTURE block leaves %d trailing bytes' % (n - o))
     return pages, start, o
 
 
@@ -589,6 +635,146 @@ def scrub_green_lsb(pages):
 
 def replace_texture_block(sec9, pages, tex_start, tex_end):
     return sec9[:tex_start] + build_texture_block(pages) + sec9[tex_end:]
+
+
+# ------------------------------------------------- depth-1 resolution lift
+def resize_depth1(data, src_px, dst_px):
+    """
+    Nearest-neighbour integer resize of a PALETTED page. Indices, not colours.
+
+    Replication and not a filter, and here that is not a preference -- an
+    index is a name, so the average of index 3 and index 200 is index 101,
+    which is a different colour entirely and usually not even a neighbouring
+    one. Index 0 is additionally the transparency key, so any blend across a
+    transparent edge would invent an opaque colour where the art has a hole.
+    This moves single bytes and never interprets them.
+    """
+    if dst_px == src_px:
+        return data
+    try:
+        import numpy as _n
+    except ImportError:
+        _n = None
+    if dst_px < src_px:
+        # DECIMATION, and it exists so the lift can be PROVEN reversible.
+        # Taking the top-left of each k x k block is the exact inverse of
+        # replication, so `_k512gate`'s falsifier 2 is a real test of where
+        # the upscale put its texels rather than a test that some resize
+        # ran. It is not for producing art.
+        if src_px % dst_px:
+            raise ValueError('depth-1 resize %d -> %d is not an integer ratio'
+                             % (src_px, dst_px))
+        k = src_px // dst_px
+        if _n is not None:
+            a = _n.frombuffer(data, dtype=_n.uint8, count=src_px * src_px)
+            return a.reshape(src_px, src_px)[::k, ::k].tobytes()
+        out = bytearray(dst_px * dst_px)
+        for y in range(dst_px):
+            srow = data[y * k * src_px:y * k * src_px + src_px]
+            out[y * dst_px:(y + 1) * dst_px] = srow[::k]
+        return bytes(out)
+    if dst_px % src_px:
+        raise ValueError('depth-1 lift %d -> %d is not an integer ratio'
+                         % (src_px, dst_px))
+    k = dst_px // src_px
+    if _n is not None:
+        a = _n.frombuffer(data, dtype=_n.uint8, count=src_px * src_px)
+        return _n.repeat(_n.repeat(a.reshape(src_px, src_px), k, 0),
+                         k, 1).tobytes()
+    out = bytearray(dst_px * dst_px)
+    for y in range(src_px):
+        row = bytearray(dst_px)
+        srow = data[y * src_px:(y + 1) * src_px]
+        for x in range(src_px):
+            row[x * k:x * k + k] = bytes([srow[x]]) * k
+        for r in range(k):
+            base = (y * k + r) * dst_px
+            out[base:base + dst_px] = row
+    return bytes(out)
+
+
+def lift_depth1(sec9, page_px, src_d1_px=VANILLA_PX, dst_d1_px=None,
+                art=None, tolerate_tail=True):
+    """
+    Rewrite every depth-1 page in `sec9` from `src_d1_px` to `dst_d1_px`.
+
+    THIS IS THE ONLY PLACE THE DEPTH-1 PAGE SIZE CHANGES, and it runs LAST,
+    after every pass that reads or writes paletted art. Everything upstream
+    keeps working in 256-unit coordinates and does not know this exists --
+    which is what makes the resolution lift separable from the ART change
+    that follows it (FINDINGS-223 s6).
+
+    `art`, when given, is `f(slot, px) -> bytes | None`: a replacement index
+    page already at `dst_d1_px`, for the build that sources Cosmos's own
+    resolution instead of replicating. Left None this is a pure 2x nearest
+    upscale, whose EXPECTED ON-SCREEN RESULT IS AN IDENTICAL PICTURE -- the
+    same texels, four times each, over the same normalised UV extent.
+
+    Returns (new_sec9, n_lifted). Raises rather than half-converting.
+    """
+    global D1_PAGE_PX
+    dst = D1_PAGE_PX if dst_d1_px is None else dst_d1_px
+    if dst not in D1_PAGE_PX_CHOICES:
+        raise ValueError('depth-1 page side %r is not one of %r'
+                         % (dst, D1_PAGE_PX_CHOICES))
+    keep = D1_PAGE_PX
+    try:
+        # Parse at the size the section ACTUALLY holds, which is not
+        # necessarily the size this build writes. Doing this by hand rather
+        # than by threading a parameter through six call sites is deliberate:
+        # the walk has to consume the block exactly, so a wrong src_d1_px
+        # raises here instead of returning a plausible garbage page.
+        D1_PAGE_PX = src_d1_px
+        try:
+            pages, s, e = parse_texture_block(sec9, page_px)
+        except Section9Error:
+            # `blackbgb` AND `blackbgb.xone`, AND NOTHING ELSE. Their section
+            # 9 writes the END marker two or three times with zero padding,
+            # so the trailing-tail check refuses them and every build to date
+            # has reported "2 field(s) not changed" and moved on.
+            #
+            # THAT IS NO LONGER AN OPTION. Declining to read a field used to
+            # mean shipping it unchanged, which was harmless. Under a 512px
+            # module it means shipping two fields whose paletted pages are
+            # still 256 while the loader reads 0x40000 -- a desynchronised
+            # walk on a field the game really does load between scenes.
+            #
+            # The PAGES parse perfectly; only the tail is odd. So walk them
+            # with the tail check off and keep everything past `tex_end`
+            # byte-for-byte, which is what `replace_texture_block` does
+            # anyway. This is deliberately NOT a general widening of the
+            # check -- the check is what makes a wrong `px` fail loudly, and
+            # widening it was tried once and was a mistake (see the note in
+            # parse_texture_block).
+            if not tolerate_tail:
+                raise
+            pages, s, e = parse_texture_block(sec9, page_px, strict_tail=False)
+    finally:
+        D1_PAGE_PX = keep
+    n = 0
+    for p in pages:
+        if p is None or p.depth != 1:
+            continue
+        if p.px != src_d1_px:
+            raise ValueError('slot %d is %dpx, expected %d'
+                             % (p.slot, p.px, src_d1_px))
+        new = art(p.slot, dst) if art is not None else None
+        if new is None:
+            new = resize_depth1(p.data, src_d1_px, dst)
+        if len(new) != dst * dst:
+            raise ValueError('slot %d lifted to %d bytes, expected %d'
+                             % (p.slot, len(new), dst * dst))
+        p.data = new
+        p.px = dst
+        n += 1
+    if not n:
+        return sec9, 0
+    try:
+        D1_PAGE_PX = dst
+        out = replace_texture_block(sec9, pages, s, e)
+    finally:
+        D1_PAGE_PX = keep
+    return out, n
 
 
 # ------------------------------------------------------------------- pixels
@@ -848,7 +1034,7 @@ def bytes_after(sec9, page_px, promote, src_px=VANILLA_PX):
             total += 2
             continue
         d2 = p.depth == 2 or promote
-        side = page_px if d2 else VANILLA_PX
+        side = page_px if d2 else D1_PAGE_PX
         total += 6 + side * side * (2 if d2 else 1)
     return total
 

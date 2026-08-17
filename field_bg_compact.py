@@ -486,7 +486,7 @@ def compact_section9(sec9, src_px=None, page_px=None):
         avail = [s for s in here if s not in claimed]
         if not avail:
             return sec9, CompactStats()
-        px = FN.VANILLA_PX if depth == 1 else pmap[group_refs[0][0]].px
+        px = FN.D1_PAGE_PX if depth == 1 else pmap[group_refs[0][0]].px
 
         # merge byte-identical cells
         canon = {}
