@@ -569,6 +569,32 @@ FIELD_BG_PRESETS = {
 # 12 is vanilla's heaviest field (fship_2) and only 5 fields reach it, so it
 # is the order the port was provisioned for. Raise it to find the real
 # ceiling; the build log names every field that exceeds whatever is set here.
+# PALETTED (depth-1) PAGE SIZE. This is the fx-texture size cap.
+#
+# It used to be settings.json-only, on the argument that a dropdown "would
+# imply a freedom it does not have" because the size is an ARCHIVE FORMAT
+# change needing ten matching module words. That argument was wrong in the
+# way that matters: the freedom is real -- `build.py` emits the module words
+# from this value and asserts if they disagree -- and hiding the control did
+# not make the setting safer, it made it invisible. The user asked for it
+# twice.
+#
+# IT IS THE ONLY CONTROL OVER FX TEXTURE SIZE THERE CAN BE. FINDINGS-225:
+# an fx page is an ordinary page bound at tile offset 34, it is almost always
+# depth-1, and section 9 has no per-page size field -- the engine infers the
+# dimension from the patched constant. So every depth-1 page in a build is
+# the same size and "cap the fx pages only" is not expressible in the format.
+# This knob moves all of them together, which is the whole available lever.
+#
+# MEASURED on the shipped 512px build, all 711 fields:
+#     depth-1 pages   1,609    421.8 MB     of which 813 are fx: 213.1 MB
+#     heaviest field  md_e1    5,632 KB across 17 pages
+# At 256 the depth-1 term drops to 105 MB and uutai1 goes 4,096 -> 2,048 KB.
+FIELD_BG_D1_PX_CHOICES = [
+    (256, '256px — vanilla size, what the game shipped (safest)'),
+    (512, '512px — 4x the bytes; needed for sharp fx/paletted art'),
+]
+
 FIELD_BG_MAX_PAGES_CHOICES = [
     (12, '12 pages \u2014 recommended (vanilla\u2019s heaviest field)'),
     (10, '10 pages \u2014 conservative'),
@@ -1075,6 +1101,13 @@ def launch_ui():
     if initial_ftc_value not in ftc_label_by_value:
         initial_ftc_value = build.field_bg_dense.MAX_TRUECOLOR_PAGES
 
+    fd1_label_by_value = dict(FIELD_BG_D1_PX_CHOICES)
+    fd1_value_by_label = {v: k for k, v in FIELD_BG_D1_PX_CHOICES}
+    initial_fd1_value = global_saved.get(
+        'field_bg_d1_px', build.ff7nx_fieldbg.VANILLA_D1_PX)
+    if initial_fd1_value not in fd1_label_by_value:
+        initial_fd1_value = build.ff7nx_fieldbg.VANILLA_D1_PX
+
     fmaxp_label_by_value = dict(FIELD_BG_MAX_PAGES_CHOICES)
     fmaxp_value_by_label = {v: k for k, v in FIELD_BG_MAX_PAGES_CHOICES}
     _fmaxp_default = build.field_bg_repack.DEFAULT_MAX_TOTAL_PAGES
@@ -1326,6 +1359,12 @@ def launch_ui():
     def current_field_bg_truecolor():
         return ftc_value_by_label.get(
             ftc_var.get(), build.field_bg_dense.MAX_TRUECOLOR_PAGES)
+
+    fd1_var = tk.StringVar(value=fd1_label_by_value[initial_fd1_value])
+
+    def current_field_bg_d1_px():
+        return fd1_value_by_label.get(fd1_var.get(),
+                                      build.ff7nx_fieldbg.VANILLA_D1_PX)
 
     fmaxp_var = tk.StringVar(value=fmaxp_label_by_value[initial_fmaxp_value])
 
@@ -1824,6 +1863,36 @@ def launch_ui():
              'Sizes other than 256 patch exefs/main AND rewrite flevel.lgp, '
              'and both halves are needed. 256px needs no module patch at all, '
              'so it is the only one testable without a full game dump.', True),
+            ('combo', 'Field background PALETTED (fx) page size', fd1_var,
+             [l for _, l in FIELD_BG_D1_PX_CHOICES],
+             'The size of every 8-bit PALETTED page, which is where the fx '
+             'textures live — the blinking lights in cosin3, the '
+             'animated blend layers, and every page the truecolor promotion '
+             'refuses.\n\n'
+             'THIS IS THE ONLY FX SIZE CONTROL THERE CAN BE, and the reason '
+             'is worth knowing before you reach for it. An fx page is an '
+             'ordinary page a tile binds at record offset 34. Section 9 '
+             'stores no per-page dimension — the engine infers it from a '
+             'constant patched into exefs/main — so every paletted page '
+             'in a build must be the same size. "Cap the fx pages only" is '
+             'not something the format can express; one page disagreeing '
+             'with the constant desynchronises the whole TEXTURE walk from '
+             'that slot on, which is a scrambled field, not a smaller one.\n\n'
+             'MEASURED on the 512px build, all 711 fields: 1,609 paletted '
+             'pages holding 421.8 MB, of which 813 are fx pages holding '
+             '213.1 MB. At 256 the paletted term drops to 105 MB; uutai1 '
+             'goes from 4,096 KB of texture to 2,048 KB and cosin3 from '
+             '2,816 KB to 2,048 KB.\n\n'
+             '256 IS NOT A DOWNGRADE FROM 512 UNTIL THE ART LANDS. Build 108 '
+             'lifted these pages by 2x REPLICATION — same 256px of '
+             'detail, four texels where there was one — so at the moment '
+             '512 costs four times the memory and bandwidth for a picture '
+             'that is bit-for-bit identical. Choose 256 if you are chasing a '
+             'crash or a frame-rate dip; the two settings should look the '
+             'same on screen, and if they do not, that is worth reporting.\n\n'
+             '512 rewrites flevel.lgp AND patches ten words of exefs/main, '
+             'and both halves are needed — they are emitted together and '
+             'the build asserts if they disagree.', True),
             ('combo', 'Field background TRUECOLOR pages', ftc_var,
              [l for _, l in FIELD_BG_TRUECOLOR_CHOICES],
              'How many pages of a field may be promoted from 8-bit paletted '
@@ -2204,6 +2273,22 @@ def launch_ui():
                                      bool(_global_setting(
                                          'field_bg_preserve_cell_coords',
                                          True)),
+                                 # FINDINGS-228. Carried through here for the
+                                 # reason the comment below gives: a key this
+                                 # dict does not know about is dropped from
+                                 # __global__ on the next Build.
+                                 'field_bg_multipal':
+                                     bool(_global_setting(
+                                         'field_bg_multipal', True)),
+                                 # FINDINGS-232. Comma-separated field names,
+                                 # empty by default. An fx BASE on a truecolor
+                                 # page is a shape the stock game never ships
+                                 # (0 of 104,925 pairs) and it crashes
+                                 # `wcrimb_2`, so it is opt-in PER FIELD and
+                                 # never global.
+                                 'field_bg_fx_base_fields':
+                                     str(_global_setting(
+                                         'field_bg_fx_base_fields', '') or ''),
                                  # FINDINGS-223. Same reason as the block
                                  # above, and it caught me: the key was
                                  # written into settings.json by hand, the
@@ -2213,10 +2298,28 @@ def launch_ui():
                                  # already been read into the environment by
                                  # then, so the build ran at 512 and the file
                                  # came back saying 256.
+                                 # NOW A DROPDOWN, so it comes from the
+                                 # widget like every other control rather
+                                 # than being echoed back from the file. The
+                                 # FINDINGS-223 note above is kept because
+                                 # the hazard it describes is still real for
+                                 # anyone hand-editing settings.json with the
+                                 # GUI open -- the dict is still rebuilt from
+                                 # scratch on save, and the widget still wins.
                                  'field_bg_d1_px':
-                                     int(_global_setting(
-                                         'field_bg_d1_px',
-                                         build.ff7nx_fieldbg.VANILLA_D1_PX)),
+                                     int(current_field_bg_d1_px()),
+                                 # HANDOFF-224 s0.11, and the rule is now
+                                 # older than the build that paid for it:
+                                 # ANY setting a build adds goes in THIS
+                                 # block, read-only or not. Build 109's
+                                 # depth-1 ART switch -- on means the lift
+                                 # writes Cosmos's 512px art where it has it,
+                                 # off means it replicates and the build is
+                                 # build 108 exactly. It is the A/B for
+                                 # "is the art the thing I am looking at".
+                                 'field_bg_d1_art':
+                                     bool(_global_setting(
+                                         'field_bg_d1_art', True)),
                                  'fps_60': bool(fps_var.get()),
                                  'movie_quality': current_movie_quality(),
                                  'movie_fit': current_movie_fit(),
@@ -2948,22 +3051,36 @@ def launch_ui():
         cap_value = current_field_tex_cap()
         bg_cap_value = current_battle_bg_tex_cap()
         fbg_px_value = current_field_bg_page_px()
-        # DEPTH-1 PAGE SIZE -- settings.json only, deliberately no dialog
-        # control. FINDINGS-223.
+        # DEPTH-1 PAGE SIZE -- NOW A DIALOG CONTROL. FINDINGS-223, 225.
         #
-        # Every other field-background option composes with the rest: they
-        # move budgets, slot counts and page ceilings around inside a format
-        # that does not change. This one changes the ARCHIVE FORMAT and needs
-        # eight extra module words to match, so a dropdown next to the others
-        # would imply a freedom it does not have. Wrong value here and the
-        # loader reads 0x40000 bytes per paletted page out of a file holding
-        # 0x10000 -- not a worse picture, a desynchronised TEXTURE walk.
+        # This used to read from settings.json only, and the note here argued
+        # that a dropdown "would imply a freedom it does not have" because
+        # the size changes the ARCHIVE FORMAT and needs ten matching module
+        # words. RETRACTED. The freedom is real: `build.py` emits those words
+        # FROM this value and raises if the two disagree, so the pairing is
+        # enforced rather than trusted. What the missing control actually
+        # achieved was that the one knob governing fx-texture size -- and
+        # therefore the one lever against the memory and bandwidth cost of
+        # the 512px build -- was invisible to the person running the tool.
+        #
+        # The hazard the old note describes is still real and still worth
+        # stating: wrong value and the loader reads 0x40000 bytes per
+        # paletted page out of a file holding 0x10000, which is not a worse
+        # picture but a desynchronised TEXTURE walk. It is prevented by the
+        # two halves being emitted together, not by hiding the control.
         #
         # An env var set before launch still wins, so an A/B needs no edit.
         if build.ff7nx_fieldbg.D1_PX_ENV not in os.environ:
             os.environ[build.ff7nx_fieldbg.D1_PX_ENV] = str(
-                build.load_settings(SETTINGS).get('__global__', {}).get(
-                    'field_bg_d1_px', build.ff7nx_fieldbg.VANILLA_D1_PX))
+                current_field_bg_d1_px())
+        # BUILD 109. Content only -- it cannot desynchronise anything,
+        # because off is 2x replication and on is different PIXELS in a page
+        # of the same size. That is why it is a plain bool while the size
+        # above needs eight module words to agree with it.
+        if build.field_bg_shadow.ENV not in os.environ:
+            os.environ[build.field_bg_shadow.ENV] = (
+                '1' if build.load_settings(SETTINGS).get(
+                    '__global__', {}).get('field_bg_d1_art', True) else '0')
         os.environ[build.field_bg_repack.BUDGET_ENV] = str(
             current_field_bg_budget_mb())
         # The value IS the constant. build.py reads
@@ -2992,6 +3109,25 @@ def launch_ui():
         # FINDINGS-136: a promoted cell keeps its grid coordinate.
         build.field_bg_dense.PRESERVE_CELL_COORDS = bool(
             _global_setting('field_bg_preserve_cell_coords', True))
+        # FINDINGS-228: promote a cell that several palettes recolour, keyed
+        # per palette, when its variants provably differ.
+        #
+        # THIS NO LONGER DRIVES `PROMOTE_FX_BASE`, AND THAT COUPLING COST A
+        # BUILD. FINDINGS-232/234. The two flags were introduced together
+        # because neither does anything without the other, so this line set
+        # both -- which meant that when `PROMOTE_FX_BASE` was reverted to
+        # False in the module to stop `wcrimb_2` crashing, THIS LINE PUT IT
+        # BACK at build time and the rebuilt archive came out byte-identical.
+        # A module constant that the GUI overwrites is not a constant, and a
+        # revert that a settings default undoes is not a revert.
+        #
+        # `PROMOTE_FX_BASE` is now owned by `field_bg_dense` alone, and the
+        # per-field experiment goes through `field_bg_fx_base_fields` below.
+        build.field_bg_dense.MULTIPAL_RECOLOUR = bool(
+            _global_setting('field_bg_multipal', True))
+        _fxb = _global_setting('field_bg_fx_base_fields', '')
+        build.field_bg_dense.PROMOTE_FX_BASE_FIELDS = frozenset(
+            s.strip().lower() for s in str(_fxb or '').split(',') if s.strip())
         os.environ[build.field_bg_repack.MAX_TOTAL_PAGES_ENV] = str(
             current_field_bg_max_pages())
         build.field_bg_repack.apply_growth_mode(
@@ -3173,6 +3309,10 @@ def main():
             os.environ[build.ff7nx_fieldbg.D1_PX_ENV] = str(
                 saved.get('__global__', {}).get(
                     'field_bg_d1_px', build.ff7nx_fieldbg.VANILLA_D1_PX))
+        if build.field_bg_shadow.ENV not in os.environ:
+            os.environ[build.field_bg_shadow.ENV] = (
+                '1' if saved.get('__global__', {}).get(
+                    'field_bg_d1_art', True) else '0')
         if build.field_bg_repack.BUDGET_ENV not in os.environ:
             os.environ[build.field_bg_repack.BUDGET_ENV] = str(
                 saved.get('__global__', {}).get(
@@ -3201,6 +3341,13 @@ def main():
             _sg.get('field_bg_clamp_palettes', False))
         build.field_bg_dense.PRESERVE_CELL_COORDS = bool(
             _sg.get('field_bg_preserve_cell_coords', True))
+        # FINDINGS-228/234. See the headless branch above -- `PROMOTE_FX_BASE`
+        # is deliberately NOT set here.
+        build.field_bg_dense.MULTIPAL_RECOLOUR = bool(
+            _sg.get('field_bg_multipal', True))
+        _fxb = _sg.get('field_bg_fx_base_fields', '')
+        build.field_bg_dense.PROMOTE_FX_BASE_FIELDS = frozenset(
+            s.strip().lower() for s in str(_fxb or '').split(',') if s.strip())
         if build.field_bg_repack.REPLACE_ONLY_ENV not in os.environ:
             build.field_bg_repack.apply_growth_mode(
                 saved.get('__global__', {}).get('field_bg_replace_only', 2))

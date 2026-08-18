@@ -84,11 +84,116 @@ BIG_CELL = _os.environ.get('SEVENTH_NX_NO_PALRANGE_BIGCELL') != '1'
 # pale block in Mt. Corel's top-left corner.
 ATLAS_BY_QUANTISE = _os.environ.get('SEVENTH_NX_NO_PALRANGE_QUANT') != '1'
 
+# ---------------------------------------------------------------------------
+# THE RENDER SCORE IS THE RIGHT RULE FOR LAYER 1 AND THE WRONG ONE ABOVE IT.
+# FINDINGS-230.
+#
+# `_best_palette` scores a candidate by rendering the cell and comparing it to
+# COSMOS'S ART. That asks "which palette best reproduces this picture", which
+# is exactly right for layer 1, whose job is to BE the picture.
+#
+# A layer-2+ tile is drawn through a BLEND MODE. Its job is to CONTRIBUTE to
+# the picture -- a green wash, a haze, a light cone -- and the quantity it has
+# to match is not Cosmos's RGB for that cell but the tint its NEIGHBOURS are
+# laying down. Score an additive overlay by colour distance to a palette-0
+# render and the neutral palette wins every time, because neutral is what is
+# closest to the source image.
+#
+# MEASURED, `mds7plr1`, the 16:9 margin overlay Cosmos authors at palette 11
+# in a field whose table ends at 10:
+#
+#     palette  5   mean RGB ( 77.4,  74.1,  55.4)   <- the render score picks
+#     palette  9   mean RGB ( 18.1,  37.3,  21.6)   <- the interior overlay uses
+#
+# Palette 9 is the dark green that lays the wash down; palette 5 is a neutral
+# grey-brown that adds haze and no hue. That is "the greenish lighting effect
+# is missing exactly in the 16:9 regions", to the byte.
+#
+# ARCHIVE-WIDE, tiles naming a palette their field does not have:
+#
+#     layer 1   10,586 tiles   66 fields      <- render score, unchanged
+#     layer 2   14,969 tiles  109 fields      <- this rule
+#     layer 3    1,452 tiles   17 fields
+#     layer 4      287 tiles    6 fields
+#               -------
+#               27,294         61% on a BLENDED layer
+#
+# THE DOCSTRING ABOVE REJECTS THE NEIGHBOUR RULE, and that rejection stands
+# where it was measured. Its table (mds5_3, mds5_5, nivl_b22, trnad_3) scores
+# fidelity to Cosmos's art over ALL LAYERS AT ONCE, so it is dominated by
+# layer 1 -- which is not the population this flag touches. Do not read it as
+# evidence about layers 2+; it never separated them.
+#
+# THE RULE ON ITS OWN IS NOT ENOUGH, AND THE MEASUREMENTS SAY SO. Four
+# versions, scored on the SEAM across the 4:3 edge (`_kpal230.py`), 83 fields:
+#
+#     A  copy the neighbour's palette INDEX      35 better  11 worse  +95.8
+#     B  render-score to the NEIGHBOURHOOD       35 better   8 worse  +95.8
+#     C  B + the per-layer seam veto below       35 better   0 worse   +0.1
+#     D  C + the SET_TOL incumbent preference    35 better   0 worse   +0.0
+#
+# A is the obvious rule and it is wrong: copying a palette INDEX onto a
+# different cell's indices is not copying its COLOUR, because the two cells
+# carry different index content. `mds5_5` regressed 72 points under it.
+#
+# The veto is what makes it safe, and the veto had to be debugged before it
+# was: it applied the trial assignment to every tile sharing a cell, while
+# `fix_field` rewrites only the OUT-OF-RANGE ones. That dragged the inner band
+# toward the outer one and made the reference arm look 5x better than it is
+# (`mds7plr1`: 7.26 modelled against a true 35.21), so the veto reverted the
+# field the whole finding rests on. See `_seam_of`.
+#
+# `SEVENTH_NX_NO_PALRANGE_LAYER=1` turns the whole thing off -> build 110
+# exactly, byte for byte. Containment is proven: 50 of 50 control fields with
+# nothing out of range come out byte-identical.
+LAYER_SCOPED = _os.environ.get('SEVENTH_NX_NO_PALRANGE_LAYER') != '1'
+NEIGHBOUR_LAYERS = frozenset((2, 3, 4))
+
+# FIELDS WHERE THE RETARGET COSTS MORE THAN IT BUYS. MEASURED, NOT GUESSED.
+#
+# The palette byte feeds `field_bg_dense`'s seating, and seating is capacity-
+# and order-sensitive: change which palette a cell is drawn through and the
+# candidate order can shift, which can displace an fx group that only fits one
+# way. `mtcrl_8` is the one field in the archive where that happens.
+#
+#     mtcrl_8   seam 7.92 -> 0.00   truecolor 741 -> 510 tiles   pages 4 -> 5
+#
+# Build 110 had taken that field from 509 to 741, so the retarget hands back
+# almost all of it to close a 7.9-point seam. Bad trade, so it does not run
+# there.
+#
+# IT IS NOT THE TEXTURE SET. Checked directly: (cell, palette) pairs are 511
+# either way and the one multi-palette cell is {0, 2} either way, so
+# `SET_TOL`'s incumbent preference is already doing its job. The loss is
+# downstream, in seating.
+#
+# THIS LIST IS REGENERATED, NOT MAINTAINED BY HAND:
+#
+#     python3 _kpalgate.py --names _kpalgate_names.txt --resume
+#     -> any field with d_tiles_tc < 0 belongs here
+#
+# It is a measured exclusion and it is honest about being one. The general
+# answer is a field-level admission test that runs the repack both ways and
+# keeps the retarget only where it costs no promoted tiles -- the same pattern
+# `_multipal_admit` uses one layer down. That is the follow-up; this is what
+# makes build 111 shippable without a regression in the meantime.
+PALRANGE_LAYER_EXCLUDE = frozenset(('mtcrl_8',))
+NEIGHBOUR_K = 8                # modal palette of the K nearest in-range tiles
+                               # of the SAME layer. Not the global modal: an
+                               # overlay can legitimately change tint across a
+                               # field, and a single answer per field would
+                               # flatten that into one. Not the single nearest
+                               # either -- that propagates one stray tile.
+
 import diag_common as DC
 import ff7nx_marginblack as MB
 import field_bg_native as FN
 
 T_PAL = MB.T_PAL
+# IMPORTED, never retyped (HANDOFF-222 s0.1). The vanilla 4:3 window is
+# dst_x in [-160, 160); everything outside it is what the widescreen mod
+# authored, and the boundary is where the seam this module now measures lives.
+HALF_43 = MB.HALF_43
 
 
 def palette_rows(sec3):
@@ -269,6 +374,151 @@ def _best_palette(arrays, pal565, art_for, rows, slot, sx, sy, edge=16):
     return bestp
 
 
+def _cell_mean(arrays, pal565, slot, sx, sy, pal, edge=16):
+    """Mean RGB this cell DRAWS through `pal`, index 0 excluded.
+
+    Index 0 is excluded because on a blended layer it contributes nothing;
+    counting it would score a palette by how much empty space the cell happens
+    to carry instead of by the colour it lays down.
+    """
+    a = arrays.get(slot)
+    if a is None or pal >= len(pal565):
+        return None
+    idx = a[sy:sy + edge, sx:sx + edge]
+    m = idx != 0
+    if not m.any():
+        return None
+    import numpy as _np
+    v = pal565[pal][idx][m].astype(_np.uint16)
+    return _np.array([float((((v >> 11) & 31) << 3).mean()),
+                      float((((v >> 5) & 63) << 2).mean()),
+                      float(((v & 31) << 3).mean())])
+
+
+# DO NOT GROW A CELL'S PALETTE SET FOR A MARGINAL COLOUR GAIN. FINDINGS-230 s4.
+#
+# `field_bg_dense` builds one truecolor texture per (cell, PALETTE) actually
+# referenced. Retargeting a margin tile onto a palette the cell is not already
+# drawn through therefore adds a TEXTURE, which needs a seat, which can need a
+# page -- and a field that cannot get the page loses promotions it already had.
+#
+# MEASURED, `mtcrl_8`: one retargeted cell, seam 7.92 -> 0.00, and 231 tiles
+# fell off the truecolor page with one page added. Build 110 had taken that
+# field from 509 to 741 truecolor tiles; this handed almost all of it back for
+# a 7.9-point seam.
+#
+# So among candidates that score within `SET_TOL` of the best, prefer one the
+# cell ALREADY names. The colour cost is bounded by the tolerance and the
+# structural cost goes to zero. Where no incumbent is close enough the best
+# candidate still wins -- this is a preference, not a veto.
+SET_TOL = 8.0                  # out of 255. Below the 5-bit quantisation step
+                               # times two, so an incumbent inside it is not a
+                               # visibly different answer.
+
+
+def _neighbour_palette(bad_tile, in_range, arrays, pal565, rows,
+                       k=NEIGHBOUR_K, edge=16, incumbent=()):
+    """
+    THE PALETTE WHOSE RENDERED CELL BEST MATCHES THE LOCAL NEIGHBOURHOOD.
+
+    NOT "the modal palette of the neighbours", which is what this function did
+    first and which MEASURED BADLY: over 83 fields with a measurable seam it
+    improved 34 and made 11 WORSE, `mds5_5` by 72 points and `sninn_2` by 96.
+    Copying a neighbour's palette index onto a different cell's indices is not
+    the same operation as copying its colour -- the two cells carry different
+    index content, so the same table can render somewhere else entirely.
+
+    So keep `_best_palette`'s method -- render every candidate and score it --
+    and change only the TARGET. `_best_palette` aims at Cosmos's art, which is
+    right for layer 1 and picks a neutral palette on a blended layer (see
+    LAYER_SCOPED). This aims at what the neighbouring overlay tiles actually
+    draw, which is the quantity the seam is made of.
+
+    Returns None when the neighbourhood cannot be rendered, and the caller then
+    falls back to `_best_palette` rather than inventing an answer.
+    """
+    same = in_range.get(bad_tile.layer)
+    if not same or pal565 is None:
+        return None
+    dx, dy = bad_tile.dx, bad_tile.dy
+    near = sorted(same, key=lambda t: (t.dx - dx) ** 2 + (t.dy - dy) ** 2)[:k]
+    tgt, n = None, 0
+    for t in near:
+        m = _cell_mean(arrays, pal565, t.slot, t.sx, t.sy, t.pal)
+        if m is None:
+            continue
+        tgt = m if tgt is None else tgt + m
+        n += 1
+    if not n:
+        return None
+    tgt = tgt / n
+    score = {}
+    for p in range(rows):
+        m = _cell_mean(arrays, pal565, bad_tile.slot, bad_tile.sx,
+                       bad_tile.sy, p, edge)
+        if m is not None:
+            score[p] = float(abs(m - tgt).mean())
+    if not score:
+        return None
+    best = min(score, key=score.get)
+    # See SET_TOL. An incumbent inside the tolerance wins, and the closest
+    # incumbent wins among several.
+    near = [p for p in incumbent
+            if p in score and score[p] <= score[best] + SET_TOL]
+    if near:
+        return min(near, key=score.get)
+    return best
+
+
+def _seam_of(tiles, layer, assign, arrays, pal565, rows, band=48):
+    """
+    The rendered discontinuity across the edge of the vanilla 4:3 window, for
+    one layer, under a given palette assignment.
+
+    THIS IS THE ARTEFACT ITSELF. The defect FINDINGS-230 describes is a hard
+    vertical line where the widescreen margin meets the original picture, so
+    the quantity to minimise is the jump between the band just inside that edge
+    and the band just outside it. Both are the same part of the scene under the
+    same light, which is what makes the comparison fair -- unlike "margin mean
+    vs interior mean", which conflates tint with content and scored this change
+    backwards on the first attempt.
+
+    `assign` maps (slot, sx, sy, layer) -> palette for the tiles being
+    rewritten; every other tile keeps the palette it names.
+
+    THE `t.pal >= rows` TEST IS LOad-BEARING AND ITS ABSENCE WAS A BUG.
+    `fix_field` rewrites ONLY the tiles whose palette is out of range, but
+    several tiles share one source cell and some of those name a palette that
+    exists. Keying the override by cell alone therefore reassigned tiles the
+    build never touches -- including in-range tiles in the INNER band, which
+    dragged the inner mean toward the outer one and made the reference arm
+    look 5x better than it is (`mds7plr1`: 7.26 against a true 35.21). The
+    veto then reverted the field this whole finding is built on.
+    """
+    def _mean(sel):
+        acc, n = None, 0
+        for t in sel:
+            p = (assign.get((t.slot, t.sx, t.sy, t.layer), t.pal)
+                 if t.pal >= rows else t.pal)
+            m = _cell_mean(arrays, pal565, t.slot, t.sx, t.sy, p)
+            if m is None:
+                continue
+            acc = m if acc is None else acc + m
+            n += 1
+        return (acc / n) if n else None
+
+    inner = [t for t in tiles if t.layer == layer
+             and (-HALF_43 <= t.dx < -HALF_43 + band
+                  or HALF_43 - band <= t.dx < HALF_43)]
+    outer = [t for t in tiles if t.layer == layer
+             and (-HALF_43 - band <= t.dx + 16 <= -HALF_43
+                  or HALF_43 <= t.dx < HALF_43 + band)]
+    a, b = _mean(inner), _mean(outer)
+    if a is None or b is None:
+        return None
+    return float(abs(a - b).mean())
+
+
 def fix_field(sec3, sec9, name='', log=None, art_for=None):
     """Return (sec9, stats). Rewrites out-of-range palette bytes in place."""
     st = {'tiles': 0, 'cells': 0, 'pals': Counter(), 'rows': 0}
@@ -323,17 +573,94 @@ def fix_field(sec3, sec9, name='', log=None, art_for=None):
     # Cosmos's art. For an all-index-0 cell that reduces to "the palette
     # whose entry 0 matches the art", which is exactly the question. For a
     # normal cell it is the ordinary best-palette choice.
-    choice = {}
-    for t in bad:
-        key = (t.slot, t.sx, t.sy)
-        if key not in choice:
+    #
+    # KEYED BY (CELL, LAYER), NOT BY CELL. See LAYER_SCOPED. One source cell
+    # can be drawn by a layer-1 tile and a layer-2 tile at once, and those two
+    # now get different answers -- which the format allows, because the palette
+    # byte lives on the TILE. Keying by cell alone would force the overlay and
+    # the background to share one palette and silently undo half of this.
+    in_range = {}
+    incumbent = {}
+    # See PALRANGE_LAYER_EXCLUDE. The name is the field's, lower-cased the way
+    # `build.py` passes it.
+    _scoped = LAYER_SCOPED and (name or '').lower() not in PALRANGE_LAYER_EXCLUDE
+    if _scoped:
+        for t in tiles:
             _pg = pages.get(t.slot)
-            _edge = 32 if (BIG_CELL and _pg is not None and _pg.size_flag) else 16
-            choice[key] = (0 if pal565 is None else
-                           _best_palette(arrays, pal565, art_for, rows,
-                                         t.slot, t.sx, t.sy, _edge))
+            if _pg is None or _pg.depth != 1 or t.pal >= rows:
+                continue
+            # The palettes this CELL is already drawn through, over every
+            # layer -- `field_bg_dense` keys its textures by (cell, palette)
+            # and does not care which layer asked. See SET_TOL.
+            incumbent.setdefault((t.slot, t.sx, t.sy), set()).add(t.pal)
+            if t.layer in NEIGHBOUR_LAYERS:
+                in_range.setdefault(t.layer, []).append(t)
+    choice = {}
+    st['by_neighbour'] = 0
+    st['by_render'] = 0
     for t in bad:
-        new = choice[(t.slot, t.sx, t.sy)]
+        key = (t.slot, t.sx, t.sy, t.layer)
+        if key in choice:
+            continue
+        _pg = pages.get(t.slot)
+        _edge = 32 if (BIG_CELL and _pg is not None and _pg.size_flag) else 16
+        new = None
+        if _scoped and t.layer in NEIGHBOUR_LAYERS:
+            new = _neighbour_palette(
+                t, in_range, arrays, pal565, rows, edge=_edge,
+                incumbent=sorted(incumbent.get((t.slot, t.sx, t.sy), ())))
+        if new is None:
+            new = (0 if pal565 is None else
+                   _best_palette(arrays, pal565, art_for, rows,
+                                 t.slot, t.sx, t.sy, _edge))
+            st['by_render'] += 1
+        else:
+            st['by_neighbour'] += 1
+        choice[key] = new
+    # ---- ADMISSION RUNS THE FALSIFIER, PER LAYER.
+    #
+    # The neighbourhood rule is right in the general case and wrong in
+    # particular fields, and no amount of argument settles which is which.
+    # MEASURED over the 83 fields with a measurable seam: it improved 35 and
+    # made 8 worse, `sninn_2` by 96 points. So do not argue -- render both
+    # assignments, keep whichever leaves the smaller seam, and let a field
+    # where the old rule was already better simply keep it.
+    #
+    # This cannot do worse than build 110 on the quantity it targets, which is
+    # the whole point of deciding it here instead of in a comment.
+    if _scoped and st['by_neighbour'] and pal565 is not None:
+        _ref = {}
+        for t in bad:
+            k = (t.slot, t.sx, t.sy, t.layer)
+            if t.layer in NEIGHBOUR_LAYERS and k not in _ref:
+                _pg = pages.get(t.slot)
+                _e = 32 if (BIG_CELL and _pg is not None and _pg.size_flag) else 16
+                _ref[k] = _best_palette(arrays, pal565, art_for, rows,
+                                        t.slot, t.sx, t.sy, _e)
+        for layer in sorted({t.layer for t in bad}
+                            & set(NEIGHBOUR_LAYERS)):
+            mix = dict(choice)
+            mix.update({k: v for k, v in _ref.items() if k[3] == layer})
+            s_new = _seam_of(tiles, layer, choice, arrays, pal565, rows)
+            s_ref = _seam_of(tiles, layer, mix, arrays, pal565, rows)
+            if s_new is None or s_ref is None:
+                continue
+            if s_new > s_ref + 0.5:
+                # COUNT WHAT IS ACTUALLY REVERTED, not every key on the layer.
+                # `_ref` holds a reference answer for every out-of-range cell
+                # on this layer, but only the ones the neighbourhood rule
+                # actually decided were ever counted in `by_neighbour` -- the
+                # rest fell through to `_best_palette` and are already there.
+                # Subtracting the whole set drove the counter negative.
+                _moved = sum(1 for k, v in _ref.items()
+                             if k[3] == layer and choice.get(k) != v)
+                choice.update({k: v for k, v in _ref.items()
+                               if k[3] == layer})
+                st['seam_reverted'] = st.get('seam_reverted', 0) + 1
+                st['by_neighbour'] -= _moved
+                st['by_render'] += _moved
+    for t in bad:
+        new = choice[(t.slot, t.sx, t.sy, t.layer)]
         st['pals'][t.pal] += 1
         st['tiles'] += 1
         cells.add((t.slot, t.sx, t.sy))

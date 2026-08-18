@@ -84,6 +84,9 @@ if _HERE not in sys.path:
 
 import diag_common as DC
 import ff7nx_marginblack as MB
+# BUILD 109. Disarmed unless `build.py` calls `arm()`, in which case every
+# entry point here is a no-op and this import costs nothing but the module.
+import field_bg_shadow as SH
 
 
 # Leave a cell alone when the art it already carries is entirely black.
@@ -240,6 +243,11 @@ MARGIN_ART_ENV = 'SEVENTH_NX_MARGIN_ART'
 DEFAULT_ON = False        # settings.json owns it: `margin_art: 1`
 
 TILE = 16
+
+# BUILD 118. `_sqdist` via BLAS instead of an (N,M,3) reduction. Bit-identical
+# by construction -- see `_sqdist` -- and ~3x faster on the hottest function in
+# the build. SEVENTH_NX_NO_FASTQ=1 restores the original expression.
+FAST_QUANTISE = os.environ.get('SEVENTH_NX_NO_FASTQ') != '1'
 # THE 32-UNIT CELL. See the `_edge` note in fill_field.
 #
 # `SEVENTH_NX_NO_BIGCELL=1` restores the 16x16 write on size_flag pages,
@@ -413,6 +421,100 @@ BLEND_BAND_FIRST_SLOT = 0x0F
 # Set True to restore the layer rule for A/B.
 KEEP0_LAYER_IS_CUTOUT = False
 
+# THE MARGIN PASS HAS NEVER RUN ABOVE LAYER 1. FINDINGS-231.
+#
+#     ff7nx_marginblack.Tile.is_margin  ->  self.layer == 1 and self.outside_43
+#
+# `outside_43` is documented one line above it as "wholly outside the 4:3
+# picture, on ANY layer", and then `is_margin` throws every other layer away.
+# `fillable_cells` is built on that property, so in margin scope every layer-2,
+# -3 and -4 tile is vetoed BEFORE any other test runs -- not by the
+# multi-palette rule, not by `_is_animated`, not by keep-0, but by the
+# definition of what a margin is. 530,349 cells written and not one of them
+# above layer 1.
+#
+# That is why the widescreen regions have no lighting overlay: Cosmos authors
+# the margin overlay as BLANK PLACEHOLDER cells and ships the art in the page
+# DDS, exactly as it does on layer 1. FFNx replaces the page and draws it. We
+# have to write it into the paletted page, and we were never looking.
+#
+# MEASURED, 701 fields (`_kl2margin.py`, FINDINGS-231 falsifier 1):
+#
+#     layer 2+ tiles outside the 4:3 picture        69,427
+#     distinct source cells                         46,785
+#     PLACEHOLDER -- a single index over 16x16       9,901
+#     ...and EXCLUSIVE to the margin                 9,892
+#     ...and Cosmos actually PAINTS it               8,284   in 173 fields
+#       of those, ANIMATED (the flicker veto)            0
+#       blend group of the page                  4 for all 8,284
+#
+# THREE THINGS THAT MEASUREMENT SETTLES, and each one removes a stated risk:
+#
+#   * ZERO are animated, so `_is_animated`'s flicker hazard does not arise in
+#     this population at all.
+#   * ALL of them are on blend group 4 -- the same group layer 1's margin
+#     placeholders already sit on. None is on the additive group, so "index 0
+#     means adds nothing and filling it paints the sky" cannot happen here.
+#   * cells == tiles == 8,284, so every one is drawn EXACTLY ONCE. They are
+#     single-palette by construction, which means HANDOFF-227's
+#     one-cell-many-palettes ceiling -- the thing that caps the paletted path
+#     everywhere else -- does not touch them.
+#
+# OFF AS OF BUILD 115, AND THE JOB MOVED. FINDINGS-235.
+#
+# This was ON in build 114 and it is the regression photographed on
+# `mds7plr1`: a fence in the right margin covered in hard black speckle where
+# FFNx draws a clean mesh, and a step at the 4:3 boundary on both sides.
+#
+# THE MECHANISM, and it is a property of WHERE the write happens rather than
+# of anything decided here. This pass writes 8-BIT INDICES INTO A 256px
+# PALETTED PAGE: one texel per cell texel, 16x16 per cell, and index 0 as a
+# ONE-BIT colour key. `field_bg_dense` then promotes the cell to a 512px
+# truecolor page, takes the COLOUR from the mod's .dds at 512 -- and takes the
+# KEY from what this pass wrote, upscaled:
+#
+#     field_bg_dense.source_cell:  zero = _up(idx == 0, scale)
+#                                  out[zero] = FN.EMPTY
+#
+# So the mesh comes back at a QUARTER of the resolution the colour does, with
+# every hole snapped to a 2x2 block. MEASURED on `mds7plr1`: 22 cells filled,
+# and of the texels this pass writes opaque, the mod's own alpha is partial
+# (0 < a < 128) on 358 of them -- those have their RGB replaced by
+# `_extend_into_gap`'s dilation FIRST and are then written solid, because
+# `_cov` is `cover >= 128` and `_art_here` is `cover > 0`. Two thresholds,
+# one cell.
+#
+# AND IT BLOCKS THE FIX. `field_bg_dense`'s atlas-gap arm keys on the MOD'S
+# alpha at the mod's resolution, and it is gated on `zero.all()` -- the
+# paletted cell being ENTIRELY index 0. Writing anything here makes that
+# false, so this pass and the correct path are mutually exclusive.
+#
+# The job now lives in `field_bg_dense.MARGIN_OVERLAY_ALPHA`, which serves the
+# same 8,284-cell population from the truecolor side: the mod's colour at 512
+# and the mod's alpha at 512, which is what FFNx draws. 22 of the 33 blank
+# layer-2 margin cells on `mds7plr1` qualify -- the same 22 this filled.
+#
+# SEVENTH_NX_MARGIN_L2=1 turns this back on for an A/B. Do not ship it on:
+# with both on, the dense arm cannot fire and the result is build 114.
+MARGIN_LAYERS_2PLUS = os.environ.get('SEVENTH_NX_MARGIN_L2') == '1'
+
+
+def _margin_tile(t):
+    """UNUSED as of FINDINGS-234 -- kept because it states the rule clearly.
+
+    `fillable_cells` went back to `is_margin`; the layer-2 population is
+    identified in `fill_field` instead, so that widening it cannot leak into
+    the candidate or veto sets. See the note at that call site.
+
+    Is this tile a widescreen margin placeholder candidate?
+
+    `MB.Tile.is_margin` is layer 1 only and is left alone -- other passes read
+    it and its meaning should not move under them. See MARGIN_LAYERS_2PLUS.
+    """
+    if t.is_margin:
+        return True
+    return MARGIN_LAYERS_2PLUS and t.layer != 1 and t.outside_43
+
 DARKEN_MARGIN_PLACEHOLDERS = True
 
 # OFF, because `ff7nx_marginpage` now solves this properly.
@@ -477,6 +579,45 @@ def dedup_cell(cell_rgb):
     """(uniq, inv) for `quantise(..., _dedup=)`. See quantise."""
     flat = cell_rgb.reshape(-1, 3).astype(np.int32)
     return np.unique(flat, axis=0, return_inverse=True)
+
+
+def _sqdist(flat, pal):
+    """
+    (N,3) x (M,3) -> (N,M) squared euclidean distance. BIT-IDENTICAL to
+    `((flat[:, None, :] - pal[None, :, :]) ** 2).sum(-1)` and ~3x faster.
+
+    WHY THIS IS EXACT AND NOT AN APPROXIMATION, which is the only thing that
+    matters here -- `quantise` decides an index that goes into the shipped
+    page, so "close enough" is a different build.
+
+        ||u - p||^2  ==  ||u||^2  -  2 u.p  +  ||p||^2
+
+    Every term is an integer: the inputs are 0..255, so u.p <= 3*255*255 =
+    195,075 and ||u||^2 <= 195,075. All of them are exactly representable in
+    float64 (which is exact for every integer below 2^53), so each product,
+    each sum and the final difference are exact integers -- not rounded ones.
+    The result therefore compares and argmins identically to the integer
+    form, ties included, and `d[..., idx].mean()` in the dither branch sees
+    the same numbers too.
+
+    The win is that the right-hand side is one BLAS `dgemm` over an (N,M)
+    result instead of materialising an (N,M,3) array and reducing it. The
+    reduction was the single hottest operation in the whole build: measured
+    over `mrkt2`, `md1_1` and `nmkin_1`, `quantise` is 48% of the pass chain
+    and `numpy.ufunc.reduce` inside it is 2.2 s of 8.4 s.
+
+    VERIFIED bit-identical on values AND argmin over 300 random (cell,
+    palette) pairs and over every real cell of the fields above, and the
+    shipped section 9 comes out byte-identical -- see `_kfastq.py`.
+
+    `SEVENTH_NX_NO_FASTQ=1` restores the original expression exactly.
+    """
+    if not FAST_QUANTISE:
+        return ((flat[:, None, :] - pal[None, :, :]) ** 2).sum(-1)
+    fl = flat.astype(np.float64)
+    pl = pal.astype(np.float64)
+    return ((fl * fl).sum(1)[:, None] + (pl * pl).sum(1)[None, :]
+            - 2.0 * (fl @ pl.T))
 
 
 def quantise(cell_rgb, pal_rgb, dither=False, _dedup=None):
@@ -551,11 +692,11 @@ def quantise(cell_rgb, pal_rgb, dither=False, _dedup=None):
         else:
             uniq, inv = np.unique(flat, axis=0, return_inverse=True)
         if len(uniq) < len(flat):
-            du = ((uniq[:, None, :] - pal[None, :, :]) ** 2).sum(-1)
+            du = _sqdist(uniq, pal)
             idx = du.argmin(1)[inv]
             return (idx + 1).astype(np.uint8).reshape(cell_rgb.shape[:2])
 
-    d = ((flat[:, None, :] - pal[None, :, :]) ** 2).sum(-1)
+    d = _sqdist(flat, pal)
     idx = d.argmin(1)
     if not dither:
         return (idx + 1).astype(np.uint8).reshape(cell_rgb.shape[:2])
@@ -571,11 +712,93 @@ def quantise(cell_rgb, pal_rgb, dither=False, _dedup=None):
     shifted = np.clip(cell_rgb.astype(np.float32)
                       + (tile * amp)[..., None], 0, 255)
     f2 = shifted.reshape(-1, 3).astype(np.int32)
-    d2 = ((f2[:, None, :] - pal[None, :, :]) ** 2).sum(-1)
+    d2 = _sqdist(f2, pal)
     return (d2.argmin(1) + 1).astype(np.uint8).reshape(cell_rgb.shape[:2])
 
 
 BLEND_BAND_FIRST_SLOT = 0x0F
+
+
+# FILL BOTH FRAMES OF AN fx PAIR INSTEAD OF NEITHER. BUILD 110.
+#
+# `_is_animated` below vetoes a layer-2+ cell whose tile carries an fx page,
+# because the engine can swap to that second page and painting Cosmos art
+# into only one of the two states reads as FLICKER. That is correct, and it
+# is correct for exactly one reason: WE ONLY EVER PAINTED ONE OF THEM.
+#
+# `fillable_cells` walks tiles and keys candidates off `T_TEX` (offset 32).
+# NO TILE NAMES AN fx PAGE AT OFFSET 32 -- an fx page is reached only through
+# `T_TEX2` (offset 34) -- so an fx page has never been a candidate and has
+# never received a single cell of Cosmos art. MEASURED on the build-109
+# archive, 160 fields: of 151 fx pages, 146 are BYTE-IDENTICAL to vanilla and
+# 5 changed. 96.7% pure vanilla, and none promoted to truecolor.
+#
+# That is the defect the user reported as "fields with widescreen expanded
+# regions are missing their fx textures", and it is also why the flicker
+# veto looked unavoidable: with one frame unpaintable, painting the other was
+# guaranteed to flicker.
+#
+# THE MOD SHIPS BOTH. MEASURED over 200 vanilla fields, 25,943 tiles carrying
+# an fx page:
+#
+#     Cosmos ships art for the BASE page   24,701   95.2%
+#     Cosmos ships art for the FX   page   25,157   97.0%
+#     BOTH                                 24,444   94.2%
+#
+# So for 94.2% of them the premise of the veto -- "the mod ships art for at
+# most one frame" -- is simply false. Paint both and there is no frame left
+# to flicker against.
+#
+# THE SAFETY RULE IS BOTH-OR-NEITHER, ENFORCED AFTER THE FILL. It is not
+# enough to decide up front that both are fillable: the fill itself refuses
+# cells for a dozen reasons (`black`, `wild`, the silhouette guard, a missing
+# borrow) and any refusal that lands on one side of a pair would recreate the
+# exact flicker this is meant to avoid. So `fill_field` reverts the written
+# side of any pair whose other side did not get written. One place, covering
+# every refusal reason including ones added later.
+#
+# The fx page swap is `use_fx_page ? fx_page : page` (FFNx
+# ff7/field/background.cpp:113) -- SAME u,v -- so the two cells are at the
+# same (sx, sy) and are drawn through the same palette. Nothing has to be
+# matched up beyond the page number.
+# ...AND IT MEASURES AT EXACTLY ZERO, SO IT IS OFF. BUILD 110.
+#
+# Everything above is true and none of it matters, because the fx veto is not
+# what is holding these cells. MEASURED over 60 fields, every distinct fx
+# pair in them:
+#
+#     fx pairs found                              60
+#     BOTH sides drawn through ONE palette         0     0.0%
+#     base cell drawn through SEVERAL palettes    60   100.0%
+#
+# Every fx-carrying cell in the sample is already refused by the
+# multi-palette rule, which runs after this one. `uutai1` is the shape of it:
+# 833 layer-2 tiles carry an fx page, all 833 sample ONE cell on slot 0, and
+# that cell is drawn through several palettes. Lifting the fx veto moves the
+# cell from one veto to another and fills nothing -- confirmed end to end,
+# `filled` identical to the byte on five fields with the flag on and off.
+#
+# So this ships OFF. The code and the both-or-neither enforcement in
+# `fill_field` are kept because the reasoning is sound and because if the
+# multi-palette rule is ever solved this becomes live immediately -- but
+# switching it on today is pure risk for a measured zero.
+#
+# THE REAL FINDING IS THE ONE THIS RULED OUT. See HANDOFF-227: fx pages,
+# parallax backdrops and the screen-filling layer-2 cells are all the SAME
+# structure -- one cell reused and recoloured per tile by the palette -- and
+# the paletted path cannot serve it, because a depth-1 page is one index
+# array shared by every palette that draws it.
+FILL_FX_PAIRS = False
+
+
+def fill_fx_pairs(env=None):
+    return FILL_FX_PAIRS and _flag('SEVENTH_NX_MARGIN_FX_PAIRS', env)
+
+
+def _flag(name, env=None):
+    raw = str(env if env is not None
+              else os.environ.get(name, '1')).strip().lower()
+    return raw not in ('0', 'off', 'no', 'none', 'false')
 
 
 def _is_animated(sec9, t, pages):
@@ -628,6 +851,28 @@ def _is_animated(sec9, t, pages):
     return eff >= BLEND_BAND_FIRST_SLOT
 
 
+def _fx_partner(sec9, t, pages, arrays):
+    """
+    The cell on this tile's fx page, or None when there is not one to pair.
+
+    Returns None -- so the caller keeps the old veto -- unless ALL of:
+      * the feature is on;
+      * the tile actually carries an fx page (a blend-band tile with no fx
+        byte has no second state to pair with, and `_is_animated`'s band test
+        still vetoes it);
+      * that page is present, depth-1 and parsed, so it can hold indices.
+    """
+    if not fill_fx_pairs():
+        return None
+    fx = sec9[t.off + MB.T_TEX2]
+    if not fx or fx == t.slot:
+        return None
+    p = pages.get(fx)
+    if p is None or p.depth != 1 or arrays.get(fx) is None:
+        return None
+    return (fx, t.sx, t.sy)
+
+
 def fillable_cells(parts, surv, scope='margin'):
     """
     {(page, palette): {(sx, sy), ...}} -- cells this pass may write.
@@ -660,6 +905,10 @@ def fillable_cells(parts, surv, scope='margin'):
     # Reported through the module rather than the return tuple, which several
     # callers unpack positionally.
     _n_anim, _n_static = [0], [0]
+    # (base_cell, fx_cell) pairs this field must fill BOTH of or NEITHER.
+    # Handed to `fill_field` on the function object rather than in the return
+    # tuple, because several callers unpack that tuple positionally.
+    _pairs = set()
 
     # ------------------------------------------------------------------
     # A PAGE IS DRAWN WITH ONE PALETTE, SO DO NOT WRITE ART ONTO A PAGE
@@ -741,6 +990,19 @@ def fillable_cells(parts, surv, scope='margin'):
         # The placeholder test, always. A cell any non-margin tile also
         # samples is NOT a margin placeholder however flat it looks -- it is
         # shared with the picture and must keep its content.
+        # REVERTED TO `is_margin`, DELIBERATELY. FINDINGS-234.
+        #
+        # A first version of MARGIN_LAYERS_2PLUS widened this predicate, and
+        # the gate caught what that costs: `flat_ok` / `not_margin` feed the
+        # `placeholder` set, which several other rules in `fill_field` consult
+        # (the EMPTY SOURCE exemption among them). Widening it changed bytes
+        # in 77 fields where not one cell was filled -- a containment failure,
+        # and exactly the kind of side effect that makes a change impossible
+        # to reason about.
+        #
+        # The layer-2 margin population is identified independently in
+        # `fill_field` (`_margin_overlay`) and used ONLY to waive the opacity
+        # quota. `fillable_cells` is therefore byte-for-byte build 111.
         if t.layer == 1 and t.is_margin:
             b = MB.source_block(a[0], a[1], t.sx, t.sy)
             if b is not None and np.unique(b).size == 1:
@@ -755,7 +1017,8 @@ def fillable_cells(parts, surv, scope='margin'):
             if b is None or np.unique(b).size != 1:
                 veto.add(cell)               # already carries art
                 continue
-        elif t.layer != 1 and _is_animated(parts[SECTION9], t, pages):
+        elif t.layer != 1 and _is_animated(parts[SECTION9], t, pages) \
+                and not _fx_partner(parts[SECTION9], t, pages, arrays):
             # ANIMATED OVERLAYS ONLY. See _is_animated for the measurement.
             #
             # This used to veto EVERY layer 2-4 cell. The flicker hazard it
@@ -770,12 +1033,29 @@ def fillable_cells(parts, surv, scope='margin'):
         elif t.layer != 1:
             _n_static[0] += 1
         want.setdefault(cell, set()).add(t.pal)
+        # ---- THE fx PARTNER BECOMES A CANDIDATE TOO. BUILD 110.
+        #
+        # Same (sx, sy), same palette, on the page the engine swaps to. It is
+        # recorded as a PAIR so `fill_field` can hold both to the
+        # both-or-neither rule; see FILL_FX_PAIRS.
+        _fxp = _fx_partner(parts[SECTION9], t, pages, arrays)
+        if _fxp is not None:
+            want.setdefault(_fxp, set()).add(t.pal)
+            not_margin.add(_fxp)
+            _pairs.add((cell, _fxp))
     out = {}
     for cell, pals in want.items():
         if cell in veto or len(pals) != 1:
             continue
         slot, sx, sy = cell
         out.setdefault((slot, next(iter(pals))), set()).add((sx, sy))
+    # PER CALL, not accumulated -- `fill_field` reads it immediately after.
+    fillable_cells.last_pairs = {
+        (b, f) for b, f in _pairs
+        if b not in veto and f not in veto
+        and len(want.get(b, ())) == 1 and len(want.get(f, ())) == 1}
+    fillable_cells.pairs_seen = (
+        getattr(fillable_cells, 'pairs_seen', 0) + len(_pairs))
     fillable_cells.layer2_animated = (
         getattr(fillable_cells, 'layer2_animated', 0) + _n_anim[0])
     fillable_cells.layer2_static = (
@@ -998,6 +1278,7 @@ def fill_field(name, raw, lgp_mod, art, log=None, scope='margin'):
     cols, hdr, npg, cpp = MB.palette_colours(parts[SECTION_PALETTE])
     surv = DC.survey(parts[SECTION9])
     cells, pages, arrays, placeholder = fillable_cells(parts, surv, scope)
+    _fx_pairs = getattr(fillable_cells, 'last_pairs', set())
     if not cells:
         return None, st
 
@@ -1024,6 +1305,52 @@ def fill_field(name, raw, lgp_mod, art, log=None, scope='margin'):
                          if (t.slot, t.sx, t.sy) not in _out}
         except Exception:                                      # noqa: BLE001
             _inside43 = set()
+
+    # ---- THE WIDESCREEN OVERLAY PLACEHOLDERS. FINDINGS-231.
+    #
+    # A cell qualifies when ALL THREE hold, and each one removes a different
+    # way this could repaint something it should not:
+    #
+    #   1. it is a PLACEHOLDER -- `fillable_cells` already proved it is a
+    #      single index over the whole 16x16, i.e. Cosmos put a blank there
+    #      and shipped the art in the page DDS;
+    #   2. NO tile inside the 4:3 picture samples it, so there is no original
+    #      to protect. `_inside43` is the same set the black-silhouette guard
+    #      uses, computed six lines up;
+    #   3. EVERY tile that draws it is layer 2 or above. A layer-1 margin cell
+    #      keeps the opacity quota it has always had -- that rule is correct
+    #      for a piece of background and nothing here touches it.
+    #
+    # MEASURED over 701 fields (`_kl2margin.py`): 8,284 such cells in 173
+    # fields, 0 animated, all on blend group 4, each drawn exactly once.
+    # COMPUTED HERE AND FROM NOTHING ELSE. See the note in `fillable_cells`:
+    # this deliberately does NOT go through `placeholder`, so the candidate
+    # set, the veto set and every other rule that reads them stay exactly as
+    # build 111 left them. The flatness test is the same one `fillable_cells`
+    # uses -- `np.unique(...).size == 1` -- applied to this population only.
+    _margin_overlay = set()
+    if MARGIN_LAYERS_2PLUS:
+        try:
+            _tl2 = MB.read_tiles(parts[SECTION9], surv, pages)
+            _lay = {}
+            for t in _tl2:
+                _lay.setdefault((t.slot, t.sx, t.sy), set()).add(t.layer)
+            _out2 = {(t.slot, t.sx, t.sy) for t in _tl2 if t.outside_43}
+            _in2 = {(t.slot, t.sx, t.sy) for t in _tl2 if not t.outside_43}
+            for t in _tl2:
+                c = (t.slot, t.sx, t.sy)
+                if (c in _in2 or c not in _out2 or 1 in _lay.get(c, {1})
+                        or c in _margin_overlay):
+                    continue
+                p = pages.get(t.slot)
+                a = arrays.get(t.slot) if p is not None else None
+                if p is None or p.depth != 1 or a is None:
+                    continue
+                b = MB.source_block(a[0], a[1], t.sx, t.sy)
+                if b is not None and np.unique(b).size == 1:
+                    _margin_overlay.add(c)
+        except Exception:                                      # noqa: BLE001
+            _margin_overlay = set()
 
     # CELLS WHERE INDEX 0 IS A GENUINE CUT-OUT. See KEEP0_CUTOUTS_ONLY.
     #
@@ -1255,6 +1582,16 @@ def fill_field(name, raw, lgp_mod, art, log=None, scope='margin'):
             else:
                 dark = False
             idx = quantise(small.astype(np.uint8), prgb)
+            # THE PRISTINE QUANTISER OUTPUT, KEPT FOR THE 512px SHADOW.
+            #
+            # BUILD 109. Every guard below overrides individual texels of
+            # `idx` -- the colour key, the vanilla silhouette, the uncovered
+            # fallback. `field_bg_shadow` needs to know WHICH texels those
+            # were so it can replicate them into the shadow instead of
+            # re-deciding them at 512, and `idx != _idx_q` is exactly that
+            # set. Costs one reference; `idx` is rebound by `np.where`
+            # everywhere below, never mutated in place.
+            _idx_q = idx
             # SANITY: quantising APPROXIMATES a colour, it never inverts one.
             # If what we are about to write is nowhere near the source, the
             # palette and the image disagree -- wrong page, wrong palette,
@@ -1364,11 +1701,43 @@ def fill_field(name, raw, lgp_mod, art, log=None, scope='margin'):
                 _all0 = bool(keep0.all())
                 _bright = int(prgb[0].max()) > ATLAS_ENTRY0_MIN_LUMA
                 _backdrop = ATLAS_PARALLAX_VOID and bool(pages[slot].size_flag)
-                if _all0 and float((cover >= 128).mean()) >= ATLAS_OPAQUE_FRAC \
-                        and (_bright or _backdrop):
+                # ---- AN OVERLAY IS TRANSPARENT BY DESIGN. FINDINGS-231.
+                #
+                # `ATLAS_OPAQUE_FRAC` is 0.9: the mod's art must cover 90% of
+                # the cell before we accept it as art rather than as void.
+                # That is right for a LAYER-1 placeholder, which is a piece of
+                # background and ought to be painted solid.
+                #
+                # It is the wrong question for a layer-2 overlay. A light
+                # cone, a haze or a coloured wash is mostly transparent --
+                # that is what makes it an overlay -- so demanding 90%
+                # opacity demands that it not be one. MEASURED, `mds7plr1`
+                # page 4, the cells carrying the missing green:
+                #
+                #     (4,  0, 80) 24%   (4, 80, 96) 35%   (4,112, 64) 62%
+                #     (4, 64, 80)  5%   (4, 96, 80) 60%   (4, 32, 64)  0%
+                #
+                # Every one fails, so the widescreen regions have had no
+                # lighting overlay in any build. The `_art_here` line below
+                # already does the correct thing once we get past this gate:
+                # write where the mod paints, put index 0 back everywhere it
+                # does not. So a partially covered overlay stays partially
+                # transparent -- it cannot become a solid block, which is the
+                # one hazard this quota was standing in for.
+                #
+                # `_bright`/`_backdrop` is waived with it and for the same
+                # reason: it tests whether entry 0 is visible enough for the
+                # cell to read as real, which is a question about a BACKGROUND
+                # cell. Here index 0 is simply what is already on screen.
+                _mo = (slot, sx, sy) in _margin_overlay
+                _cov_ok = (float((cover >= 128).mean()) >= ATLAS_OPAQUE_FRAC
+                           if not _mo else bool((cover > 0).any()))
+                if _all0 and _cov_ok and (_bright or _backdrop or _mo):
                     _is_cut = False
                     st['atlas_filled'] = st.get('atlas_filled', 0) + 1
-                    if not _bright:
+                    if _mo:
+                        st['margin_overlay'] = st.get('margin_overlay', 0) + 1
+                    elif not _bright:
                         st['atlas_parallax'] = st.get('atlas_parallax', 0) + 1
             if _is_cut:
                 idx = np.where(keep0, np.uint8(0), idx)
@@ -1561,10 +1930,62 @@ def fill_field(name, raw, lgp_mod, art, log=None, scope='margin'):
             for r in range(_edge):
                 base = (sy + r) * 256 + sx
                 buf[base:base + _edge] = bytes(idx[r])
+            # ---- THE 512px SHADOW. BUILD 109, HANDOFF-224.
+            #
+            # `small` was this same `src` box-filtered all the way down to
+            # the 256-unit cell. `field_bg_shadow` stops half way and
+            # quantises against THIS palette -- `prgb`, the effective one --
+            # so the shadow cannot drift in colour from the page it shadows,
+            # only in resolution, which is the point. Nothing about the
+            # bytes just written to `buf` changes; this is additive.
+            if SH.active():
+                st['shadow'] = st.get('shadow', 0) + SH.record(
+                    name, idx, _idx_q, src, k, prgb, quantise, _edge)
             st['filled'] += 1
             wrote.add((slot, sx, sy))
             if dark:
                 st['darkened'] += 1
+
+    # ------------------------------------------------ BOTH OR NEITHER.
+    #
+    # BUILD 110, and this is the whole reason the fx veto can be lifted at
+    # all. See FILL_FX_PAIRS.
+    #
+    # The loop above refuses cells for a dozen independent reasons -- the art
+    # is near-black, the quantisation came out wildly off-colour, the
+    # silhouette guard fired, the borrow found nothing. Any one of those
+    # landing on ONE side of an fx pair leaves the base frame carrying Cosmos
+    # art and the fx frame carrying vanilla, and the engine swapping between
+    # them is precisely the FLICKER the old veto existed to prevent.
+    #
+    # So the pairing is enforced HERE, after every refusal has already
+    # happened, rather than predicted before them. A pair with one side
+    # written has that side put back exactly as it was; the field ends up in
+    # the state build 109 would have produced for those two cells.
+    #
+    # Reverting is a byte copy from the ORIGINAL page, which is what
+    # `pages[slot].data` still holds -- `newdata` is a separate bytearray.
+    if _fx_pairs:
+        for base, fxc in sorted(_fx_pairs):
+            wa, wb = base in wrote, fxc in wrote
+            if wa == wb:
+                continue
+            bad = base if wa else fxc
+            slot, sx, sy = bad
+            buf = newdata.get(slot)
+            if buf is None:
+                continue
+            page = pages[slot]
+            src = page.data
+            _e3 = 32 if (BIG_CELL and page.size_flag) else TILE
+            for r in range(_e3):
+                o = (sy + r) * 256 + sx
+                buf[o:o + _e3] = src[o:o + _e3]
+            wrote.discard(bad)
+            st['filled'] -= 1
+            st['fx_unpaired'] = st.get('fx_unpaired', 0) + 1
+        st['fx_paired'] = sum(
+            1 for b, f in _fx_pairs if b in wrote and f in wrote)
 
     # ------------------------------------------------- the repoint, and the
     # cells it would otherwise strand.
@@ -1604,6 +2025,56 @@ def fill_field(name, raw, lgp_mod, art, log=None, scope='margin'):
         parts[SECTION9], nt = MP.apply_repoint(parts[SECTION9], surv, pages,
                                                chosen, placeholder)
         st['pal_tiles'] = nt
+
+    # ------------------------------------------------ THE TIER-2 SHADOW PASS
+    #
+    # BUILD 109. Runs over EVERY cell on every depth-1 page, including every
+    # one the loop above refused, and writes NOTHING into the page -- it only
+    # records how each cell should be resampled when the lift takes it to
+    # 512. See the tier-2 note in `field_bg_shadow`; the short version is
+    # that the multi-palette veto is a statement about COLOUR and a resample
+    # map does not mention colour, so the veto does not reach it.
+    #
+    # HERE, AND NOT IN A PASS OF ITS OWN, for the same reason the fill is
+    # here: Cosmos names its art by the page number the cell is on NOW, and
+    # this is the last point at which that lookup resolves. It is also the
+    # only place `_pal_for` and the borrow logic already exist.
+    #
+    # `newdata` is read rather than `pages[slot].data` so the map is built
+    # against what the fill just wrote, not against what it replaced.
+    if SH.active() and SH.map_enabled():
+        for slot, page in sorted(pages.items()):
+            if page.depth != 1:
+                continue
+            buf = newdata.get(slot)
+            arr = np.frombuffer(bytes(buf) if buf is not None else page.data,
+                                np.uint8, count=256 * 256).reshape(256, 256)
+            _e2 = 32 if (BIG_CELL and page.size_flag) else TILE
+            # The palette only picks WHICH of Cosmos's images to use as the
+            # guide, never what is written, so the most common one a tile on
+            # this page names is good enough and a borrow is harmless.
+            _pals = sorted({p for (s, p) in cells if s == slot})
+            got = None
+            for _p in (_pals or [0]):
+                try:
+                    got = art(name, slot, _p)
+                except Exception:                              # noqa: BLE001
+                    got = None
+                if got is not None:
+                    break
+            if got is None:
+                continue
+            img = got[0]
+            k = img.shape[1] // 256
+            if k < 2:
+                continue
+            for sy in range(0, 256, _e2):
+                for sx in range(0, 256, _e2):
+                    src = img[sy * k:(sy + _e2) * k, sx * k:(sx + _e2) * k]
+                    if src.shape[:2] != (_e2 * k, _e2 * k):
+                        continue
+                    st['shadow_map'] = st.get('shadow_map', 0) + SH.record_map(
+                        name, arr[sy:sy + _e2, sx:sx + _e2], src, k, _e2)
 
     if not st['filled'] and not st.get('pal_tiles'):
         return None, st

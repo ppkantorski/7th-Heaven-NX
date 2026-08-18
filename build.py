@@ -60,6 +60,7 @@ import field_bg_native
 import field_bg_repack
 import field_bg_compact
 import field_bg_pagecap
+import field_bg_shadow
 
 # Largest DECOMPRESSED field file this build wrote. apply_field_bg
 # needs it: the game decompresses a field into a fixed 2,000,000-byte
@@ -3817,7 +3818,8 @@ def _lift_depth1_payloads(archive, payloads, log=lambda *_: None):
         try:
             parts = lgp.split_sections(raw)
             new9, k = field_bg_native.lift_depth1(
-                parts[8], px, field_bg_native.VANILLA_PX, dst)
+                parts[8], px, field_bg_native.VANILLA_PX, dst,
+                art=field_bg_shadow.lift_art(name))
             if not k:
                 continue
             parts[8] = new9
@@ -3837,13 +3839,16 @@ def _lift_depth1_payloads(archive, payloads, log=lambda *_: None):
             'straight from the source archive -- they carry paletted pages '
             'too, so leaving them alone was never an option here)' % untouched)
     log('  field background DEPTH-1 LIFT: %s paletted page(s) taken from '
-        '%dx%d to %dx%d across %s field(s). The INDICES are unchanged -- this '
-        'is 2x replication, so the picture is expected to be identical and '
-        'any visible difference is the module patch, not the art. Largest '
-        'field now %s bytes against a %s cap.'
+        '%dx%d to %dx%d across %s field(s). Every texel not covered by the '
+        'ART line below is 2x replication, so it is build 108 exactly and '
+        'any visible difference there is the module patch, not the art. '
+        'Largest field now %s bytes against a %s cap.'
         % (f'{n_pages:,}', field_bg_native.VANILLA_PX,
            field_bg_native.VANILLA_PX, dst, dst, f'{n_fields:,}',
            f'{biggest:,}', f'{FIELD_BG_RAW_CAP:,}'))
+    _sh = field_bg_shadow.summarise()
+    if _sh:
+        log(_sh)
     # A PARTIAL LIFT IS NOT A DEGRADED BUILD, IT IS A BROKEN ONE, so this
     # raises rather than logging and carrying on. A field left at 256 while
     # the module reads 0x40000 per paletted page desynchronises its TEXTURE
@@ -5002,6 +5007,26 @@ def _build_flevel(archive_path, chunks, field_files, romfs, log,
                 '4:3 picture too, on layer 1' if _ma_scope == 'all'
                 else 'MARGIN ONLY -- the 4:3 picture is not touched'))
             _bc_art = ff7nx_marginart.provider_source(_art)
+            # ---- ARM THE 512px SHADOW. BUILD 109, HANDOFF-224.
+            #
+            # HERE and not earlier, because this is the first pass that has
+            # Cosmos's art in hand, and not later, because it is the ONLY
+            # pass that has it while the page numbering still matches the
+            # names Cosmos gave its DDS files (see this call's ordering note
+            # below, and FINDINGS-197).
+            #
+            # `arm` disarms itself unless the depth-1 lift is going to run at
+            # exactly 2x, so under a 256px build every `SH.record` call
+            # inside `fill_field` returns 0 and the build is bit-for-bit
+            # build 107. It does NOT touch `field_bg_native.D1_PAGE_PX` --
+            # see HANDOFF-224 s0.10; the whole point of the shadow is that
+            # the pipeline stays in 256-unit coordinates until the lift.
+            if field_bg_shadow.arm(FIELD_BG_D1_TARGET_PX,
+                                   field_bg_native.VANILLA_PX):
+                log('  depth-1 ART: recording Cosmos\'s 512px art alongside '
+                    'the 256px pages, for the lift to write instead of '
+                    'replicating. A page with no recording keeps build '
+                    '108\'s 2x replication.')
             ma_stats = ff7nx_marginart.apply_to_flevel(
                 archive, payloads, ff7nx_marginart.provider_source(_art),
                 encode=lambda raw: _encode_field_cached(archive, raw), log=log,

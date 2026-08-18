@@ -198,6 +198,54 @@ BORROW_MAX_DIST = float('inf')
 # of the previous tree.
 ATLAS_GAP = os.environ.get('SEVENTH_NX_NO_ATLASGAP') != '1'
 
+# THE WIDESCREEN OVERLAY PLACEHOLDER TAKES THE MOD'S ALPHA. FINDINGS-235.
+#
+# The same reasoning as the atlas-gap arm, for the one population `bare_keys`
+# structurally cannot admit.
+#
+# Cosmos authors the 16:9 extension of an OVERLAY layer the way it authors the
+# extension of layer 1: blank placeholder cells in section 9, with the real
+# art shipped in the page .dds. On FFNx the .dds replaces the page and the
+# overlay draws through its own alpha, which is why the green wash there runs
+# the full width with no step at the 4:3 boundary. On this port the cell is a
+# genuine 100%-index-0 cell, so `out[zero] = FN.EMPTY` keys the whole thing
+# and the overlay is simply absent outside the picture.
+#
+# `bare_keys` is the existing answer to "index 0 here is not a cut-out" and it
+# cannot serve these cells: it requires that NOTHING draws underneath, and in
+# the widescreen margin layer 1 always does -- that art is the whole point of
+# the margin. `bare` is asking "is there a hole behind this key", which is the
+# right question for `mtcrl_5`'s sky and the wrong one here. The question here
+# is "is this key a shape the artist cut, or a placeholder the artist left",
+# and the population below answers it by construction:
+#
+#   * EVERY tile that draws the cell is on LAYER 2 -- a layer-1 margin cell is
+#     background, keeps the quota it has always had, and is
+#     `ff7nx_marginart`'s business, not this one's; a layer-3/4 cell has no
+#     fixed screen position, so "outside the picture" is not decidable for it;
+#   * EVERY tile that draws it is WHOLLY OUTSIDE the 4:3 picture, and no tile
+#     inside the picture samples it, so there is no original to protect;
+#   * the paletted source cell is ENTIRELY index 0 (`zero.all()`, enforced at
+#     the arm itself) -- nothing was cut out of anything;
+#   * the mod's alpha says it PAINTS there.
+#
+# Then `out[zero & tm] = FN.EMPTY` puts the key back at the MOD'S resolution
+# and on the MOD'S alpha, and the colour is already the mod's at 512. That is
+# what FFNx draws, texel for texel.
+#
+# WHY THIS AND NOT `ff7nx_marginart.MARGIN_LAYERS_2PLUS`. The previous attempt
+# (build 114) wrote these cells in the margin-art pass, which quantises the
+# .dds to 16x16 8-bit indices against the tile's palette. That put a 16x16
+# 1-bit mask under a 512px colour -- `zero` is upscaled by `_up` and drives
+# the key -- so the mesh came back at a quarter of the resolution the colour
+# did: the speckled fence photographed on `mds7plr1`. Worse, writing indices
+# there makes `zero.all()` false, which disables this arm and the atlas-gap
+# arm both. The two changes are mutually exclusive and this is the one with
+# the resolution.
+#
+# `SEVENTH_NX_NO_MARGIN_L2_ALPHA=1` restores build 113 exactly.
+MARGIN_OVERLAY_ALPHA = os.environ.get('SEVENTH_NX_NO_MARGIN_L2_ALPHA') != '1'
+
 # THE 32-UNIT TILE VETO -- NOW OFF BY DEFAULT, BECAUSE THE HANDLING EXISTS.
 #
 # HISTORY, because the default flipping is the whole of HANDOFF-192 5.1.
@@ -274,8 +322,10 @@ ORIGIN = {}
 class Stats:
     __slots__ = ('hue_kept_art',
                  'cells', 'pages', 'tiles', 'from_art', 'from_art_borrow',
-                 'from_vanilla', 'keyed', 'fx_pairs', 'refused', 'pages_before',
-                 'borrow_refused', 'origin', 'atlas_gap', 'bare')
+                 'from_vanilla', 'keyed', 'fx_pairs', 'refused',
+                 'pages_before',
+                 'borrow_refused', 'origin', 'atlas_gap', 'bare',
+                 'margin_l2', 'margin_l2_filled')
 
     def __init__(self):
         self.cells = self.pages = self.tiles = 0
@@ -288,6 +338,8 @@ class Stats:
         self.origin = {}
         self.atlas_gap = 0        # cells whose atlas gap took the mod's art
         self.bare = 0             # cells with nothing behind them at all
+        self.margin_l2 = 0        # layer-2+ widescreen margin placeholders
+        self.margin_l2_filled = 0     # ...of those, served the mod's alpha
 
 
 def _pal_rgb(sec3):
@@ -628,6 +680,58 @@ def bare_keys(pages, arrays, tiles, keys):
             continue
         if all((g[0], g[1]) not in covered for g in got):
             out.add(k)
+    return out
+
+
+def margin_overlay_keys(pages, arrays, tiles, keys):
+    """
+    The subset of `keys` that are LAYER-2 WIDESCREEN MARGIN PLACEHOLDERS.
+
+    See MARGIN_OVERLAY_ALPHA for what this is for. Three conditions, all of
+    them about the TILES, so this can be decided before a single texel is
+    read:
+
+      1. EVERY tile that draws the cell is on layer 2 -- not layer 1, and
+         not layers 3/4 either;
+      2. every one of them is WHOLLY outside the 4:3 picture;
+      3. no tile inside the 4:3 picture samples the cell.
+
+    2 and 3 are not the same test. A cell can be sampled by one margin tile
+    and one interior tile, and then it is shared with the picture and is not
+    ours -- that is what 3 refuses. `Tile.outside_43` is the property this
+    reads and it is deliberately the LAYER-AGNOSTIC one; `Tile.is_margin`
+    means layer 1 as well and several other passes depend on it meaning that,
+    so it is left alone. FINDINGS-234 is the record of what widening a shared
+    predicate costs.
+
+    LAYERS 3 AND 4 ARE EXCLUDED FOR `bare_keys`'S REASON, WHICH IS THE ONLY
+    ONE THAT MATTERS HERE. A parallax tile's destination is not a fixed screen
+    position -- `ff7nx_ws` moves its clip and wrap points precisely because it
+    scrolls at its own rate -- so "wholly outside the 4:3 picture" is a
+    statement about one camera position and not about the tile. Condition 2 is
+    therefore undecidable for them and the cell is left alone. MEASURED over
+    ten of the largest fields: 398 of 2,852 otherwise-qualifying cells have a
+    layer-3/4 tile, so this costs 14% of the population and removes the whole
+    class. The parallax void has its own arm already -- ATLAS_PARALLAX_VOID.
+
+    The flatness test is NOT here. `source_cell` already has the destination
+    cell in hand and asks `zero.all()` on the real bytes, which is stricter
+    than anything this could compute and is the same test the atlas-gap arm
+    uses. Deciding it twice is how the two arms drift apart.
+    """
+    lay, out43, in43 = {}, set(), set()
+    for t in tiles:
+        c = (t.slot, t.sx, t.sy)
+        lay.setdefault(c, set()).add(t.layer)
+        (out43 if t.outside_43 else in43).add(c)
+    out = set()
+    for k in keys:
+        c = (k[0], k[1], k[2])
+        if c in in43 or c not in out43:
+            continue
+        if lay.get(c) != {2}:
+            continue
+        out.add(k)
     return out
 
 
@@ -1034,7 +1138,8 @@ def _up(a, s):
 
 
 def source_cell(k, rec, pages, arrays, pal565, art_for, pals_for, st,
-                scale=1, origin=None, hue_broken_cell=False, edge=TILE):
+                scale=1, origin=None, hue_broken_cell=False, edge=TILE,
+                force_transfer=False):
     """An (edge*scale, edge*scale) uint16 R5G6B5 cell, from the mod's art.
 
     `scale` is `page_px // 256`. AT 256 IT IS 1 AND NOTHING BELOW CHANGES.
@@ -1234,7 +1339,15 @@ def source_cell(k, rec, pages, arrays, pal565, art_for, pals_for, st,
             out = _up(buf[sy * s:(sy + edge) * s, sx * s:(sx + edge) * s],
                       scale // max(1, s)).copy()
         pal_ref = _up(pal565[pal][idx], scale)
-        if src_pal != pal and not hue_broken_cell and not KEEP_ART_ON_BORROW:
+        # `force_transfer` IS THE MULTI-PALETTE ARM AND IT IS DELIBERATELY
+        # NARROW. See MULTIPAL_RECOLOUR. It defaults False, so it changes
+        # nothing for any existing caller, and `dense_repack` sets it only for
+        # cells its admission test has already proved recolour rather than
+        # collapse. `hue_broken_cell` still wins: a cell with no chromaticity
+        # has no colour for the transfer to take, and `_multipal_admit`
+        # refuses those before they reach here.
+        if (src_pal != pal and not hue_broken_cell
+                and (force_transfer or not KEEP_ART_ON_BORROW)):
             # BORROWED. Keep the detail, take the colour from the palette this
             # cell actually names. See _detail_transfer.
             out = _detail_transfer(out, pal_ref)
@@ -1321,12 +1434,31 @@ def source_cell(k, rec, pages, arrays, pal565, art_for, pals_for, st,
         # leaves empty stay empty. The tile currently draws NOTHING -- it is
         # a fully-keyed cell over bare framebuffer -- so this can only add
         # pixels the reference renderer already shows, never hide any.
-        _atlas = (ATLAS_GAP and art is not None and rec.get('bare')
+        #
+        # ...OR THE CELL IS A WIDESCREEN OVERLAY PLACEHOLDER. FINDINGS-235.
+        #
+        # Condition 2 above -- "nothing else draws underneath" -- is what a
+        # margin overlay cell can never satisfy, because layer 1 draws the
+        # margin art it sits on top of. It is also not the question: `bare`
+        # asks whether closing the key would hide something, and outside the
+        # 4:3 picture the mod is the only authority on what belongs there.
+        # 1, 3 and 4 all still apply, unchanged, and `margin_overlay_keys`
+        # adds the scope: layer 2+, wholly outside the picture, and sampled by
+        # no interior tile. See MARGIN_OVERLAY_ALPHA.
+        _mo = MARGIN_OVERLAY_ALPHA and bool(rec.get('margin_l2'))
+        _atlas = (ATLAS_GAP and art is not None
+                  and (rec.get('bare') or _mo)
                   and bool(zero.all()))
         if _atlas and tm.shape == out.shape and not tm.all():
             out[zero & tm] = FN.EMPTY
-            st.atlas_gap += 1
-            dense_repack.atlas_gap = getattr(dense_repack, 'atlas_gap', 0) + 1
+            if _mo and not rec.get('bare'):
+                st.margin_l2_filled += 1
+                dense_repack.margin_l2_filled = (
+                    getattr(dense_repack, 'margin_l2_filled', 0) + 1)
+            else:
+                st.atlas_gap += 1
+                dense_repack.atlas_gap = (
+                    getattr(dense_repack, 'atlas_gap', 0) + 1)
         else:
             out[zero] = FN.EMPTY
     # On layer 1 index 0 is NOT a cut-out -- it is drawn, and its colour
@@ -1666,7 +1798,167 @@ KEEP_ART_ON_BORROW = True
 # shares it to one colour. Only safe when the mod ships exact art per palette.
 MULTI_PALETTE_VETO = True
 
+# THE VETO'S ONE EXCEPTION, MEASURED. FINDINGS-228, HANDOFF-227 s5.6.
+#
+# The veto refuses a multi-palette cell on this stated ground:
+#
+#     "Keying by (slot,sx,sy,PAL) does not save it: Cosmos ships only `_00`
+#      for these pages, so every variant BORROWS palette 0's art and they all
+#      come out identical anyway."
+#
+# THAT CLAIM IS TRUE AS BUILD 109 SHIPS, and `_kmpal.py` measured exactly why:
+# `KEEP_ART_ON_BORROW` is True, so the `_detail_transfer` arm at the top of
+# `source_cell`'s borrow branch is DEAD CODE and a borrowed cell keeps
+# Cosmos's palette-0 pixels whatever palette the tile names. 393 of 458
+# multi-palette cells come back BYTE-IDENTICAL across their palettes.
+#
+# It stops being true when the transfer is applied, because
+# `_detail_transfer(art565, tgt565)` takes COLOUR from `tgt565` -- the paletted
+# page rendered through THIS tile's palette -- so two palettes give two
+# different textures. MEASURED over the whole archive (701 fields):
+#
+#     multi-palette cells                458    113,780 tiles   17.9% of drawn
+#       admitted today (exact art)         0                    <- see below
+#       hue-broken, skip the transfer    393    103,725 tiles
+#       CLEAN                             65     10,055 tiles
+#         variants differ with transfer   30      3,156 tiles    0.50% of drawn
+#
+#     on those 30: per-palette mean RGB spread / VANILLA's
+#                  median 0.83, p10 0.58, p90 1.22
+#                  correlation with vanilla's per-palette mean, median 1.000
+#
+# So the gradient SURVIVES on that population -- and it is 0.50% of the drawn
+# tiles, not the 29% the coverage gap is made of. This is a small, real win and
+# it is not the ceiling moving.
+#
+# TWO THINGS THIS MEASUREMENT ALSO SETTLES, both of which were assumed:
+#   * ZERO cells in the archive have exact art at every palette that draws
+#     them, so the `set(pals) <= have` arm below has never once admitted a
+#     cell. The "20% at the cell's own palette" figure in build 109's log is
+#     over ALL layer-2+ cells, and none of that 20% is multi-palette.
+#   * 85.8% of multi-palette cells are HUE-BROKEN. They skip the transfer, so
+#     they are exactly as identical with it on as with it off. A near-black
+#     cell has no chromaticity, which is what makes it hue-broken and what
+#     makes it unfixable here -- HANDOFF-227 s3.2 predicted this and it holds.
+#
+# ADMISSION RUNS THE FALSIFIER. `_multipal_admit` builds the real textures for
+# every palette the cell is drawn through and refuses the cell unless they
+# actually differ, so a cell that would collapse to one colour CANNOT be
+# admitted by construction rather than by argument. False restores build 109.
+MULTIPAL_RECOLOUR = True
+MULTIPAL_MIN_FRAC = 0.10       # texels that must differ between the closest
+MULTIPAL_MIN_MEAN = 2.0        # pair of palettes, and by how much -- 2/255 is
+                               # below the 5-bit step, so rounding cannot
+                               # reach it
+MULTIPAL_MIN_CORR = 0.0        # the promoted per-palette means must move the
+                               # SAME WAY as vanilla's, not merely differ.
+                               # 12% of the passing cells came back
+                               # anti-correlated; this is what excludes them.
+
+# ON AS OF BUILD 110, AND ONLY BECAUSE `MULTIPAL_RECOLOUR` GIVES IT SOMETHING
+# TO SEAT. FINDINGS-228.
+#
+# These two flags are each downstream of the other, which is why both measured
+# at zero on their own:
+#
+#   * the cells this flag admits are one cell drawn through many palettes --
+#     that IS what an animated beam or waterfall is -- so `MULTI_PALETTE_VETO`
+#     refused every one of them;
+#   * and the cells `MULTIPAL_RECOLOUR` admits are fx BASES, so `cand` dropped
+#     them as `fx_cells` before the veto ever ran.
+#
+# MEASURED through the real pass chain, three arms, 471 fields:
+#
+#     off  = build 109                         fx = this flag alone
+#     on   = both
+#
+#     fx  vs off   BYTE-IDENTICAL in 471 of 471 fields
+#     on  vs off   26 fields change, 26 cells admitted, +2,531 tiles
+#                  promoted to truecolor
+#                  truecolor pages  +0        total pages  -33
+#                  texture bytes    -2,112 KB (the emptied paletted pages
+#                                    are compacted away, so it is CHEAPER)
+#                  tiles lost 0, new slots >= 29: 0, page budget: not reached
+#     fx pairs 3,976: px mismatches 0, depth mismatches 0, dangling 1 -> 1
+#                  (that one is pre-existing and identical in both arms)
+#
+# AND IT WAS A CRASH, NOT A VETO, THAT HID THIS. See `_edge_of` below:
+# with this flag on, seating a pair raised KeyError on the PARTNER key and
+# build.py logged the whole field as "not repacked". HANDOFF-227 s3.1's A/B
+# was reading that.
+# ...AND IT IS OFF AGAIN. `wcrimb_2` CRASHES ON HARDWARE. FINDINGS-232.
+#
+# Atmosphere report `01786995986`, resolved through `nxmap`:
+#
+#     winmain 0x67DB30 +0xC34
+#       field_main_loop 0x60E5B7 +0xB30
+#         field_sub_6388EE +0x7C
+#           field_draw_everything 0x63A60B +0x3E8
+#             0x640213 +0x1D8          <- the TEXTURE LOADER
+#               0x66E641 +0x364        <- engine texture create
+#                 [thunk] -> native shim -> nn::diag::detail::Abort
+#
+# This is the LOAD path, not the draw path, and it is our data. What build 110
+# changed in that field is exactly one thing:
+#
+#     build 109   fx pairs (base slot 0, fx slot 15)   BOTH depth-1 paletted
+#                 pages [0(d1), 11,12,13,14(d2), 15(d1), 26,27,28(d2)]
+#     build 110   fx pairs (base slot 27, fx slot 28)  BOTH depth-2 512px
+#                 pages [11,12,13,14,26,27,28] -- all truecolor, no paletted
+#
+# So `PROMOTE_FX_BASE` does not only promote the BASE. The seating loop's
+# column allocator moves the PARTNER with it (`todo`/`fx_slot_of`), and an fx
+# frame ends up on a 512px truecolor page. FINDINGS-161 flagged the mirror of
+# this as never observed on hardware and said so explicitly; this direction is
+# just as untested and it is what the console is refusing.
+#
+# 26 fields now ship that configuration and `wcrimb_2` is the heaviest of them
+# -- 7 truecolor pages, 3.5 MB, and NO paletted page left at all. Whether the
+# trigger is the pair, the size or the last paletted page going away is not
+# settled, and a crash is not the place to keep guessing.
+#
+# WHAT THIS COSTS: build 110's +3,064 truecolor tiles across 26 fields, since
+# `MULTIPAL_RECOLOUR` only ever admits fx base cells. Build 111's palette work
+# is independent and unaffected.
+# ...AND VANILLA SETTLES WHY. MEASURED over the STOCK archive, 701 fields,
+# every fx pair in the game:
+#
+#     base d1 + fx d1     104,797 tiles   422 fields    the normal case
+#     base d1 + fx d2         128 tiles     1 field     md_e1, slot 26
+#     base d2 + fx d1               0
+#     base d2 + fx d2               0       <- what build 110 made, 26 fields
+#
+# An fx BASE is on a paletted page in 104,925 of 104,925 cases. The stock game
+# has never once asked this console to draw an animated tile whose base page is
+# truecolor, in either the mixed or the matched form. That is not "untested",
+# it is "never shipped", and the crash is the console saying so.
+#
+# THE ONE PRECEDENT RUNS THE OTHER WAY. `md_e1` proves the FX page may be
+# depth 2 while the base stays paletted. So promoting the PARTNER and leaving
+# the base alone reproduces a configuration the stock game already ships --
+# which is the safe half of this idea and is where the fx-page sharpness the
+# user has been asking about actually lives. It buys no truecolor TILES (a
+# tile counts by its base page) but it is the only part of this with a
+# hardware precedent.
 PROMOTE_FX_BASE = False
+
+# PER-FIELD OPT-IN, SO THE HARDWARE QUESTION COSTS ONE FIELD AND NOT 26.
+#
+# The 3,064 tiles build 110 gained are not recoverable by argument: vanilla
+# says the base is always paletted, and the only way to learn whether this
+# console tolerates otherwise is to ask it. This makes that ask cheap.
+#
+# Put ONE field in here, build, and open it. If it renders, the configuration
+# is survivable and the flag can widen a few fields at a time; if it crashes,
+# exactly one field is affected and the answer is final.
+#
+#     PROMOTE_FX_BASE_FIELDS = frozenset(('las3_2',))
+#
+# `las3_2` is the right first candidate: it is the largest single gain (+731
+# tiles, 58.8% -> 99.8% truecolor), it ends with a paletted page still present
+# (6 pages, 1 paletted) unlike `wcrimb_2`, and it is easy to reach in game.
+# An empty set means the flag is off everywhere, which is build 109 behaviour.
+PROMOTE_FX_BASE_FIELDS = frozenset()
 
 # LOW-SLOT PROBE -- put truecolor pages in free slots 0..25 instead of the
 # 29+ range that does not render on this port. Rationale, disassembly and
@@ -1788,6 +2080,81 @@ def max_total_pages():
 # and does not survive being made the rule.
 
 
+def _multipal_admit(ks, keys, pages, arrays, pal565, art_for, pals_for,
+                    hc, org, scale):
+    """
+    MULTIPAL_RECOLOUR's falsifier, run at ADMISSION TIME. See the constant.
+
+    `ks` is every (slot,sx,sy,pal) key for ONE cell. Returns True only when
+    the promoted textures -- built by `source_cell` itself, with the detail
+    transfer forced on, so this is the picture the build would actually seat
+    and not a model of it -- differ from each other AND move the same way
+    vanilla's do.
+
+    A cell that fails here is refused exactly as before. That is the whole
+    safety argument: the collapse the veto protects against is detected on
+    the real bytes rather than predicted from a rule.
+    """
+    if not ks or len(ks) < 2:
+        return False
+    # FALSIFIER 3 (HANDOFF-227 s5.6): a hue-broken cell SKIPS the transfer, so
+    # its variants are identical whatever this flag says. Refuse the cell if
+    # ANY palette is hue-broken -- not just the broken ones -- because a cell
+    # half-recoloured and half-not is a seam, and 85.8% of this population is
+    # hue-broken anyway.
+    if art_for is None:
+        return False
+    for k in ks:
+        if hue_broken(k, arrays, pal565, art_for, hc, org) > HUE_BROKEN_DIST:
+            return False
+    # A THROWAWAY `Stats`. These `source_cell` calls are a TEST, and a cell
+    # this function refuses is never seated -- counting its borrow in the
+    # field's own numbers would make `from_art_borrow` a count of cells
+    # considered rather than cells drawn, which is the reporting error
+    # HANDOFF-227 s6 records twice.
+    st = Stats()
+    vs, vans = [], []
+    for k in ks:
+        rec = keys.get(k)
+        if rec is None:
+            return False
+        edge = BIG_TILE if rec.get('edge') == BIG_TILE else TILE
+        try:
+            c = source_cell(k, rec, pages, arrays, pal565, art_for, pals_for,
+                            st, scale, org, False, edge, force_transfer=True)
+        except Exception:                                      # noqa: BLE001
+            return False
+        vs.append(c)
+        pl = k[3] if 0 <= k[3] < len(pal565) else len(pal565) - 1
+        idx = arrays[k[0]][k[2]:k[2] + edge, k[1]:k[1] + edge]
+        vans.append(pal565[pl][idx])
+    if any(c.shape != vs[0].shape for c in vs):
+        return False
+
+    def _mean(a):
+        r, g, b = _unpack565(a)
+        return np.array([r.mean(), g.mean(), b.mean()], np.float64)
+
+    # THE CLOSEST PAIR, not the mean pair. One palette that collapses onto
+    # another is the defect; an average over pairs would hide it.
+    for i in range(len(vs)):
+        for j in range(i + 1, len(vs)):
+            ri, rj = _unpack565(vs[i]), _unpack565(vs[j])
+            d = (np.abs(ri[0].astype(np.int32) - rj[0]) +
+                 np.abs(ri[1].astype(np.int32) - rj[1]) +
+                 np.abs(ri[2].astype(np.int32) - rj[2])) / 3.0
+            if (d > 0.5).mean() < MULTIPAL_MIN_FRAC:
+                return False
+            if d.mean() < MULTIPAL_MIN_MEAN:
+                return False
+    m = np.array([_mean(c).mean() for c in vs])
+    v = np.array([_mean(a).mean() for a in vans])
+    if m.std() > 0.5 and v.std() > 0.5:
+        if float(np.corrcoef(v, m)[0, 1]) < MULTIPAL_MIN_CORR:
+            return False
+    return True
+
+
 def dense_repack(sec3, sec9, field='', art_for=None, pals_for=None, px=256,
                  max_tc=MAX_TRUECOLOR_PAGES):
     """
@@ -1850,6 +2217,18 @@ def dense_repack(sec3, sec9, field='', art_for=None, pals_for=None, px=256,
         for k in _bare:
             keys[k]['bare'] = True
         st.bare = len(_bare)
+    # See MARGIN_OVERLAY_ALPHA. Computed once per field, from the tiles this
+    # function has already read, and used for ONE decision -- whether the
+    # atlas-gap arm may take the mod's alpha for this cell. It sets no other
+    # field on `rec` and nothing else consults it.
+    if ATLAS_GAP and MARGIN_OVERLAY_ALPHA:
+        try:
+            _mo = margin_overlay_keys(pages, arrays, tiles, keys)
+        except Exception:                                      # noqa: BLE001
+            _mo = set()
+        for k in _mo:
+            keys[k]['margin_l2'] = True
+        st.margin_l2 = len(_mo)
     # See PROMOTE_FX_BASE. `fx_partners` is the side that must stay paletted
     # (an fx frame is drawn through the additive/average band, which has no
     # depth-2 equivalent that renders on this port). `fx_cells` is what the
@@ -1859,7 +2238,11 @@ def dense_repack(sec3, sec9, field='', art_for=None, pals_for=None, px=256,
     fx_partners = set()
     for v in fx_of.values():
         fx_partners |= v
-    fx_cells = fx_partners if PROMOTE_FX_BASE else (set(fx_of) | fx_partners)
+    # See PROMOTE_FX_BASE_FIELDS. Resolved ONCE per field and used by both
+    # sites, so the candidate filter and the seating loop can never disagree
+    # about whether this field promotes fx bases.
+    _fxbase = PROMOTE_FX_BASE or (field or '').lower() in PROMOTE_FX_BASE_FIELDS
+    fx_cells = fx_partners if _fxbase else (set(fx_of) | fx_partners)
 
     # PRIORITY: the cells the most tiles draw. Those cover the most screen.
     # A CELL THAT USES THE KEY STAYS PALETTED.
@@ -1946,8 +2329,24 @@ def dense_repack(sec3, sec9, field='', art_for=None, pals_for=None, px=256,
         p = pages.get(t.slot)
         if p is not None and p.depth == 1:
             _bypal.setdefault((t.slot, t.sx, t.sy), set()).add(t.pal)
+    # RESOLVED HERE RATHER THAN BELOW. `_multipal_admit` calls `source_cell`,
+    # which needs marginpage's origin map to find Cosmos's art at all -- ask
+    # with post-split slot numbers and the answer is "the mod ships nothing",
+    # which is the renumbering trap of HANDOFF-222 s8 and would silently make
+    # every admission fail. The block that used to compute this a few lines
+    # down now reuses `_org`.
+    _hc = {}
+    try:
+        import ff7nx_marginpage as _MPG
+        _org = _MPG.ORIGIN.get(field) or None
+    except Exception:                                          # noqa: BLE001
+        _org = None
+    _mp_force = set()
     if MULTI_PALETTE_VETO:
         _kept = []
+        _mp_seen = {}
+        _cand_set = set(cand)
+        _scale = max(1, px // 256)
         for k in cand:
             pals = _bypal.get((k[0], k[1], k[2]), ())
             if len(pals) > 1:
@@ -1980,6 +2379,33 @@ def dense_repack(sec3, sec9, field='', art_for=None, pals_for=None, px=256,
                 have = set((pals_for(k[0]) if pals_for is not None else None)
                            or ())
                 if not set(pals) <= have:
+                    # THE ONE EXCEPTION, AND IT RUNS ITS OWN FALSIFIER.
+                    # See MULTIPAL_RECOLOUR. Decided once per CELL and cached,
+                    # because the test costs one `source_cell` per palette and
+                    # `cand` holds one key per palette of the same cell.
+                    _c = (k[0], k[1], k[2])
+                    if MULTIPAL_RECOLOUR:
+                        ok = _mp_seen.get(_c)
+                        if ok is None:
+                            _ks = [(k[0], k[1], k[2], p) for p in sorted(pals)]
+                            # EVERY palette of the cell must still be a
+                            # candidate. A cell promoted at two palettes and
+                            # left paletted at a third is a resolution seam
+                            # between tiles of the same surface, which is the
+                            # defect FINDINGS-213 spent a build on.
+                            ok = (all(kk in _cand_set for kk in _ks)
+                                  and _multipal_admit(
+                                      _ks, keys, pages, arrays, pal565,
+                                      art_for, pals_for, _hc, _org, _scale))
+                            _mp_seen[_c] = ok
+                            if ok:
+                                dense_repack.multipal_admitted = (
+                                    getattr(dense_repack,
+                                            'multipal_admitted', 0) + 1)
+                        if ok:
+                            _mp_force.add(k)
+                            _kept.append(k)
+                            continue
                     dense_repack.multipal_vetoed = (
                         getattr(dense_repack, 'multipal_vetoed', 0) + 1)
                     continue
@@ -1991,16 +2417,13 @@ def dense_repack(sec3, sec9, field='', art_for=None, pals_for=None, px=256,
 
     # Measured BEFORE the TRUE_BLACK filter, because it is what exempts a
     # cell from it. See below.
-    _hc = {}
+    #
+    # `_hc` and `_org` are RESOLVED ABOVE, before the multi-palette veto, which
+    # needs them. `_hc` is a cache keyed by cell, so the admission test's
+    # entries are reused here rather than recomputed. The comment that used to
+    # sit here still holds: `_org` is resolved unconditionally because
+    # `source_cell` needs it whether or not HUE_FIRST is on.
     _hb = {}
-    # RESOLVED UNCONDITIONALLY. `source_cell` needs it whether or not
-    # HUE_FIRST is on, and scoping it inside that branch made it a NameError
-    # the moment the flag was turned off.
-    try:
-        import ff7nx_marginpage as _MPG
-        _org = _MPG.ORIGIN.get(field) or None
-    except Exception:                                          # noqa: BLE001
-        _org = None
     if HUE_FIRST and art_for is not None:
         _hb = {k: hue_broken(k, arrays, pal565, art_for, _hc, _org)
                for k in cand}
@@ -2304,8 +2727,24 @@ def dense_repack(sec3, sec9, field='', art_for=None, pals_for=None, px=256,
     # `field_load_textures` (x86 0x640292) ABANDONS THE WHOLE LOOP on the
     # first page it cannot allocate, so every page after it draws nothing.
     # That is why this is a constraint and not a preference.
+    # OVER `keys`, NOT `cand`, AND THAT IS A BUG FIX. FINDINGS-228.
+    #
+    # An fx PARTNER is never a candidate -- `fx_cells` holds it whether or not
+    # `PROMOTE_FX_BASE` is on -- but it IS appended to `chosen` when its base
+    # is seated, and the seating loop then reads `_edge_of[fk]`. Built over
+    # `cand` that is a KeyError, which `build.py` catches per field and logs
+    # as "not repacked": the field loses its ENTIRE truecolor promotion, not
+    # just the pair.
+    #
+    #     PROMOTE_FX_BASE=True, las3_2:  KeyError: (15, 0, 0, 8)
+    #
+    # So `PROMOTE_FX_BASE` has never seated one pair in this tree, and
+    # HANDOFF-227 s3.1's "A/B measures +0 tiles, +0 pages, +0 bytes" was
+    # reading a crash, not a downstream veto. `_edge_of` is a pure lookup, so
+    # widening its domain cannot change a decision -- `_big_cand` and
+    # `_small_cand` below still filter `cand` explicitly.
     _edge_of = {k: (BIG_TILE if keys[k].get('edge') == BIG_TILE else TILE)
-                for k in cand}
+                for k in keys}
     _big_cand = [k for k in cand if _edge_of[k] == BIG_TILE]
     _small_cand = [k for k in cand if _edge_of[k] == TILE]
 
@@ -2529,7 +2968,7 @@ def dense_repack(sec3, sec9, field='', art_for=None, pals_for=None, px=256,
         _edge = _edge_of[k]
         partners = [fk for fk in (fx_of.get(k) or ())
                     if fk in keys and fk[0] in pages]
-        if partners and not PROMOTE_FX_BASE:
+        if partners and not _fxbase:
             continue
         done = [fk for fk in partners if fk in fx_slot_of]
         todo = [fk for fk in partners if fk not in fx_slot_of]
@@ -2606,7 +3045,8 @@ def dense_repack(sec3, sec9, field='', art_for=None, pals_for=None, px=256,
         try:
             cell = source_cell(k, keys[k], pages, arrays, pal565,
                                art_for, pals_for, st, scale, _org,
-                               _hb.get(k, 0.0) > HUE_BROKEN_DIST, _edge)
+                               _hb.get(k, 0.0) > HUE_BROKEN_DIST, _edge,
+                               force_transfer=(k in _mp_force))
         except Exception:                                      # noqa: BLE001
             continue
         t = _edge * scale
