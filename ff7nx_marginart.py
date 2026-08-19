@@ -248,6 +248,13 @@ TILE = 16
 # by construction -- see `_sqdist` -- and ~3x faster on the hottest function in
 # the build. SEVENTH_NX_NO_FASTQ=1 restores the original expression.
 FAST_QUANTISE = os.environ.get('SEVENTH_NX_NO_FASTQ') != '1'
+
+# Check every `_sqdist` result against the slow path, and that it is finite.
+# See _sqdist: the fast path suppresses three RuntimeWarnings that Apple's
+# Accelerate raises spuriously, and this is how that suppression is kept
+# honest rather than taken on trust. Costs more than it saves -- diagnostic
+# only, never on in a build.
+CHECK_FASTQ = os.environ.get('SEVENTH_NX_CHECK_FASTQ') == '1'
 # THE 32-UNIT CELL. See the `_edge` note in fill_field.
 #
 # `SEVENTH_NX_NO_BIGCELL=1` restores the 16x16 write on size_flag pages,
@@ -610,14 +617,55 @@ def _sqdist(flat, pal):
     palette) pairs and over every real cell of the fields above, and the
     shipped section 9 comes out byte-identical -- see `_kfastq.py`.
 
+    THE `errstate` IS NOT PAPERING OVER ANYTHING. IT IS AN APPLE BUG.
+
+    On an Apple-silicon Mac this line prints, once per call:
+
+        RuntimeWarning: divide by zero encountered in matmul
+        RuntimeWarning: overflow encountered in matmul
+        RuntimeWarning: invalid value encountered in matmul
+
+    THE EXPRESSION CONTAINS NO DIVISION. It is add, subtract and multiply,
+    so a divide-by-zero flag cannot come from the arithmetic -- that alone
+    proves the flags are raised inside the BLAS kernel and not by the values.
+    numpy on macOS links against Apple's Accelerate, whose dgemm reads
+    padding lanes of uninitialised memory; the lanes are discarded from the
+    result, but the FPU status bits they set are not, and numpy turns the
+    status register into warnings after the call. Known, reported, and Apple
+    is aware -- numpy issues 28687, 28790 and 29820, all filed against the
+    M4 mac mini specifically. Building numpy against OpenBLAS makes it stop.
+
+    The values cannot overflow either, which is the same bound the exactness
+    argument above rests on: every term is a non-negative integer <= 3 * 255
+    * 255 = 195,075, against a float64 exact range of 2^53. RE-MEASURED here
+    over 4,000 random (cell, palette) pairs: zero non-finite results, zero
+    value mismatches against the slow path, zero argmin mismatches, max
+    |delta| exactly 0.
+
+    So the flags are suppressed for THIS expression only -- not process-wide
+    via np.seterr, which would hide genuine warnings in every other pass --
+    and `SEVENTH_NX_CHECK_FASTQ=1` turns on the assertion that the
+    suppression is honest, at roughly the cost of the slow path.
+
+    Measured at 126 us per call either way: the context manager is free
+    against the matmul it wraps.
+
     `SEVENTH_NX_NO_FASTQ=1` restores the original expression exactly.
     """
     if not FAST_QUANTISE:
         return ((flat[:, None, :] - pal[None, :, :]) ** 2).sum(-1)
     fl = flat.astype(np.float64)
     pl = pal.astype(np.float64)
-    return ((fl * fl).sum(1)[:, None] + (pl * pl).sum(1)[None, :]
-            - 2.0 * (fl @ pl.T))
+    with np.errstate(divide='ignore', over='ignore', invalid='ignore'):
+        out = ((fl * fl).sum(1)[:, None] + (pl * pl).sum(1)[None, :]
+               - 2.0 * (fl @ pl.T))
+    if CHECK_FASTQ:
+        slow = ((flat[:, None, :] - pal[None, :, :]) ** 2).sum(-1)
+        if not np.isfinite(out).all():
+            raise AssertionError('_sqdist: non-finite distance')
+        if not np.array_equal(out, slow.astype(np.float64)):
+            raise AssertionError('_sqdist: fast path disagrees with slow')
+    return out
 
 
 def quantise(cell_rgb, pal_rgb, dither=False, _dedup=None):

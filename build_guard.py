@@ -754,6 +754,30 @@ COUNTERS = (
      r'UNMEASURABLE: ([\d,]+) cell', 'dense repack'),
     ('low slot probe',
      r'LOW-SLOT PROBE: ([\d,]+) free slot', 'dense repack'),
+    # FINDINGS-247. Registered so the line cannot vanish silently -- if the
+    # regex stops matching, the counter reads None and the guard says
+    # "moved", which is the only way a fresh session finds out the pass did
+    # not run (HANDOFF-246 trap 1.2). `subunit texels` is the one to watch:
+    # it must fall to zero with SEVENTH_NX_NO_SUBUNIT_KEY=1 and must never
+    # move on its own.
+    ('subunit key cells',
+     r'SUB-UNIT KEY: ([\d,]+) layer-2 cut-out cell', 'dense repack'),
+    ('subunit key units',
+     r'SUB-UNIT KEY: [\d,]+ layer-2 cut-out cell\(s\) had their colour key '
+     r'refined below unit size across ([\d,]+) unit', 'dense repack'),
+    ('subunit key texels',
+     r'un-keying ([\d,]+) texel', 'dense repack'),
+    # FINDINGS-249. `inplace pages` is the one that decides a build: it is
+    # page-neutral but NOT heap-neutral, so if it moves without the settings
+    # moving, some field is asking the loader for more memory than the last
+    # build did -- and that is what black squares are.
+    ('inplace pages',
+     r'IN-PLACE PARALLAX: ([\d,]+) 32-unit page', 'dense repack'),
+    ('inplace fields',
+     r'IN-PLACE PARALLAX: [\d,]+ 32-unit page\(s\) in ([\d,]+) field',
+     'dense repack'),
+    ('inplace cells',
+     r'promoting ([\d,]+) cell\(s\)', 'dense repack'),
     ('page cap fields',
      r"PAGE CAP .*?: ([\d,]+) field\(s\) had a page split", 'page cap'),
     ('page cap pages',

@@ -246,6 +246,219 @@ ATLAS_GAP = os.environ.get('SEVENTH_NX_NO_ATLASGAP') != '1'
 # `SEVENTH_NX_NO_MARGIN_L2_ALPHA=1` restores build 113 exactly.
 MARGIN_OVERLAY_ALPHA = os.environ.get('SEVENTH_NX_NO_MARGIN_L2_ALPHA') != '1'
 
+# THE OVERLAY EDGE IS ERODED BACK TO THE UNIT GRID. FINDINGS-247.
+#
+# THE DEFECT, MEASURED. `_ksplitkey` classified every layer-2 depth-2 unit on
+# fship_2 / mtcrl_4 / mtcrl_5 / mds7plr1 / mrkt2 against Cosmos's own alpha,
+# resolved through ORIGIN:
+#
+#     whole-unit disagreement   3,463 units   0.4% of 799,744
+#     sub-unit (MIXED) units   50,196         6.3%
+#     ...of the mixed ones we KEY 42,481 and DRAW 7,715
+#
+# We almost never key the wrong UNIT. The entire defect is sub-unit, and the
+# direction is the tell: where the mod cuts a unit partially we key 85% of
+# them, i.e. we throw the WHOLE unit away. So an overlay's silhouette erodes
+# back to the unit grid and reveals what is beneath it in 3-screen-pixel
+# bites. That is exactly why it is an OVERLAP artefact: on layer 1 there is
+# nothing behind, so erosion is invisible; on layer 2 over layer 1 it is the
+# blockiness along the girders of `fship_2`, the path in `wcrimb_2` and the
+# rail in `mtcrl_4`. The same population `_kedge` counts as 337,548 LOST
+# texels on layer 2 across 119 fields.
+#
+# THE FIX IS ONE PREDICATE AND IT WAS ALREADY WRITTEN. The atlas-gap arm
+# below already does `out[zero & tm] = FN.EMPTY` -- key only where the mod is
+# ALSO clear -- and `tm` is already resampled to the destination shape. It was
+# simply gated to `zero.all()` cells. This extends it, and ONLY it.
+#
+# SCOPED TO THE MIXED UNITS, WHICH IS NARROWER THAN FINDINGS-247 ASKED FOR
+# AND IS THE WHOLE SAFETY ARGUMENT. A unit is refined only where the mod's
+# alpha is NON-UNIFORM across it. Three consequences fall out by construction
+# rather than by measurement, and each one closes a way this could go wrong:
+#
+#   1. NO WHOLE-UNIT CHANGE. A unit the mod paints entirely, and a unit the
+#      mod leaves entirely clear, are keyed exactly as they are today. The
+#      0.4% whole-unit population is untouched, so this cannot turn an
+#      overlay into an opaque rectangle and cannot fabricate a hole.
+#   2. NO CELL LOSES ITS KEY. `mixed` means `tm` is True SOMEWHERE in the
+#      unit, so `zero & tm` keeps at least one keyed texel in every unit that
+#      is keyed today. Every per-cell consumer asking "does this cell use the
+#      key" reads the same answer it read before.
+#   3. MONOTONE. `zero & tm` is a strict SUBSET of `zero`, so the change can
+#      only ever UN-key a texel, never key one vanilla did not. Nothing that
+#      draws today stops drawing.
+#
+# The residual risk is the mirror of 3 -- an un-keyed texel is opaque and an
+# opaque texel can HIDE something -- and it is bounded to the texels of a
+# boundary unit where the mod's own alpha says it PAINTS. That is the
+# occlusion census in `_ksubgate`, not an argument.
+#
+# THE CEILING, STATED HONESTLY. At `page_px` 512 a unit is 2x2 destination
+# texels against the mod's 4x4, so this captures HALF the available sub-unit
+# detail and halves the step from one unit to half a unit. At 768 it is 3x3
+# and three quarters. It is a real improvement, not a cure, and it is the
+# reason 768 is worth re-enabling AFTER this rather than instead of it -- the
+# two compound, where 768 alone just sharpens the tiles either side of a
+# still-blocky boundary.
+#
+# AND IT KEYS ON `hmask`, NOT `tmask`. The atlas-gap arm uses `tmask`
+# (alpha < 8) because it asks a per-CELL question -- "does the mod paint in
+# this cell at all". Per TEXEL the paranoid threshold is a defect: it calls a
+# 4%-alpha texel fully painted, and Cosmos draws a DARK OUTLINE along the
+# boundary of every overlay, so drawing those opaque puts a black fringe one
+# texel wide around the thing this change exists to sharpen. MEASURED on the
+# newly-opaque texels: 45% of `mtcrl_4`'s, 27% of `mtcrl_5`'s and 21% of
+# `wcrimb_2`'s sit at alpha 8..127. `PageArt.hmask` is the 50% rule and it is
+# what this arm reads.
+#
+# INERT AT 256. `scale` is 1 there, a unit is one texel, no unit can be
+# mixed, and the guard below refuses before the reshape.
+#
+# `SEVENTH_NX_NO_SUBUNIT_KEY=1` restores build 118 exactly.
+SUBUNIT_KEY = os.environ.get('SEVENTH_NX_NO_SUBUNIT_KEY') != '1'
+
+# BUILD 121 -- THE MOD'S ALPHA IS THE AUTHORITY ON ITS OWN SILHOUETTE.
+# FINDINGS-253. THIS IS THE OPPOSITE DIRECTION FROM SUBUNIT_KEY ABOVE.
+#
+# `source_cell` writes the key from VANILLA'S INDEX (`out[zero] = FN.EMPTY`,
+# `zero` being `idx == 0`) but fills mod-transparent texels from the VANILLA
+# PIXEL (`out[tm] = pal_ref[tm]`). A texel where Cosmos says "nothing is here"
+# and vanilla's index is NOT 0 therefore falls through both arms: not keyed,
+# because `zero` is false, and painted with vanilla's own colour. On the
+# Highwind's hull that colour is the 1997 art's hard black outline.
+#
+# THAT IS WHY ONE SILHOUETTE IS PERFECT IN PLACES AND BLACK-STEPPED IN OTHERS.
+# Where the old outline pixel happened to be index 0 we key it and the edge is
+# clean; where it was a dark NON-zero index we paint it and it reads as a
+# stair-step. Same edge, same mod art, different vanilla index.
+#
+# MEASURED inside `source_cell`, keyed cells only, `fship_1`:
+#
+#     texels where the MOD IS CLEAR (tmask, alpha < 8)   312,897
+#       ...we KEY them, correctly                        307,052   98.1%
+#       ...we DRAW them from the vanilla fallback          5,845    1.9%
+#          of those, NEAR-BLACK                            2,683
+#
+# `_kedge.py` named this years of builds ago: "extra -- our key says OPAQUE,
+# the mod paints NOTHING. The FAT edge. This is the girder stair-step: we draw
+# scenery over sky." Build 119's gate measured `extra` at 382,788 texels
+# archive-wide and only required that it not RISE. This is the build that
+# makes it FALL: 1,776,580 -> 886,009 over 681 fields, measured through
+# ORIGIN by `_kmodgate.py`.
+#
+# AND IT KEYS ON `tmask`, NOT `hmask`, AND THAT IS THE OPPOSITE OF BUILD 119.
+# Each direction wants its own conservative end of the alpha range:
+#
+#   SUBUNIT_KEY  UN-keys, so it must be sure the mod really PAINTS
+#                -> `hmask`, alpha >= 128, the 50% rule.
+#   MODCLEAR_KEY ADDS key, so it must be sure the mod really paints NOTHING
+#                -> `tmask`, alpha < 8.
+#
+# Using `hmask` here would key everything below half alpha and eat the
+# silhouette; using `tmask` there would draw a 4%-alpha texel opaque and put
+# build 116's black fringe back. The two thresholds are not interchangeable
+# and the asymmetry is the safety argument, not an inconsistency.
+#
+# SCOPE, and every term is load-bearing:
+#   * layer 2+ only (`rec['l2']`) -- on layer 1 index 0 is drawn, not a
+#     cut-out, and there is by definition nothing behind it;
+#   * `art is not None` -- `tm` does not exist in the vanilla branch;
+#   * `tm.shape == out.shape` -- a shape mismatch means the art slice missed;
+#   * inside `rec['key']` already, so a cell that is not a cut-out is
+#     untouched.
+#
+# `MODCLEAR_WHOLE` is a SEPARATE, tighter question: a cell the mod leaves
+# ENTIRELY clear (`tm.all()`) would become entirely key. That is a whole cell
+# of reveal rather than a boundary of it, so it is gated on its own and off.
+# MEASURED: it never fires on this archive anyway -- `modclear_whole` is 0
+# across all 681 fields -- so turning it on would be a change with no
+# population and it is kept off for the day one appears.
+#
+# `SEVENTH_NX_NO_MODCLEAR_KEY=1` restores build 120 exactly.
+MODCLEAR_KEY = os.environ.get('SEVENTH_NX_NO_MODCLEAR_KEY') != '1'
+MODCLEAR_WHOLE = os.environ.get('SEVENTH_NX_MODCLEAR_WHOLE') == '1'
+
+# ...AND ONLY WHERE THE TEXEL WE WOULD OTHERWISE PAINT IS BLACK.
+# THIS TERM IS THE ENTIRE SAFETY ARGUMENT OF BUILD 121. DO NOT REMOVE IT
+# WITHOUT A PER-TEXEL COVER MASK IN `dense_repack`.
+#
+# HANDOFF-254 s4.5 reported the reveal risk as measuring at ZERO on four
+# fields: `rec['bare']` said 100% of the newly-keyed texels had something
+# drawing behind them. `bare` IS PER CELL. s4.5 said so and asked the next
+# session to build the per-TEXEL version. `_kreveal.py` is that census, and
+# the per-cell answer was hiding a real population:
+#
+#     field       newly keyed   something behind   NOTHING behind
+#     fship_1         5,845       5,845  100.0%        0    0.0%
+#     fship_2        15,423      15,423  100.0%        0    0.0%
+#     mtcrl_4        29,921      25,909   86.6%    4,012   13.4%
+#     wcrimb_2        6,791       6,683   98.4%      108    1.6%
+#
+# 4,120 texels of framebuffer, in the two fields Patrick names most often.
+# "Something draws at this cell's destinations" really does not prove cover
+# at every texel inside the cell, and shipping on the per-cell number would
+# have traded a black outline for a black hole on the Mt. Corel track --
+# which is exactly the loss FINDINGS-253 s5 said would make this a clear
+# regression.
+#
+# THE PER-TEXEL COVER MASK IS THE RIGHT FIX AND IT IS NOT AVAILABLE HERE.
+# `source_cell` works in SOURCE cell space; a cell can be drawn by many
+# tiles at many destinations, and the raster that answers "is this texel
+# covered" lives in `dense_repack`'s caller. Building it is a real change to
+# the inner loop with its own cost and its own interaction with
+# `field_bg_compact`. It is the next build, not this one.
+#
+# SO THIS BUILD TAKES THE SUBSET WHERE THE QUESTION CANNOT ARISE.
+#
+#   Key only where the colour we would otherwise paint is ALREADY BLACK.
+#
+# and the argument is closed rather than measured:
+#
+#   * something behind  -> we replace a black texel with the art that
+#     belongs there. That is the whole prize, and it is the defect Patrick
+#     reported by name -- "black steps", "black parts".
+#   * NOTHING behind    -> we replace a near-black texel with the
+#     framebuffer, which is black. The picture does not change. It cannot
+#     open a hole, because there was nothing there to lose.
+#
+# In other words the change is MONOTONE IN THE PICTURE: it can only ever
+# turn black into not-black, never art into black. That is a stronger
+# guarantee than any cover census can give, and it does not depend on a
+# raster this function cannot see.
+#
+# MEASURED ARCHIVE-WIDE with the term on (`_kreveal.py --summary`, 681
+# fields): 890,571 texels newly keyed, 855,565 of them revealing art and
+# 35,006 revealing the framebuffer -- and the most any one of those 35,006
+# loses is 33 of 255, because every one of them was black to begin with.
+# `art replaced by black` is 0. Without the term the same run put 4,954
+# texels of black where art is today.
+#
+# THE THRESHOLD is the same one every speck census in this project uses --
+# max channel < 40 of 255, `_ksubgate.DARK`, `_kgapmeasure`, `_kreveal`.
+# It is applied to the FINAL R5G6B5 colour, after the NEAR_BLACK lift, so a
+# texel that merely rounds to the key is inside it rather than beside it.
+MODCLEAR_DARK_ONLY = os.environ.get('SEVENTH_NX_MODCLEAR_ALL') != '1'
+MODCLEAR_DARK = int(os.environ.get('SEVENTH_NX_MODCLEAR_DARK') or 40)
+
+
+def _maxchan565(a):
+    """Max 8-bit channel of an R5G6B5 array, by the engine's own expansion.
+
+    Bit replication, not a shift -- `_seam._rgb565` and `field_bg_native`
+    both spell this out, and it is what makes NEAR_BLACK's R1 G2 B1 land on
+    exactly (8, 8, 8) instead of (8, 8, 8)-ish. The exactness matters here
+    because NEAR_BLACK is precisely the population this predicate is about.
+    """
+    u = a.astype(np.uint32)
+    r = (u >> 11) & 31
+    g = (u >> 5) & 63
+    b = u & 31
+    r8 = (r << 3) | (r >> 2)
+    g8 = (g << 2) | (g >> 4)
+    b8 = (b << 3) | (b >> 2)
+    return np.maximum(np.maximum(r8, g8), b8)
+
+
 # THE 32-UNIT TILE VETO -- NOW OFF BY DEFAULT, BECAUSE THE HANDLING EXISTS.
 #
 # HISTORY, because the default flipping is the whole of HANDOFF-192 5.1.
@@ -325,7 +538,9 @@ class Stats:
                  'from_vanilla', 'keyed', 'fx_pairs', 'refused',
                  'pages_before',
                  'borrow_refused', 'origin', 'atlas_gap', 'bare',
-                 'margin_l2', 'margin_l2_filled')
+                 'margin_l2', 'margin_l2_filled',
+                 'subunit_cells', 'subunit_units', 'subunit_texels',
+                 'modclear_cells', 'modclear_texels', 'modclear_whole')
 
     def __init__(self):
         self.cells = self.pages = self.tiles = 0
@@ -340,6 +555,12 @@ class Stats:
         self.bare = 0             # cells with nothing behind them at all
         self.margin_l2 = 0        # layer-2+ widescreen margin placeholders
         self.margin_l2_filled = 0     # ...of those, served the mod's alpha
+        self.subunit_cells = 0    # layer-2 cut-outs refined below unit size
+        self.subunit_units = 0    # ...units in them the mod cuts partially
+        self.subunit_texels = 0   # ...texels that stopped being keyed
+        self.modclear_cells = 0   # cut-out cells where the mod paints nothing
+        self.modclear_texels = 0  # ...texels that STARTED being keyed
+        self.modclear_whole = 0   # ...cells the mod leaves entirely clear
 
 
 def _pal_rgb(sec3):
@@ -1460,7 +1681,106 @@ def source_cell(k, rec, pages, arrays, pal565, art_for, pals_for, st,
                 dense_repack.atlas_gap = (
                     getattr(dense_repack, 'atlas_gap', 0) + 1)
         else:
-            out[zero] = FN.EMPTY
+            # ...OR THE MOD CUTS SOME OF THESE UNITS IN HALF. FINDINGS-247.
+            #
+            # See SUBUNIT_KEY for the measurement and the safety argument.
+            # `zero` is uniform per unit by construction (`_up` of a 16x16
+            # index block); `tm` is at the DESTINATION resolution and is the
+            # mod's own coverage. Where the two disagree WITHIN a unit, the
+            # unit is a silhouette boundary and today the whole of it is
+            # thrown away.
+            #
+            # Refine those units and only those: `keep` is `zero` everywhere
+            # else, so a unit the mod paints whole and a unit the mod leaves
+            # whole are keyed byte-for-byte as before. A field with no mixed
+            # unit comes out identical without needing a special case.
+            #
+            # The `art is not None` guard is not optional -- `tm` does not
+            # exist in the `st.from_vanilla` branch above.
+            # THE THRESHOLD IS `hmask`, NOT `tmask`, AND THAT IS DELIBERATE.
+            # See PageArt.hmask in field_bg_repack. `tmask` answers "does
+            # this cell contain any transparency at all" at alpha < 8, which
+            # would call a 4%-alpha texel painted and draw Cosmos's dark
+            # boundary outline at full strength -- build 116's black fringe,
+            # reintroduced one texel wide around every overlay. `hmask` is
+            # the 50% rule, which is the honest 1-bit reduction of an 8-bit
+            # alpha. `_clear` is its complement: the mod covers LESS than
+            # half of this texel, so the key stays.
+            _hm = getattr(art, 'hmask', None) if art is not None else None
+            _clear = None
+            if _hm is not None:
+                _c = _hm[_asy * s:_asy * s + t * step:step,
+                         _asx * s:_asx * s + t * step:step]
+                if _c.shape == out.shape:
+                    _clear = ~_c
+            _sub = (SUBUNIT_KEY and art is not None and scale > 1
+                    and bool(rec.get('l2'))
+                    and _clear is not None
+                    and _clear.shape == (edge * scale, edge * scale)
+                    and zero.shape == _clear.shape
+                    and _clear.any() and not _clear.all())
+            # ...AND WHERE THE MOD PAINTS NOTHING AT ALL, KEY IT. FINDINGS-253.
+            #
+            # See MODCLEAR_KEY. This is the mirror of the arm above and it is
+            # deliberately computed as a SEPARATE mask rather than folded into
+            # `_clear`, because the two read different alpha thresholds -- this
+            # one `tmask` (alpha < 8), that one `hmask` (alpha >= 128) -- and
+            # collapsing them would be the bug each guard exists to prevent.
+            #
+            # `_mck` is unioned into whichever key mask the arms above compute,
+            # so this can only ever ADD key. `subunit_texels` is still counted
+            # against `zero` alone, so build 119's counter keeps meaning what
+            # it meant, and with MODCLEAR_KEY off the three branches below
+            # collapse to exactly build 120's `out[zero]` / `out[keep]`.
+            _mck = None
+            if (MODCLEAR_KEY and art is not None and bool(rec.get('l2'))
+                    and tm.shape == out.shape and tm.any()
+                    and (MODCLEAR_WHOLE or not tm.all())):
+                _mck = tm
+                if MODCLEAR_DARK_ONLY:
+                    # See MODCLEAR_DARK_ONLY. This is the term that makes the
+                    # change monotone IN THE PICTURE -- black can become art,
+                    # art can never become black -- and it is what stands in
+                    # for the per-texel cover mask `source_cell` cannot see.
+                    _mck = _mck & (_maxchan565(out) < MODCLEAR_DARK)
+                    if not _mck.any():
+                        _mck = None
+            if _sub:
+                _tu = _clear.reshape(edge, scale, edge, scale)
+                _mixed = _tu.any(axis=(1, 3)) & ~_tu.all(axis=(1, 3))
+                if _mixed.any():
+                    keep = zero & (_clear | ~_up(_mixed, scale))
+                    st.subunit_cells += 1
+                    st.subunit_units += int(_mixed.sum())
+                    st.subunit_texels += int(zero.sum() - keep.sum())
+                    dense_repack.subunit_cells = (
+                        getattr(dense_repack, 'subunit_cells', 0) + 1)
+                    dense_repack.subunit_units = (
+                        getattr(dense_repack, 'subunit_units', 0)
+                        + int(_mixed.sum()))
+                    dense_repack.subunit_texels = (
+                        getattr(dense_repack, 'subunit_texels', 0)
+                        + int(zero.sum() - keep.sum()))
+                else:
+                    keep = zero
+            else:
+                keep = zero
+            if _mck is not None:
+                _final = keep | _mck
+                _added = int(_final.sum() - keep.sum())
+                if _added:
+                    st.modclear_cells += 1
+                    st.modclear_texels += _added
+                    dense_repack.modclear_cells = (
+                        getattr(dense_repack, 'modclear_cells', 0) + 1)
+                    dense_repack.modclear_texels = (
+                        getattr(dense_repack, 'modclear_texels', 0) + _added)
+                    if bool(_mck.all()):
+                        st.modclear_whole += 1
+                        dense_repack.modclear_whole = (
+                            getattr(dense_repack, 'modclear_whole', 0) + 1)
+                keep = _final
+            out[keep] = FN.EMPTY
     # On layer 1 index 0 is NOT a cut-out -- it is drawn, and its colour
     # matters. Proved on hardware: setting entry 0 to black removed the
     # Sector 6 yellow and put black speckles across Wall Market, which cannot
@@ -2015,6 +2335,25 @@ LOW_SLOT_TOP = 14         # FINDINGS-156 placement probe. 25 = build 64.
 # shape as the dead "Field background budget (MB)" control this module's
 # byte-budget note describes.
 MAX_TRUECOLOR_PAGES = 3   # REVERTED with D2_OPAQUE_SLOTS, FINDINGS-218
+
+# CONVERT A WHOLE 32-UNIT PARALLAX PAGE INTO A TRUECOLOR ONE IN ITS OWN SLOT.
+# FINDINGS-249. See the arm in `dense_repack` for the measurement and the
+# legality argument. `SEVENTH_NX_NO_INPLACE_BIG=1` restores build 119.
+INPLACE_BIG = os.environ.get('SEVENTH_NX_NO_INPLACE_BIG') != '1'
+
+# THE PER-FIELD RUNTIME MEMORY CEILING, IN MB, AND IT BOUNDS `INPLACE_BIG`
+# ALONE.
+#
+# A conversion is free in PAGES and costs 3.07 MB at 768px, and
+# `field_bg_budget_mb` ships at 0.0 (UNLIMITED), so without this the arm has
+# no bound at all -- and `field_load_textures` abandons its whole loop on the
+# first texture it cannot allocate, which is what black squares are.
+#
+# 27.5 is not a guess. `mrkt4` is the archive's heaviest field at 27.31 MB and
+# it ships in build 119, so this is the largest figure with evidence behind
+# it. Nothing else consults it, and no field reaches it today, so it cannot
+# take anything away from build 119.
+FIELD_MB_CAP = float(os.environ.get('SEVENTH_NX_FIELD_MB_CAP') or 27.5)
 _MAX_TOTAL_PAGES_DEFAULT = 12
 
 # HOW MUCH OF A FIELD'S TRUECOLOR BUDGET THE 32-UNIT POPULATION MAY TAKE.
@@ -2860,6 +3199,116 @@ def dense_repack(sec3, sec9, field='', art_for=None, pals_for=None, px=256,
         _net += need - 1
         n_big_pages += need
         _admit.add(sl)
+
+    # ---- CONVERT A WHOLE PARALLAX PAGE **IN PLACE**. FINDINGS-249.
+    #
+    # THE LOOP ABOVE NEEDS A FREE DESTINATION SLOT AND THAT IS THE ONLY THING
+    # STOPPING `fship_2`.
+    #
+    # MEASURED at the shipping settings (768px, 20 pages), 260 fields:
+    #
+    #     fship_2   15 pages, slots 4..14 are ELEVEN 32-unit PALETTED pages,
+    #               every one of them a `_whole` group needing exactly ONE
+    #               destination page -- 672 parallax cells, the sky and the
+    #               girders -- and `_room_slots` is **0**, so all eleven are
+    #               refused. Its only free slots are 26/27/28 and the 16-unit
+    #               half takes all three.
+    #
+    #     archive   65 convertible groups refused across 9 fields, 4,423
+    #               parallax cells. `fship_2`/`fship_22`..`_25` are 55 of them.
+    #
+    # A whole group that needs exactly one page frees exactly one page -- its
+    # own -- so it does not need a free slot at all. It can be written back
+    # into the slot it came from. The page emission below already replaces
+    # `plist[slot]` unconditionally and the dead-page sweep already spares any
+    # slot in `dest`, so nothing downstream has to change.
+    #
+    # WHY THIS IS LEGAL, AND IT IS ALREADY ON HARDWARE. The engine reads a
+    # page's TYPE from section 9 and not from its slot index (x86 0x62D147),
+    # and draws any type-2 page below slot 33 opaque (x86 0x6403C0). Build
+    # 119 ships 32-unit TRUECOLOR pages in LOW slots today -- `mtcrl_4` at
+    # 12/13/14, `mtcrl_5` at 11/12, `wcrimb_2` at 11/12/13 -- and those are
+    # the fields Patrick judges as improved. This arm changes WHICH low slot,
+    # not whether a low slot can hold one.
+    #
+    # PAGE-NEUTRAL BY CONSTRUCTION: one freed, one added, `need == 1` enforced.
+    # `_net` is unchanged, so the no-growth loop sees exactly what it saw.
+    #
+    # BUT NOT MEMORY-NEUTRAL, AND THAT IS THE REAL BUDGET. At 768 a paletted
+    # page is 0.31 MB and a truecolor one is 3.38 MB, so each conversion costs
+    # +3.07 MB of the loader's heap -- and `field_bg_budget_mb` is 0.0, i.e.
+    # UNLIMITED, so nothing bounds it today. `field_load_textures` (x86
+    # 0x640292) abandons the whole loop on the first texture it cannot
+    # allocate and every page after it draws nothing, which is what scattered
+    # black squares are. So this arm carries its own ceiling.
+    #
+    # THE CEILING IS THE HIGHEST FIGURE ALREADY PROVEN ON HARDWARE, not a
+    # guess: `mrkt4` ships at 27.31 MB in build 119. `fship_2` is at 13.88 MB
+    # and therefore affords 4 conversions, not 11. Deliberately a measured
+    # bound rather than an optimistic one -- builds 52 and 55 bought black
+    # squares with exactly this kind of optimism.
+    #
+    # IT CANNOT REGRESS ANYTHING. The cap is consulted ONLY by this arm, and
+    # no field exceeds it today (27.31 is the archive maximum), so with the
+    # arm off it is unreachable. `SEVENTH_NX_NO_INPLACE_BIG=1` restores 119.
+    _inplace = []
+    if INPLACE_BIG and _whole:
+        try:
+            import field_bg_repack as _FR2
+            _d2 = _FR2._page_bytes(px, 2)
+            _cap_b = FIELD_MB_CAP * 1048576.0
+            # THE BASELINE IS THE PROJECTED FIELD, NOT THE SOURCE FIELD, AND
+            # GETTING THAT WRONG IS WORTH A BLACK SQUARE.
+            #
+            # The first version summed the SOURCE pages only. On `fship_2`
+            # that is 15 paletted pages = 4.65 MB, so the cap appeared to
+            # allow SEVEN conversions -- and the field came out at 35.35 MB
+            # against a 27.5 MB ceiling, because the 16-unit half's three
+            # truecolor pages and the conversions themselves were never
+            # counted. A budget that does not include what the rest of the
+            # pass is about to allocate is not a budget.
+            #
+            # So: every source page, PLUS the 16-unit half's new pages, PLUS
+            # the free-slot parallax groups already admitted above (each of
+            # which adds `need` pages and frees its own source page).
+            _proj_b = sum(_FR2._page_bytes(p.px, p.depth)
+                          for p in pages.values())
+            _proj_b += _small_take * _d2
+            for _sl in _admit:
+                _need = -(-len(_groups[_sl]) // BIG_PER_PAGE)
+                _proj_b += _need * _d2
+                if _sl in pages:
+                    _proj_b -= _FR2._page_bytes(pages[_sl].px,
+                                                pages[_sl].depth)
+            _cur_b = _proj_b
+            for sl in _whole:
+                if sl in _admit or sl not in pages:
+                    continue
+                if len(_groups[sl]) > BIG_PER_PAGE:     # need == 1, exactly
+                    continue
+                _p = pages[sl]
+                if _p.depth != 2 and not _p.size_flag:
+                    # A 32-unit population must land on a size_flag page, and
+                    # reusing a slot whose source is NOT 32-unit would change
+                    # the grid the engine reads it on. Refuse rather than
+                    # reinterpret -- that mistake is the build-84 checkerboard.
+                    continue
+                _delta = _d2 - _FR2._page_bytes(_p.px, _p.depth)
+                if _cur_b + _delta > _cap_b:
+                    continue
+                _cur_b += _delta
+                _admit.add(sl)
+                _inplace.append(sl)
+            if _inplace:
+                dense_repack.inplace_big = (
+                    getattr(dense_repack, 'inplace_big', 0) + len(_inplace))
+                dense_repack.inplace_fields = (
+                    getattr(dense_repack, 'inplace_fields', 0) + 1)
+                dense_repack.inplace_cells = (
+                    getattr(dense_repack, 'inplace_cells', 0)
+                    + sum(len(_groups[s]) for s in _inplace))
+        except Exception:                                      # noqa: BLE001
+            _inplace = []
     freeable = len(_admit)
 
     if len(_admit) < len(_groups):
@@ -2876,8 +3325,12 @@ def dense_repack(sec3, sec9, field='', art_for=None, pals_for=None, px=256,
     # and `LOW_SLOT_TOP` are a measured placement probe (FINDINGS-156) and
     # reordering that population would confound this change with that one. The
     # parallax pages are taken from the TAIL instead.
-    seats_big = (free_slots[_small_take:_small_take + n_big_pages]
-                 if n_big_pages else [])
+    # The in-place seats are the groups' OWN slots, appended AFTER the free
+    # ones so a field that has free slots fills them exactly as build 119 did
+    # and the flat cursor's order is unchanged for everything else.
+    seats_big = ((free_slots[_small_take:_small_take + n_big_pages]
+                  if n_big_pages else []) + _inplace)
+    n_big_pages += len(_inplace)
     seats = free_slots[:_small_take]
     _seats_of = {BIG_TILE: seats_big, TILE: seats}
     _big_slots = set(seats_big)

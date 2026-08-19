@@ -3436,6 +3436,87 @@ def _convert_field_backgrounds(archive, payloads, log, dds_sources=()):
                    % (field_bg_dense.LOW_SLOT_ORDER,
                       'highest' if field_bg_dense.LOW_SLOT_ORDER == 'desc'
                       else 'lowest')))
+        # SUB-UNIT KEY. FINDINGS-247. Printed because HANDOFF-246's second
+        # trap is a whole session spent gating a pass that never ran, and
+        # the log is the only place that can be checked.
+        _suc = getattr(field_bg_dense.dense_repack, 'subunit_cells', 0)
+        if _suc:
+            _dense_line += (
+                ' -- SUB-UNIT KEY: %s layer-2 cut-out cell(s) had their '
+                'colour key refined below unit size across %s unit(s) the '
+                'mod cuts partially, un-keying %s texel(s). Our key is '
+                'uniform over a unit by construction and Cosmos\'s alpha is '
+                'not, so where an overlay\'s edge crossed a unit we used to '
+                'throw the WHOLE unit away and the silhouette eroded back to '
+                'the unit grid -- 3 screen pixels at a time, visible only '
+                'where two layers overlap because on layer 1 there is '
+                'nothing behind. MEASURED over 5 fields before the fix: '
+                '50,196 partially-cut units and we keyed 42,481 of them. '
+                'Threshold is PageArt.hmask (alpha >= 128, the 50%% rule) '
+                'and NOT tmask (alpha >= 8) -- Cosmos outlines its overlays '
+                'dark, and drawing a quarter-alpha outline opaque is a black '
+                'fringe one texel wide. Un-keying only ever makes a texel '
+                'opaque, never transparent, and only inside a unit that '
+                'keeps at least one keyed texel, so no cell loses its key. '
+                'Set SEVENTH_NX_NO_SUBUNIT_KEY=1 to restore build 118.'
+                % (f"{_suc:,}",
+                   f"{getattr(field_bg_dense.dense_repack, 'subunit_units', 0):,}",
+                   f"{getattr(field_bg_dense.dense_repack, 'subunit_texels', 0):,}"))
+        # MOD-CLEAR KEY. FINDINGS-253. Same reason as the block above: a pass
+        # that silently never fires is HANDOFF-246's second trap, and the log
+        # is the only place it can be checked after the fact.
+        _mcc = getattr(field_bg_dense.dense_repack, 'modclear_cells', 0)
+        if _mcc:
+            _dense_line += (
+                ' -- MOD-CLEAR KEY: %s layer-2 cut-out cell(s) gained the '
+                'colour key on %s texel(s) where COSMOS PAINTS NOTHING but '
+                'vanilla\'s index is not 0 (%s of those cells are clear in '
+                'full). We took the key from vanilla\'s index and the FILL '
+                'from vanilla\'s pixel, so a texel the mod calls empty over a '
+                'non-zero vanilla index was neither keyed nor skipped -- it '
+                'was painted with the 1997 art\'s hard black outline. That is '
+                'the black stair-step on the Highwind hull, and it is why one '
+                'silhouette is flawless in places and choppy in others: where '
+                'the old outline happened to be index 0 we keyed it, where it '
+                'was a dark non-zero index we drew it. MEASURED on fship_1: '
+                'of 312,897 texels the mod calls clear we keyed 307,052 '
+                '(98.1%%) and drew 5,845, of which 2,683 are near-black. '
+                'Threshold is PageArt.tmask (alpha < 8) and NOT hmask -- this '
+                'arm ADDS key, so it must be sure the mod paints NOTHING, '
+                'which is the OPPOSITE conservative end from SUB-UNIT KEY '
+                'above. Adding key reveals what is behind; the per-texel '
+                'reveal census (_kmodclear.py) is what proves something does. '
+                'Set SEVENTH_NX_NO_MODCLEAR_KEY=1 to restore build 120.'
+                % (f"{_mcc:,}",
+                   f"{getattr(field_bg_dense.dense_repack, 'modclear_texels', 0):,}",
+                   f"{getattr(field_bg_dense.dense_repack, 'modclear_whole', 0):,}"))
+        # IN-PLACE PARALLAX CONVERSION. FINDINGS-249.
+        _ip = getattr(field_bg_dense.dense_repack, 'inplace_big', 0)
+        if _ip:
+            _dense_line += (
+                ' -- IN-PLACE PARALLAX: %s 32-unit page(s) in %s field(s) '
+                'were converted from 8-bit to truecolor IN THEIR OWN SLOT, '
+                'promoting %s cell(s). A parallax page whose every key is '
+                'promotable frees exactly one page and needs exactly one, so '
+                'it does not need a FREE slot -- and that was the only thing '
+                'stopping fship_2, whose slots 4..14 are eleven convertible '
+                '32-unit paletted pages while its only free slots (26/27/28) '
+                'go to the 16-unit half. The engine reads a page TYPE from '
+                'section 9 rather than from its slot (x86 0x62D147) and draws '
+                'any type-2 page below slot 33 opaque (x86 0x6403C0), and '
+                'build 119 already ships 32-unit truecolor pages in low slots '
+                '(mtcrl_4 at 12/13/14). PAGE-NEUTRAL by construction. The '
+                'cost is HEAP: %0.2f MB per conversion at %dpx, bounded by '
+                'field_bg_dense.FIELD_MB_CAP = %.1f MB, which is the heaviest '
+                'field already proven on hardware (mrkt4, 27.31 MB). That '
+                'ceiling is why fship_2 takes 4 of its 11 and not all 11. '
+                'Set SEVENTH_NX_NO_INPLACE_BIG=1 to restore build 119.'
+                % (f"{_ip:,}",
+                   f"{getattr(field_bg_dense.dense_repack, 'inplace_fields', 0):,}",
+                   f"{getattr(field_bg_dense.dense_repack, 'inplace_cells', 0):,}",
+                   (field_bg_repack._page_bytes(px, 2)
+                    - field_bg_repack._page_bytes(256, 1)) / 1048576.0,
+                   px, field_bg_dense.FIELD_MB_CAP))
         log(_dense_line)
     if up_fields:
         log(f'  field background: UPSCALED {up_pages} page(s) in {up_fields} '

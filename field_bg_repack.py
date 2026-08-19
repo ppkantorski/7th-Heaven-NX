@@ -750,7 +750,7 @@ def resample_rgba(rgba, w, h, px, log=None):
 class PageArt:
     """One (page, palette) image as a packed 565 page, ready to crop cells."""
 
-    __slots__ = ('px', 'buf', '_op', 'tmask', 'bmask')
+    __slots__ = ('px', 'buf', '_op', 'tmask', 'bmask', 'hmask')
 
     def __init__(self, dds_bytes, page_px):
         import dds_decode
@@ -766,12 +766,42 @@ class PageArt:
         # does, and it comes from the art's ALPHA rather than a reserved
         # colour. With true_black() on, opaque black disqualifies it too --
         # see true_black() for why that is the only exact way to keep it.
+        #
+        # `hmask` IS A DIFFERENT QUESTION FROM `tmask` AND THE DIFFERENCE
+        # MATTERS. FINDINGS-247.
+        #
+        # `tmask` exists to DISQUALIFY a cell from promotion, so its
+        # threshold is deliberately paranoid: alpha < 8 -- one part in 32 of
+        # transparency is enough to say "this cell contains transparency".
+        # That is right for a per-cell veto and WRONG as a per-texel "should
+        # this be drawn" test, because its complement calls a texel at 4%
+        # alpha fully painted.
+        #
+        # It matters now because `field_bg_dense.SUBUNIT_KEY` turns the mod's
+        # alpha into a 1-bit decision PER TEXEL, and the honest 1-bit
+        # reduction of an 8-bit alpha is a 50% threshold: at 128 the error is
+        # symmetric either way. MEASURED on the newly-opaque texels of
+        # `mtcrl_4`, `mtcrl_5` and `wcrimb_2` -- 45%, 27% and 21% of them sit
+        # at alpha 8..127, i.e. mostly TRANSPARENT, and Cosmos draws a dark
+        # outline along exactly those boundaries. Drawing a 25%-alpha dark
+        # outline at full strength is a black fringe one texel wide around
+        # every overlay, which is the defect build 116 spent a whole session
+        # removing. `hmask` is what keeps this change from reintroducing it.
+        #
+        # Pillow's BOX resize is alpha-weighted -- verified again here, a
+        # quarter-covered texel comes back (199,179,159,128) from
+        # (200,180,160,255) -- so the COLOUR at a partial texel is the art's
+        # own and the only thing that is wrong is drawing it opaque.
+        #
+        # Costs one bool page (256 KB at 512px) beside the two that already
+        # exist, and nothing reads it unless SUBUNIT_KEY is on.
         if _np is not None:
             a = _np.frombuffer(rgba, dtype=_np.uint8, count=n * 4)
             op = a[3::4] >= 8
             self.tmask = (~op).reshape(page_px, page_px)
             self.bmask = (op & ((a[0::4] | a[1::4] | a[2::4]) == 0)
                           ).reshape(page_px, page_px)
+            self.hmask = (a[3::4] >= 128).reshape(page_px, page_px)
         else:
             self.tmask = bytes(1 if rgba[i * 4 + 3] < 8 else 0
                                for i in range(n))
@@ -780,6 +810,8 @@ class PageArt:
                       and not (rgba[i * 4] | rgba[i * 4 + 1]
                                | rgba[i * 4 + 2])) else 0
                 for i in range(n))
+            self.hmask = bytes(1 if rgba[i * 4 + 3] >= 128 else 0
+                               for i in range(n))
         self._op = {}
 
     def cell_opaque(self, cx, cy, grid):
