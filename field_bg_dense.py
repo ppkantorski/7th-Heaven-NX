@@ -3034,8 +3034,35 @@ PROMOTE_FX_BASE_FIELDS = frozenset()
 # measured headroom are at the use site in `dense_repack`. False restores
 # build 54 exactly.
 LOW_SLOT_PROBE = True
-LOW_SLOT_MAX_TC = 7            # 7 covers the whole archive: pages a field
-                               # needs to be 100% truecolor, MEASURED --
+# RAISED 7 -> 10 WITH `FIELD_MB_CAP`, BUILD 130. FINDINGS-270.
+#
+# THE OLD COMMENT BELOW WAS MEASURED AT 512px AND IS NO LONGER TRUE. "7 covers
+# the whole archive" was counted when a page held 512/16 = 32 cells per side;
+# `field_bg_page_px` is now 768 and the same art needs more pages, so the
+# distribution it quotes has moved out from under it. This is the same class
+# of stale constant as `max_total_pages`.
+#
+# MEASURED at the production config (768px, max_pages 20), the ONLY fields
+# that respond are the two that are genuinely budget-bound -- everything else
+# is byte-identical because it was never near the ceiling:
+#
+#     field       tc7/27.5MB      tc10/35MB       tc14/45MB
+#     crater_1    91.1% 24.6MB    99.4% 31.0MB   100.0% 33.8MB
+#     fship_2     67.6% 26.1MB    76.1% 32.2MB    88.8% 41.4MB
+#     mrkt4       98.2% 27.3MB    98.2% 27.3MB    98.2% 27.3MB   (unchanged)
+#     gaia_1      71.4% 19.7MB    71.4% 19.7MB    71.4% 19.7MB   (unchanged)
+#
+# 10 AND NOT 14, DELIBERATELY. `crater_1` is essentially complete at 10 and
+# the archive's worst field goes 27.3 -> 32.2 MB, one modest step past
+# `mrkt4`, which is the heaviest figure ever proven on this hardware. 14
+# would take `fship_2` further but puts the worst field at 41.4 MB, 1.5x
+# anything proven -- and `field_load_textures` abandons its whole loop on the
+# first texture it cannot allocate, which is what a black square is. If 10 is
+# clean on hardware, 14 is the next step and the numbers above are already
+# measured for it.
+LOW_SLOT_MAX_TC = int(os.environ.get('SEVENTH_NX_LOW_SLOT_MAX_TC') or 10)
+                               # STALE, kept for the record -- measured at
+                               # 512px, not 768:
                                # 1p:46 2p:246 3p:166 4p:179 5p:49 6p:11 7p:4
 # EVERY FIELD. Proven on 18 Wall Market fields in build 56.
 #
@@ -3090,6 +3117,13 @@ MAX_TRUECOLOR_PAGES = 3   # REVERTED with D2_OPAQUE_SLOTS, FINDINGS-218
 # legality argument. `SEVENTH_NX_NO_INPLACE_BIG=1` restores build 119.
 INPLACE_BIG = os.environ.get('SEVENTH_NX_NO_INPLACE_BIG') != '1'
 
+# GIVE THE 32-UNIT PARALLAX HALF THE FREE **LOW** SLOTS, NOT THE TAIL OF THE
+# 26..28 BAND. FINDINGS-267. See the seat split for the measurement.
+#
+# Page-neutral by construction: the seat COUNTS are unchanged, only the slot
+# numbers move. `SEVENTH_NX_NO_PARALLAX_LOW_SLOT=1` restores build 127.
+PARALLAX_LOW_SLOT = os.environ.get('SEVENTH_NX_NO_PARALLAX_LOW_SLOT') != '1'
+
 # THE PER-FIELD RUNTIME MEMORY CEILING, IN MB, AND IT BOUNDS `INPLACE_BIG`
 # ALONE.
 #
@@ -3102,7 +3136,24 @@ INPLACE_BIG = os.environ.get('SEVENTH_NX_NO_INPLACE_BIG') != '1'
 # it ships in build 119, so this is the largest figure with evidence behind
 # it. Nothing else consults it, and no field reaches it today, so it cannot
 # take anything away from build 119.
-FIELD_MB_CAP = float(os.environ.get('SEVENTH_NX_FIELD_MB_CAP') or 27.5)
+# RAISED 27.5 -> 35.0 WITH `LOW_SLOT_MAX_TC`, BUILD 130. FINDINGS-270.
+#
+# 27.5 was `mrkt4`'s 27.31 MB -- the heaviest field proven on hardware -- and
+# it was the right bound while nothing needed more. Two fields do:
+# `crater_1` reaches 99.4% of tiles at 768 at 31.0 MB and `fship_2` 76.1% at
+# 32.2 MB, so 35.0 is the smallest ceiling that admits both with headroom.
+#
+# MEASURED over the heavy fields: the archive's worst field goes 27.3 -> 32.2
+# MB and only `crater_1` and the five `fship_2*` states move at all. Every
+# other field is byte-identical, because a cap only binds where it binds.
+#
+# THIS IS THE NUMBER TO WATCH ON HARDWARE. It is the first time this project
+# has shipped a field heavier than `mrkt4`, and the failure mode is not a
+# crash -- `field_load_textures` abandons its loop on the first texture it
+# cannot allocate, so the symptom is scattered black squares in the heaviest
+# fields. `SEVENTH_NX_FIELD_MB_CAP=27.5` restores the old ceiling exactly.
+FIELD_MB_CAP = float(os.environ.get('SEVENTH_NX_FIELD_MB_CAP') or 35.0)
+
 _MAX_TOTAL_PAGES_DEFAULT = 12
 
 # HOW MUCH OF A FIELD'S TRUECOLOR BUDGET THE 32-UNIT POPULATION MAY TAKE.
@@ -4104,10 +4155,67 @@ def dense_repack(sec3, sec9, field='', art_for=None, pals_for=None, px=256,
     # The in-place seats are the groups' OWN slots, appended AFTER the free
     # ones so a field that has free slots fills them exactly as build 119 did
     # and the flat cursor's order is unchanged for everything else.
-    seats_big = ((free_slots[_small_take:_small_take + n_big_pages]
-                  if n_big_pages else []) + _inplace)
+    # ---- ...EXCEPT THAT THE TAIL IS WHERE SLOT 28 IS. FINDINGS-267.
+    #
+    # `free_slots` is `BANDS[4]` (26,27,28) followed by the low-slot probe's
+    # list, so the 16-unit half takes 26 and 27 and the parallax half is
+    # handed 28 FIRST -- the last slot this port's loader reaches
+    # (`field_load_textures`, ARM64 module +0x10DC370, `cmp x23, #0x1d`).
+    #
+    # MEASURED on `fship_1`, and it is the whole reported defect: layer 3 is
+    # three pages and the one on slot 28 carries the ENTIRE top of the
+    # backdrop, y -128..0, full width -- exactly the region where layer 1 has
+    # no tiles and the parallax is the only thing on screen.
+    #
+    #     slot 13   32 tiles   y   64..128
+    #     slot 14   64 tiles   y  -32..96
+    #     slot 28   64 tiles   y -128..0     <- the black triangle
+    #
+    # ...while slots 0,1,2,3,4,6,7,8,9,10,11,12 all sit FREE.
+    #
+    # A LOW SLOT IS THE PROVEN PLACE FOR THIS POPULATION, and specifically for
+    # 32-unit parallax pages: build 119 ships `mtcrl_4`'s on slots 12/13/14
+    # and it is on hardware. The engine reads a page's TYPE from section 9
+    # rather than from its slot (x86 0x62D147) and draws any type-2 page below
+    # slot 33 opaque (x86 0x6403C0), so the low slots are not a blend-mode
+    # question for a depth-2 page -- FINDINGS-168 s2.3 read the port's own
+    # branch and there is no slot test on the depth-2 path at all.
+    #
+    # THIS IS A RENUMBERING AND NOTHING ELSE. The COUNT each half receives is
+    # taken from what the old expression would have produced, so no field can
+    # gain or lose a page, a cell or a tile by it -- only the slot numbers
+    # move. That is what makes it safe to run archive-wide and what the gate
+    # checks.
+    _would_be = (free_slots[_small_take:_small_take + n_big_pages]
+                 if n_big_pages else [])
+    # SCOPED TO FIELDS THAT WOULD OTHERWISE PUT A PARALLAX PAGE IN THE HIGH
+    # BAND, and this restriction is the difference between a fix and build
+    # 128. Without it the reseat also moves fields whose parallax is ALREADY
+    # low -- `wcrimb_2` 11,12,13 -> 12,13,14, `onna_5` 11,12 -> 13,14 --
+    # which changes bytes on fields that have nothing wrong with them for no
+    # benefit at all. That is precisely the "339 fields taking an unproven
+    # risk for no benefit" this file objects to twenty lines above, and doing
+    # it here would be the same mistake in the other direction.
+    #
+    # With the guard, a field is touched only when it has a parallax page in
+    # 26..28 AND a free slot below 15 to put it in. Everything else is
+    # byte-identical to build 127, which is claim 1 of `_kslotgate.py`.
+    if PARALLAX_LOW_SLOT and any(s >= BANDS[4][0] for s in _would_be):
+        _lo = [s for s in free_slots if s < BANDS[4][0]]
+        _hi = [s for s in free_slots if s >= BANDS[4][0]]
+        _big_seats = (_lo + _hi)[:len(_would_be)]
+        _taken = set(_big_seats)
+        # The 16-unit half keeps its historical preference -- `free_slots` is
+        # still in its own order, minus what the parallax took.
+        _rest = [s for s in free_slots if s not in _taken]
+        seats_big = _big_seats + _inplace
+        seats = _rest[:_small_take]
+        dense_repack.parallax_relowed = (
+            getattr(dense_repack, 'parallax_relowed', 0) + 1)
+    else:
+        seats_big = _would_be + _inplace
+        seats = free_slots[:_small_take]
     n_big_pages += len(_inplace)
-    seats = free_slots[:_small_take]
     _seats_of = {BIG_TILE: seats_big, TILE: seats}
     _big_slots = set(seats_big)
     if n_big_pages:

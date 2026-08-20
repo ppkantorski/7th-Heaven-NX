@@ -136,6 +136,29 @@ class TestParallaxFill(unittest.TestCase):
         self.assertEqual(added, {},
                          'a viewport-pinned mask must never be tiled')
 
+    def test_junon_train_overlays_are_never_repeated(self):
+        """The moving train/banner layers are not tileable backdrops."""
+        for name, authored_tiles in (('junonl2', 56), ('junonr2', 95)):
+            with self.subTest(field=name):
+                parts = field_parts(name)
+                before = PF._layers(parts[8], parts[8].find(b'BACK'),
+                                    parts[8].find(b'TEXTURE'))
+                new9, added = PF.apply_to_section9(parts[8], parts[7],
+                                                    field_name=name)
+                after = PF._layers(new9, new9.find(b'BACK'),
+                                   new9.find(b'TEXTURE'))
+                n_before = next(n for layer, _c, _first, n in before
+                                if layer == 4)
+                n_after = next(n for layer, _c, _first, n in after
+                               if layer == 4)
+                self.assertEqual(n_before, authored_tiles)
+                self.assertEqual(
+                    n_after, n_before,
+                    'the fill appended a second copy of the banner')
+                self.assertNotIn(4, added)
+                self.assertIn(3, added,
+                              'the independent layer-3 fill regressed')
+
     def test_every_filled_layer_actually_scrolls(self):
         arch = lgp.Archive(FLEVEL)
         checked = 0

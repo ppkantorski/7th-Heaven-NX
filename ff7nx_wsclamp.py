@@ -686,6 +686,11 @@ CAVE_SITES = {
 # resolve -- only a metric that could not express the answer.
 PARALLAX_RIGHT_KNOBS = ('pright4b', 'pright3', 'pright4a')
 
+# THE FLOOR FOR `parallax_right`. FINDINGS-272 -- see that function's
+# docstring for the measurement and why raising it is the safe direction.
+# 107 restores build 130.
+PARALLAX_RIGHT_MIN = 107   # REVERTED, build 132. See FINDINGS-274.
+
 # STILL LISTED, AND STILL MEANINGFUL: these two are WRAPS, not culls. The name
 # is what keeps `CULL_CAVE_SITES` from asserting cull semantics against them in
 # the test suite. It no longer means "not shipped".
@@ -698,6 +703,24 @@ PARALLAX_SHIFT_KNOBS = ('pright3', 'pright4a')
 # assumption. Named here so `CULL_CAVE_SITES` keeps `verdict()`'s cull oracle
 # away from them, exactly as PARALLAX_SHIFT_KNOBS does on the x axis.
 PARALLAX_BOTTOM_KNOBS = ('pbottom3', 'pbottom4a', 'pbottom4b')
+
+# THE FLOOR FOR THE VERTICAL WRAP BOUND. FINDINGS-273 -- see
+# `parallax_bottom_bound` for the measurement. 16 restores build 131.
+#
+# MEASURED over all 96 parallax layers in the archive, the bound each one
+# needs so that no tile which can be on screen is teleported:
+#
+#     satisfied at   16   (today)     0 of 96
+#     satisfied at  288              82 of 96
+#     satisfied at  512              96 of 96
+#
+#     worst: crater_1 L4 512, mtcrl_5 L3 416, sbwy4_6 L3 392,
+#            gaia_1/gaia_2 L4 384, midgal L3 376, wcrimb_1/2 L3 360
+#
+# 512 covers the archive and is exactly half the 1024 that `bg3/bg4_height`
+# reads in almost every field, so a layer that genuinely repeats still wraps
+# at its own midpoint rather than never.
+PARALLAX_BOTTOM_MIN = 16   # NOT RAISED. See FINDINGS-274.
 
 # The two in-place immediates that come with them. `ptop3`/`ptop4` ship at
 # STOCK, which is what withdraws build 96's 272; `phalf3` keeps build 96's 120.
@@ -718,9 +741,49 @@ def parallax_right(scale):
     0.75 that is 106.67 -> 107, which is exactly `abs(wide_viewport_x)`.
     Rounded UP, because the test is `>=`: one unit short wraps a tile that
     is still on screen, and one unit long merely draws a tile that is not.
+
+    ...AND 107 IS TOO SHORT FOR A LAYER THAT IS NOT A REPEATING BACKDROP.
+    FINDINGS-272, reported from hardware on `junonl2`.
+
+    The rule this feeds is FFNx's, quoted in full at `PARALLAX_RIGHT_KNOBS`:
+
+        if (tile.x <= bg.x - left_offset || tile.x >= bg.x + right_offset)
+            tile.x += (...) ? -layer_width : layer_width;
+
+    A tile outside the window is not culled, it is MOVED a whole layer width.
+    For a repeating sky that is the entire point -- it is how a finite tile
+    set covers an endless scroll, and the art is authored to survive it.
+
+    **`junonl2`'s layer 4 is not a sky.** It is one object -- the train and
+    the Rufus banner -- painted at a specific spot, and MEASURED it reaches
+    `tile.x - bg.x = 352` while the window ends at 107. So its right-hand
+    tiles are thrown a whole layer width and land back inside the picture as
+    a second banner above the first, which is exactly what was photographed.
+
+    THE DIRECTION IS THE SAFE ONE AND THIS DOCSTRING ALREADY SAID SO: "one
+    unit short wraps a tile that is still on screen, and one unit long merely
+    draws a tile that is not." Too small is a visible misplacement; too large
+    costs a tile that is off screen anyway.
+
+    384 AND NOT MORE. It clears `junonl2`'s measured 352 with margin, and it
+    stays well under the 1024 that `bg3/bg4_width` reads in almost every
+    field -- so a layer that genuinely repeats still wraps before it runs out
+    of art. Going to the archive's worst case (768, `anfrst_3/4`) would
+    approach that width and start disabling the wrap itself, which is a
+    different change and needs its own evidence.
+
+    `SEVENTH_NX_WS_PARALLAX_RIGHT` overrides it -- set 107 to reproduce
+    build 130 exactly, or a larger value to test further.
     """
     import math
-    return int(math.ceil((640.0 / scale - 640.0) / 2.0))
+    env = os.environ.get('SEVENTH_NX_WS_PARALLAX_RIGHT', '').strip()
+    if env:
+        try:
+            return int(env)
+        except ValueError:
+            pass
+    base = int(math.ceil((640.0 / scale - 640.0) / 2.0))
+    return max(base, PARALLAX_RIGHT_MIN)
 
 
 def parallax_bottom(scale=WS_SCALE):
@@ -789,11 +852,65 @@ CULL_CAVE_SITES = {k: v for k, v in CAVE_SITES.items()
                    and k not in PARALLAX_BOTTOM_KNOBS}
 
 
+def parallax_bottom_bound(scale=WS_SCALE):
+    """
+    The parallax vertical WRAP BOUND -- which is NOT the picture's extent.
+
+    FINDINGS-273. `parallax_bottom` is 16 because "the port's picture runs to
+    bg.y + 16", and that number is correct for `parallax_half_height`, which
+    is half the PICTURE. The two happened to share a value and were therefore
+    the same function; they are not the same quantity.
+
+    The bound's job is different. From the block above, in this file's own
+    words: a tile outside the window *"is TELEPORTED a whole layer height
+    away -- it does not fail to draw, it draws somewhere else."* So the bound
+    has to cover where the ART can sit relative to `bg.y`, not where the
+    picture ends. MEASURED on `junonl2`, the field reported from hardware:
+
+        L3   art y -128..192   bg.y span -72..72   max(tile.y - bg.y) = 264
+        L4   art y  -64..192   bg.y span -72..72   max(tile.y - bg.y) = 264
+                                       against bottom_offset = 16  -> WRAPS
+
+    Its layer 4 is one object -- the train and the Rufus banner -- so the
+    teleported tiles are not a sky repeating, they are a second banner ABOVE
+    the first, which is exactly what was photographed twice.
+
+    512 is the archive's worst case (`crater_1` L4) and half the 1024 that
+    `bg3/bg4_height` reads in almost every field, so a layer that genuinely
+    repeats still wraps at its own midpoint. AT THE CURRENT 16, NONE of the
+    archive's 96 parallax layers is safe -- every one has tiles that get
+    teleported.
+
+    The counter-risk of raising it is a layer that needed the wrap to fill
+    the top of the frame and now runs out instead. That case is already
+    served from the archive side: `ff7nx_parallaxfill` adds 6,340 tiles
+    across 46 fields for exactly it (FINDINGS-207), so the wrap is not the
+    only thing holding those layers up.
+
+    RAISING IT IS THE SAFE DIRECTION, for the reason `parallax_right`'s
+    docstring gives on the other axis: the test is `>=`, so one unit short
+    teleports a tile that is still on screen, and one unit long merely keeps
+    a tile that is off it.
+
+    `parallax_half_height` deliberately still reads `parallax_bottom`, so the
+    120 that build 96 shipped and `test_wsclamp` asserts does not move.
+
+    `SEVENTH_NX_WS_PARALLAX_BOTTOM=16` restores build 131 exactly.
+    """
+    env = os.environ.get('SEVENTH_NX_WS_PARALLAX_BOTTOM', '').strip()
+    if env:
+        try:
+            return int(env)
+        except ValueError:
+            pass
+    return max(parallax_bottom(scale), PARALLAX_BOTTOM_MIN)
+
+
 def parallax_vertical_values(scale=WS_SCALE):
     """The parallax VERTICAL knobs and their derived values. FINDINGS-205."""
     out = {}
     for knob in PARALLAX_BOTTOM_KNOBS:
-        out[knob] = parallax_bottom(scale)
+        out[knob] = parallax_bottom_bound(scale)
     for knob in PARALLAX_TOP_KNOBS:
         out[knob] = parallax_top(scale)
     for knob in PARALLAX_HALF_KNOBS:

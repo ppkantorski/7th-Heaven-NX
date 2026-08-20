@@ -240,14 +240,26 @@ class TestParallaxVertical(unittest.TestCase):
                     '%s should have exactly one boundary, at the camera' % name)
 
     def test_bias_moves_the_wrap_point_by_exactly_the_bias(self):
-        want = C.parallax_bottom()
+        # FINDINGS-273: the WRAP BOUND is not the picture's bottom extent.
+        # This used to read `parallax_bottom()` -- 16, "the same number
+        # bottom1/bottom2 already ship on this axis" -- which compared a wrap
+        # against a CULL. The bound has to cover where the ART can sit
+        # relative to bg.y (junonl2 measures 264), not where the picture ends.
+        # `parallax_half_height` still reads `parallax_bottom`, so the 120
+        # below is untouched.
+        want = C.parallax_bottom_bound()
         img = module(C.shipped_values())
         for name in C.PARALLAX_BOTTOM_KNOBS:
             with self.subTest(name):
+                # The sweep must reach the bound: `flip`'s default window is
+                # -400..400 and FINDINGS-273 puts the bound at 512, so a
+                # default sweep reports [] -- no boundary found -- which is a
+                # range limit and not a failure.
                 self.assertEqual(
-                    flip(img, name), [want],
-                    '%s must wrap at cam+%d, the same number bottom1/bottom2 '
-                    'already ship on this axis' % (name, want))
+                    flip(img, name, lo=-64, hi=want + 64), [want],
+                    '%s must wrap at cam+%d, which is where the ART can sit '
+                    'relative to bg.y -- NOT the picture extent that '
+                    'bottom1/bottom2 use (FINDINGS-273)' % (name, want))
 
     def test_all_three_move_together(self):
         """
@@ -257,7 +269,7 @@ class TestParallaxVertical(unittest.TestCase):
         """
         v = C.shipped_values()
         self.assertEqual({v[k] for k in C.PARALLAX_BOTTOM_KNOBS},
-                         {C.parallax_bottom()})
+                         {C.parallax_bottom_bound()})
 
     def test_the_x_axis_is_undisturbed(self):
         """Adding the y set must not move where the shipped x set wraps."""

@@ -3436,6 +3436,39 @@ def _convert_field_backgrounds(archive, payloads, log, dds_sources=()):
                    % (field_bg_dense.LOW_SLOT_ORDER,
                       'highest' if field_bg_dense.LOW_SLOT_ORDER == 'desc'
                       else 'lowest')))
+        # PARALLAX OFF THE TAIL SLOT. FINDINGS-267.
+        _plw = getattr(field_bg_dense.dense_repack, 'parallax_relowed', 0)
+        if _plw:
+            _dense_line += (
+                ' -- PARALLAX LOW SLOT: %s field(s) had a 32-unit parallax '
+                'page re-seated out of the 26..28 band into a free slot below '
+                '15. `free_slots` is BANDS[4] followed by the low-slot probe, '
+                'so the 16-unit half took 26 and 27 and the backdrop was '
+                'handed 28 FIRST -- the LAST slot this port\'s loader reaches '
+                '(field_load_textures, ARM64 module +0x10DC370, cmp x23 #0x1d, '
+                'FINDINGS-168 s2.2). MEASURED on fship_1 (the cargo ship): its '
+                'layer 3 is three pages and the one on slot 28 carried the '
+                'ENTIRE top of the backdrop, y -128..0 at full width -- '
+                'exactly the region where layer 1 has no tiles at all and the '
+                'parallax is the only thing on screen, and exactly where the '
+                'black triangle is reported. Slots 0-4 and 6-12 were free the '
+                'whole time. A low slot is the PROVEN place for this '
+                'population: build 119 ships mtcrl_4\'s 32-unit truecolor '
+                'pages on 12/13/14 and the engine reads a page\'s TYPE from '
+                'section 9 rather than its slot, with NO slot test at all on '
+                'the depth-2 path (FINDINGS-168 s2.3). SCOPED to fields that '
+                'would otherwise put a parallax page at 26+, so a field whose '
+                'backdrop is already low is untouched -- without that guard '
+                'wcrimb_2 (11,12,13 -> 12,13,14) and onna_5 changed bytes for '
+                'no benefit. PAGE-NEUTRAL: the seat COUNTS are taken from what '
+                'the old expression produced, so only slot NUMBERS move. '
+                'GATED (_kslotgate.py) over all 84 fields with a layer 3/4: '
+                '15 changed, all off slot 28, and the composited picture is '
+                'IDENTICAL texel for texel in every one (pages, truecolor '
+                'pages, tiles and section-9 length all unchanged); 69 of 69 '
+                'control fields byte-identical. Set '
+                'SEVENTH_NX_NO_PARALLAX_LOW_SLOT=1 to restore build 127.'
+                % f"{_plw:,}")
         # SUB-UNIT KEY. FINDINGS-247. Printed because HANDOFF-246's second
         # trap is a whole session spent gating a pass that never ran, and
         # the log is the only place that can be checked.
