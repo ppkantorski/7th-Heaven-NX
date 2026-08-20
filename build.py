@@ -3490,6 +3490,85 @@ def _convert_field_backgrounds(archive, payloads, log, dds_sources=()):
                 % (f"{_mcc:,}",
                    f"{getattr(field_bg_dense.dense_repack, 'modclear_texels', 0):,}",
                    f"{getattr(field_bg_dense.dense_repack, 'modclear_whole', 0):,}"))
+        # THIN STRUCTURE RECOVERED FROM THE NATIVE ALPHA. FINDINGS-258.
+        _wt = getattr(field_bg_dense.dense_repack, 'wire_texels', 0)
+        if _wt:
+            _dense_line += (
+                ' -- THIN STRUCTURE: %s texel(s) were handed back from the '
+                'colour key and given the mod\'s own colour, because the mod '
+                'PAINTS there and only the downsample said otherwise. '
+                'PageArt.tmask is alpha < 8 computed AFTER resample_rgba, an '
+                'alpha-weighted BOX filter, so it asks whether the AVERAGE '
+                'coverage of a texel is under 3%% -- and for a thin structure '
+                'that is the wrong question. mds7plr1\'s fence wire is about '
+                'one native pixel wide, 1024 -> 768 puts ~1.8 native pixels '
+                'in a texel, and a wire crossing a corner averages under the '
+                'threshold; the mod-clear arm then keyed it and the green '
+                'background showed through as specks. MEASURED against the '
+                'native DDS: 8,508 keyed texels on mds7plr1 and 3,968 on '
+                'fship_2 have native art that is fully OPAQUE, and `present` '
+                'and `opaque` are the SAME number -- the signature of a thin '
+                'structure lost to a box filter, not of an antialiased edge. '
+                'PageArt.amax/cmax max-pool the NATIVE alpha and carry that '
+                'pixel\'s colour, which matters because rgb_to_565 returns '
+                'EMPTY below the alpha cut: without cmax these texels come '
+                'back at NEAR_BLACK and the fix trades a green speck for a '
+                'black one (measured at exactly mean luminance 8.0). Scoped '
+                'to BRIGHT recovered colour so Cosmos\'s own dark outline '
+                'stays keyed -- archive-wide ZERO texels handed back render '
+                'near-black, mean luminance 97.6 of 255, and zero are newly '
+                'keyed. Set SEVENTH_NX_NO_PAINT_MAXPOOL=1 to restore '
+                'build 123.'
+                % f"{_wt:,}")
+        # COVER-LICENSED MOD-CLEAR KEY. FINDINGS-257.
+        _cc = getattr(field_bg_dense.dense_repack, 'cover_cells', 0)
+        if _cc:
+            _dense_line += (
+                ' -- COVER LICENCE: %s cell(s) carried a per-texel proof '
+                'that SOMETHING draws behind them, which lets the MOD-CLEAR '
+                'arm above key a texel that is not black. Build 121 could '
+                'only key what was already black, so the non-black half of '
+                'every fat edge stayed at UNIT resolution -- one game pixel, '
+                'four screen pixels, a visible stair-step. MEASURED with '
+                '_kstep.py on fship_1: 955 uniform boundary units -> 488. '
+                'The cover raster INCLUDES the parallax, and that is the one '
+                'place layers 3/4 are allowed to matter: for COLOUR a '
+                'scrolling backdrop is useless, but for the KEY "does '
+                'anything draw here" has the same answer at every camera '
+                'position. It excludes other layer-2 cells and any parallax '
+                'cell that is not opaque throughout, because this arm keys '
+                'those too and cover taken from them is not a fixed point. '
+                'archive-wide the fat edge (_kedge extra) falls 1,776,580 -> '
+                '131,799, and ZERO non-black texels are keyed with nothing '
+                'at all behind them. Set SEVENTH_NX_NO_MODCLEAR_COVER=1 to '
+                'restore build 122.'
+                % f"{_cc:,}")
+        # BAKED PARTIAL-ALPHA BLEND. FINDINGS-255.
+        _bl = getattr(field_bg_dense.dense_repack, 'blend_cells', 0)
+        if _bl:
+            _dense_line += (
+                ' -- BAKED BLEND: %s cell(s) had %s texel(s) of dark rim '
+                'blended toward what draws behind them, from %s cell(s) '
+                'whose backdrop could be judged at all. Cosmos authors those '
+                'texels at alpha 128..249 and FFNx BLENDS them; a truecolor '
+                'page here has a 1-bit colour key and no alpha, so we drew '
+                'them at full strength and the result is a hard dark rim '
+                'tracing every silhouette. We cannot ship alpha, but we can '
+                'ship its RESULT -- alpha*mod + (1-alpha)*backdrop is exactly '
+                'the pixel FFNx produces. COLOUR ONLY: not one texel changes '
+                'keyed status, no page, tile, byte or kilobyte moves. Scoped '
+                'to texels that render below %s of 255 AND whose backdrop is '
+                'brighter in EVERY channel, so the arm can only ever lighten '
+                'a dark rim -- art can never become black even if the '
+                'backdrop were wrong. Layers 3 and 4 are never used as a '
+                'backdrop: they scroll, so what is behind them is a '
+                'different answer at every camera position. MEASURED over '
+                '681 fields: 177,576 texels, mean lift +12.7 of 255, zero '
+                'darkened. Set SEVENTH_NX_NO_BLEND=1 to restore build 121.'
+                % (f"{_bl:,}",
+                   f"{getattr(field_bg_dense.dense_repack, 'blend_texels', 0):,}",
+                   f"{getattr(field_bg_dense.dense_repack, 'backdrop_cells', 0):,}",
+                   field_bg_dense.BLEND_DARK))
         # IN-PLACE PARALLAX CONVERSION. FINDINGS-249.
         _ip = getattr(field_bg_dense.dense_repack, 'inplace_big', 0)
         if _ip:

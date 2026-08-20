@@ -440,6 +440,190 @@ MODCLEAR_WHOLE = os.environ.get('SEVENTH_NX_MODCLEAR_WHOLE') == '1'
 MODCLEAR_DARK_ONLY = os.environ.get('SEVENTH_NX_MODCLEAR_ALL') != '1'
 MODCLEAR_DARK = int(os.environ.get('SEVENTH_NX_MODCLEAR_DARK') or 40)
 
+# BUILD 123 -- ...OR WHERE SOMETHING PROVABLY DRAWS BEHIND IT. FINDINGS-257.
+#
+# THE DEFECT THAT IS LEFT IS NOT BLACK, IT IS BLOCKY. Patrick, after 122:
+# "still kind of choppy". The crops are stair-steps, not dark pixels, and
+# `_kstep.py` says why -- of the boundary UNITS on `fship_1` and `fship_2`,
+# 39% and 31% are still UNIFORM, i.e. the silhouette snaps to the unit grid.
+# A unit is one game pixel and the screen shows it at 4 screen pixels, so a
+# uniform boundary unit is a 4-pixel stair-step no matter how good the art is.
+#
+# WHY THEY ARE STILL UNIFORM. Build 119 refines a unit where VANILLA says
+# transparent and the mod cuts it (`keep = zero & (_clear | ~mixed)`). Where
+# vanilla says OPAQUE and the mod cuts the unit, `zero` is False, `keep` is
+# False, and we draw the whole unit -- the fat edge, at unit resolution.
+# Build 121 keys exactly that population, but only where the texel is already
+# BLACK, so the non-black half of every such boundary stayed blocky.
+#
+# LIFTING THE DARK RESTRICTION OUTRIGHT IS NOT SAFE, AND THE SHIPPED BUILD
+# IS THE PROOF. Same census, same fields, `_kreveal.py`:
+#
+#                            build 121 (shipped)   unrestricted
+#     newly keyed                     28,805           57,980
+#       static cover                   1,961            3,709
+#       parallax behind it            14,429           32,600
+#       NOTHING AT ALL                12,415           21,671
+#         ...of those, NOT black           0            9,248
+#
+# Build 121 put 12,415 texels over literal framebuffer and not one of them
+# was visible, because every one was already black -- which is why hardware
+# came back clean. The unrestricted predicate would put **9,248 texels of
+# real colour** over framebuffer on four fields. Those are holes.
+#
+# SO THE RULE IS THE UNION OF TWO SAFE CASES, NOT THE REMOVAL OF ONE:
+#
+#     key where the mod is clear AND (the texel is already black
+#                                     OR something provably draws behind it)
+#
+# and the second arm is what `backdrop_keys` returns as `rec['cover']`. It
+# INCLUDES the parallax, and that is the one place in this file where layers
+# 3 and 4 are allowed to matter. The reason is that the question changes:
+#
+#   for COLOUR (the blend, build 122) a scrolling backdrop is useless,
+#     because the pixel behind a texel is different at every camera position;
+#   for the KEY it is decisive, because "does ANYTHING draw here" has the
+#     same answer at every camera position for a backdrop that wraps.
+#
+# Keying a texel over the parallax shows the sea behind the Highwind -- which
+# is what the reference renderer shows, since FFNx simply does not draw a
+# texel the mod leaves clear. Keying one over nothing shows the framebuffer,
+# and that is only acceptable when it was black to begin with.
+#
+# `SEVENTH_NX_NO_MODCLEAR_COVER=1` restores build 122 exactly.
+MODCLEAR_COVER = os.environ.get('SEVENTH_NX_NO_MODCLEAR_COVER') != '1'
+
+# BUILD 124 -- "THE MOD PAINTS NOTHING" IS A **MAX**, NOT A MEAN.
+# FINDINGS-258. THIS IS THE FENCE.
+#
+# Patrick, on `mds7plr1` after 123: the fence is much better, but the upper
+# left corner of it has BRIGHT GREEN SPECKS -- and bright green is what is
+# behind the fence. We keyed the wire.
+#
+# `PageArt.tmask` is `alpha < 8` computed AFTER `resample_rgba`, which is an
+# alpha-weighted BOX filter. So it asks "is the AVERAGE coverage of this
+# texel below 3%". For a thin structure that question has the wrong answer:
+# `mds7plr1`'s fence wire is about one native pixel wide, 1024 -> 768 puts
+# ~1.8 native pixels in a destination texel, and a wire crossing a corner
+# averages under the threshold. `tmask` then says "the mod paints nothing
+# here" about a texel whose native art is FULLY OPAQUE.
+#
+# MEASURED against the native DDS, over the texels the mod-clear arm keys:
+#
+#     field       keyed at alpha<8    native art present    native OPAQUE
+#     mds7plr1        396,178             8,508  2.1%        8,508  2.1%
+#     fship_2         641,489             3,968  0.6%        3,968  0.6%
+#
+# `present` and `OPAQUE` are the SAME NUMBER. There is no soft-edge
+# population in here at all, which is the signature of a thin structure lost
+# to a box filter rather than of an anti-aliased boundary -- and it is why
+# this is safe to fix without touching the black-edge work: the texels being
+# taken back are ones where the mod paints at full strength, not ones on the
+# fat edge. 98-99% of the mod-clear population is untouched.
+#
+# TWO CONSUMERS, AND BOTH WERE WRONG IN THE SAME DIRECTION.
+#
+#   1. the key. `_mck` now reads `amax < 8` -- the mod paints nothing
+#      ANYWHERE in the texel's footprint -- instead of `tm`.
+#   2. THE VANILLA FALLBACK, and this one matters just as much. `source_cell`
+#      does `out[tm] = pal_ref[tm]`: where the mod is transparent, take the
+#      VANILLA pixel. On a wire texel that overwrites the mod's own colour --
+#      which the alpha-weighted resample got RIGHT, it is the wire's colour --
+#      with the 1997 art. So simply un-keying those texels would hand them
+#      back to vanilla and put the old fence there. Both arms have to read
+#      the same predicate or the fix trades a green speck for a grey one.
+#
+# `SEVENTH_NX_NO_PAINT_MAXPOOL=1` restores build 123 exactly.
+PAINT_MAXPOOL = os.environ.get('SEVENTH_NX_NO_PAINT_MAXPOOL') != '1'
+
+# BUILD 122 -- BAKE THE BLEND THE 1-BIT KEY CANNOT DO. FINDINGS-255.
+#
+# After build 121 the black left on a silhouette boundary splits in two, and
+# `_kresid.py` measured the split on the four fields Patrick reports:
+#
+#     the mod's alpha there    fship_1   fship_2   wcrimb_2   mtcrl_4
+#     255  (opaque)              68.7%     65.4%      67.2%     77.1%
+#     250..254                    3.3%      3.9%       0.3%      2.9%
+#     128..249                   28.1%     30.7%      32.5%     20.1%
+#
+# THE FIRST TWO ROWS ARE NOT OURS AND THIS FLAG MUST NOT TOUCH THEM. Checked
+# against the mod's own decoded art, the shipped texel is byte-identical in
+# 100.0% of cases, and checked against the NATIVE 1024px DDS the alpha is
+# 255.0 and the colour is already dark -- mean max channel 16.6 on `fship_1`,
+# 18.6 on `fship_2`. Cosmos outlines the Highwind's plating with a hard,
+# fully-opaque dark line. FFNx draws that line exactly as we do because there
+# is nothing to decide. It is the art.
+#
+# THE THIRD ROW IS OURS. Those texels are ones FFNx BLENDS and we draw at full
+# strength, because a truecolor page in this format has a 1-bit colour key and
+# no alpha channel. `PageArt.hmask`'s 50% rule is the honest 1-bit reduction
+# of an 8-bit alpha and it is already what the code uses -- but "right on
+# average" and "invisible" are different claims. A hard rim at 100% where the
+# reference shows 55% is spatially COHERENT: it traces the whole silhouette,
+# which is exactly why the eye finds it and why the average error does not
+# predict how bad it looks.
+#
+# AND FLIPPING THE THRESHOLD IS NOT THE ANSWER. At alpha 200 drawing is 20%
+# wrong and keying is 80% wrong; keying the band would trade a rim that is too
+# dark for a silhouette eaten by a texel, which is build 116 in the other
+# direction. There is exactly one version of this that is right rather than
+# differently wrong:
+#
+#     out = alpha * mod + (1 - alpha) * whatever draws underneath
+#
+# which is the pixel FFNx produces. We cannot ship alpha; we can ship its
+# RESULT, because the destination is truecolor. **No key moves, no page moves,
+# no tile moves, no byte of section 9 changes length. This is colour only.**
+#
+# WHAT IT NEEDS is the thing FINDINGS-254 already named as the missing piece:
+# what is behind, per texel. `backdrop_keys()` computes it, and its five
+# refusal conditions are the whole safety of this arm -- read them there
+# before changing anything here.
+#
+# SCOPED TO DARK TEXELS, for build 121's reason and it is the same reason.
+# A blend can only move a dark rim TOWARD the background, so the change stays
+# MONOTONE IN THE PICTURE: black can become art, art cannot become black. If
+# the backdrop were somehow wrong, the damage is bounded to lightening a dark
+# texel toward a neighbouring colour -- which is a far smaller error than
+# darkening art, and it is the asymmetry that makes this safe to ship without
+# a per-camera-position proof.
+#
+# THE BAND. `BLEND_MIN` is 8 -- below that `tmask` says the mod paints
+# nothing and build 121's arm owns the texel. `BLEND_MAX` is 250 rather than
+# 255 because 250..254 is 3% of the population and rounds to the same colour
+# anyway; excluding it keeps this arm off anything that is effectively opaque.
+#
+# `SEVENTH_NX_NO_BLEND=1` restores build 121 exactly.
+BLEND_PARTIAL = os.environ.get('SEVENTH_NX_NO_BLEND') != '1'
+BLEND_MIN = int(os.environ.get('SEVENTH_NX_BLEND_MIN') or 8)
+BLEND_MAX = int(os.environ.get('SEVENTH_NX_BLEND_MAX') or 250)
+BLEND_DARK = int(os.environ.get('SEVENTH_NX_BLEND_DARK') or 40)
+
+
+def _rgb8_565(a):
+    """R5G6B5 -> (r, g, b) uint16 planes, by the engine's bit replication."""
+    u = a.astype(np.uint16)
+    r = (u >> 11) & 31
+    g = (u >> 5) & 63
+    b = u & 31
+    return ((r << 3) | (r >> 2), (g << 2) | (g >> 4), (b << 3) | (b >> 2))
+
+
+def _565_rgb8(r, g, b):
+    """(r, g, b) 8-bit -> R5G6B5, `field_bg_native.rgb_to_565`'s arithmetic.
+
+    Rounds onto the level*8 grid the engine reconstructs (`c * 0.125 + 0.5`,
+    i.e. `(c + 4) // 8`), keeps GREEN'S LOW BIT ZERO by building green as a
+    5-bit value shifted up -- x86 0x63F350 ORs that bit onto BLUE on this
+    port, which is `_pal_rgb`'s light-purple Sector 6 patches -- and lifts a
+    result of 0x0000 off the colour key.
+    """
+    q = lambda c: np.minimum(np.uint16(31),                     # noqa: E731
+                             (c.astype(np.uint16) + 4) // 8)
+    v = ((q(r) << 11) | ((q(g) << 1) << 5) | q(b)).astype(np.uint16)
+    v[v == FN.EMPTY] = FN.NEAR_BLACK
+    return v
+
 
 def _maxchan565(a):
     """Max 8-bit channel of an R5G6B5 array, by the engine's own expansion.
@@ -540,7 +724,9 @@ class Stats:
                  'borrow_refused', 'origin', 'atlas_gap', 'bare',
                  'margin_l2', 'margin_l2_filled',
                  'subunit_cells', 'subunit_units', 'subunit_texels',
-                 'modclear_cells', 'modclear_texels', 'modclear_whole')
+                 'modclear_cells', 'modclear_texels', 'modclear_whole',
+                 'blend_cells', 'blend_texels', 'backdrop_cells',
+                 'wire_texels')
 
     def __init__(self):
         self.cells = self.pages = self.tiles = 0
@@ -561,6 +747,10 @@ class Stats:
         self.modclear_cells = 0   # cut-out cells where the mod paints nothing
         self.modclear_texels = 0  # ...texels that STARTED being keyed
         self.modclear_whole = 0   # ...cells the mod leaves entirely clear
+        self.blend_cells = 0      # cells with a baked partial-alpha blend
+        self.blend_texels = 0     # ...texels blended toward the backdrop
+        self.backdrop_cells = 0   # cells backdrop_keys() could judge
+        self.wire_texels = 0      # thin-structure texels the box filter lost
 
 
 def _pal_rgb(sec3):
@@ -902,6 +1092,289 @@ def bare_keys(pages, arrays, tiles, keys):
         if all((g[0], g[1]) not in covered for g in got):
             out.add(k)
     return out
+
+
+def backdrop_keys(pages, arrays, tiles, keys, pal565, px):
+    """
+    `{cell_key: uint16 (n, n)}` -- WHAT DRAWS UNDERNEATH A LAYER-2 CELL.
+
+    BUILD 122. `BLEND_PARTIAL` needs the pixel that is behind a partial-alpha
+    texel so it can bake `alpha*mod + (1-alpha)*behind`, which is the pixel
+    FFNx produces. `source_cell` works in SOURCE cell space and cannot see a
+    destination, so the answer is computed here -- once per field, over tiles
+    this function has already read, exactly as `bare_keys` is -- and handed
+    down on `rec`.
+
+    FIVE CONDITIONS, AND EVERY ONE OF THEM IS A THING THAT WOULD OTHERWISE
+    BAKE THE WRONG COLOUR INTO THE ARCHIVE PERMANENTLY.
+
+      1. EVERY tile that draws the cell is on LAYER 2. Not layer 1, which has
+         nothing behind it; and not layers 3/4, whose destination is not a
+         fixed screen position at all -- `ff7nx_ws` moves their clip and wrap
+         points because they scroll at their own rate, so "what is behind" is
+         a different answer at every camera position. `bare_keys` has refused
+         to judge them since it was written and this refuses for the same
+         reason. A baked blend is worse than a refused one: it is wrong at
+         every camera position except the one it was baked for.
+      2. SOMETHING DRAWS UNDERNEATH, AND IT IS RECORDED PER TEXEL. Where
+         nothing does, the backdrop is the framebuffer and there is nothing
+         to blend toward, so the mask comes back False there and the texel
+         keeps the colour it has today. This is a mask, not a veto: a cell
+         that is covered in part is still worth blending in that part.
+      3. THE BACKDROP IS THE COMPOSITE IN DRAW ORDER, AND EACH LAYER-2 TILE
+         IS SAMPLED BEFORE IT IS COMPOSITED. Layer 1 is NOT the only thing
+         under an overlay and assuming it was is what the first two versions
+         of this function got wrong -- `mtcrl_4` has ONE layer-1 tile and
+         715 layer-2 tiles, so its backdrop is almost entirely other
+         overlays. Sampling after compositing would read the tile's own
+         pixels back and report full cover for free.
+      4. THE CELL IS REUSED CONSISTENTLY. A cell can be drawn by many tiles
+         at many destinations -- that is the entire point of an atlas -- and
+         there is ONE copy of its texels. Baking the backdrop of one
+         destination corrupts every other. So all of the cell's destinations
+         must show the SAME thing underneath, compared on the bytes.
+      5. 16-UNIT CELLS ONLY. A 32-unit `size_flag` cell is parallax by
+         construction and condition 1 has already excluded it; the guard is
+         kept because HANDOFF-189's whole lesson is that assuming 16 is how
+         this codebase produces checkerboards.
+
+    ONE APPROXIMATION, STATED RATHER THAN HIDDEN. The raster is built from
+    the cells as they are BEFORE this pass blends them, so an overlay that is
+    itself blended and then serves as the backdrop for a second overlay above
+    it contributes its pre-blend colour. The error is second order -- only
+    dark rim texels move, and only toward the thing behind them -- and
+    resolving it properly would mean ordering the whole promotion by draw
+    order, which no other pass in this file does.
+
+    LAYER 1 COVERS ITS WHOLE TILE. On layer 1 index 0 is not a cut-out -- it
+    is rendered, in entry 0's colour -- which this project has proved on
+    hardware twice (the Sector 6 yellow, and `PROMOTE_LAYER1_KEY`'s note). So
+    the backdrop of a layer-1 tile is its full 16x16, and where the vanilla
+    index is 0 the backdrop is entry 0's colour, which is what the screen
+    shows there.
+
+    LAST TILE WINS where two layer-1 tiles share a destination, which is
+    `dense_repack`'s own `_l1_last` rule and is measured there: 69 of 346,666
+    positions carry more than one layer-1 tile. Painting the raster in tile
+    order gives that for free.
+
+    AND IT IS A RASTER, NOT A DICTIONARY OF POSITIONS. The first version of
+    this function looked the backdrop up by `l1[(t.dx, t.dy)]` -- exact tile
+    coordinates -- and refused 174 of 217 candidate cells on `fship_1`, 395
+    of 458 on `fship_2` and **715 of 715 on `mtcrl_4`**, all reported as "no
+    layer 1 underneath". That was the measurement, not the game: layer-2
+    destinations are NOT on layer 1's 16-grid, so an overlay at dx = 8 sits
+    across two layer-1 tiles and matches neither of them. A raster is the
+    only structure that can answer a question about a rectangle that spans
+    tiles.
+    """
+    scale = max(1, px // 256)
+    n = TILE * scale
+    lay1 = [t for t in tiles if t.layer == 1]
+    lay2 = [t for t in tiles if t.layer == 2]
+    par = [t for t in tiles if t.layer >= 3]
+    if not lay2:
+        return {}
+    xs = [t.dx for t in tiles]
+    ys = [t.dy for t in tiles]
+    span = 32                                   # the widest tile the format has
+    x0, y0 = min(xs), min(ys)
+    w = (max(xs) + span - x0) * scale
+    h = (max(ys) + span - y0) * scale
+    if w <= 0 or h <= 0 or w * h > 64_000_000:
+        return {}
+    cov = np.zeros((h, w), bool)
+    rgb = np.zeros((h, w), np.uint16)
+    anyc = np.zeros((h, w), bool)          # cover INCLUDING the parallax
+
+    def _fit(blk, want):
+        s0 = blk.shape[0]
+        if s0 == want:
+            return blk
+        if want > s0 and want % s0 == 0:
+            f = want // s0
+            return np.repeat(np.repeat(blk, f, 0), f, 1)
+        if s0 > want and s0 % want == 0:
+            return blk[::s0 // want, ::s0 // want]
+        return None
+
+    def _block(t, nu=TILE):
+        """(colour, drawn) at destination resolution, or (None, None)."""
+        p = pages.get(t.slot)
+        a = arrays.get(t.slot)
+        if p is None or a is None:
+            return None, None
+        if getattr(p, 'size_flag', 0) and nu == TILE:
+            return None, None
+        try:
+            if p.depth == 2:
+                s = p.px // 256
+                blk = a[t.sy * s:(t.sy + nu) * s,
+                        t.sx * s:(t.sx + nu) * s]
+                if blk.shape[0] != nu * s:
+                    return None, None
+                drawn = blk != FN.EMPTY
+            else:
+                pal = t.pal if t.pal < len(pal565) else len(pal565) - 1
+                idx = a[t.sy:t.sy + nu, t.sx:t.sx + nu]
+                if idx.shape != (nu, nu):
+                    return None, None
+                blk = pal565[pal][idx]
+                # On layer 1 index 0 IS drawn -- see the docstring -- and on
+                # layer 2 it is the cut-out. That asymmetry is this module's
+                # oldest rule and it decides cover here as it does there.
+                drawn = (np.ones(idx.shape, bool) if t.layer == 1
+                         else (idx != 0))
+            want = nu * scale
+            blk = _fit(np.ascontiguousarray(blk), want)
+            drawn = _fit(drawn, want)
+        except Exception:                                      # noqa: BLE001
+            return None, None
+        if blk is None or drawn is None or blk.shape != (want, want):
+            return None, None
+        return blk, drawn
+
+    # THE PARALLAX GOES DOWN FIRST, AND IT IS COVER FOR THE KEY ONLY.
+    #
+    # Layers 3 and 4 draw BEHIND 1 and 2 even though `walk_layers` yields
+    # them last. For the COLOUR question they are useless -- they scroll, so
+    # the pixel behind a given texel is different at every camera position,
+    # which is why `rgb` never sees them and `MODCLEAR_COVER_PAR` is not
+    # allowed to feed the blend. For the KEY question they are decisive:
+    # "does ANYTHING draw here" has the same answer at every camera position
+    # for a backdrop that wraps, and the difference between "the sea is
+    # behind this texel" and "the framebuffer is behind this texel" is the
+    # difference between a fixed edge and a black hole.
+    #
+    # A LOWER BOUND, deliberately: a parallax tile wraps, so its static
+    # extent understates where it actually draws. Under-counting cover can
+    # only make this arm refuse work it could have done.
+    for t in par:
+        nu = 32 if getattr(pages.get(t.slot), 'size_flag', 0) else TILE
+        m = nu * scale
+        ry = (t.dy - y0) * scale
+        rx = (t.dx - x0) * scale
+        if ry < 0 or rx < 0 or ry + m > h or rx + m > w:
+            continue
+        blk, drawn = _block(t, nu)
+        if drawn is None:
+            continue
+        # ONLY A PARALLAX CELL THAT IS OPAQUE THROUGHOUT COUNTS AS COVER.
+        #
+        # The same self-reference as the layer-2 exclusion above, one layer
+        # down and subtler. A parallax cell is on layer 3/4, so `rec['l2']`
+        # is true for it and the mod-clear arm CAN key it -- which means a
+        # partially transparent parallax cell is not a fixed point either,
+        # and cover taken from it may evaporate in the same build that
+        # relied on it.
+        #
+        # `drawn.all()` is the exact test rather than a margin: the key arm
+        # only ever runs inside `if rec['key']`, and `rec['key']` is
+        # `_uses_key`, which is true iff the cell contains index 0. A cell
+        # with none cannot be keyed by any arm in this file, now or later.
+        #
+        # MEASURED: without this, `_kreveal` found 9 non-black texels keyed
+        # over literal framebuffer archive-wide, ALL NINE in `md8_b2` --
+        # whose parallax is 57.5% keyed, i.e. a sparse cut-out rather than a
+        # backdrop. Nine texels in 1.2 million is the size of the hole this
+        # closes; the reason to close it is that it is a CLASS, and the next
+        # field like `md8_b2` might not be so cheap.
+        if not drawn.all():
+            continue
+        anyc[ry:ry + m, rx:rx + m] |= drawn
+
+    # DRAW ORDER. `read_tiles` walks layer 1 then 2 then 3 then 4 and, within
+    # a layer, the tile records in file order -- which is the order the engine
+    # consumes them. Layers 3 and 4 are never composited: see condition 1.
+    back = {}
+    for t in lay1 + lay2:
+        ry = (t.dy - y0) * scale
+        rx = (t.dx - x0) * scale
+        if ry < 0 or rx < 0 or ry + n > h or rx + n > w:
+            continue
+        if t.layer == 2:                       # SAMPLE FIRST...
+            # THE KEY'S COVER MASK IS LAYER 1 AND THE PARALLAX ONLY -- IT
+            # DELIBERATELY EXCLUDES OTHER LAYER-2 CELLS, AND THAT IS NOT
+            # CONSERVATISM FOR ITS OWN SAKE.
+            #
+            # `MODCLEAR_COVER` keys layer-2 cells. If one layer-2 cell were
+            # allowed to be the cover for another, this arm would be reading
+            # a raster it is itself about to punch holes in: cell B is
+            # licensed by cell A, and then A gets keyed too and B's licence
+            # was never true. MEASURED with layer 2 included, `_kreveal` on
+            # the four fields found 15 non-black texels keyed over literal
+            # framebuffer, and every one was that self-reference.
+            #
+            # Layer 1 cannot be keyed by this arm (`rec['l2']` excludes it)
+            # and on layer 1 index 0 DRAWS, so its cover is a fixed point.
+            # The parallax is one for the same reason at the granularity
+            # that matters here. Excluding layer 2 makes the mask true
+            # independently of anything this build does, which is the only
+            # version of "provably draws behind it" worth the word.
+            back[t.off] = (np.ascontiguousarray(rgb[ry:ry + n, rx:rx + n]),
+                           np.ascontiguousarray(cov[ry:ry + n, rx:rx + n]),
+                           np.ascontiguousarray(anyc[ry:ry + n, rx:rx + n]))
+        blk, drawn = _block(t)                 # ...COMPOSITE SECOND
+        if blk is None:
+            continue
+        sub_r = rgb[ry:ry + n, rx:rx + n]
+        sub_c = cov[ry:ry + n, rx:rx + n]
+        sub_r[drawn] = blk[drawn]
+        sub_c |= drawn
+        if t.layer == 1:
+            anyc[ry:ry + n, rx:rx + n] |= drawn
+
+    where = {}
+    for t in tiles:
+        where.setdefault(t.off, t)
+    out, covers = {}, {}
+    for k, rec in keys.items():
+        if not rec.get('l2'):
+            continue
+        p = pages.get(k[0])
+        if p is None or getattr(p, 'size_flag', 0):
+            continue                                            # 5
+        got = [where.get(off) for off in rec['tiles']]
+        if not got or any(g is None for g in got):
+            continue
+        if any(g.layer != 2 for g in got):
+            continue                                            # 1
+        pair0 = None
+        ok = True
+        agree = True
+        anyk = None
+        for g in got:
+            pr = back.get(g.off)
+            if pr is None:
+                ok = False
+                break
+            # THE KEY MASK IS THE **AND** ACROSS DESTINATIONS, ALWAYS.
+            # A cell has one copy of its texels, so a texel may only be
+            # keyed if it is safe to key at EVERY place the cell is drawn.
+            # This is a separate reduction from the colour agreement below
+            # because it can succeed where that one fails -- two
+            # destinations can both be covered and still be covered by
+            # different colours, and the key does not care which.
+            anyk = pr[2] if anyk is None else (anyk & pr[2])
+            if pair0 is None:
+                pair0 = pr
+            elif agree and not (np.array_equal(pr[0], pair0[0])   # 4
+                                and np.array_equal(pr[1], pair0[1])):
+                # THE COLOUR DISAGREES ACROSS DESTINATIONS, SO THE BLEND IS
+                # OFF FOR THIS CELL -- BUT THE KEY IS NOT. A separate flag
+                # rather than poisoning `pair0`: the first version set
+                # `pair0 = False` here and the next iteration then indexed a
+                # bool, which the caller's `except` swallowed by disabling
+                # BOTH arms for the whole field. A guard that silently turns
+                # a pass off is worse than no guard.
+                agree = False
+        if not ok or anyk is None:
+            continue
+        if anyk.any():
+            covers[k] = anyk
+        if agree and pair0 is not None and pair0[1].any():        # 2
+            out[k] = pair0
+    return out, covers
 
 
 def margin_overlay_keys(pages, arrays, tiles, keys):
@@ -1503,6 +1976,12 @@ def source_cell(k, rec, pages, arrays, pal565, art_for, pals_for, st,
     # (40/40 cells) and its PIXELS were still (79.5, 67.8, 27.8) against the
     # interior sky's (65.4, 65.4, 58.0). Right depth, wrong colour -- which is
     # why build 61 looked identical on hardware despite every counter moving.
+    # `_wire` MUST EXIST ON EVERY PATH THROUGH THIS FUNCTION.
+    # It is written only in the `art is not None` branch, and the key block
+    # below subtracts it unconditionally -- so the vanilla branch would raise
+    # NameError, which `dense_repack` would swallow as "field not repacked"
+    # and cost that field every truecolor page it was going to get.
+    _wire = None
     _asl, _asx, _asy = slot, sx, sy
     if origin:
         _o = origin.get((slot, sx, sy))
@@ -1601,8 +2080,69 @@ def source_cell(k, rec, pages, arrays, pal565, art_for, pals_for, st,
         # game draws there.
         tm = art.tmask[_asy * s:_asy * s + t * step:step,
                        _asx * s:_asx * s + t * step:step]
-        if tm.shape == out.shape and tm.any():
-            out[tm] = pal_ref[tm]
+        # `tpaint` IS `tm` NARROWED BY THE MOD'S TRUE COVERAGE. See
+        # PAINT_MAXPOOL. Where the native art paints and only the box filter
+        # says otherwise, the mod's own colour -- which the alpha-weighted
+        # resample got right -- must NOT be replaced by the 1997 pixel, and
+        # the key arms below must not key it either. One predicate, both
+        # places, or the fix trades a green speck for a grey one.
+        tpaint = tm
+        _am = getattr(art, 'amax', None) if PAINT_MAXPOOL else None
+        _cm = getattr(art, 'cmax', None) if PAINT_MAXPOOL else None
+        _wire = None
+        if _am is not None and _cm is not None:
+            _a2 = _am[_asy * s:_asy * s + t * step:step,
+                      _asx * s:_asx * s + t * step:step]
+            _c2 = _cm[_asy * s:_asy * s + t * step:step,
+                      _asx * s:_asx * s + t * step:step]
+            if _a2.shape == tm.shape and _c2.shape == tm.shape:
+                # ...AND ONLY WHERE THE RECOVERED WIRE IS **BRIGHT**.
+                #
+                # Same rule as MODCLEAR_DARK_ONLY and the blend, for the same
+                # reason: this arm may only ever make a texel lighter.
+                #
+                # A thin structure the box filter lost can be dark -- a
+                # girder edge rather than a fence wire -- and recovering
+                # those would put Cosmos's own dark outline back over the
+                # background, which is the black edge builds 121 and 123
+                # spent themselves removing. MEASURED without this term, the
+                # texels handed back from the key rendered near-black 3,875
+                # times on `mtcrl_4`, 318 on `fship_1` and 304 on `fship_2`.
+                #
+                # With it the arm is monotone in the picture in the same
+                # sense as everything else here: a keyed texel can only be
+                # replaced by a BRIGHT one, never by a dark one. The fence
+                # wire is bright, which is why it is the thing that comes
+                # back; Cosmos's dark outline stays keyed, exactly as it is
+                # today. Patrick's two constraints are the two halves of
+                # this one predicate.
+                _bright = _maxchan565(_c2) >= MODCLEAR_DARK
+                tpaint = tm & ((_a2 < 8) | ~_bright)
+                _wire = tm & ~tpaint
+                if not _wire.any():
+                    _wire = None
+        if tpaint.shape == out.shape and tpaint.any():
+            out[tpaint] = pal_ref[tpaint]
+        # AND THE THIN STRUCTURE GETS ITS OWN COLOUR BACK.
+        #
+        # This is not optional and leaving it out is measurably worse than
+        # doing nothing. `rgb_to_565` returns EMPTY below `alpha_cut`, so
+        # `art.buf` is ZERO at every texel the box filter pushed under alpha
+        # 8 -- the mod's colour is not merely dim there, it was never
+        # written. Narrowing the vanilla fallback without supplying a
+        # replacement therefore leaves the texel at 0x0000, which the
+        # NEAR_BLACK lift turns into (8, 8, 8): MEASURED at exactly mean
+        # luminance 8.0 across all four test fields, i.e. a black speck
+        # traded for a green one.
+        #
+        # `cmax` is the colour of the highest-alpha NATIVE pixel in the
+        # texel's footprint -- the wire itself, at full strength, from the
+        # art before any of this pipeline touched it.
+        if _wire is not None and _wire.shape == out.shape:
+            out[_wire] = _c2[_wire]
+            st.wire_texels += int(_wire.sum())
+            dense_repack.wire_texels = (
+                getattr(dense_repack, 'wire_texels', 0) + int(_wire.sum()))
     else:
         st.from_vanilla += 1
         out = _up(pal565[pal][idx], scale).copy()
@@ -1670,8 +2210,12 @@ def source_cell(k, rec, pages, arrays, pal565, art_for, pals_for, st,
         _atlas = (ATLAS_GAP and art is not None
                   and (rec.get('bare') or _mo)
                   and bool(zero.all()))
-        if _atlas and tm.shape == out.shape and not tm.all():
-            out[zero & tm] = FN.EMPTY
+        if _atlas and tpaint.shape == out.shape and not tpaint.all():
+            # The atlas arm may not re-key a recovered wire either.
+            _ak = zero & tpaint
+            if _wire is not None and _wire.shape == _ak.shape:
+                _ak = _ak & ~_wire
+            out[_ak] = FN.EMPTY
             if _mo and not rec.get('bare'):
                 st.margin_l2_filled += 1
                 dense_repack.margin_l2_filled = (
@@ -1734,10 +2278,23 @@ def source_cell(k, rec, pages, arrays, pal565, art_for, pals_for, st,
             # collapse to exactly build 120's `out[zero]` / `out[keep]`.
             _mck = None
             if (MODCLEAR_KEY and art is not None and bool(rec.get('l2'))
-                    and tm.shape == out.shape and tm.any()
-                    and (MODCLEAR_WHOLE or not tm.all())):
-                _mck = tm
-                if MODCLEAR_DARK_ONLY:
+                    and tpaint.shape == out.shape and tpaint.any()
+                    and (MODCLEAR_WHOLE or not tpaint.all())):
+                _mck = tpaint
+                _cvr = rec.get('cover') if MODCLEAR_COVER else None
+                if _cvr is not None and _cvr.shape != out.shape:
+                    _cvr = None
+                if MODCLEAR_DARK_ONLY and _cvr is not None:
+                    # BUILD 123. See MODCLEAR_COVER. The dark test still runs
+                    # -- it is what makes a texel with nothing behind it safe
+                    # -- and the cover test is a second, independent licence
+                    # for the same texel. A texel needs one of the two, not
+                    # both, and the union is strictly larger than build 122's
+                    # population, so this arm can only ever key MORE.
+                    _mck = _mck & ((_maxchan565(out) < MODCLEAR_DARK) | _cvr)
+                    if not _mck.any():
+                        _mck = None
+                elif MODCLEAR_DARK_ONLY:
                     # See MODCLEAR_DARK_ONLY. This is the term that makes the
                     # change monotone IN THE PICTURE -- black can become art,
                     # art can never become black -- and it is what stands in
@@ -1765,6 +2322,27 @@ def source_cell(k, rec, pages, arrays, pal565, art_for, pals_for, st,
                     keep = zero
             else:
                 keep = zero
+            # A RECOVERED WIRE MUST SURVIVE THE KEY BLOCK, AND IN BUILD 124
+            # IT DID NOT. THIS IS THE BUG THAT MADE THAT BUILD "MARGINAL".
+            #
+            # `_wire` is written up in the art branch, which runs BEFORE this
+            # one. `keep` is built from `zero` (vanilla's index) and `_clear`
+            # (`hmask`) and knows nothing about `tpaint`, so
+            # `out[keep] = FN.EMPTY` keyed every recovered wire texel straight
+            # back wherever vanilla's index happened to be 0 -- which on a
+            # fence is most of them, because vanilla's fence is transparent
+            # between its own wires.
+            #
+            # MEASURED after build 124 on `mds7plr1`: 3,663 texels still keyed
+            # over art the mod paints OPAQUELY, 1,283 of them with a mean
+            # alpha under 8 -- i.e. exactly the population `_wire` had already
+            # rescued and this block then threw away again. Patrick's word for
+            # the result was "marginally" better.
+            #
+            # The subtraction is unconditional and last: nothing else in this
+            # function may re-key a texel the mod paints at full strength.
+            if _wire is not None and _wire.shape == keep.shape:
+                keep = keep & ~_wire
             if _mck is not None:
                 _final = keep | _mck
                 _added = int(_final.sum() - keep.sum())
@@ -1787,6 +2365,85 @@ def source_cell(k, rec, pages, arrays, pal565, art_for, pals_for, st,
     # happen if the index is discarded. So the colour above is kept as it is,
     # lifted off 0x0000 by the line before this one so it cannot be mistaken
     # for a key.
+    #
+    # ...AND LAST OF ALL, BAKE THE BLEND THE 1-BIT KEY CANNOT DO.
+    # BUILD 122, FINDINGS-255. See BLEND_PARTIAL for the measurement and
+    # `backdrop_keys` for the five conditions `rec['under']` had to pass.
+    #
+    # DELIBERATELY THE LAST THING THIS FUNCTION DOES, AND AFTER THE KEY.
+    # `out != FN.EMPTY` is then the real, final answer to "does this texel
+    # draw", so this arm structurally cannot blend a texel that is keyed and
+    # structurally cannot key one that is not. Running it earlier would mean
+    # re-deriving that answer, and the two derivations would drift.
+    _und = rec.get('under') if BLEND_PARTIAL else None
+    _alp = getattr(art, 'alpha', None) if art is not None else None
+    if (_und is not None and _alp is not None
+            and _und[0].shape == out.shape):
+        _a = _alp[_asy * s:_asy * s + t * step:step,
+                  _asx * s:_asx * s + t * step:step]
+        if _a.shape == out.shape:
+            # `_und[1]` IS THE PER-TEXEL COVER MASK AND IT IS NOT OPTIONAL.
+            # Without it a texel with nothing behind it would blend toward
+            # `rgb`'s zero fill, i.e. toward BLACK -- which would make this
+            # arm darken a rim instead of lightening it and destroy the
+            # monotone-in-the-picture property the whole build rests on.
+            # ...AND ONLY WHERE THE BACKDROP IS LIGHTER THAN THE RIM.
+            #
+            # MEASURED, and it is the one thing the design note above got
+            # wrong: a blend is not monotone by itself. `_kblendgate` on
+            # eight fields found 79 of 2,279 changed texels getting DARKER,
+            # because the thing behind a dark rim is sometimes darker still
+            # -- a shadow under an overlay, or another dark overlay. Those
+            # blends are arithmetically CORRECT and they are given up
+            # anyway, because 3.5% of the population is not worth trading
+            # the property the whole build is argued from:
+            #
+            #     black can become art; art can never become black.
+            #
+            # With this term the result is bounded below by the texel we
+            # already ship and above by the backdrop, so the arm cannot
+            # darken anything even if `backdrop_keys` were wrong about what
+            # is behind. That is a structural guarantee rather than a
+            # measured one, and it is what makes this safe to bake into the
+            # archive permanently.
+            # AND THE TEST IS PER CHANNEL, NOT ON THE MAXIMUM.
+            # Comparing brightness alone is not sufficient and the gate
+            # caught it: `out` = (0, 0, 39) against a backdrop of
+            # (40, 0, 0) passes a max-channel test and still blends DOWN to
+            # (20, 0, 19). One texel in 2,003 did exactly that. Requiring
+            # every channel to be at least as bright makes the result
+            # bounded below by `out` in every channel as a matter of
+            # arithmetic, so nothing can darken -- and it keeps the value
+            # written a TRUE blend rather than a clamped one, which is the
+            # whole justification for writing it.
+            _or, _og, _ob = _rgb8_565(out)
+            _ur, _ug, _ub = _rgb8_565(_und[0])
+            _bm = (_und[1] & (_a >= BLEND_MIN) & (_a < BLEND_MAX)
+                   & (out != FN.EMPTY)
+                   & (_maxchan565(out) < BLEND_DARK)
+                   & (_ur >= _or) & (_ug >= _og) & (_ub >= _ob)
+                   & ((_ur > _or) | (_ug > _og) | (_ub > _ob)))
+            if _bm.any():
+                _w = _a[_bm].astype(np.uint16)
+                sr, sg, sb = _rgb8_565(out[_bm])
+                dr, dg, db = _rgb8_565(_und[0][_bm])
+                _iw = np.uint16(255) - _w
+                # Integer, rounded, and never in float: this writes archive
+                # bytes and a float path would make the output depend on the
+                # numpy build. `+ 127` is the round-half-up the engine's own
+                # reconstruction expects.
+                _mix = lambda a, b: (                          # noqa: E731
+                    (a.astype(np.uint32) * _w + b.astype(np.uint32) * _iw
+                     + 127) // 255).astype(np.uint16)
+                out[_bm] = _565_rgb8(_mix(sr, dr), _mix(sg, dg),
+                                     _mix(sb, db))
+                _n = int(_bm.sum())
+                st.blend_cells += 1
+                st.blend_texels += _n
+                dense_repack.blend_cells = (
+                    getattr(dense_repack, 'blend_cells', 0) + 1)
+                dense_repack.blend_texels = (
+                    getattr(dense_repack, 'blend_texels', 0) + _n)
     return out
 
 
@@ -2568,6 +3225,33 @@ def dense_repack(sec3, sec9, field='', art_for=None, pals_for=None, px=256,
         for k in _mo:
             keys[k]['margin_l2'] = True
         st.margin_l2 = len(_mo)
+    # See BLEND_PARTIAL and backdrop_keys(). Computed once per field from the
+    # tiles already read, exactly as the two blocks above are, and used for
+    # ONE decision -- what colour a partial-alpha texel blends toward. It sets
+    # no other field on `rec`, nothing else consults it, and a field where it
+    # returns nothing comes out byte-identical.
+    #
+    # The `except` is not laziness. This walks tile destinations and page
+    # arrays that four earlier passes have rewritten; a field where that walk
+    # cannot be completed must lose the BLEND, not the whole repack. That is
+    # the same failure mode `bare_keys` guards above, and losing a repack
+    # costs the field every truecolor page it was going to get.
+    if BLEND_PARTIAL or MODCLEAR_COVER:
+        try:
+            _bd, _cv = backdrop_keys(pages, arrays, tiles, keys, pal565, px)
+        except Exception:                                      # noqa: BLE001
+            _bd, _cv = {}, {}
+        if BLEND_PARTIAL:
+            for k, blk in _bd.items():
+                keys[k]['under'] = blk
+        if MODCLEAR_COVER:
+            for k, m in _cv.items():
+                keys[k]['cover'] = m
+        st.backdrop_cells = len(_bd)
+        dense_repack.backdrop_cells = (
+            getattr(dense_repack, 'backdrop_cells', 0) + len(_bd))
+        dense_repack.cover_cells = (
+            getattr(dense_repack, 'cover_cells', 0) + len(_cv))
     # See PROMOTE_FX_BASE. `fx_partners` is the side that must stay paletted
     # (an fx frame is drawn through the additive/average band, which has no
     # depth-2 equivalent that renders on this port). `fx_cells` is what the

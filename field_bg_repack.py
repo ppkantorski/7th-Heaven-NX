@@ -747,14 +747,79 @@ def resample_rgba(rgba, w, h, px, log=None):
     return img.resize((px, px), _filter(RESAMPLE_UP)).tobytes()
 
 
+def _coverage_maxpool(rgba, n):
+    """Native RGBA (h, w, 4) -> (amax, cmax) at (n, n).
+
+    `amax` is the HIGHEST alpha anywhere in each destination texel's
+    footprint and `cmax` is THAT PIXEL'S COLOUR, as R5G6B5. Together they
+    answer "does the mod paint anywhere in this texel, and if so with what",
+    which is the question a box filter's mean destroys for a thin structure.
+
+    ARGMAX-BY-ALPHA IN TWO PASSES, WITHOUT AN ARGMAX. Packing
+    `(a << 24) | (r << 16) | (g << 8) | b` into one uint32 makes an ordinary
+    `np.maximum` select the highest-alpha pixel and carry its colour along
+    for free -- ties break on colour, which is harmless. `reduceat` is used
+    rather than a reshape because 1024 -> 768 is not an integer ratio; the
+    partition is the same one `resample_rgba` averages over.
+
+    When the page is LARGER than the art the indices repeat and `reduceat`
+    returns the single element at that index -- a nearest sample, which is
+    the right answer when a destination texel is smaller than a source pixel.
+
+    THE GREEN LSB IS LEFT ALONE HERE. `source_cell` masks it on everything
+    it writes (`out & ~0x0020`), and doing it twice in two places is how the
+    two spellings drift apart.
+    """
+    if rgba is None or _np is None:
+        return None, None
+    try:
+        h, w, _ = rgba.shape
+        v = ((rgba[:, :, 3].astype(_np.uint32) << 24)
+             | (rgba[:, :, 0].astype(_np.uint32) << 16)
+             | (rgba[:, :, 1].astype(_np.uint32) << 8)
+             | rgba[:, :, 2].astype(_np.uint32))
+        if h != n or w != n:
+            iy = (_np.arange(n) * h) // n
+            ix = (_np.arange(n) * w) // n
+            v = _np.maximum.reduceat(v, iy, axis=0)
+            v = _np.maximum.reduceat(v, ix, axis=1)
+            v = v[:n, :n]
+        amax = (v >> 24).astype(_np.uint8)
+        r = ((v >> 16) & 255).astype(_np.uint16)
+        g = ((v >> 8) & 255).astype(_np.uint16)
+        b = (v & 255).astype(_np.uint16)
+        q = lambda c: _np.minimum(_np.uint16(31), (c + 4) // 8)  # noqa: E731
+        cmax = ((q(r) << 11) | ((q(g) << 1) << 5) | q(b)).astype(_np.uint16)
+        return (_np.ascontiguousarray(amax), _np.ascontiguousarray(cmax))
+    except Exception:                                          # noqa: BLE001
+        return None, None
+
+
+# KEEP THE MOD'S RAW ALPHA ON EVERY PageArt. See PageArt.__init__.
+# `SEVENTH_NX_NO_ART_ALPHA=1` drops it and disables the baked blend with it.
+KEEP_ALPHA = os.environ.get('SEVENTH_NX_NO_ART_ALPHA') != '1'
+
+
 class PageArt:
     """One (page, palette) image as a packed 565 page, ready to crop cells."""
 
-    __slots__ = ('px', 'buf', '_op', 'tmask', 'bmask', 'hmask')
+    __slots__ = ('px', 'buf', '_op', 'tmask', 'bmask', 'hmask', 'alpha',
+                 'amax', 'cmax')
 
     def __init__(self, dds_bytes, page_px):
         import dds_decode
         rgba, w, h = dds_decode.decode_dds(dds_bytes)
+        # The NATIVE alpha plane, kept before the resample throws it away.
+        # See `amax` below -- this is the only point in the pipeline where
+        # the art's true coverage still exists.
+        alpha_src = None
+        if _np is not None and KEEP_ALPHA:
+            try:
+                alpha_src = _np.frombuffer(
+                    rgba, dtype=_np.uint8, count=w * h * 4
+                ).reshape(h, w, 4)
+            except Exception:                                  # noqa: BLE001
+                alpha_src = None
         rgba = resample_rgba(rgba, w, h, page_px)
         self.px = page_px
         n = page_px * page_px
@@ -802,6 +867,50 @@ class PageArt:
             self.bmask = (op & ((a[0::4] | a[1::4] | a[2::4]) == 0)
                           ).reshape(page_px, page_px)
             self.hmask = (a[3::4] >= 128).reshape(page_px, page_px)
+            # THE RAW ALPHA, FOR BUILD 122's BAKED BLEND. See
+            # `field_bg_dense.BLEND_PARTIAL`.
+            #
+            # Every mask above is already a THRESHOLD, and the question build
+            # 122 asks is not a threshold question: "by how much would FFNx
+            # have blended this texel" cannot be answered from three booleans
+            # that each threw the number away. So the plane is kept.
+            #
+            # It costs one uint8 page -- 590 KB at 768px, the same order as
+            # each of the three bool masks beside it -- and it is kept only
+            # when something is going to read it, so a build with the blend
+            # off allocates exactly what build 121 allocated.
+            self.alpha = (a[3::4].reshape(page_px, page_px).copy()
+                          if KEEP_ALPHA else None)
+            # `amax` -- DOES THE MOD PAINT **ANYWHERE** IN THIS TEXEL'S
+            # FOOTPRINT? THE MEAN CANNOT ANSWER THAT AND `tmask` IS A MEAN.
+            #
+            # `resample_rgba` is an alpha-weighted BOX filter, so `tmask`
+            # asks "is the AVERAGE coverage of this texel below 3%". For a
+            # THIN STRUCTURE that is the wrong question and the answer is
+            # actively false: `mds7plr1`'s fence wire is about one native
+            # pixel wide, 1024 -> 768 puts roughly 1.8 native pixels in a
+            # destination texel, and a wire crossing a corner averages down
+            # under the threshold. `tmask` then reports "the mod paints
+            # nothing here" about a texel whose art is FULLY OPAQUE.
+            #
+            # MEASURED against the native DDS, texels the mod-clear arm keys:
+            # 8,508 on `mds7plr1` and 3,968 on `fship_2` have native art that
+            # is not merely present but OPAQUE (alpha >= 128). Every single
+            # one of the `has art` texels was also `opaque` -- there is no
+            # soft-edge population here at all, which is exactly the
+            # signature of a thin structure lost to a box filter rather than
+            # of an anti-aliased boundary.
+            #
+            # Those are the bright green specks in the fence: we keyed a wire
+            # and the background showed through.
+            #
+            # MAX-POOLED FROM THE **NATIVE** ALPHA, over the same partition
+            # the box filter averages over. `np.maximum.reduceat` handles the
+            # non-integer 1024 -> 768 ratio, and when the page is LARGER than
+            # the art the duplicate indices make it a nearest sample, which
+            # is the correct degenerate case.
+            self.amax, self.cmax = (_coverage_maxpool(alpha_src, page_px)
+                                    if KEEP_ALPHA else (None, None))
         else:
             self.tmask = bytes(1 if rgba[i * 4 + 3] < 8 else 0
                                for i in range(n))
@@ -812,6 +921,8 @@ class PageArt:
                 for i in range(n))
             self.hmask = bytes(1 if rgba[i * 4 + 3] >= 128 else 0
                                for i in range(n))
+            self.alpha = None          # numpy-only; the blend requires it
+            self.amax = self.cmax = None
         self._op = {}
 
     def cell_opaque(self, cx, cy, grid):

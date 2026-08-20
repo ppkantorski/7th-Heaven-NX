@@ -1309,6 +1309,12 @@ def provider_source(provider):
         # and the build reported it as a per-field refusal rather than as the
         # type error it was.
         return rgba, used
+    # THE PROVIDER, CARRIED ON THE FUNCTION. `ff7nx_greenkey` needs the
+    # raw `PageArt` (its `amax`/`cmax` planes), and this wrapper hands back
+    # unpacked RGB. Attaching the provider is the smallest way to give a
+    # later pass access to the same already-open art without changing this
+    # function's contract or re-opening the .iro.
+    art_for.provider = provider
     return art_for
 
 
@@ -2213,6 +2219,34 @@ def apply_to_flevel(archive, payloads, art, encode=None, log=print,
             ps = s.get('pal')
             if ps:
                 merge_pal(st['pal'], ps, s)
+            # SQUARE'S CHROMA-KEY ENTRY, RE-INDEXED TO THE MOD'S ART.
+            # FINDINGS-261, `ff7nx_greenkey`. It runs HERE, inside this
+            # loop, for two reasons: `art` is already open at the vanilla
+            # page numbering (see this function's docstring on why that
+            # matters and what running after the repack shipped), and the
+            # field's bytes are already in hand, so the pass costs one
+            # section split rather than a second pass over the archive.
+            #
+            # It is deliberately AFTER `fill_field`: marginart may itself
+            # have rewritten the cell, and there is no point re-indexing a
+            # marker that no longer exists.
+            try:
+                import ff7nx_greenkey as _GK
+                _prov = getattr(art, 'provider', None)
+                if _GK.enabled() and _prov is not None:
+                    _base = new if new is not None else raw
+                    _pn = lgp.split_sections(_base)
+                    _s9, _gs = _GK.fix_section9(_pn[8], _pn[3],
+                                                _prov.open(name), log=log)
+                    if _gs.get('pages'):
+                        _pn[8] = _s9
+                        new = lgp.join_sections(_pn)
+                    for _k, _v in _gs.items():
+                        if isinstance(_v, int):
+                            st['green_' + _k] = st.get('green_' + _k, 0) + _v
+            except Exception as _exc:                          # noqa: BLE001
+                st['refused'].append((name, 'greenkey %s: %s'
+                                      % (type(_exc).__name__, str(_exc)[:50])))
             if new is None:
                 continue
             payloads[name] = encode(new)
