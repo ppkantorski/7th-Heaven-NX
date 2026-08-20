@@ -49,6 +49,7 @@ import ff7nx_marginblack
 import ff7nx_blackcell
 import ff7nx_marginpage
 import ff7nx_parallaxfill
+import ff7nx_fshipart
 import ff7nx_marginpal
 import ff7nx_palkey
 import field_bg_dense
@@ -5391,6 +5392,19 @@ def _build_flevel(archive_path, chunks, field_files, romfs, log,
     # from a patched constant; a single 256px page left behind would be read
     # as 512px and desynchronise the whole TEXTURE walk from that slot on.
     _lift_depth1_payloads(archive, payloads, log)
+
+    # Cosmos itself paints an isolated near-black wedge into the left margin
+    # of fship_1 and its scene twin fship_12.  It is one disconnected
+    # component in one uniquely referenced layer-2 source cell, with the
+    # stationary layer-3 sea proven to cover it.  Key only that component so
+    # the existing sea shows through.  This runs after every page rewrite and
+    # fails closed if any part of that exact fingerprint changes.
+    fa_stats = ff7nx_fshipart.apply_to_flevel(
+        archive, payloads, encode=lambda raw: _encode_field_cached(archive, raw),
+        log=log)
+    fa_line = ff7nx_fshipart.summarise(fa_stats)
+    if fa_line:
+        log(fa_line)
 
     # LAST of the section-9 passes, and deliberately so. FINDINGS-207.
     #
