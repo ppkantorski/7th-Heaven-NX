@@ -493,6 +493,67 @@ MODCLEAR_DARK = int(os.environ.get('SEVENTH_NX_MODCLEAR_DARK') or 40)
 # `SEVENTH_NX_NO_MODCLEAR_COVER=1` restores build 122 exactly.
 MODCLEAR_COVER = os.environ.get('SEVENTH_NX_NO_MODCLEAR_COVER') != '1'
 
+# BUILD 127 -- INDEX 0 IS THE COLOUR KEY ON LAYER 1 TOO. FINDINGS-265.
+#
+# THE REPORT: brown stair-steps along the bottom of `ealin_2`, teal squares in
+# `woa_3`, "flat tan" in Wall Market -- and every previous attempt to fix them
+# picked a COLOUR for the square, which is why each one still stood out.
+#
+# THE COLOUR WAS THE WRONG QUESTION. `ealin_2`'s brown is
+# rgb(156, 105, 57) = palette 2's ENTRY 0, and 20,239 of its 20,556 brown
+# texels sit exactly where VANILLA'S INDEX IS 0. Entry 0 is the transparency
+# index. It is not art and it is not meant to be seen in any colour.
+#
+# MEASURED over vanilla's 6,423 palettes: entry 0 is pure black in 51.5% and
+# near-black in 13.3%, and where it is VISIBLE (35.3%) the commonest values
+# are pure green x138, pure cyan x57, white x39, pure red x32, pure magenta
+# x23, pure blue x17. **That is a chroma-key set.**
+#
+# AND THE RULE THIS FILE HAS CARRIED SINCE IT WAS WRITTEN IS WRONG AS STATED.
+# "On layer 1 index 0 is NOT a cut-out -- it is drawn, and its colour
+# matters." Measured against vanilla: 865,427 layer-1 index-0 texels sit on
+# palettes whose entry 0 is VISIBLE -- `ancnt1` slot 0 palette 1 has entry 0 =
+# rgb(0, 251, 0) and 242 such texels in a single tile. If layer 1 painted
+# index 0, the Ancient Forest would have blocks of pure green in vanilla FF7.
+# It does not.
+#
+# FFNx agrees, in `src/common.cpp:1726`:
+#
+#     if(color_key && pixel == 0) return 0;      // fully transparent
+#
+# -- the palette entry is never read. And the flag is resolved PER PALETTE
+# (`palette_colorkey[palette_index]`), not per layer, so "layer 1 draws index
+# 0" is a mis-generalisation of "some palettes switch the key off".
+#
+# SO WHY DID THE HARDWARE TEST SEE ENTRY 0's COLOUR? Because WE draw it. With
+# `PROMOTE_LAYER1_KEY` on -- and it IS on -- a keyed layer-1 cell is promoted
+# to truecolor, the key block below only restores the key when `l1_over`, and
+# `out[tpaint] = pal_ref[tpaint]` therefore bakes entry 0's colour as an
+# OPAQUE pixel into a page that has no palette and no index 0 any more. Change
+# entry 0 and our baked output changes. That test proved this pipeline draws
+# entry 0; it never proved the engine does. Line ~3486's note that "build 72
+# turned PROMOTE_LAYER1_KEY on and Wall Market grew flat tan" is the same
+# defect, reported three years earlier and read as a colour problem.
+#
+# WHAT THIS ARM DOES, AND WHY IT IS THE CONSERVATIVE HALF OF THE FINDING.
+#
+# The finding would justify keying index 0 on every promoted layer-1 cell.
+# This arm does NOT do that. It keys only where the MOD ALSO PAINTS NOTHING:
+#
+#     vanilla says index 0   AND   Cosmos's alpha says clear   ->   key it
+#
+# Both authorities agree there is nothing there, so nothing is what should be
+# drawn, and no judgement about entry 0's colour is required at all. Where
+# Cosmos DOES paint over vanilla's index 0 the texel is left exactly as it is
+# -- that is the `lost` population (FINDINGS-263), it is thirty-three times
+# larger, and it wants its own build with its own gate.
+#
+# It is monotone: it only ever ADDS key, and only where two independent
+# sources agree the texel is empty.
+#
+# `SEVENTH_NX_NO_MODCLEAR_L1=1` restores build 126 exactly.
+MODCLEAR_L1 = os.environ.get('SEVENTH_NX_NO_MODCLEAR_L1') != '1'
+
 # BUILD 124 -- "THE MOD PAINTS NOTHING" IS A **MAX**, NOT A MEAN.
 # FINDINGS-258. THIS IS THE FENCE.
 #
@@ -726,7 +787,7 @@ class Stats:
                  'subunit_cells', 'subunit_units', 'subunit_texels',
                  'modclear_cells', 'modclear_texels', 'modclear_whole',
                  'blend_cells', 'blend_texels', 'backdrop_cells',
-                 'wire_texels')
+                 'wire_texels', 'l1key_cells', 'l1key_texels')
 
     def __init__(self):
         self.cells = self.pages = self.tiles = 0
@@ -751,6 +812,8 @@ class Stats:
         self.blend_texels = 0     # ...texels blended toward the backdrop
         self.backdrop_cells = 0   # cells backdrop_keys() could judge
         self.wire_texels = 0      # thin-structure texels the box filter lost
+        self.l1key_cells = 0      # layer-1 cells whose entry-0 bake was keyed
+        self.l1key_texels = 0     # ...texels both vanilla and the mod call empty
 
 
 def _pal_rgb(sec3):
@@ -2366,6 +2429,35 @@ def source_cell(k, rec, pages, arrays, pal565, art_for, pals_for, st,
     # lifted off 0x0000 by the line before this one so it cannot be mistaken
     # for a key.
     #
+    # ...AND ON LAYER 1, INDEX 0 IS STILL THE COLOUR KEY. FINDINGS-265.
+    #
+    # See MODCLEAR_L1. The key block above restores the key on a layer-1 cell
+    # only when `l1_over`, so with `PROMOTE_LAYER1_KEY` on every other keyed
+    # layer-1 cell bakes entry 0's colour as an opaque pixel -- `ealin_2`'s
+    # brown steps, `woa_3`'s teal square, Wall Market's flat tan.
+    #
+    # OUTSIDE the `rec['key']` block on purpose: that block's layer-1 arm is
+    # governed by `PROMOTE_LAYER1_KEY`, which is a promotion policy, and this
+    # is not a promotion question. It is "both authorities say this texel is
+    # empty", and it must hold whatever the policy is.
+    #
+    # `zero` is vanilla's index 0; `tpaint` is Cosmos's alpha saying clear,
+    # already narrowed by `amax` so a thin structure the box filter lost is
+    # not mistaken for emptiness (build 124). The AND of the two is the only
+    # thing this arm keys.
+    if (MODCLEAR_L1 and art is not None and not rec.get('l2')
+            and tpaint.shape == out.shape and zero.shape == out.shape):
+        _l1k = tpaint & zero & (out != FN.EMPTY)
+        if _l1k.any():
+            out[_l1k] = FN.EMPTY
+            _n1 = int(_l1k.sum())
+            st.l1key_cells += 1
+            st.l1key_texels += _n1
+            dense_repack.l1key_cells = (
+                getattr(dense_repack, 'l1key_cells', 0) + 1)
+            dense_repack.l1key_texels = (
+                getattr(dense_repack, 'l1key_texels', 0) + _n1)
+
     # ...AND LAST OF ALL, BAKE THE BLEND THE 1-BIT KEY CANNOT DO.
     # BUILD 122, FINDINGS-255. See BLEND_PARTIAL for the measurement and
     # `backdrop_keys` for the five conditions `rec['under']` had to pass.

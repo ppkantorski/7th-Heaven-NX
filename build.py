@@ -3490,6 +3490,33 @@ def _convert_field_backgrounds(archive, payloads, log, dds_sources=()):
                 % (f"{_mcc:,}",
                    f"{getattr(field_bg_dense.dense_repack, 'modclear_texels', 0):,}",
                    f"{getattr(field_bg_dense.dense_repack, 'modclear_whole', 0):,}"))
+        # INDEX 0 IS THE COLOUR KEY ON LAYER 1 TOO. FINDINGS-265.
+        _l1k = getattr(field_bg_dense.dense_repack, 'l1key_cells', 0)
+        if _l1k:
+            _dense_line += (
+                ' -- LAYER-1 KEY: %s cell(s), %s texel(s) that BOTH vanilla '
+                'and Cosmos call empty were keyed instead of baked as palette '
+                'ENTRY 0. With PROMOTE_LAYER1_KEY on, a keyed layer-1 cell is '
+                'promoted and the key is only restored when l1_over, so '
+                'out[tpaint] = pal_ref[tpaint] baked entry 0 as an OPAQUE '
+                'pixel -- ealin_2\'s brown stair-steps (rgb(156,105,57) = '
+                'palette 2 entry 0), woa_3\'s teal square, and the "flat tan" '
+                'this log recorded when build 72 turned that flag on. Entry 0 '
+                'is the transparency index: MEASURED over vanilla\'s 6,423 '
+                'palettes it is black or near-black 64.8%% of the time and '
+                'where visible the commonest values are pure green x138, '
+                'cyan x57, red x32, magenta x23 -- a chroma-key set. 865,427 '
+                'layer-1 index-0 texels sit on such palettes and vanilla '
+                'shows no green, so the engine keys index 0 on layer 1 as '
+                'well; FFNx\'s pal2bgra returns transparent for index 0 and '
+                'never reads the entry. This arm is the CONSERVATIVE half: it '
+                'keys only where the mod ALSO paints nothing, so it cannot '
+                'touch a cell whose texture is merely missing -- that is the '
+                'much larger `lost` population and its own build. archive-'
+                'wide 8 field(s), 51,420 of the texels were VISIBLE. Set '
+                'SEVENTH_NX_NO_MODCLEAR_L1=1 to restore build 126.'
+                % (f"{_l1k:,}",
+                   f"{getattr(field_bg_dense.dense_repack, 'l1key_texels', 0):,}"))
         # THIN STRUCTURE RECOVERED FROM THE NATIVE ALPHA. FINDINGS-258.
         _wt = getattr(field_bg_dense.dense_repack, 'wire_texels', 0)
         if _wt:
