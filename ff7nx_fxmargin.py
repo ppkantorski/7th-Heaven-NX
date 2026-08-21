@@ -5,14 +5,15 @@ Cosmos can point many layer-2+ tiles at one base/FX cell and rely on external
 textures to supply the real pixels.  On the native paletted path the FX atlas
 can be shared across palettes, so an in-place write is unsafe.  This pass
 copies each complete FX atlas at the SAME coordinates: mds7plr1 onto
-palette-pure pages, and the two MDS5 proof effects onto one full-resolution
-truecolor page each. The base page and runtime UV never move. The complete
-effect is repointed, including its 4:3 cells.
+palette-pure pages, mds5_2/mds5_3 onto one full-resolution truecolor page
+each, and mds5_5 onto separate truecolor pages for its two static glass
+variants while retaining its animated lamp page. The base page and runtime
+UV never move. The complete effect is repointed, including its 4:3 cells.
 
 Build 136 proved that a cell-by-cell admission rule is invalid for a lighting
 sheet: mds5_2 moved 64 of 85 cells and mds5_3 moved 63 of 144, producing the
 visible missing-square pattern.  The repair is deliberately limited to the
-three hardware-observed fields and is all-or-nothing by complete field effect.
+four hardware-observed fields and is all-or-nothing by complete field effect.
 It also carries the Cosmos FX reconstruction through the 4:3 picture instead
 of creating a new old/Cosmos boundary there.
 
@@ -60,13 +61,18 @@ T_SRC_X_BIG, T_SRC_Y_BIG = 42, 46
 MAX_QUANT_ERR = MA.MAX_QUANT_ERR
 # A complete lighting sheet cannot tolerate the margin-art pass's broad
 # single-cell ceiling: one badly represented tile is a visible square.  All
-# three proof fields fit below 10/255 after palette selection.
+# the paletted proof fields fit below 10/255 after palette selection.
 COMPLETE_MAX_QUANT_ERR = 10.0
 
 # Build 136's broad 157-field population regressed on hardware.  Do not infer
 # safety archive-wide from an offline renderer that cannot reproduce the
 # console's animation timing.  Expand this only after hardware proof.
-TARGET_FIELDS = frozenset(('mds5_2', 'mds5_3', 'mds7plr1'))
+#
+# mds5_5 is a separate, measured complete effect: 102 page-15 references,
+# including all 28 widescreen-margin tiles.  Its three palette groups resolve
+# to three DIFFERENT Cosmos DDS images, so it takes the palette-split
+# truecolour path below rather than collapsing them onto one atlas.
+TARGET_FIELDS = frozenset(('mds5_2', 'mds5_3', 'mds5_5', 'mds7plr1'))
 
 # Build 137 proved the complete-effect selection, but these two effects still
 # exposed the native 256px/8-bit destination: mds5_2 as a magnified edge grid,
@@ -75,7 +81,13 @@ TARGET_FIELDS = frozenset(('mds5_2', 'mds5_3', 'mds7plr1'))
 # be premultiplied into one 768px truecolor additive clone without a palette.
 # mds7plr1 is hardware-correct and deliberately remains on the proven
 # paletted path.
-TRUECOLOR_FIELDS = frozenset(('mds5_2', 'mds5_3'))
+TRUECOLOR_FIELDS = frozenset(('mds5_2', 'mds5_3', 'mds5_5'))
+# Most proof effects resolve every tile palette to one byte-identical DDS and
+# therefore need one clone. mds5_5 deliberately does not: palette 3 falls
+# back to Cosmos palette 0 (wide glass), while palettes 4 and 6 name the
+# interior glass and lamp glow. One depth-2 page has no palette, so preserving
+# all three images requires one complete clone per resolved DDS variant.
+PALETTE_SPLIT_TRUECOLOR_FIELDS = frozenset(('mds5_5',))
 NO_TRUECOLOR_ENV = 'SEVENTH_NX_NO_FX_TRUECOLOR'
 # The MDS5_2 lighting mask in Cosmos is still native-grid coverage inside a
 # 1024px DDS: single opaque/transparent steps become three-texel blocks at
@@ -234,9 +246,15 @@ def _truecolor_effect(name, parts, sec9, pages, by_group, art, st, log,
 
     configured_px = FB.page_px()
     px = None
+    split_palette = name.lower() in PALETTE_SPLIT_TRUECOLOR_FIELDS
+    provider = getattr(art, 'provider', None)
+    # key -> [(unit-key, tiles), ...]. Ordinarily key is (fx, None), which is
+    # exactly the historical one-page-per-FX-atlas behaviour. For the one
+    # measured palette-split field it is (fx, resolved DDS palette), keeping
+    # FFNx's exact-then-palette-0 selection without merging different art.
+    rows_by_atlas = collections.defaultdict(list)
     atlas = {}
     for fx, rows in sorted(rows_by_fx.items()):
-        variants = []
         for _key, tiles in rows:
             source_pal = _key[6]
             try:
@@ -271,15 +289,30 @@ def _truecolor_effect(name, parts, sec9, pages, by_group, art, st, log,
             elif img.shape[0] != px:
                 st['no_art'] += len(rows)
                 return None, st
-            variants.append(np.ascontiguousarray(img, np.uint8))
-        first = variants[0]
-        if any(not np.array_equal(first, other) for other in variants[1:]):
-            # Palette-specific DDS variants cannot share one truecolor page.
-            # Refuse instead of silently choosing one.
-            st['no_art'] += len(rows)
-            return None, st
-        atlas[fx] = first
+            # mds5_5 palette 6 has four Cosmos runtime states (the lamp
+            # glows). A static truecolor clone would freeze one arbitrary
+            # state. Palette-split effects may leave an ambiguous semantic
+            # variant on the original page while the independent static glass
+            # variants move; their tile groups and DDS images do not overlap.
+            if (split_palette and provider is not None
+                    and (name.lower(), fx, used)
+                    in getattr(provider, 'ambiguous_slots', ())):
+                st['ambiguous_kept'] = st.get('ambiguous_kept', 0) + len(tiles)
+                continue
+            akey = (fx, used if split_palette else None)
+            img = np.ascontiguousarray(img, np.uint8)
+            first = atlas.get(akey)
+            if first is not None and not np.array_equal(first, img):
+                # Palette-specific DDS variants cannot share one truecolor
+                # page. The default remains refusal; the hardware-scoped
+                # mds5_5 path separated them by resolved DDS palette above.
+                st['no_art'] += len(rows)
+                return None, st
+            atlas[akey] = img
+            rows_by_atlas[akey].append((_key, tiles))
 
+    if not atlas:
+        return None, st
     present = len(pages)
     if present + len(atlas) > FR.max_total_pages():
         st['nofit'] = sum(len(x) for x in rows_by_fx.values())
@@ -292,9 +325,10 @@ def _truecolor_effect(name, parts, sec9, pages, by_group, art, st, log,
     buf = bytearray(sec9)
     new_pages = {}
     moved = 0
-    for fx in sorted(atlas):
+    for akey in sorted(atlas):
         slot = free.pop(0)
-        img = _soften_additive_alpha(name, atlas[fx], rows_by_fx[fx], px)
+        img = _soften_additive_alpha(name, atlas[akey],
+                                     rows_by_atlas[akey], px)
         # The console page has no 8-bit alpha channel, but this is additive
         # blend mode 1: alpha*colour can be baked into the stored colour and
         # then added normally.  Fully opaque texels remain byte-for-byte the
@@ -312,7 +346,7 @@ def _truecolor_effect(name, parts, sec9, pages, by_group, art, st, log,
         data = FR.rgba_to_565_buf(enc.tobytes(), px * px, width=px,
                                   black_ok=True)
         new_pages[slot] = FN.Page(slot, 0, 2, data, px)
-        for _key, tiles in rows_by_fx[fx]:
+        for _key, tiles in rows_by_atlas[akey]:
             for t in tiles:
                 buf[t.off + T_FX] = slot
                 moved += 1
@@ -322,7 +356,7 @@ def _truecolor_effect(name, parts, sec9, pages, by_group, art, st, log,
         plist[slot] = page
     parts[SECTION9] = FN.replace_texture_block(bytes(buf), plist,
                                                tex_start, tex_end)
-    st['units'] = sum(len(rows) for rows in rows_by_fx.values())
+    st['units'] = sum(len(rows) for rows in rows_by_atlas.values())
     st['tiles'] = moved
     st['pages'] = len(new_pages)
     st['truecolor_pages'] = len(new_pages)
@@ -336,7 +370,7 @@ def _truecolor_effect(name, parts, sec9, pages, by_group, art, st, log,
 def split_field(name, raw, lgp_mod, art, log=None):
     """Return ``(new_raw_or_None, stats)`` for one field."""
     st = {'units': 0, 'tiles': 0, 'pages': 0, 'truecolor_pages': 0, 'dark': 0,
-          'no_art': 0, 'partial': 0, 'nofit': 0}
+          'no_art': 0, 'partial': 0, 'nofit': 0, 'ambiguous_kept': 0}
     if name.lower() not in TARGET_FIELDS:
         return None, st
     parts = lgp_mod.split_sections(raw)
@@ -550,7 +584,7 @@ def apply_to_flevel(archive, payloads, art, encode=None, log=print,
 
     encode = encode or (lambda raw: archive.encode_field(raw))
     st = {'read': 0, 'changed': 0, 'units': 0, 'tiles': 0, 'pages': 0,
-          'truecolor_pages': 0,
+          'truecolor_pages': 0, 'ambiguous_kept': 0,
           'dark': 0, 'no_art': 0, 'nofit': 0, 'refused': []}
     for name in archive.names():
         entry = archive.index.get(name)
@@ -566,8 +600,8 @@ def apply_to_flevel(archive, payloads, art, encode=None, log=print,
                    else archive.decompressed(entry))
             new, one = split_field(name, raw, lgp, art, log=log)
             st['read'] += 1
-            for k in ('units', 'tiles', 'pages', 'truecolor_pages', 'dark',
-                      'no_art', 'nofit'):
+            for k in ('units', 'tiles', 'pages', 'truecolor_pages',
+                      'ambiguous_kept', 'dark', 'no_art', 'nofit'):
                 st[k] += one[k]
             if new is None:
                 continue
@@ -586,6 +620,10 @@ def apply_to_flevel(archive, payloads, art, encode=None, log=print,
 def summarise(st):
     if not st or not st.get('changed'):
         return ''
+    extra = ''
+    if st.get('ambiguous_kept'):
+        extra += (' %d animated-state tile(s) remained on their original '
+                  'runtime page.' % st['ambiguous_kept'])
     return ('COMPLETE FX ATLAS: %d Cosmos FX cell(s) copied onto %d page(s) '
             '(%d full-resolution truecolor) across %d hardware-scoped '
             'field(s); %d '
@@ -595,4 +633,4 @@ def summarise(st):
                st['changed'], st['tiles'],
                ' %d eligible cell(s) were left byte-identical because the '
                'complete field had no safe slots.' % st['nofit']
-               if st.get('nofit') else ''))
+               if st.get('nofit') else '') + extra)

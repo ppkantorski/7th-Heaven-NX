@@ -2877,9 +2877,11 @@ MULTI_PALETTE_VETO = True
 CROSSLAYER_EXACT_ENV = 'SEVENTH_NX_NO_CROSSLAYER_EXACT'
 # The structural predicate is general, but admitting it archive-wide changed
 # the result of mds7plr1's complete-FX A/B even after the upper-record guard.
-# Keep the hardware-requested proof field scoped until another field has its
-# own final-chain proof. This is admission scope, not pixel special-casing.
-CROSSLAYER_EXACT_FIELDS = frozenset(('mds5_2',))
+# Keep only hardware-requested proof fields scoped here. mds5_2 and mds5_5
+# each have their own final-chain falsifier proving that exactly one layer-1
+# record moves, every upper-layer sibling stays byte-identical, and no page is
+# added. This is admission scope, not pixel special-casing.
+CROSSLAYER_EXACT_FIELDS = frozenset(('mds5_2', 'mds5_5'))
 
 
 def crosslayer_exact_enabled():
@@ -3572,9 +3574,9 @@ def dense_repack(sec3, sec9, field='', art_for=None, pals_for=None, px=256,
                     # ONE SOURCE CELL CAN SERVE TWO DIFFERENT SEMANTIC
                     # SURFACES. FINDINGS-275.
                     #
-                    # mds5_2 page 0 cell (0,0) is the upper-left layer-1
-                    # backdrop through palette 0, and is independently reused
-                    # by animated layer-2 tiles through palettes 8 and 9.
+                    # mds5_2 page 0 cell (0,0), and the analogous measured
+                    # mds5_5 cell, are layer-1 backdrop art through palette 0
+                    # independently reused by animated upper-layer palettes.
                     # Cosmos ships exact palette-0 art only.  The broad
                     # multi-palette veto therefore held the backdrop at 256px
                     # merely because unrelated upper-layer draws borrow the

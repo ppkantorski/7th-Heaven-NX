@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import collections
 import os
 import struct
 import unittest
@@ -252,6 +253,142 @@ class FxMarginIntegration(unittest.TestCase):
         self.assertGreater(len(xs), 0)
         self.assertTrue(np.all(xs < 16))
         self.assertTrue(np.all(ys < 16))
+
+    def test_mds5_5_glass_variants_split_without_freezing_lamps(self):
+        """Static glass moves by palette; the four-state lamp page does not."""
+        name = 'mds5_5'
+        raw = PF._with_mod_section9(
+            self.arc.decompressed(self.arc.index[name]), name)
+        parts = lgp.split_sections(raw)
+        parts[8], _ = PR.fix_field(parts[3], parts[8], name,
+                                   art_for=self.provider.open(name))
+        before = lgp.join_sections(parts)
+        filled, _ = MA.fill_field(
+            name, before, lgp, MA.provider_source(self.provider), scope='all')
+        before = filled or before
+        after, st = FX.split_field(
+            name, before, lgp, MA.provider_source(self.provider))
+        self.assertIsNotNone(after)
+        self.assertEqual(
+            {k: st[k] for k in ('units', 'tiles', 'pages',
+                                'truecolor_pages', 'ambiguous_kept')},
+            {'units': 92, 'tiles': 92, 'pages': 2,
+             'truecolor_pages': 2, 'ambiguous_kept': 10})
+
+        a, b = [lgp.split_sections(x)[8] for x in (before, after)]
+        sa, sb = DC.survey(a), DC.survey(b)
+        pa = {p.slot: p for p in sa['pages']}
+        pb = {p.slot: p for p in sb['pages']}
+        ta = MB.read_tiles(a, sa, pa)
+        tb = MB.read_tiles(b, sb, pb)
+        self.assertEqual(len(ta), len(tb))
+        changed_records = [(old, new) for old, new in zip(ta, tb)
+                           if a[old.off:old.off + 52]
+                           != b[new.off:new.off + 52]]
+        self.assertEqual(len(changed_records), 92)
+        self.assertTrue(all(old.layer >= 2 and old.pal in (3, 4)
+                            for old, _new in changed_records))
+        groups = collections.defaultdict(list)
+        for old, new in zip(ta, tb):
+            old_fx = a[old.off + FX.T_FX]
+            if old.layer < 2 or not a[old.off + FX.T_BLEND] or not old_fx:
+                continue
+            groups[old.pal].append((old, new))
+            old_rec = bytearray(a[old.off:old.off + 52])
+            new_rec = bytearray(b[new.off:new.off + 52])
+            old_rec[FX.T_FX] = new_rec[FX.T_FX]
+            self.assertEqual(old_rec, new_rec)
+
+        # Palette 3 is the 28-cell widescreen glass, palette 4 the 64-cell
+        # interior glass. Each gets one complete 768px page. Palette 6 is ten
+        # animated lamp records and must stay on original page 15.
+        self.assertEqual({k: len(v) for k, v in groups.items()},
+                         {3: 28, 4: 64, 6: 10})
+        page_for_pal = {}
+        for pal in (3, 4):
+            slots = {b[n.off + FX.T_FX] for _o, n in groups[pal]}
+            self.assertEqual(len(slots), 1)
+            page_for_pal[pal] = next(iter(slots))
+            page = pb[page_for_pal[pal]]
+            self.assertEqual((page.depth, page.px), (2, 768))
+        self.assertTrue(all(
+            a[o.off + FX.T_FX] == b[n.off + FX.T_FX] == 15
+            for o, n in groups[6]))
+        self.assertEqual(pa[15].data, pb[15].data)
+
+        # The new pages are literal Cosmos variants after the one required
+        # additive-alpha premultiply. In particular, palette 0's transparent
+        # far-right cells remain transparent exactly as FFNx renders them;
+        # no reflected, stretched or interpolated pixels are synthesized.
+        source = MA.provider_source(self.provider)
+        for pal, used in ((3, 0), (4, 4)):
+            direct = FX._provider_rgba(source, name, 15, used, 768)
+            self.assertIsNotNone(direct)
+            enc = direct.copy()
+            aa = enc[..., 3].astype(np.uint16)
+            enc[..., :3] = ((enc[..., :3].astype(np.uint16)
+                             * aa[..., None] + 127) // 255).astype(np.uint8)
+            enc[..., 3] = 255
+            want = FX.FR.rgba_to_565_buf(
+                enc.tobytes(), 768 * 768, width=768, black_ok=True)
+            self.assertEqual(pb[page_for_pal[pal]].data, want)
+        right = [n for _o, n in groups[3] if n.dx >= 160]
+        self.assertEqual(len(right), 12)
+
+    def test_mds5_5_dark_cell_is_only_cross_layer_exact_change(self):
+        """The top discontinuity is one exact Cosmos layer-1 cell."""
+        KS.bootstrap()
+        SEAM._init()
+        g = SEAM._G
+
+        def _chain(disabled=False):
+            env = {FD.CROSSLAYER_EXACT_ENV: '1'} if disabled else {}
+            with mock.patch.dict(os.environ, env, clear=False):
+                return KS.chain(
+                    'mds5_5', g['arch'], g['ent'], g['prov'], g['art'],
+                    MA.provider_source(g['prov']), g['scope'])
+
+        oldp, newp = _chain(True), _chain(False)
+        old9, new9 = oldp[8], newp[8]
+        old_s, new_s = DC.survey(old9), DC.survey(new9)
+        old_pm = {p.slot: p for p in old_s['pages']}
+        new_pm = {p.slot: p for p in new_s['pages']}
+        old_t = MB.read_tiles(old9, old_s, old_pm)
+        new_t = MB.read_tiles(new9, new_s, new_pm)
+        target = [(a, b) for a, b in zip(old_t, new_t)
+                  if a.layer == 1 and a.dx == -160 and a.dy == -120]
+        self.assertEqual(len(target), 1)
+        a, b = target[0]
+        self.assertEqual((old_pm[a.slot].depth, old_pm[a.slot].px), (1, 256))
+        self.assertEqual((new_pm[b.slot].depth, new_pm[b.slot].px), (2, 768))
+        self.assertEqual([(p.slot, p.depth, p.px) for p in old_s['pages']],
+                         [(p.slot, p.depth, p.px) for p in new_s['pages']])
+        diffs = [(a, b) for a, b in zip(old_t, new_t)
+                 if old9[a.off:a.off + 52] != new9[b.off:b.off + 52]]
+        self.assertEqual(diffs, target)
+        self.assertTrue(all(
+            old9[a.off:a.off + 52] == new9[b.off:b.off + 52]
+            for a, b in zip(old_t, new_t) if a.layer >= 2))
+
+        old_im, old_o = RF.render(lgp.join_sections(oldp), (1,))
+        new_im, new_o = RF.render(lgp.join_sections(newp), (1,))
+        self.assertEqual(old_o, new_o)
+        mod = g['prov'].open('mds5_5')(0, 0)
+        self.assertIsNotNone(mod)
+        exact = RF._d2_rgb(np.frombuffer(mod.buf, '<u2')
+                           .reshape(mod.px, mod.px))[:48:3, :48:3]
+        x0, y0 = -160 - new_o[0], -120 - new_o[1]
+        self.assertFalse(np.array_equal(old_im[y0:y0 + 16, x0:x0 + 16],
+                                        exact))
+        self.assertTrue(np.array_equal(new_im[y0:y0 + 16, x0:x0 + 16],
+                                       exact))
+        changed = np.any(old_im != new_im, axis=2)
+        ys, xs = np.where(changed)
+        self.assertGreater(len(xs), 0)
+        self.assertTrue(np.all((xs + old_o[0] >= -160)
+                               & (xs + old_o[0] < -144)))
+        self.assertTrue(np.all((ys + old_o[1] >= -120)
+                               & (ys + old_o[1] < -104)))
 
     def test_reported_mds5_effects_are_never_partially_moved(self):
         expected = {'mds5_2': (85, 1), 'mds5_3': (226, 1)}
