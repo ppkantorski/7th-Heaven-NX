@@ -48,6 +48,8 @@ import ff7nx_uncrop
 import ff7nx_marginblack
 import ff7nx_blackcell
 import ff7nx_marginpage
+import ff7nx_fxmargin
+import ff7nx_fxpages
 import ff7nx_parallaxfill
 import ff7nx_fshipart
 import ff7nx_marginpal
@@ -2705,7 +2707,8 @@ def _snapshot_page_counts(archive, payloads):
     return out
 
 
-def _convert_field_backgrounds(archive, payloads, log, dds_sources=()):
+def _convert_field_backgrounds(archive, payloads, log, dds_sources=(),
+                               fx_art=None, fx_stats=None):
     """
     Rewrite section 9 of EVERY field so the file agrees with a module patched
     by ff7nx_fieldbg.
@@ -2811,7 +2814,7 @@ def _convert_field_backgrounds(archive, payloads, log, dds_sources=()):
 
     dense = {'fields': 0, 'cells': 0, 'pages': 0, 'pages_before': 0,
              'from_art': 0, 'from_art_borrow': 0, 'from_vanilla': 0,
-             'refused': [], 'toobig': []}
+             'crosslayer_exact': 0, 'refused': [], 'toobig': []}
     art = None
     if dds_sources:
         art = field_bg_repack.ArtProvider(dds_sources, px, log)
@@ -2887,6 +2890,10 @@ def _convert_field_backgrounds(archive, payloads, log, dds_sources=()):
     pagecap_refused = []              # (field, [(slot, tiles), ...])
     page_cost = []                    # (field, live pages, bytes) for the
                                       # per-field ceiling report below
+    fxp_stats = {'fields': 0, 'pages': 0, 'tiles': 0, 'bytes': 0,
+                 'blend_veto': 0, 'base_veto': 0, 'art_veto': 0,
+                 'budget_veto': 0,
+                 'deferred': 0, 'names': [], 'page_names': []}
     for name in sorted(archive.index):
         entry = archive.index[name]
         if not archive.is_field(entry):
@@ -2952,6 +2959,76 @@ def _convert_field_backgrounds(archive, payloads, log, dds_sources=()):
         except field_bg_native.Section9Error as exc:
             skipped.append((name, str(exc)))
             continue
+        # BUILD 139 / FINDINGS-195: a full-resolution depth-2 FX page may
+        # only be inserted AFTER resize_section9 has converted every depth-2
+        # page already in the field to `px`.  Build 138 inserted the 768px FX
+        # page upstream while the section still stored its ordinary pages at
+        # 256px.  resize_section9 walked the block as 256px, landed in the
+        # middle of the new page, and refused both MDS5 fields ("slot 17 has
+        # depth 8448/16896").  That refusal left the ENTIRE field at 256px.
+        # Here the section has one coherent depth-2 size, the original FX page
+        # numbers still exist, and dense/compact/cap can account for the new
+        # page normally.
+        if (fx_art is not None and name.lower() in
+                ff7nx_fxmargin.TRUECOLOR_FIELDS):
+            if fx_stats is not None:
+                fx_stats['read'] = fx_stats.get('read', 0) + 1
+            try:
+                _fxparts = list(parts)
+                _fxparts[8] = new9
+                _fxraw, _fxone = ff7nx_fxmargin.split_field(
+                    name, lgp.join_sections(_fxparts), lgp, fx_art, log=log)
+                if fx_stats is not None:
+                    for _fk in ('units', 'tiles', 'pages',
+                                'truecolor_pages', 'dark', 'no_art', 'nofit'):
+                        fx_stats[_fk] = (fx_stats.get(_fk, 0)
+                                         + _fxone.get(_fk, 0))
+                if _fxraw is not None:
+                    new9 = lgp.split_sections(_fxraw)[8]
+                    if fx_stats is not None:
+                        fx_stats['changed'] = fx_stats.get('changed', 0) + 1
+            except Exception as exc:                           # noqa: BLE001
+                if fx_stats is not None:
+                    fx_stats.setdefault('refused', []).append(
+                        (name, '%s: %s' %
+                         (type(exc).__name__, str(exc)[:60])))
+        # FINDINGS-194, ARCHIVE HALF.  A complete additive page can become
+        # truecolor IN PLACE now that the module gives depth-2 slots 15..23
+        # their native additive blend.  This is deliberately after the
+        # uniform resize above and before dense/compact/cap, so every later
+        # pass parses one coherent depth-2 size and accounts for the page.
+        #
+        # Page count and every tile record remain byte-identical. The direct
+        # Cosmos DDS replaces the whole page; blend 2/3, palette-specific
+        # disagreement, missing art and either hard byte ceiling are vetoes.
+        if fx_art is not None:
+            try:
+                _fp, _fs, _fe = field_bg_native.parse_texture_block(new9, px)
+                _present = [p for p in _fp if p is not None]
+                _runtime = sum(field_bg_repack._page_bytes(p.px, p.depth)
+                               for p in _present)
+                # Preserve the ordinary dense pass's full truecolor allowance
+                # in the projection. FX pages have a separate proven blend
+                # path and must not buy their smoke by evicting scene art.
+                _ordinary_d2 = sum(
+                    1 for p in _present
+                    if p.depth == 2 and not (0x0F <= p.slot < 0x18))
+                _reserve = max(
+                    0, field_bg_dense.MAX_TRUECOLOR_PAGES - _ordinary_d2)
+                _reserve += ff7nx_fxpages.DOWNSTREAM_D2_RESERVE
+                _runtime_headroom = max(
+                    0, int(field_bg_dense.FIELD_MB_CAP * 1048576.0)
+                    - _runtime
+                    - _reserve * field_bg_repack._page_bytes(px, 2))
+                _raw_now = len(raw) - len(parts[8]) + len(new9)
+                new9, _fxp_one = ff7nx_fxpages.upgrade_section9(
+                    name, new9, fx_art, px,
+                    max_raw_delta=max(0, FIELD_BG_RAW_CAP - _raw_now),
+                    max_runtime_delta=_runtime_headroom)
+                ff7nx_fxpages.merge(fxp_stats, _fxp_one)
+            except Exception as exc:                           # noqa: BLE001
+                log('  ! additive FX page: %s left unchanged -- %s: %s'
+                    % (name, type(exc).__name__, str(exc)[:80]))
         # Repack AFTER the rescale, so the pre-existing truecolor pages are
         # already at `px` and parse_texture_block agrees with itself.
         # ---- PROMOTE, THEN PAY FOR IT
@@ -3062,11 +3139,23 @@ def _convert_field_backgrounds(archive, payloads, log, dds_sources=()):
         if art is not None and name.lower() in art.fields():
             _af, _pf = art.open(name), art.palettes
         _try9, dst, cst, _dense_ok = _pre9, None, None, False
+        # The three-page dense ceiling was measured for ordinary scenery.
+        # Existing additive depth-2 pages are page-neutral FX frames; counting
+        # them against that ceiling would turn ujunon1's four smoke pages into
+        # a reason to discard every ordinary truecolor scene page. Offset the
+        # ceiling by exactly the protected FX population on this field.
+        try:
+            _pp, _ps, _pe = field_bg_native.parse_texture_block(_pre9, px)
+            _fx_tc = sum(1 for p in _pp if p is not None and p.depth == 2
+                         and 0x0F <= p.slot < 0x18)
+        except Exception:                                      # noqa: BLE001
+            _fx_tc = 0
         try:
             for _tc in range(field_bg_dense.MAX_TRUECOLOR_PAGES, -1, -1):
                 try:
                     _try9, dst = field_bg_dense.dense_repack(
-                        parts[3], _pre9, name, _af, _pf, px, max_tc=_tc)
+                        parts[3], _pre9, name, _af, _pf, px,
+                        max_tc=_tc + _fx_tc)
                 except Exception as exc:                       # noqa: BLE001
                     log(f'  ! field background: {name} not repacked -- {exc}')
                     _try9, dst = _pre9, None
@@ -3271,6 +3360,7 @@ def _convert_field_backgrounds(archive, payloads, log, dds_sources=()):
             dense['from_art'] += dst.from_art
             dense['from_art_borrow'] += dst.from_art_borrow
             dense['from_vanilla'] += dst.from_vanilla
+            dense['crosslayer_exact'] += dst.crosslayer_exact
         if cst is not None and getattr(cst, 'rejected', None):
             if getattr(cst, 'window_refused', None):
                 cmp_windowed.append((name, cst.window_refused))
@@ -3411,6 +3501,20 @@ def _convert_field_backgrounds(archive, payloads, log, dds_sources=()):
                 % (f"{_hbc:,}", f"{_hbf:,}", field_bg_dense.HUE_BROKEN_DIST,
                    f"{getattr(field_bg_dense.dense_repack, 'hue_kept_art', 0):,}",
                    f"{getattr(field_bg_dense.hue_broken, 'unmeasured', 0):,}"))
+        _cle = dense['crosslayer_exact']
+        if _cle:
+            _dense_line += (
+                ' -- CROSS-LAYER EXACT ART: %s layer-1 cell(s) used their '
+                'own exact Cosmos palette variant even though the same atlas '
+                'coordinate is independently reused by upper-layer tiles '
+                'through other palettes. The upper-layer/borrowed variants '
+                'remain paletted; only the exact layer-1 tile references '
+                'move. This is mds5_2\'s upper-left 16x16 cell: the old broad '
+                'multi-palette veto left that one cell at 256px and its dark '
+                'palette pixels formed the stepped chain inside the light. '
+                'Same-layer multi-palette surfaces remain all-or-nothing. '
+                'Set %s=1 to restore the broad veto.'
+                % (f"{_cle:,}", field_bg_dense.CROSSLAYER_EXACT_ENV))
         _low = getattr(field_bg_dense.dense_repack, 'low_slots_offered', 0)
         if _low:
             _dense_line += (
@@ -3965,6 +4069,12 @@ def _convert_field_backgrounds(archive, payloads, log, dds_sources=()):
             + (f'; {no_fit} more for want of a free truecolor slot'
                if no_fit else ''))
     _log_page_cost_report(page_cost, px, log, ng_retry, ng_over, ng_margin)
+    _fxp_line = ff7nx_fxpages.summarise(fxp_stats)
+    if _fxp_line:
+        log('  ' + _fxp_line)
+        if fxp_stats['names']:
+            log('      fields: ' + ', '.join(fxp_stats['names'][:24])
+                + ('' if len(fxp_stats['names']) <= 24 else ', ...'))
     if nf:
         log(f'  field background: {npg} truecolor page(s) in {nf} field(s) '
             f'rescaled to {px}x{px}')
@@ -5263,6 +5373,23 @@ def _build_flevel(archive_path, chunks, field_files, romfs, log,
             if mpal_line:
                 log('  ' + mpal_line)
 
+            # AFTER marginart has served every non-animated cell, while the
+            # DDS names still match the original page numbers.  If an active
+            # lighting/FX atlas reaches a margin, copy its COMPLETE effect at
+            # the UVs already sampled by the game.  The resting/base page and
+            # packed runtime UV stay untouched.  This is hardware-scoped and
+            # all-or-nothing: a partial lighting sheet is visible as missing
+            # squares (Build 136).
+            # Keep the hardware-proven mds7plr1 paletted repair here. The two
+            # truecolor effects run inside `_convert_field_backgrounds`,
+            # AFTER that function has uniformly resized every pre-existing
+            # depth-2 page.  Putting 768px data upstream of that boundary is
+            # the Build-138 whole-field quality regression (FINDINGS-195).
+            fxm_stats = ff7nx_fxmargin.apply_to_flevel(
+                archive, payloads, _bc_art,
+                encode=lambda raw: _encode_field_cached(archive, raw),
+                log=log, fields={'mds7plr1'})
+
             if not ff7nx_blackcell.disabled():
                 # `overlay=True` ONLY HERE, and the ordering is the reason.
                 # The overlay-margin fill reads Cosmos's art by PAGE NUMBER,
@@ -5327,7 +5454,19 @@ def _build_flevel(archive_path, chunks, field_files, romfs, log,
                 log('  ' + pk_line)
 
     if ff7nx_fieldbg.enabled():
-        _convert_field_backgrounds(archive, payloads, log, dds_sources)
+        _convert_field_backgrounds(
+            archive, payloads, log, dds_sources,
+            fx_art=_bc_art, fx_stats=fxm_stats if _bc_art is not None else None)
+
+    # The two truecolor FX pages are inserted *inside* the conversion above,
+    # after each field's existing depth-2 pages have been uniformly rescaled.
+    # Summarise only now so the line describes what actually survived that
+    # structural gate.  mds7plr1's Build-137 paletted result is included in
+    # the same aggregate.
+    if _bc_art is not None:
+        fxm_line = ff7nx_fxmargin.summarise(fxm_stats)
+        if fxm_line:
+            log('  ' + fxm_line)
 
     # RUN TWICE, BEFORE AND AFTER THE REPACK, AND BOTH ARE NEEDED.
     #
@@ -6852,10 +6991,11 @@ def apply_field_bg(sdout, dump, log=lambda *_: None, produced=()):
     """
     Let field background TRUECOLOR pages be bigger than 256x256.
 
-    Six words in `exefs/main`; see ff7nx_fieldbg.py for the derivation and
-    README-field-bg-512-MEASURED.md for how each one was measured. depth-1
-    (8-bit paletted) pages are deliberately left at 256 -- the loader's
-    #0x10000 is shared with their read count and is NOT touched.
+    The size words plus the narrowly scoped seven-word depth-2 additive
+    ladder in `exefs/main`; see ff7nx_fieldbg.py, FINDINGS-194 and
+    README-field-bg-512-MEASURED.md. depth-1 (8-bit paletted) pages are
+    deliberately left at 256 -- the loader's #0x10000 is shared with their
+    read count and is NOT touched.
 
     Runs AFTER apply_fps_patches and apply_widescreen, on their output, for
     exactly the same reason those two run last: it edits `exefs/main`, and
@@ -6863,18 +7003,15 @@ def apply_field_bg(sdout, dump, log=lambda *_: None, produced=()):
     wrote. The same refusal-to-clobber check is applied, for the same
     reason.
 
-    This pass needs no cave space. All six words are in-place immediates,
-    nowhere near the 60 FPS sites or the tail gap at 0x1152660.
+    This pass needs no cave space. Every word is replaced in place, nowhere
+    near the 60 FPS sites or the tail gap at 0x1152660.
     """
     if not ff7nx_fieldbg.enabled():
         return []
     px = ff7nx_fieldbg.page_px()
     if not ff7nx_fieldbg.patches_module(px, FIELD_BG_MAX_RAW):
-        # 256px on a build whose biggest field still fits the stock
-        # 2,000,000 byte buffer. Every word this pass would write already
-        # holds the value it wants, so there is nothing to do -- and, more
-        # usefully, nothing to REQUIRE: this is the one field-background
-        # setting that ships as a flevel.lgp alone, with no game dump.
+        # Reached only when the selected size, field buffer, depth-1 setting,
+        # and the optional FX truecolor path collectively need no word.
         log('')
         log(f'{px}x{px} field background pages need no module patch '
             f'(the stock words already say {px}); flevel.lgp carries this '

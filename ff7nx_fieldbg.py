@@ -357,6 +357,42 @@ SITE_FIELD_BUF  = 0x921A4C      # ldr w23, [x0]  <- [0xCFF598], the field
 # this to 0x2a only alongside a real blend-ladder trampoline.
 SITE_LOAD_SLOTS = 0x10DC4A4     # cmp x23, #0x1d   field_load_textures bound
 
+# ------------------------------------------------------------- FINDINGS-194
+# DEPTH-2 ADDITIVE PAGES IN THE ALREADY-LOADED 15..23 BAND.
+#
+# The port gives every depth-2 page blend 4 unconditionally.  Build 138's two
+# hardware-scoped Cosmos lighting atlases need their real 768px pixels, but
+# promoting a slot-15 effect without correcting this arm would turn the whole
+# page into an opaque rectangle.  There is no cave and none is needed: the
+# depth-1 average arm repeats the join setup in six words. Compressing it to
+# two words recovers four adjacent words for a depth-2 slot test.
+#
+# The resulting rule is intentionally narrow:
+#   depth 1: byte-for-byte identical at every slot, including +14/+18 aliases
+#   depth 2: slots 15..23 additive; every other slot remains opaque
+#
+# The target effects use blend_mode 1 exclusively. Depth-2 pages are still
+# refused for blend modes 2/3, whose +14/+18 alias registrations have separate
+# depth checks. See ff7nx_fxmargin._truecolor_effect.
+FX_BLEND_SITES = (
+    0x10DC3E8, 0x10DC3EC, 0x10DC3F0, 0x10DC3F4,
+    0x10DC3F8, 0x10DC3FC, 0x10DC410,
+)
+FX_BLEND_ORIG = (
+    0x2A1503E0, 0x2A1303E1, 0x2A1703E2, 0x2A1703E3,
+    0x2A1F03E4, 0x14000028, 0x321E03E4,
+)
+FX_BLEND_NEW = (
+    0x2A1F03E4,  # mov   w4, wzr             average depth-1 arm
+    0x1400000D,  # b     0x10dc420
+    0x51003EE8,  # sub   w8, w23, #15        depth-2 ladder
+    0x7100251F,  # cmp   w8, #9
+    0x1A9F2724,  # csinc w4, w25, wzr, hs    4 outside / 1 inside
+    0x14000009,  # b     0x10dc420
+    0x17FFFFF8,  # b     0x10dc3f0           depth 2 enters ladder
+)
+FX_TRUECOLOR_DISABLE_ENV = 'SEVENTH_NX_NO_FX_TRUECOLOR'
+
 # The slot the loop must reach to cover the whole depth-2 opaque band. The
 # loop is `cmp / b.ne`, i.e. exclusive, so this is one past slot 0x20.
 LOAD_SLOTS_FOR_D2_OPAQUE = 0x21
@@ -373,6 +409,19 @@ ORIG = {
     SITE_FIELD_BUF:  0xB9400017,
     SITE_LOAD_SLOTS: 0xF10076FF,                        # cmp x23, #0x1d
 }
+
+
+def _fx_blend_words():
+    """Seven verified in-place words, or {} for the explicit rollback."""
+    if os.environ.get(FX_TRUECOLOR_DISABLE_ENV, '').strip().lower() in (
+            '1', 'true', 'yes', 'on'):
+        return {}
+    why = ('field FX: depth-2 slots 15..23 use additive blend while every '
+           'depth-1 slot and every other depth-2 slot retain stock behavior '
+           '(FINDINGS-194)')
+    return {off: (old, new, why)
+            for off, old, new in zip(FX_BLEND_SITES, FX_BLEND_ORIG,
+                                     FX_BLEND_NEW)}
 
 # The one word we deliberately do NOT touch, checked so a future build that
 # moved it fails loudly instead of being patched half-way.
@@ -668,10 +717,10 @@ def patches_module(px=None, max_raw=None):
     True when the chosen size actually needs `exefs/main` written.
 
     256 writes none of the six SIZE words -- the module already says 256 --
-    so a 256px build usually needs no module at all, only the repacked
-    flevel, which makes it the one setting testable without a full game
-    dump. "Usually", because a big enough build still needs the field
-    decompression buffer widened; pass `max_raw` to find out.
+    but the complete Cosmos FX path still needs the seven-word additive
+    depth-2 ladder unless its explicit rollback is set. A big enough build
+    can additionally require the field decompression buffer to widen; pass
+    `max_raw` to include that decision.
     """
     px = page_px() if px is None else px
     return bool(words(px, None, max_raw))
@@ -712,7 +761,7 @@ def words(px=None, bleed=None, max_raw=None):
         raise ValueError('unsupported field background page size %r' % px)
     if px == VANILLA_PAGE_PX:
         # 256 needs none of the six SIZE words -- the module already holds
-        # 256 everywhere, so writing them would be a no-op.
+        # 256 everywhere. It can still need the FX blend ladder below.
         #
         # It still needs the FIELD BUFFER, though, and that is easy to miss:
         # promoting a page from paletted to truecolor doubles it (256*256*1
@@ -727,6 +776,7 @@ def words(px=None, bleed=None, max_raw=None):
         out = _field_buffer_word(max_raw)
         out.update(_load_slots_word())
         out.update(_d1_words())
+        out.update(_fx_blend_words())
         return out
 
     pixels = px * px                                  # 0x40000 at 512
@@ -789,6 +839,7 @@ def words(px=None, bleed=None, max_raw=None):
     out.update(_field_buffer_word(max_raw))
     out.update(_load_slots_word())
     out.update(_d1_words())
+    out.update(_fx_blend_words())
     if bleed if bleed is not None else halve_bleed():
         # -0.4375/256 -> -0.4375/px, so the tile-edge bleed guard stays the
         # same fraction of a TEXEL. Costs correctness on the depth-1 pages

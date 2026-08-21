@@ -2092,6 +2092,11 @@ class ArtProvider:
         self.by_page = {}                   # (field, page) -> {palette, ...}
         self.readers = {}
         self.ambiguous = 0
+        # Exact (field,page,palette) keys with more than one DDS state. Most
+        # callers intentionally choose the hashless/base state; an in-place
+        # FX conversion cannot, because embedding one page would collapse a
+        # runtime animation. Exposed so that pass can veto rather than guess.
+        self.ambiguous_slots = set()
         self.ambiguous_base = 0        # settled on the page's base dump
         self.ambiguous_arbitrary = 0   # no base dump; first by sorted name
         import iro
@@ -2103,6 +2108,8 @@ class ArtProvider:
                 continue
             idx = index_field_dds(entries, allowed)
             self.ambiguous += sum(1 for v in idx.values() if len(v) > 1)
+            self.ambiguous_slots.update(k for k, v in idx.items()
+                                        if len(v) > 1)
             st = {}
             for key, entry in resolve(
                     idx, not strict(), st).items():

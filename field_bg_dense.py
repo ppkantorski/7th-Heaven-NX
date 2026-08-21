@@ -787,7 +787,8 @@ class Stats:
                  'subunit_cells', 'subunit_units', 'subunit_texels',
                  'modclear_cells', 'modclear_texels', 'modclear_whole',
                  'blend_cells', 'blend_texels', 'backdrop_cells',
-                 'wire_texels', 'l1key_cells', 'l1key_texels')
+                 'wire_texels', 'l1key_cells', 'l1key_texels',
+                 'crosslayer_exact')
 
     def __init__(self):
         self.cells = self.pages = self.tiles = 0
@@ -814,6 +815,7 @@ class Stats:
         self.wire_texels = 0      # thin-structure texels the box filter lost
         self.l1key_cells = 0      # layer-1 cells whose entry-0 bake was keyed
         self.l1key_texels = 0     # ...texels both vanilla and the mod call empty
+        self.crosslayer_exact = 0 # exact L1 variants split from upper palettes
 
 
 def _pal_rgb(sec3):
@@ -2867,6 +2869,23 @@ KEEP_ART_ON_BORROW = True
 # shares it to one colour. Only safe when the mod ships exact art per palette.
 MULTI_PALETTE_VETO = True
 
+# A multi-palette coordinate is not necessarily one surface.  Permit an
+# exact-art layer-1 key when every conflicting palette key is used only on
+# upper layers; the borrowed upper-layer keys remain paletted.  This is a
+# per-reference split, not PROMOTE_FX_BASE, and it changes neither side of an
+# animated pair.  Set the env var to restore the pre-FINDINGS-275 veto.
+CROSSLAYER_EXACT_ENV = 'SEVENTH_NX_NO_CROSSLAYER_EXACT'
+# The structural predicate is general, but admitting it archive-wide changed
+# the result of mds7plr1's complete-FX A/B even after the upper-record guard.
+# Keep the hardware-requested proof field scoped until another field has its
+# own final-chain proof. This is admission scope, not pixel special-casing.
+CROSSLAYER_EXACT_FIELDS = frozenset(('mds5_2',))
+
+
+def crosslayer_exact_enabled():
+    return os.environ.get(CROSSLAYER_EXACT_ENV, '').strip().lower() not in (
+        '1', 'true', 'yes', 'on')
+
 # THE VETO'S ONE EXCEPTION, MEASURED. FINDINGS-228, HANDOFF-227 s5.6.
 #
 # The veto refuses a multi-palette cell on this stated ground:
@@ -3508,6 +3527,11 @@ def dense_repack(sec3, sec9, field='', art_for=None, pals_for=None, px=256,
     except Exception:                                          # noqa: BLE001
         _org = None
     _mp_force = set()
+    # Candidates admitted only by the cross-layer exception are a monotonic
+    # bonus population: they must never displace or reorder an established
+    # candidate.  Folded into `_newly` below, beside the same safeguard for
+    # newly eligible keyed layer-1 cells.
+    _crosslayer_exact = set()
     if MULTI_PALETTE_VETO:
         _kept = []
         _mp_seen = {}
@@ -3545,6 +3569,39 @@ def dense_repack(sec3, sec9, field='', art_for=None, pals_for=None, px=256,
                 have = set((pals_for(k[0]) if pals_for is not None else None)
                            or ())
                 if not set(pals) <= have:
+                    # ONE SOURCE CELL CAN SERVE TWO DIFFERENT SEMANTIC
+                    # SURFACES. FINDINGS-275.
+                    #
+                    # mds5_2 page 0 cell (0,0) is the upper-left layer-1
+                    # backdrop through palette 0, and is independently reused
+                    # by animated layer-2 tiles through palettes 8 and 9.
+                    # Cosmos ships exact palette-0 art only.  The broad
+                    # multi-palette veto therefore held the backdrop at 256px
+                    # merely because unrelated upper-layer draws borrow the
+                    # same atlas coordinate.  Their pixels and tile records
+                    # never share a draw: `chosen` rewrites only this key's
+                    # own `tiles`, so promoting palette 0 cannot collapse or
+                    # recolour palettes 8/9.
+                    #
+                    # Admit the exact layer-1 variant only when EVERY other
+                    # palette using this coordinate belongs exclusively to an
+                    # upper layer.  Same-layer variants still take the old
+                    # all-or-nothing path below, borrowed variants are still
+                    # refused, and an overlapping layer-1 key has already
+                    # been removed by the colour-key candidate gate.  This is
+                    # the narrow structural distinction the old "one cell,
+                    # many palettes" rule was missing.
+                    _siblings = [keys.get((k[0], k[1], k[2], _p))
+                                 for _p in pals if _p != k[3]]
+                    if ((field or '').lower() in CROSSLAYER_EXACT_FIELDS
+                            and crosslayer_exact_enabled()
+                            and not keys[k]['l2'] and k[3] in have
+                            and _siblings
+                            and all(_r is not None and _r.get('l2')
+                                    for _r in _siblings)):
+                        _kept.append(k)
+                        _crosslayer_exact.add(k)
+                        continue
                     # THE ONE EXCEPTION, AND IT RUNS ITS OWN FALSIFIER.
                     # See MULTIPAL_RECOLOUR. Decided once per CELL and cached,
                     # because the test costs one `source_cell` per palette and
@@ -3651,7 +3708,7 @@ def dense_repack(sec3, sec9, field='', art_for=None, pals_for=None, px=256,
     # item 2, "no field's truecolor tile count goes DOWN".
     _newly = ({k for k in cand
                if keys[k]['key'] and not keys[k]['l2']} if PROMOTE_LAYER1_KEY
-              else set())
+              else set()) | _crosslayer_exact
 
     def _rank(k):
         return (1 if k in _newly else 0,
@@ -4223,6 +4280,7 @@ def dense_repack(sec3, sec9, field='', art_for=None, pals_for=None, px=256,
         dense_repack.big_fields = getattr(dense_repack, 'big_fields', 0) + 1
 
     chosen = []
+    _cross_written = []
     occupancy = {}
     fx_slot_of = {}
     _placed_at = {}
@@ -4331,6 +4389,17 @@ def dense_repack(sec3, sec9, field='', art_for=None, pals_for=None, px=256,
             if done and _placed_at[done[0]] != (cx, cy):
                 continue
             avoid = {fx_slot_of[fk] for fk in done}
+            if k in _crosslayer_exact:
+                # Keep this bonus on a destination page used only by layer 1.
+                # `field_bg_compact` may reseat every record on a mixed page;
+                # letting one backdrop improvement churn upper-layer/FX tile
+                # records would defeat the structural isolation this exception
+                # is based on. Established candidates have all been processed
+                # first, so this set is complete and no later upper-layer key
+                # can enter the selected page. If no layer-1-only seat exists,
+                # refuse the bonus and retain the old bytes.
+                avoid |= {sl2 for k2, sl2, _cx2, _cy2 in chosen
+                          if keys[k2].get('l2')}
             got = _col_free(cx, cy, 1 + len(todo), avoid, _edge)
             if got is None:
                 continue
@@ -4425,6 +4494,9 @@ def dense_repack(sec3, sec9, field='', art_for=None, pals_for=None, px=256,
                         out[off + T_FX_PAGE] = ns
             st.tiles += 1
         st.cells += 1
+        if k in _crosslayer_exact:
+            st.crosslayer_exact += 1
+            _cross_written.append(k)
 
     # Original pages nothing points at any more cost a texture for nothing.
     live = set()
@@ -4452,9 +4524,82 @@ def dense_repack(sec3, sec9, field='', art_for=None, pals_for=None, px=256,
     # loop -- a `source_cell` exception `continue`s above without writing the
     # cell, and an entry for a cell that was never promoted would point a
     # consumer at art for a page the tile no longer names.
+    result = FN.replace_texture_block(bytes(out), plist, tex_start, tex_end)
+
+    # THE EXCEPTION MAY NOT CHURN AN UPPER-LAYER RECORD DOWNSTREAM.
+    # FINDINGS-275's rule is safe because it moves only exact layer-1 tile
+    # references. `field_bg_compact`, however, repacks whole page groups: one
+    # new layer-1 reference can perturb its packing order and thereby rewrite
+    # unrelated layer-2/FX records even though their rendered pixels happen to
+    # remain equal offline. That is a wider runtime claim than this fix earns.
+    #
+    # Falsify it before returning. Build the exact flag-off dense result by
+    # restoring only the bonus records from the input section (the bonus is
+    # ranked last and uses free seats, so every established placement is
+    # byte-identical), compact both throwaway sections, and compare EVERY
+    # upper-layer tile record. If one byte would move, withdraw the bonuses.
+    # Their now-unreferenced pixels are harmless and the caller's compaction
+    # drops them; pages and established tile references stay unchanged.
+    if _cross_written:
+        try:
+            import field_bg_compact as _FC
+            if _FC.enabled():
+                baseline = bytearray(result)
+                _bonus_offs = set()
+                for _k in _cross_written:
+                    for _off in keys[_k]['tiles']:
+                        baseline[_off:_off + 52] = sec9[_off:_off + 52]
+                        _bonus_offs.add(_off)
+                on_cmp, _ = _FC.compact_section9(result, src_px=px)
+                off_cmp, _ = _FC.compact_section9(bytes(baseline), src_px=px)
+
+                def _upper_records(_s9):
+                    _sv = DC.survey(_s9)
+                    _pm = {p.slot: p for p in _sv['pages']}
+                    return [(t.off, _s9[t.off:t.off + 52])
+                            for t in MB.read_tiles(_s9, _sv, _pm)
+                            if t.layer >= 2]
+
+                if _upper_records(on_cmp) != _upper_records(off_cmp):
+                    result = bytes(baseline)
+                    for _off in _bonus_offs:
+                        st.origin.pop(_off, None)
+                    st.cells -= len(_cross_written)
+                    st.tiles -= len(_bonus_offs)
+                    # Every admitted key is exact at its own palette; that is
+                    # the gate above, so source_cell counted it in from_art.
+                    st.from_art -= len(_cross_written)
+                    st.crosslayer_exact = 0
+                    dense_repack.crosslayer_guard_refused = (
+                        getattr(dense_repack,
+                                'crosslayer_guard_refused', 0)
+                        + len(_cross_written))
+        except Exception:                                      # noqa: BLE001
+            # A guard that cannot decide must withdraw, never widen.
+            baseline = bytearray(result)
+            _bonus_offs = set()
+            for _k in _cross_written:
+                for _off in keys[_k]['tiles']:
+                    baseline[_off:_off + 52] = sec9[_off:_off + 52]
+                    _bonus_offs.add(_off)
+            result = bytes(baseline)
+            for _off in _bonus_offs:
+                st.origin.pop(_off, None)
+            st.cells -= len(_cross_written)
+            st.tiles -= len(_bonus_offs)
+            st.from_art -= len(_cross_written)
+            st.crosslayer_exact = 0
+            dense_repack.crosslayer_guard_refused = (
+                getattr(dense_repack, 'crosslayer_guard_refused', 0)
+                + len(_cross_written))
+
+    if st.crosslayer_exact:
+        dense_repack.crosslayer_exact = (
+            getattr(dense_repack, 'crosslayer_exact', 0)
+            + st.crosslayer_exact)
     if field and st.origin:
         ORIGIN[field] = dict(st.origin)
-    return FN.replace_texture_block(bytes(out), plist, tex_start, tex_end), st
+    return result, st
 
 
 def summarise(t):
