@@ -66,15 +66,18 @@ def test_encoding():
         },
     }
     for px, expect in want.items():
-        got = FB.words(px)
+        got = {k: v for k, v in FB.words(px).items()
+               if k not in FB.FX_BLEND_SITES}
         check('%dpx: site count' % px, len(got) == len(expect),
               '%d vs %d' % (len(got), len(expect)))
         for off, text in expect.items():
             check('%dpx: +0x%X disassembles as %r' % (px, off, text),
                   off in got and dis(got[off][1]) == text,
                   dis(got[off][1]) if off in got else 'missing')
-    # 256 is a no-op, not an error
-    check('256px produces no patches', FB.words(256) == {})
+    # 256 needs no SIZE words, but the scoped truecolor FX pages still need
+    # the additive depth-2 ladder.
+    check('256px produces only the FX blend ladder',
+          set(FB.words(256)) == set(FB.FX_BLEND_SITES))
     # the bleed word only appears when asked for
     check('bleed off by default', FB.SITE_BLEED not in FB.words(512, False))
     check('bleed on when asked', FB.SITE_BLEED in FB.words(512, True))
@@ -626,6 +629,60 @@ def test_art_opacity():
         os.environ[RP.TRUE_BLACK_ENV] = _sv
 
 
+def test_unkeyed_overlay_alpha():
+    """Cosmos alpha survives when margin art consumed the old index-0 key."""
+    print('unkeyed overlay alpha')
+    import numpy as np
+    import field_bg_dense as FD
+    import field_bg_repack as RP
+
+    class Page:
+        depth = 1
+
+    px = 512
+    src = np.ones((256, 256), np.uint8)  # no index 0: rec['key'] is false
+    src[0, 1] = 2
+    pal = np.zeros((1, 256), np.uint16)
+    pal[0, 1] = FN.NEAR_BLACK
+    pal[0, 2] = np.uint16(0x7BEF)        # real colour must not become a hole
+
+    art = RP.PageArt.__new__(RP.PageArt)
+    buf = np.full((px, px), np.uint16(0x1234), np.uint16)
+    tm = np.zeros((px, px), bool)
+    # Two texels Cosmos leaves completely clear. The first falls back to an
+    # already-black palette colour; the second falls back to real colour.
+    buf[0, (0, 2)] = FN.EMPTY
+    tm[0, (0, 2)] = True
+    art.px, art.buf = px, buf.tobytes()
+    art.tmask = tm
+    art.bmask = np.zeros_like(tm)
+    art.hmask = ~tm
+    art.alpha = None
+    art.amax = art.cmax = None
+    art._op = {}
+
+    rec = {'pal': 0, 'l2': True, 'key': False}
+    st = FD.Stats()
+    out = FD.source_cell((1, 0, 0, 0), rec, {1: Page()}, {1: src},
+                         pal, lambda _page, _pal: art, None, st, scale=2)
+    check('unkeyed layer-2 clear black texel regains the key',
+          int(out[0, 0]) == FN.EMPTY, hex(int(out[0, 0])))
+    check('unkeyed alpha cannot turn real colour into a hole without cover',
+          int(out[0, 2]) != FN.EMPTY, hex(int(out[0, 2])))
+    check('unkeyed alpha leaves opaque Cosmos art untouched',
+          int(out[1, 1]) != FN.EMPTY, hex(int(out[1, 1])))
+    cover = np.zeros((32, 32), bool)
+    cover[0, 2] = True
+    rec2 = dict(rec, cover=cover)
+    out2 = FD.source_cell((1, 0, 0, 0), rec2, {1: Page()}, {1: src},
+                          pal, lambda _page, _pal: art, None, FD.Stats(),
+                          scale=2)
+    check('per-texel cover licenses a clear non-black overlay texel',
+          int(out2[0, 2]) == FN.EMPTY, hex(int(out2[0, 2])))
+    check('unkeyed alpha is counted separately for the build log',
+          getattr(FD.dense_repack, 'modclear_unkeyed_texels', 0) >= 1)
+
+
 def test_compact(flevel):
     """
     Compaction must free textures and change NOTHING a tile can see.
@@ -773,6 +830,7 @@ def main():
     test_pixels()
     test_quantiser()
     test_art_opacity()
+    test_unkeyed_overlay_alpha()
     test_remap()
     test_growth_mode()
     test_resolve_base_dump()

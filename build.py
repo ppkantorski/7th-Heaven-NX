@@ -3628,6 +3628,25 @@ def _convert_field_backgrounds(archive, payloads, log, dds_sources=(),
                 % (f"{_mcc:,}",
                    f"{getattr(field_bg_dense.dense_repack, 'modclear_texels', 0):,}",
                    f"{getattr(field_bg_dense.dense_repack, 'modclear_whole', 0):,}"))
+        # FINDINGS-280: the mod can still carry alpha after margin art has
+        # consumed every old index-0 unit. Count this subset separately so a
+        # build log proves that the church fix actually ran.
+        _mcu = getattr(field_bg_dense.dense_repack,
+                       'modclear_unkeyed_cells', 0)
+        if _mcu:
+            _dense_line += (
+                ' -- UNKEYED DDS ALPHA: %s promoted layer-2 cell(s) regained '
+                'the colour key on %s texel(s) where Cosmos alpha is fully '
+                'clear even though the rewritten paletted cell no longer '
+                'contains index 0. This is church\'s two left-margin black '
+                'triangles: transparent DDS cuts were lifted from 0x0000 to '
+                'opaque NEAR_BLACK before the old MOD-CLEAR block could see '
+                'them. Scoped to texels already below the same dark threshold '
+                'or carrying the same per-texel cover proof, so black can '
+                'reveal art but opaque art cannot become a hole. Set '
+                'SEVENTH_NX_NO_MODCLEAR_UNKEYED=1 to disable this addition.'
+                % (f"{_mcu:,}",
+                   f"{getattr(field_bg_dense.dense_repack, 'modclear_unkeyed_texels', 0):,}"))
         # INDEX 0 IS THE COLOUR KEY ON LAYER 1 TOO. FINDINGS-265.
         _l1k = getattr(field_bg_dense.dense_repack, 'l1key_cells', 0)
         if _l1k:

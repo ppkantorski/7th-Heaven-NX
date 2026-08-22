@@ -378,6 +378,40 @@ SUBUNIT_KEY = os.environ.get('SEVENTH_NX_NO_SUBUNIT_KEY') != '1'
 MODCLEAR_KEY = os.environ.get('SEVENTH_NX_NO_MODCLEAR_KEY') != '1'
 MODCLEAR_WHOLE = os.environ.get('SEVENTH_NX_MODCLEAR_WHOLE') == '1'
 
+# A PROMOTED OVERLAY CAN NEED THE MOD'S KEY EVEN WHEN ITS PALETTED CELL NO
+# LONGER CONTAINS INDEX 0. FINDINGS-280.
+#
+# `ff7nx_marginart` runs before this pass.  On a widescreen placeholder it can
+# replace every index-0 unit with Cosmos art, so `collect()` quite correctly
+# reports `rec['key'] == False` by the time the dense pass sees the cell.  The
+# DDS can nevertheless contain sub-cell transparent cuts.  PageArt packs
+# those as 0x0000, the line in `source_cell` which protects opaque black then
+# lifts them to NEAR_BLACK, and the MOD-CLEAR block used to be unreachable
+# because it lived wholly inside `if rec['key']`.  `church` made that blind
+# spot visible as two near-black triangles in the left 16:9 extension:
+# In the user's Build 145 archive at the real 768px setting, 333 transparent
+# DDS texels survived as NEAR_BLACK across four promoted layer-2 records; 303
+# of them are the two photographed triangles.
+#
+# This is deliberately the darkest, monotone subset of MODCLEAR_KEY, not a
+# general request to trust alpha on every unkeyed cell:
+#
+#   * layer 2+ only -- alpha is a cut-out there;
+#   * Cosmos alpha below 8 only -- the mod paints nothing;
+#   * a partial cell only -- no whole-cell hole can be opened;
+#   * only a texel already below MODCLEAR_DARK, unless the existing per-texel
+#     cover proof says something draws behind it;
+#   * `tpaint`, not raw tmask -- the native max-pool wire rescue still wins.
+#
+# Consequently this can only replace an already-black pixel with what is
+# behind it.  With no backdrop the framebuffer is black and the picture is
+# unchanged; with a backdrop it removes black.  It cannot hide opaque Cosmos
+# art, change page placement, or alter any established keyed-cell path.
+#
+# `SEVENTH_NX_NO_MODCLEAR_UNKEYED=1` is the exact A/B for this addition.
+MODCLEAR_UNKEYED = (MODCLEAR_KEY and
+                    os.environ.get('SEVENTH_NX_NO_MODCLEAR_UNKEYED') != '1')
+
 # ...AND ONLY WHERE THE TEXEL WE WOULD OTHERWISE PAINT IS BLACK.
 # THIS TERM IS THE ENTIRE SAFETY ARGUMENT OF BUILD 121. DO NOT REMOVE IT
 # WITHOUT A PER-TEXEL COVER MASK IN `dense_repack`.
@@ -2424,6 +2458,37 @@ def source_cell(k, rec, pages, arrays, pal565, art_for, pals_for, st,
                             getattr(dense_repack, 'modclear_whole', 0) + 1)
                 keep = _final
             out[keep] = FN.EMPTY
+
+    # THE DDS CAN STILL HAVE A KEY WHEN THE REWRITTEN PALETTED CELL DOES NOT.
+    # FINDINGS-280. Keep this separate from the established `rec['key']`
+    # block above: `not rec['key']` makes every old keyed-cell result
+    # byte-identical and exposes exactly the blind population documented at
+    # MODCLEAR_UNKEYED.
+    if (MODCLEAR_UNKEYED and art is not None and bool(rec.get('l2'))
+            and not rec['key'] and tpaint.shape == out.shape
+            and tpaint.any() and (MODCLEAR_WHOLE or not tpaint.all())):
+        _mcu = tpaint
+        _cvr = rec.get('cover') if MODCLEAR_COVER else None
+        if _cvr is not None and _cvr.shape != out.shape:
+            _cvr = None
+        if MODCLEAR_DARK_ONLY and _cvr is not None:
+            _mcu = _mcu & ((_maxchan565(out) < MODCLEAR_DARK) | _cvr)
+        elif MODCLEAR_DARK_ONLY:
+            _mcu = _mcu & (_maxchan565(out) < MODCLEAR_DARK)
+        if _mcu.any():
+            out[_mcu] = FN.EMPTY
+            _nu = int(_mcu.sum())
+            st.modclear_cells += 1
+            st.modclear_texels += _nu
+            dense_repack.modclear_cells = (
+                getattr(dense_repack, 'modclear_cells', 0) + 1)
+            dense_repack.modclear_texels = (
+                getattr(dense_repack, 'modclear_texels', 0) + _nu)
+            dense_repack.modclear_unkeyed_cells = (
+                getattr(dense_repack, 'modclear_unkeyed_cells', 0) + 1)
+            dense_repack.modclear_unkeyed_texels = (
+                getattr(dense_repack, 'modclear_unkeyed_texels', 0) + _nu)
+
     # On layer 1 index 0 is NOT a cut-out -- it is drawn, and its colour
     # matters. Proved on hardware: setting entry 0 to black removed the
     # Sector 6 yellow and put black speckles across Wall Market, which cannot
