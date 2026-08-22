@@ -2897,6 +2897,8 @@ def _convert_field_backgrounds(archive, payloads, log, dds_sources=(),
                  'deferred': 0, 'names': [], 'page_names': []}
     # THE PAGES THAT WERE ALREADY TRUECOLOR IN 1997. FINDINGS-282.
     vtc_stats = ff7nx_vanillatc.Stats()
+    # (field, pages_with_filler_arm, pages_without) -- see FINDINGS-288.
+    filler_pageback = []
     for name in sorted(archive.index):
         entry = archive.index[name]
         if not archive.is_field(entry):
@@ -3233,6 +3235,52 @@ def _convert_field_backgrounds(archive, payloads, log, dds_sources=(),
                     break
                 if _live <= before:
                     break
+                # ---- GIVE BACK THE FILLER CELL BEFORE GIVING UP A CEILING.
+                # FINDINGS-288.
+                #
+                # `FILLER_EXACT` admits the shared-cell layer-1 key that the
+                # multi-palette rule refuses, and it is monotonic in CELLS by
+                # construction -- those keys sort to the back of the queue.
+                # It is not monotonic in PAGES: measured over 118 fields it
+                # grows exactly one, `bugin1a` 4 -> 5, because its key is the
+                # first cell of a page nothing else needed.
+                #
+                # Dropping the truecolor ceiling to pay for that is the wrong
+                # trade by an order of magnitude -- one square against a whole
+                # page of cells -- so try the cheap thing first: re-run this
+                # one field with the arm off, at the SAME ceiling. It costs a
+                # second repack on ~1% of fields and nothing anywhere else.
+                if (getattr(dst, 'filler_exact', 0)
+                        and field_bg_dense.FILLER_EXACT):
+                    field_bg_dense.FILLER_EXACT = False
+                    try:
+                        _r9, _rdst = field_bg_dense.dense_repack(
+                            parts[3], _pre9, name, _af, _pf, px,
+                            max_tc=_tc + _fx_tc)
+                    except Exception:                          # noqa: BLE001
+                        _r9, _rdst = None, None
+                    finally:
+                        field_bg_dense.FILLER_EXACT = True
+                    if _rdst is not None and not _rdst.refused:
+                        _rc = None
+                        if field_bg_compact.enabled():
+                            try:
+                                _r9, _rc = field_bg_compact.compact_section9(
+                                    _r9, src_px=px)
+                            except Exception:                  # noqa: BLE001
+                                _rc = None
+                        try:
+                            _rp, _rx, _ry = (
+                                field_bg_native.parse_texture_block(_r9, px))
+                            _rlive = sum(1 for p in _rp if p is not None)
+                        except Exception:                      # noqa: BLE001
+                            _rlive = _live + 1
+                        if _rlive < _live:
+                            filler_pageback.append((name, _live, _rlive))
+                            _try9, dst, cst = _r9, _rdst, _rc
+                            _live = _rlive
+                            if _live <= before:
+                                break
                 # DO NOT PAY FOR THE FRAME GUARD IN TRUECOLOR.
                 #
                 # This loop drops the truecolor ceiling until the field stops
@@ -3781,6 +3829,54 @@ def _convert_field_backgrounds(archive, payloads, log, dds_sources=(),
                    f"{getattr(field_bg_dense.dense_repack, 'blend_texels', 0):,}",
                    f"{getattr(field_bg_dense.dense_repack, 'backdrop_cells', 0):,}",
                    field_bg_dense.BLEND_DARK))
+        # THE EDGE COLUMNS CONVERT FIRST. FINDINGS-289.
+        if getattr(field_bg_dense, 'INPLACE_EDGE_FIRST', False):
+            _dense_line += (
+                ' -- IN-PLACE ORDER: the 32-unit pages the in-place parallax '
+                'arm may convert are now offered OUTERMOST-COLUMN FIRST, then '
+                'by tile count as before. The cap stops that loop part way -- '
+                'fship_2 affords 4 of its 11 at 3.06 MB each against '
+                'FIELD_MB_CAP -- and which pages won was decided by tile count '
+                'alone, which says nothing about whether the page is on '
+                'screen. MEASURED on fship_2, whose parallax is SIX animation '
+                'frames: the outermost right column is split across two pages, '
+                'masks 0x02..0x10 on a converted one (67%% art) and masks 0x20 '
+                'and 0x40 on an unconverted one (0%%), so four frames of six '
+                'drew the right edge and two drew nothing -- black that BLINKS '
+                'with the cloud cycle, which is why every composited '
+                'measurement missed it. An outermost page is what the 16:9 '
+                'margin depends on; an interior one has neighbours that cover '
+                'for it. PAGE-NEUTRAL and HEAP-NEUTRAL: the same loop admits '
+                'the same NUMBER of pages under the same cap, only the choice '
+                'changes. GATED over 45 parallax fields: 32 columns gained '
+                'art, ZERO lost any, net -1 page. Set '
+                'SEVENTH_NX_NO_INPLACE_EDGE=1 to restore build 152.')
+
+        # THE FILLER CELL, SHARED WITH FX. FINDINGS-288.
+        _fe = getattr(field_bg_dense.dense_repack, 'filler_exact', 0)
+        if _fe:
+            _dense_line += (
+                ' -- SHARED-CELL LAYER-1 KEY: %s cell(s) were admitted whose '
+                'atlas coordinate is ALSO used, at other palettes, by layer-2 '
+                'FX or oversized tiles. The "one cell, many palettes" rule is '
+                'all-or-nothing and those siblings can never be candidates, so '
+                'the whole cell was refused -- including the ONE layer-1 '
+                'palette Cosmos actually ships art for. MEASURED: source cell '
+                '(0,0), the atlas FILLER, is stranded on 144 of 254 fields, '
+                'and it is the black square on mds6_22 (rendered through its '
+                'palette at luminance 13.4 beside neighbours at 30) and the '
+                'square at the top-left corner of a great many others. This '
+                'is CROSSLAYER_EXACT_FIELDS\' own structural test -- layer-1 '
+                'key, every sibling layer-2, exact art shipped -- applied '
+                'wherever it holds instead of on two named fields. It cannot '
+                'split a colour: a sibling that is not a candidate does not '
+                'render beside it at a second resolution. MONOTONIC IN CELLS '
+                'by construction (these sort to the BACK of the queue and can '
+                'evict nothing); where it would cost a PAGE the field is '
+                're-run once with the arm off rather than paying a truecolor '
+                'ceiling for it. Set SEVENTH_NX_NO_FILLER_EXACT=1 to restore '
+                'build 151.' % f"{_fe:,}")
+
         # THE BACKDROP'S OWN MARGIN. FINDINGS-284.
         _pl3 = getattr(field_bg_dense.dense_repack, 'parallax_l3_filled', 0)
         if _pl3:
@@ -4147,6 +4243,11 @@ def _convert_field_backgrounds(archive, payloads, log, dds_sources=(),
     _fxp_line = ff7nx_fxpages.summarise(fxp_stats)
     if _fxp_line:
         log('  ' + _fxp_line)
+    if filler_pageback:
+        log('  shared-cell layer-1 key: %d field(s) gave the cell back rather '
+            'than gain a page (%s)'
+            % (len(filler_pageback),
+               ', '.join('%s %d->%d' % r for r in filler_pageback[:4])))
     _vtc_line = ff7nx_vanillatc.summarise(vtc_stats)
     if _vtc_line:
         log(_vtc_line)

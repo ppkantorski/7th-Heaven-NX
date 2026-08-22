@@ -249,6 +249,15 @@ MARGIN_OVERLAY_ALPHA = os.environ.get('SEVENTH_NX_NO_MARGIN_L2_ALPHA') != '1'
 # build 148 withdrew: the scope was right, the `hmask.all()` opacity quota was
 # what made it inert. See `parallax_backdrop_keys` and the `_par` arm.
 PARALLAX_ATLAS = os.environ.get('SEVENTH_NX_NO_BACKDROP_ATLAS') != '1'
+# THE FILLER CELL. FINDINGS-288. `CROSSLAYER_EXACT_FIELDS`' structural test,
+# applied wherever it holds instead of only on two named fields. Monotonic:
+# the keys it admits sort to the back of the queue and can evict nothing.
+FILLER_EXACT = os.environ.get('SEVENTH_NX_NO_FILLER_EXACT') != '1'
+# The IN-PLACE parallax conversion order: pages carrying an OUTERMOST column
+# first, because those are the ones the 16:9 margin depends on. Page-neutral
+# and heap-neutral -- same count under the same cap, different choice.
+# FINDINGS-289.
+INPLACE_EDGE_FIRST = os.environ.get('SEVENTH_NX_NO_INPLACE_EDGE') != '1'
 
 # THE OVERLAY EDGE IS ERODED BACK TO THE UNIT GRID. FINDINGS-247.
 #
@@ -822,7 +831,7 @@ class Stats:
                  'pages_before',
                  'borrow_refused', 'origin', 'atlas_gap', 'bare',
                  'margin_l2', 'margin_l2_filled',
-                 'parallax_l3', 'parallax_l3_filled',
+                 'parallax_l3', 'parallax_l3_filled', 'filler_exact',
                  'subunit_cells', 'subunit_units', 'subunit_texels',
                  'modclear_cells', 'modclear_texels', 'modclear_whole',
                  'blend_cells', 'blend_texels', 'backdrop_cells',
@@ -844,6 +853,7 @@ class Stats:
         self.margin_l2_filled = 0     # ...of those, served the mod's alpha
         self.parallax_l3 = 0          # layer-3-only 32-unit atlas cells
         self.parallax_l3_filled = 0   # ...of those, took Cosmos's art
+        self.filler_exact = 0         # shared-cell layer-1 keys admitted
         self.subunit_cells = 0    # layer-2 cut-outs refined below unit size
         self.subunit_units = 0    # ...units in them the mod cuts partially
         self.subunit_texels = 0   # ...texels that stopped being keyed
@@ -3746,14 +3756,57 @@ def dense_repack(sec3, sec9, field='', art_for=None, pals_for=None, px=256,
                     # many palettes" rule was missing.
                     _siblings = [keys.get((k[0], k[1], k[2], _p))
                                  for _p in pals if _p != k[3]]
+                    _xlayer = (not keys[k]['l2'] and k[3] in have
+                               and _siblings
+                               and all(_r is not None and _r.get('l2')
+                                       for _r in _siblings))
                     if ((field or '').lower() in CROSSLAYER_EXACT_FIELDS
-                            and crosslayer_exact_enabled()
-                            and not keys[k]['l2'] and k[3] in have
-                            and _siblings
-                            and all(_r is not None and _r.get('l2')
-                                    for _r in _siblings)):
+                            and crosslayer_exact_enabled() and _xlayer):
                         _kept.append(k)
                         _crosslayer_exact.add(k)
+                        continue
+                    # ---- THE SAME SHAPE, EVERYWHERE. FINDINGS-288.
+                    #
+                    # The arm above is this exact structural test, scoped to
+                    # two hardware-proven fields. The FILLER CELL is the same
+                    # situation on 144 of 254 fields, and it is the black
+                    # square on `mds6_22` and the teal square on `woa_3`:
+                    #
+                    #   woa_3, source cell (0,0) of page 0
+                    #     (0,0,0,0)  l2=False  in_fx=False   <- the ONE layer-1
+                    #                                           tile, and the
+                    #                                           only palette
+                    #                                           Cosmos ships
+                    #     (0,0,0,2..7) l2=True  in_fx=True   <- FX partners,
+                    #                                           three of them
+                    #                                           big/nogrid
+                    #
+                    # Every layer-2 sibling is an FX or oversized use of the
+                    # same atlas COORDINATE -- not a second palette of the same
+                    # SURFACE, which is the only thing the all-or-nothing rule
+                    # was written to protect. Because the siblings cannot be
+                    # candidates, the whole cell is refused, and the single
+                    # layer-1 tile is left rendering 1997 filler: black at
+                    # luminance 13.4 on `mds6_22`, palette ENTRY 0 on `woa_3`.
+                    # Nearly all the layer-2 references are keyed and draw
+                    # nothing, which is why the damage is exactly one opaque
+                    # square per field.
+                    #
+                    # There is no colour-split risk: `k[3] in have` means the
+                    # mod ships art for THIS palette, and a sibling that is not
+                    # a candidate is not going to render at a second
+                    # resolution beside it.
+                    #
+                    # MONOTONIC BY CONSTRUCTION: `_crosslayer_exact` feeds
+                    # `_newly`, which sorts to the BACK of the queue, so an
+                    # exempted key can only ever take capacity nothing else
+                    # wanted. No field can lose a truecolor cell to this.
+                    if FILLER_EXACT and _xlayer:
+                        _kept.append(k)
+                        _crosslayer_exact.add(k)
+                        st.filler_exact += 1
+                        dense_repack.filler_exact = (
+                            getattr(dense_repack, 'filler_exact', 0) + 1)
                         continue
                     # THE ONE EXCEPTION, AND IT RUNS ITS OWN FALSIFIER.
                     # See MULTIPAL_RECOLOUR. Decided once per CELL and cached,
@@ -4175,10 +4228,44 @@ def dense_repack(sec3, sec9, field='', art_for=None, pals_for=None, px=256,
     _groups = {}
     for k in _big_cand:
         _groups.setdefault(k[0], []).append(k)
+    # ---- THE EDGE COLUMNS GO FIRST. FINDINGS-289.
+    #
+    # `_whole` is the list of 32-unit pages the IN-PLACE arm may convert, and
+    # the loop below admits them in this order until `FIELD_MB_CAP` stops it.
+    # The order was tile COUNT alone, which is a reasonable proxy for value and
+    # says nothing about whether the page is on screen.
+    #
+    # MEASURED on `fship_2`, which can afford 4 of its 11 (32.2 MB used against
+    # a 35.0 MB cap, 3.06 MB per conversion) -- the parallax is SIX animation
+    # frames, and the outermost right column is split across two pages:
+    #
+    #     column 192, masks 0x02..0x10   slot 13   converted   art  67%
+    #     column 192, masks 0x20, 0x40   slot 14   NOT         art   0%
+    #
+    # Four frames of six draw the right edge and two draw nothing, so the black
+    # blinks with the cloud cycle instead of sitting still -- which is why it
+    # survived every composite measurement I made.
+    #
+    # A page carrying an OUTERMOST column is the one the 16:9 margin depends
+    # on; an interior page has neighbours that cover for it. So those sort
+    # first, tile count still deciding inside each group. PAGE-NEUTRAL and
+    # HEAP-NEUTRAL by construction: the same loop admits the same NUMBER of
+    # pages under the same cap, only the choice changes.
+    _edge_slots = set()
+    try:
+        _l3x = sorted({t.dx for t in tiles if t.layer in (3, 4)})
+        if len(_l3x) > 2:
+            _edge_x = {_l3x[0], _l3x[1], _l3x[-1], _l3x[-2]}
+            _edge_slots = {t.slot for t in tiles
+                           if t.layer in (3, 4) and t.dx in _edge_x}
+    except Exception:                                          # noqa: BLE001
+        _edge_slots = set()
     _whole = sorted((sl for sl, ks in _groups.items()
                      if sl in pages and _keys_on.get(sl) == len(ks)
                      and sl not in _fx_live),
-                    key=lambda sl: -len(_groups[sl]))
+                    key=lambda sl: (0 if (INPLACE_EDGE_FIRST
+                                          and sl in _edge_slots) else 1,
+                                    -len(_groups[sl])))
 
     # THE 16-UNIT HALF RESERVES ONLY WHAT IT CAN FILL, NOT THE WHOLE CAP.
     #

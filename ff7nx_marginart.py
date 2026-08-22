@@ -1401,15 +1401,39 @@ def fill_field(name, raw, lgp_mod, art, log=None, scope='margin'):
     # by layer 3 and by NOTHING else, exactly as `field_bg_dense`'s
     # `parallax_backdrop_keys` requires. The admission test keeps the old,
     # broader `_backdrop` so nothing that ships today stops shipping.
+    # ---- AND IT IS COMPUTED UNCONDITIONALLY, WHICH BUILD 151 GOT WRONG.
+    # FINDINGS-289.
+    #
+    # `MARGIN_LAYERS_2PLUS` is FALSE in the shipped settings. Build 151 put
+    # this set inside that block, so it was always empty, `_bd` was always
+    # False, and the backdrop waiver never fired at all -- silently reverting
+    # build 150's `fship_2` fix for every cell the DENSE arm does not also
+    # reach. MEASURED on the shipped build 152, `fship_2` layer 3 per
+    # animation frame:
+    #
+    #     masks 0x02..0x10   column 192 on slot 13 (converted)   art  67%
+    #     masks 0x20, 0x40   column 192 on slot 14 (PALETTED)    art   0%
+    #
+    # Four frames of six look right and two are black, which is the flicker at
+    # the right edge. Slot 14 stays paletted because `IN-PLACE PARALLAX` is
+    # bounded by `FIELD_MB_CAP` and `fship_2` takes 4 of its 11 convertible
+    # pages -- so the paletted-page arm is exactly what those cells need, and
+    # it is the arm that stopped running.
+    #
+    # The layer walk this needs has nothing to do with `MARGIN_LAYERS_2PLUS`.
     _backdrop_only = set()
+    _lay = {}
+    try:
+        for t in MB.read_tiles(parts[SECTION9], surv, pages):
+            _lay.setdefault((t.slot, t.sx, t.sy), set()).add(t.layer)
+        _backdrop_only = {c for c, ls in _lay.items() if ls == {3}}
+    except Exception:                                          # noqa: BLE001
+        _backdrop_only = set()
+
     _margin_overlay = set()
     if MARGIN_LAYERS_2PLUS:
         try:
             _tl2 = MB.read_tiles(parts[SECTION9], surv, pages)
-            _lay = {}
-            for t in _tl2:
-                _lay.setdefault((t.slot, t.sx, t.sy), set()).add(t.layer)
-            _backdrop_only = {c for c, ls in _lay.items() if ls == {3}}
             _out2 = {(t.slot, t.sx, t.sy) for t in _tl2 if t.outside_43}
             _in2 = {(t.slot, t.sx, t.sy) for t in _tl2 if not t.outside_43}
             for t in _tl2:
@@ -1426,7 +1450,6 @@ def fill_field(name, raw, lgp_mod, art, log=None, scope='margin'):
                     _margin_overlay.add(c)
         except Exception:                                      # noqa: BLE001
             _margin_overlay = set()
-            _backdrop_only = set()
 
     # CELLS WHERE INDEX 0 IS A GENUINE CUT-OUT. See KEEP0_CUTOUTS_ONLY.
     #
