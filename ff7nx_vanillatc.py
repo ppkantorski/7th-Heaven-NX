@@ -135,7 +135,7 @@ def disabled():
 
 class Stats:
     __slots__ = ('fields', 'pages', 'cells', 'texels', 'refused_page',
-                 'refused_cell', 'no_art', 'ambiguous', 'names')
+                 'refused_cell', 'no_art', 'ambiguous', 'keyed', 'names')
 
     def __init__(self):
         self.fields = 0
@@ -146,12 +146,13 @@ class Stats:
         self.refused_cell = 0
         self.no_art = 0
         self.ambiguous = 0
+        self.keyed = 0
         self.names = []
 
 
 def merge(a, b):
     for k in ('fields', 'pages', 'cells', 'texels', 'refused_page',
-              'refused_cell', 'no_art', 'ambiguous'):
+              'refused_cell', 'no_art', 'ambiguous', 'keyed'):
         setattr(a, k, getattr(a, k) + getattr(b, k))
     a.names.extend(b.names)
 
@@ -169,11 +170,11 @@ def referenced_cells(sec9, back, tex, slots):
     keeps the refusal granular: one bad cell of a parallax block does not cost
     the other three.
     """
-    out = {s: set() for s in slots}
+    out = {s: {} for s in slots}
     if not out:
         return out
 
-    def mark(first, n, span):
+    def mark(first, n, span, layer):
         for i in range(n):
             off = first + i * FN.TILE_SIZE
             s = sec9[off + T_TEX]
@@ -182,12 +183,13 @@ def referenced_cells(sec9, back, tex, slots):
             sx, sy = sec9[off + T_SRCX], sec9[off + T_SRCY]
             for dy in range(0, span, TILE):
                 for dx in range(0, span, TILE):
-                    out[s].add(((sx + dx) // TILE, (sy + dy) // TILE))
+                    c = ((sx + dx) // TILE, (sy + dy) // TILE)
+                    out[s].setdefault(c, set()).add(layer)
 
     o = back + 4                                   # "BACK"
     _w, _h, n1, _d, _b = struct.unpack_from('<HHHHH', sec9, o)
     o += 10
-    mark(o, n1, TILE)                              # layer 1
+    mark(o, n1, TILE, 1)                           # layer 1
     o += n1 * FN.TILE_SIZE + 2
     for layer, unused in ((2, 16), (3, 10), (4, 10)):
         if o >= tex:
@@ -200,7 +202,7 @@ def referenced_cells(sec9, back, tex, slots):
             raise ValueError('layer flag %d at %d' % (flag, o - 1))
         _w, _h, n = struct.unpack_from('<HHH', sec9, o)
         o += 6 + unused + 2
-        mark(o, n, TILE if layer == 2 else 32)
+        mark(o, n, TILE if layer == 2 else 32, layer)
         o += n * FN.TILE_SIZE + 2
     if o != tex:
         raise ValueError('layer walk ended at %d, TEXTURE at %d' % (o, tex))
@@ -225,17 +227,48 @@ def _opaque_16_page(page, s):
     return (page != 0).reshape(n, s, n, s).any(axis=(1, 3))
 
 
-def convert_page(dst, vanilla, art_buf, cells, px):
-    """(n_cells, n_texels) substituted in `dst` (a mutable ndarray view).
+def convert_page(dst, vanilla, art_buf, cells, px, tmask=None):
+    """(n_cells, n_texels, n_keyed) substituted in `dst` (a mutable view).
 
     `vanilla` is the ORIGINAL 256px depth-2 page, `art_buf` the mod's page at
-    `px`. Only cells in `cells` are considered, and each one must clear three
-    gates independently.
+    `px`, `cells` a {(cell_x, cell_y): {layers}} map, and `tmask` the mod's
+    "paints NOTHING" mask (alpha < 8) at `px`.
+
+    TWO RULES, BECAUSE A BACKGROUND AND AN OVERLAY WANT OPPOSITE THINGS.
+
+    A LAYER-1 cell is the background. Transparency there shows the clear
+    colour, i.e. black, so the silhouette must not move at all: the cell is
+    substituted only where Cosmos and vanilla agree on opacity exactly. That
+    is the build-149 rule, unchanged, and MEASURED it costs nothing --
+    Cosmos paints 100% of every layer-1 cell on these pages.
+
+    A LAYER-2+ cell is an OVERLAY, and there the 1997 page is the problem.
+    FINDINGS-287, measured on `gldst`:
+
+        layer 2, slot 27:  61,730 of 407,808 texels (15.1%) are texels where
+        COSMOS PAINTS NOTHING and we draw a pixel anyway
+
+    Those are the black blocks, and the fact that the player can walk BEHIND
+    them is what says they are on layer 2. It is the same defect the MOD-CLEAR
+    KEY arm already fixes for PALETTED pages -- "a texel the mod calls empty
+    over a non-zero vanilla index was neither keyed nor skipped, it was
+    painted with the 1997 art's hard black outline" -- and it never reached
+    here because a vanilla depth-2 page is never promoted (FINDINGS-282).
+
+    So on an overlay cell the transparency taken is the UNION of the two:
+
+        clear = tmask | (vanilla == 0)
+
+    which can only ever REVEAL what is behind, never hide it. Cosmos's cut is
+    honoured, vanilla's holes stay holes, and no hole is ever filled. The
+    threshold is `tmask` (alpha < 8), the same conservative end MOD-CLEAR
+    uses, because this arm ADDS transparency and so must be sure the mod
+    paints nothing.
     """
     s = px // PAGE_UNITS
     up = None
-    n_cell = n_tex = 0
-    for cx, cy in sorted(cells):
+    n_cell = n_tex = n_key = 0
+    for (cx, cy), layers in sorted(cells.items()):
         if cx * TILE + TILE > PAGE_UNITS or cy * TILE + TILE > PAGE_UNITS:
             continue
         vb = vanilla[cy * TILE:(cy + 1) * TILE, cx * TILE:(cx + 1) * TILE]
@@ -244,19 +277,26 @@ def convert_page(dst, vanilla, art_buf, cells, px):
         ab = art_buf[y0:y1, x0:x1]
         if ab.shape != (TILE * s, TILE * s):
             continue
-        # GATE 1 -- the silhouette must not move.
-        if not (_opaque_16(ab, s) == (vb != 0)).all():
-            continue
+        overlay = tmask is not None and layers and min(layers) >= 2
+        if not overlay:
+            # GATE 1 -- on the background the silhouette must not move.
+            if not (_opaque_16(ab, s) == (vb != 0)).all():
+                continue
         # GATE 2 -- the destination must still be the untouched upscale, so
         # anything an earlier pass deliberately wrote here is left alone.
         if up is None:
             up = np.repeat(np.repeat(vanilla, s, axis=0), s, axis=1)
         if not (dst[y0:y1, x0:x1] == up[y0:y1, x0:x1]).all():
             continue
-        dst[y0:y1, x0:x1] = ab
+        blk = ab
+        if overlay:
+            clear = tmask[y0:y1, x0:x1] | (up[y0:y1, x0:x1] == 0)
+            blk = np.where(clear, np.uint16(FN.EMPTY), ab)
+            n_key += int((clear & (up[y0:y1, x0:x1] != 0)).sum())
+        dst[y0:y1, x0:x1] = blk
         n_cell += 1
         n_tex += ab.size
-    return n_cell, n_tex
+    return n_cell, n_tex, n_key
 
 
 def apply_to_section9(sec9, vanilla9, px, art_for, field=None,
@@ -320,7 +360,11 @@ def apply_to_section9(sec9, vanilla9, px, art_for, field=None,
         van = np.frombuffer(vraw[p.slot].data, '<u2').reshape(PAGE_UNITS,
                                                               PAGE_UNITS)
         dst = np.frombuffer(p.data, '<u2').reshape(px, px).copy()
-        n_cell, n_tex = convert_page(dst, van, buf, cells, px)
+        tm = getattr(art, 'tmask', None)
+        if tm is not None and tm.shape != buf.shape:
+            tm = None
+        n_cell, n_tex, n_key = convert_page(dst, van, buf, cells, px, tm)
+        st.keyed += n_key
         st.refused_cell += len(cells) - n_cell
         if not n_cell:
             continue
@@ -370,8 +414,22 @@ def summarise(st):
         'count, slot, palette, UV, tile record or header word changes: this '
         'writes pixels into pages that already exist, at coordinates the tiles '
         'already sample, so it cannot move a page or overrun the frame cap. '
-        'Fields: %s%s. Set %s=1 to restore build 148.'
+        '-- COSMOS ALPHA ON LAYER 2+: %s texel(s) of 1997 filler were made '
+        'TRANSPARENT because Cosmos paints nothing there. A vanilla depth-2 '
+        'page is never promoted, so the MOD-CLEAR KEY arm that fixes exactly '
+        'this for paletted pages never reached it -- "a texel the mod calls '
+        'empty over a non-zero vanilla index was neither keyed nor skipped, '
+        'it was painted with the 1997 art\'s hard black outline". MEASURED on '
+        'gldst: 61,730 of layer 2\'s 407,808 texels, and they are the black '
+        'blocks the player can walk BEHIND -- which is what says they are an '
+        'overlay and not the background. Scoped to cells EVERY tile of which '
+        'is layer 2+, at the tmask threshold (alpha < 8, the same '
+        'conservative end MOD-CLEAR uses), and the transparency taken is the '
+        'UNION of Cosmos\'s and vanilla\'s: a hole is never filled and a '
+        'layer-1 cell never gains one, so this can only reveal what is '
+        'behind, never hide it. Fields: %s%s. Set %s=1 to restore build 148.'
         % (f'{st.cells:,}', f'{st.texels:,}', f'{st.pages:,}',
            f'{st.fields:,}',
            f'{st.cells + st.refused_cell:,}', f'{st.refused_cell:,}',
+           f'{st.keyed:,}',
            worst, ' ...' if len(st.names) > 6 else '', OFF_ENV))

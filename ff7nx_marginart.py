@@ -1382,6 +1382,26 @@ def fill_field(name, raw, lgp_mod, art, log=None, scope='margin'):
     # set, the veto set and every other rule that reads them stay exactly as
     # build 111 left them. The flatness test is the same one `fillable_cells`
     # uses -- `np.unique(...).size == 1` -- applied to this population only.
+    # CELLS SAMPLED ONLY BY THE LAYER-3 BACKDROP. FINDINGS-286.
+    #
+    # `_backdrop` below tests the PAGE (`size_flag`, the 32-unit parallax
+    # shape) and nothing else, which is enough for the admission test it was
+    # written for but NOT enough to waive the opacity quota. Build 150 waived
+    # it on `_backdrop` alone and the counter guard caught it immediately:
+    #
+    #     keep0 cells    5,939 -> 6,439        +500
+    #     keep0 dropped  2,479,975 -> 2,831,147   +351,172 texels un-keyed
+    #
+    # A 32-unit page can carry cells that layer 2 also samples, and un-keying
+    # one of those turns a genuine overlay cut-out into an opaque block -- the
+    # black squares on `gldst` that the player can walk BEHIND, which is what
+    # tells you they are on layer 2 and not the backdrop.
+    #
+    # So the quota waiver gets its own, narrower set: the cell must be sampled
+    # by layer 3 and by NOTHING else, exactly as `field_bg_dense`'s
+    # `parallax_backdrop_keys` requires. The admission test keeps the old,
+    # broader `_backdrop` so nothing that ships today stops shipping.
+    _backdrop_only = set()
     _margin_overlay = set()
     if MARGIN_LAYERS_2PLUS:
         try:
@@ -1389,6 +1409,7 @@ def fill_field(name, raw, lgp_mod, art, log=None, scope='margin'):
             _lay = {}
             for t in _tl2:
                 _lay.setdefault((t.slot, t.sx, t.sy), set()).add(t.layer)
+            _backdrop_only = {c for c, ls in _lay.items() if ls == {3}}
             _out2 = {(t.slot, t.sx, t.sy) for t in _tl2 if t.outside_43}
             _in2 = {(t.slot, t.sx, t.sy) for t in _tl2 if not t.outside_43}
             for t in _tl2:
@@ -1405,6 +1426,7 @@ def fill_field(name, raw, lgp_mod, art, log=None, scope='margin'):
                     _margin_overlay.add(c)
         except Exception:                                      # noqa: BLE001
             _margin_overlay = set()
+            _backdrop_only = set()
 
     # CELLS WHERE INDEX 0 IS A GENUINE CUT-OUT. See KEEP0_CUTOUTS_ONLY.
     #
@@ -1807,8 +1829,10 @@ def fill_field(name, raw, lgp_mod, art, log=None, scope='margin'):
                 # backdrop cell stays one-third transparent and cannot become
                 # a solid block, which is the one hazard this quota stood for.
                 _mo = (slot, sx, sy) in _margin_overlay
+                # ...and the waiver takes the NARROW set, not `_backdrop`.
+                _bd = _backdrop and (slot, sx, sy) in _backdrop_only
                 _cov_ok = (bool((cover > 0).any())
-                           if (_mo or _backdrop)
+                           if (_mo or _bd)
                            else float((cover >= 128).mean())
                            >= ATLAS_OPAQUE_FRAC)
                 if _all0 and _cov_ok and (_bright or _backdrop or _mo):

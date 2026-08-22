@@ -48,13 +48,13 @@ class TestCellGates(unittest.TestCase):
         self.dst = np.repeat(np.repeat(self.van, S, axis=0), S, axis=1).copy()
 
     def test_an_agreeing_cell_is_substituted(self):
-        n, t = VT.convert_page(self.dst, self.van, self.art, {(0, 0)}, PX)
+        n, t, _k = VT.convert_page(self.dst, self.van, self.art, {(0, 0): {1}}, PX)
         self.assertEqual(n, 1)
         self.assertEqual(t, (VT.TILE * S) ** 2)
         self.assertTrue((self.dst[:VT.TILE * S, :VT.TILE * S] == 0x1234).all())
 
     def test_an_unreferenced_cell_is_never_touched(self):
-        VT.convert_page(self.dst, self.van, self.art, {(0, 0)}, PX)
+        VT.convert_page(self.dst, self.van, self.art, {(0, 0): {1}}, PX)
         rest = self.dst[VT.TILE * S:, :]
         self.assertTrue((rest == 0x0841).all(),
                         'a cell no tile samples was rewritten')
@@ -63,13 +63,13 @@ class TestCellGates(unittest.TestCase):
         """Vanilla clear, Cosmos opaque -- the silhouette would change."""
         self.van[0, 0] = 0
         self.dst = np.repeat(np.repeat(self.van, S, axis=0), S, axis=1).copy()
-        n, _t = VT.convert_page(self.dst, self.van, self.art, {(0, 0)}, PX)
+        n, _t, _k = VT.convert_page(self.dst, self.van, self.art, {(0, 0): {1}}, PX)
         self.assertEqual(n, 0)
 
     def test_a_cell_cosmos_would_CUT_is_refused(self):
         """Vanilla opaque, Cosmos clear -- a hole the artist did not draw."""
         self.art[0:S, 0:S] = 0
-        n, _t = VT.convert_page(self.dst, self.van, self.art, {(0, 0)}, PX)
+        n, _t, _k = VT.convert_page(self.dst, self.van, self.art, {(0, 0): {1}}, PX)
         self.assertEqual(n, 0)
 
     def test_sub_cell_detail_is_allowed(self):
@@ -81,15 +81,52 @@ class TestCellGates(unittest.TestCase):
         """
         self.art[:VT.TILE * S, :VT.TILE * S] = np.arange(
             (VT.TILE * S) ** 2, dtype=np.uint16).reshape(VT.TILE * S, -1) | 1
-        n, _t = VT.convert_page(self.dst, self.van, self.art, {(0, 0)}, PX)
+        n, _t, _k = VT.convert_page(self.dst, self.van, self.art, {(0, 0): {1}}, PX)
         self.assertEqual(n, 1)
 
     def test_a_cell_another_pass_already_wrote_is_left_alone(self):
         """GATE 2: only the untouched upscale may be replaced."""
         self.dst[0, 0] = 0x7777
-        n, _t = VT.convert_page(self.dst, self.van, self.art, {(0, 0)}, PX)
+        n, _t, _k = VT.convert_page(self.dst, self.van, self.art, {(0, 0): {1}}, PX)
         self.assertEqual(n, 0)
         self.assertEqual(int(self.dst[0, 0]), 0x7777)
+
+    def test_an_overlay_cell_takes_COSMOS_ALPHA(self):
+        """FINDINGS-287, and it is the gldst black squares.
+
+        On a cell every tile of which is layer 2+, a texel the mod does not
+        paint becomes TRANSPARENT even though vanilla painted it. That is the
+        1997 filler the MOD-CLEAR arm removes on paletted pages and could
+        never reach here.
+        """
+        tm = np.zeros((PX, PX), bool)
+        tm[:VT.TILE * S, :VT.TILE * S] = True          # mod paints nothing
+        n, _t, k = VT.convert_page(self.dst, self.van, self.art,
+                                   {(0, 0): {2}}, PX, tm)
+        self.assertEqual(n, 1)
+        self.assertEqual(k, (VT.TILE * S) ** 2)
+        self.assertTrue((self.dst[:VT.TILE * S, :VT.TILE * S]
+                         == FN.EMPTY).all())
+
+    def test_a_layer_1_cell_never_gains_transparency(self):
+        """There it would show the clear colour -- a NEW black square."""
+        tm = np.ones((PX, PX), bool)
+        n, _t, k = VT.convert_page(self.dst, self.van, self.art,
+                                   {(0, 0): {1}}, PX, tm)
+        self.assertEqual(k, 0)
+        self.assertFalse((self.dst[:VT.TILE * S, :VT.TILE * S]
+                          == FN.EMPTY).any())
+
+    def test_an_overlay_never_FILLS_a_vanilla_hole(self):
+        """The transparency taken is the UNION, so a hole stays a hole."""
+        self.van[0, 0] = 0
+        self.dst = np.repeat(np.repeat(self.van, S, axis=0), S, axis=1).copy()
+        tm = np.zeros((PX, PX), bool)
+        n, _t, _k = VT.convert_page(self.dst, self.van, self.art,
+                                    {(0, 0): {2}}, PX, tm)
+        self.assertEqual(n, 1)
+        self.assertTrue((self.dst[:S, :S] == FN.EMPTY).all(),
+                        'a vanilla hole was filled')
 
     def test_the_opacity_reduction_is_ANY_not_ALL(self):
         """A cell Cosmos only antialiases into reads as a disagreement.
@@ -183,7 +220,8 @@ class TestAgainstTheArchive(unittest.TestCase):
                                    {26, 27})
         self.assertTrue(refs[26], 'cosmo samples slot 26')
         for cells in refs.values():
-            for cx, cy in cells:
+            for (cx, cy), layers in cells.items():
+                self.assertTrue(layers, 'a cell with no layer recorded')
                 self.assertLess(cx, 16)
                 self.assertLess(cy, 16)
 
