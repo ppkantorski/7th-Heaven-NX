@@ -245,6 +245,10 @@ ATLAS_GAP = os.environ.get('SEVENTH_NX_NO_ATLASGAP') != '1'
 #
 # `SEVENTH_NX_NO_MARGIN_L2_ALPHA=1` restores build 113 exactly.
 MARGIN_OVERLAY_ALPHA = os.environ.get('SEVENTH_NX_NO_MARGIN_L2_ALPHA') != '1'
+# THE BACKDROP'S OWN MARGIN. FINDINGS-284, and the correction to the waiver
+# build 148 withdrew: the scope was right, the `hmask.all()` opacity quota was
+# what made it inert. See `parallax_backdrop_keys` and the `_par` arm.
+PARALLAX_ATLAS = os.environ.get('SEVENTH_NX_NO_BACKDROP_ATLAS') != '1'
 
 # THE OVERLAY EDGE IS ERODED BACK TO THE UNIT GRID. FINDINGS-247.
 #
@@ -818,6 +822,7 @@ class Stats:
                  'pages_before',
                  'borrow_refused', 'origin', 'atlas_gap', 'bare',
                  'margin_l2', 'margin_l2_filled',
+                 'parallax_l3', 'parallax_l3_filled',
                  'subunit_cells', 'subunit_units', 'subunit_texels',
                  'modclear_cells', 'modclear_texels', 'modclear_whole',
                  'blend_cells', 'blend_texels', 'backdrop_cells',
@@ -837,6 +842,8 @@ class Stats:
         self.bare = 0             # cells with nothing behind them at all
         self.margin_l2 = 0        # layer-2+ widescreen margin placeholders
         self.margin_l2_filled = 0     # ...of those, served the mod's alpha
+        self.parallax_l3 = 0          # layer-3-only 32-unit atlas cells
+        self.parallax_l3_filled = 0   # ...of those, took Cosmos's art
         self.subunit_cells = 0    # layer-2 cut-outs refined below unit size
         self.subunit_units = 0    # ...units in them the mod cuts partially
         self.subunit_texels = 0   # ...texels that stopped being keyed
@@ -1144,6 +1151,52 @@ def _draws(arr, page, sx, sy):
         return bool((b != FN.EMPTY).any())
     b = arr[sy:sy + TILE, sx:sx + TILE]
     return bool(b.any())
+
+
+def parallax_backdrop_keys(pages, tiles, keys):
+    """
+    The `keys` sampled EXCLUSIVELY by the 32-unit layer-3 backdrop.
+
+    THE POPULATION `bare` CANNOT SEE, AND FINDINGS-284 IS WHY IT MATTERS.
+
+    `bare_keys` asks "does anything else draw at this destination", because
+    keying a cell that something sits behind would open a hole. For the
+    BACKDROP that question has no content: layer 3 is the bottom-most thing on
+    screen, so nothing can be behind it and keying it can only ever produce
+    black. Meanwhile layers 1 and 2 DO draw at the same destination -- Cosmos
+    widened them to +/-224 for the 16:9 frame -- so `bare` is False for every
+    margin cell of the backdrop and the atlas-gap arm never runs there.
+
+    MEASURED on `fship_2`, the four 32-unit columns Cosmos added for the
+    widened frame, every cell of them vanilla-all-zero and layer-3-exclusive:
+
+        col -192  Cosmos covers 100.0%      col  160  Cosmos covers 100.0%
+        col -224  Cosmos covers  67.7%      col  192  Cosmos covers  67.7%
+
+    67% is not damaged art. The margin is 53.5 units, which is one whole
+    32-unit column plus 21.5 of the next, and 21.5 / 32 = 67% -- the artist
+    covering exactly as much of the outermost column as the frame can show.
+    Those are the two columns that come out BLACK on hardware, and they are
+    the bars at the left and right edge of the picture.
+
+    LAYER 4 IS EXCLUDED even when it shares the 32-unit page shape: several
+    fields use layer 4 for a train, a banner or a keyhole mask, and a one-off
+    foreground object does not inherit layer 3's no-occlusion proof.
+
+    Destination coordinates are deliberately irrelevant. A layer-3 tile can
+    wrap, but it is the backdrop wherever it lands.
+    """
+    layers = {}
+    for t in tiles:
+        layers.setdefault((t.slot, t.sx, t.sy), set()).add(t.layer)
+    out = set()
+    for k in keys:
+        page = pages.get(k[0])
+        if page is None or not page.size_flag:
+            continue
+        if layers.get((k[0], k[1], k[2])) == {3}:
+            out.add(k)
+    return out
 
 
 def bare_keys(pages, arrays, tiles, keys):
@@ -2306,8 +2359,27 @@ def source_cell(k, rec, pages, arrays, pal565, art_for, pals_for, st,
         # adds the scope: layer 2+, wholly outside the picture, and sampled by
         # no interior tile. See MARGIN_OVERLAY_ALPHA.
         _mo = MARGIN_OVERLAY_ALPHA and bool(rec.get('margin_l2'))
+        # ...OR THE CELL IS THE BACKDROP'S OWN MARGIN. FINDINGS-284.
+        #
+        # `bare` is asking whether keying this cell would hide something. On
+        # layer 3 it cannot: the backdrop is the bottom-most thing on screen.
+        # What `bare` actually sees at a margin destination is layers 1 and 2
+        # drawing ON TOP of it -- Cosmos widened those to +/-224 -- so it
+        # answers False and the whole arm is skipped for exactly the cells the
+        # 16:9 frame needs. `parallax_backdrop_keys` supplies the scope
+        # instead: layer-3-EXCLUSIVE, on a 32-unit `size_flag` page.
+        #
+        # THERE IS DELIBERATELY NO OPACITY QUOTA HERE, and that is the whole
+        # correction. Build 148's withdrawn waiver demanded `hmask.all()` --
+        # Cosmos opaque over EVERY texel -- which passes the columns that
+        # already worked (100%) and refuses the two that are black (67%). The
+        # body below is already per-texel: it re-keys `zero & tpaint`, so a
+        # two-thirds covered cell stays one-third transparent and cannot
+        # become a solid block. `zero.all()` still guarantees vanilla draws
+        # nothing here, so this is strictly additive over what is black today.
+        _par = PARALLAX_ATLAS and bool(rec.get('parallax_l3'))
         _atlas = (ATLAS_GAP and art is not None
-                  and (rec.get('bare') or _mo)
+                  and (rec.get('bare') or _mo or _par)
                   and bool(zero.all()))
         if _atlas and tpaint.shape == out.shape and not tpaint.all():
             # The atlas arm may not re-key a recovered wire either.
@@ -2315,7 +2387,11 @@ def source_cell(k, rec, pages, arrays, pal565, art_for, pals_for, st,
             if _wire is not None and _wire.shape == _ak.shape:
                 _ak = _ak & ~_wire
             out[_ak] = FN.EMPTY
-            if _mo and not rec.get('bare'):
+            if _par and not (rec.get('bare') or _mo):
+                st.parallax_l3_filled += 1
+                dense_repack.parallax_l3_filled = (
+                    getattr(dense_repack, 'parallax_l3_filled', 0) + 1)
+            elif _mo and not rec.get('bare'):
                 st.margin_l2_filled += 1
                 dense_repack.margin_l2_filled = (
                     getattr(dense_repack, 'margin_l2_filled', 0) + 1)
@@ -3454,6 +3530,16 @@ def dense_repack(sec3, sec9, field='', art_for=None, pals_for=None, px=256,
         for k in _mo:
             keys[k]['margin_l2'] = True
         st.margin_l2 = len(_mo)
+    # See PARALLAX_ATLAS and parallax_backdrop_keys(). Same shape as the two
+    # blocks above, same one decision, and it sets no other field on `rec`.
+    if ATLAS_GAP and PARALLAX_ATLAS:
+        try:
+            _pl3 = parallax_backdrop_keys(pages, tiles, keys)
+        except Exception:                                      # noqa: BLE001
+            _pl3 = set()
+        for k in _pl3:
+            keys[k]['parallax_l3'] = True
+        st.parallax_l3 = len(_pl3)
     # See BLEND_PARTIAL and backdrop_keys(). Computed once per field from the
     # tiles already read, exactly as the two blocks above are, and used for
     # ONE decision -- what colour a partial-alpha texel blends toward. It sets

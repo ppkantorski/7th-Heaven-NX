@@ -198,35 +198,32 @@ FILL_X = os.environ.get('SEVENTH_NX_PARALLAX_FILL_X') == '1'
 # mechanism with a different risk: `FILL_X` repeats a scrolling layer, this
 # one extends a stationary layer's outermost column outward.
 #
-# DEFAULT OFF AGAIN AFTER BUILD 148 MEASURED IT ON HARDWARE. FINDINGS-283.
+# DEFAULT ON FROM BUILD 150, AND FINDINGS-283 IS RETRACTED. FINDINGS-285.
 #
-# Build 148 turned this on with the window corrected. Hardware: `fship_2` was
-# UNCHANGED -- the screenshots from builds 147 and 148 are byte-identical in
-# every edge column. Two things were wrong, and the second one is fatal:
+# Build 148 turned this on and `fship_2` did not change, so build 149 turned it
+# off again on the theory that a CULL after the shift was dropping the
+# re-encoded columns. `_kl3shift.py` EXECUTES the port's own encoded words
+# through `arm64emu`, with the shipping `left_offset`/`half_width` patches
+# applied, and there is no cull:
 #
-#   1. THE MARGIN WAS ALREADY AUTHORED. Build 148's census read the VANILLA
-#      dump, where `fship_2` layer 3 is x -160..160. The build does not run on
-#      that: Cosmos Limit Break ships `fship_2.chunk.9` with layer 3 at
-#      x -224..224, 14 columns. Cosmos widened the parallax the same way it
-#      widened layers 1 and 2. There was no missing art.
+#     stored  160  ->  drawn at  -864     Cosmos's own column, wrapped away
+#     stored  192  ->  drawn at  -832     same
+#     stored 1184  ->  drawn at   160     ON SCREEN, exits at the anim test
+#     stored 1216  ->  drawn at   192     ON SCREEN
 #
-#   2. THE ENGINE THROWS THE RIGHT HALF AWAY, AND THE ARCHIVE CANNOT STOP IT.
-#      `field_layer3_pick_tiles` applies the same bound as a CULL after the
-#      shift, and `right_offset` is 0 in this port. Cosmos's columns at
-#      x 160 and 192 wrap to -864/-832 and are dropped. The columns build 148
-#      wrote at x + width DO come back to 160/192 through the wrap -- and are
-#      then dropped by the cull, which is why nothing changed.
+# 0xA07E6C is the anim-group test and then `add_page_tile`. Nothing between the
+# shift and the draw looks at the position again. The encoding works.
 #
-#      It is not addressable. `screen(x) = 320 - bg.x + x` and the cull is
-#      `x < bg.x + 0`, so `screen < 320` for every tile the engine will draw,
-#      whatever `bg?_pos_x` and `dst_x` are set to. 320 is the 4:3 right edge.
+# What was actually wrong is that the ART was not there. `field_bg_dense` keyed
+# the outermost margin column out because Cosmos covers it 67% and the
+# atlas-gap arm demanded `bare` -- see FINDINGS-284 and `PARALLAX_ATLAS`. So
+# build 148 moved the tiles into place over cells that draw nothing, and the
+# one column that did have art (160 -> px 1120..1216) revealed sky behind
+# machinery that is largely opaque.
 #
-# MEASURED on the shipped build 148: 1,069 tiles encoded for the right margin
-# across 23 fields, and the engine culls 1,069 of them -- 100%. The pass is
-# pure weight. It stays off until `ff7nx_fieldwide`'s KNOWN GAP is closed
-# (`right_offset` 0 -> 107), and once that is closed Cosmos's own columns draw
-# and this pass is very likely not needed at all.
-EDGE_X = os.environ.get('SEVENTH_NX_PARALLAX_EDGE_X') == '1'
+# The two halves only work together: this pass puts the columns where the
+# frame can see them, and the dense waiver gives them something to draw.
+EDGE_X = os.environ.get('SEVENTH_NX_NO_PARALLAX_EDGE_X') != '1'
 
 # Layers 3/4 normally represent a repeating backdrop, but that is not an
 # invariant of the format. `junonl2` and `junonr2` layer 4 are moving

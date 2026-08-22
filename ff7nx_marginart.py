@@ -1783,9 +1783,34 @@ def fill_field(name, raw, lgp_mod, art, log=None, scope='margin'):
                 # reason: it tests whether entry 0 is visible enough for the
                 # cell to read as real, which is a question about a BACKGROUND
                 # cell. Here index 0 is simply what is already on screen.
+                # ---- AND A BACKDROP IS TRANSPARENT AT ITS EDGE. FINDINGS-284.
+                #
+                # The paragraph above is the whole argument and it is just as
+                # true one layer up. MEASURED on `fship_2` layer 3, the four
+                # 32-unit columns Cosmos added for the widened frame:
+                #
+                #     col -192  Cosmos covers 100.0%   -> passes, art taken
+                #     col  160  Cosmos covers 100.0%   -> passes, art taken
+                #     col -224  Cosmos covers  67.7%   -> FAILS, cell keyed
+                #     col  192  Cosmos covers  67.7%   -> FAILS, cell keyed
+                #
+                # 67% is not damaged art: the margin is 53.5 units, one whole
+                # 32-unit column plus 21.5 of the next, and 21.5/32 = 67% --
+                # the artist covering exactly as much of the outermost column
+                # as the frame can show. Keying them is the black bar at each
+                # edge of the picture.
+                #
+                # `_all0` already proves vanilla draws NOTHING in this cell, so
+                # taking the art is strictly additive over what is black today,
+                # and `_art_here` below writes only where the mod paints and
+                # puts index 0 back everywhere else -- so a two-thirds covered
+                # backdrop cell stays one-third transparent and cannot become
+                # a solid block, which is the one hazard this quota stood for.
                 _mo = (slot, sx, sy) in _margin_overlay
-                _cov_ok = (float((cover >= 128).mean()) >= ATLAS_OPAQUE_FRAC
-                           if not _mo else bool((cover > 0).any()))
+                _cov_ok = (bool((cover > 0).any())
+                           if (_mo or _backdrop)
+                           else float((cover >= 128).mean())
+                           >= ATLAS_OPAQUE_FRAC)
                 if _all0 and _cov_ok and (_bright or _backdrop or _mo):
                     _is_cut = False
                     st['atlas_filled'] = st.get('atlas_filled', 0) + 1

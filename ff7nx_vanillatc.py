@@ -346,16 +346,17 @@ def summarise(st):
     return (
         '  VANILLA TRUECOLOR PAGES: %s cell(s), %s texel(s) on %s page(s) '
         'across %s field(s) took the mod\'s art instead of the 1997 page '
-        'pixel-replicated up to %s. Every pass that puts Cosmos art on a field '
+        'pixel-replicated up to the destination size. Every pass that puts Cosmos art on a field '
         'works by PROMOTING a paletted page, so a page that was ALREADY '
         'depth-2 in vanilla has nothing to promote and falls through all of '
         'them -- the only thing that ever touched it was '
         'field_bg_native.resize_depth2, which is honest nearest-neighbour '
         'replication. MEASURED before this pass: cosmo slot 26, the canyon and '
         'the huts, was 99.2%% identical to the vanilla upscale, 59 of its 64 '
-        'cells byte for byte, and field_bg_dense.source_cell counted the whole '
-        'class as "%s from the paletted page" without anyone reading it as a '
-        'defect. The art was always shipped: cosmo page 26 is 4,883 unique '
+        'cells byte for byte, and field_bg_dense.source_cell counted the class '
+        'in its "from the paletted page" total without anyone reading it as a '
+        'defect. %s cell(s) were looked at here. '
+        'The art was always shipped: cosmo page 26 is 4,883 unique '
         'colours at full size in the .iro. SCOPED PER CELL, and a cell is '
         'refused unless (a) it is actually SAMPLED by a tile, (b) Cosmos and '
         'vanilla agree on its opacity exactly -- 8,317 of 8,736 referenced '
@@ -371,6 +372,6 @@ def summarise(st):
         'already sample, so it cannot move a page or overrun the frame cap. '
         'Fields: %s%s. Set %s=1 to restore build 148.'
         % (f'{st.cells:,}', f'{st.texels:,}', f'{st.pages:,}',
-           f'{st.fields:,}', f'{FN.D1_PAGE_PX}px+',
+           f'{st.fields:,}',
            f'{st.cells + st.refused_cell:,}', f'{st.refused_cell:,}',
            worst, ' ...' if len(st.names) > 6 else '', OFF_ENV))

@@ -3781,18 +3781,34 @@ def _convert_field_backgrounds(archive, payloads, log, dds_sources=(),
                    f"{getattr(field_bg_dense.dense_repack, 'blend_texels', 0):,}",
                    f"{getattr(field_bg_dense.dense_repack, 'backdrop_cells', 0):,}",
                    field_bg_dense.BLEND_DARK))
-        # WITHDRAWN -- THE OPAQUE LAYER-3 ATLAS WAIVER. FINDINGS-281.
-        #
-        # The build-148 candidate that shipped here waived the colour key on
-        # all-zero 32-unit cells referenced only by layer 3, on the theory
-        # that fship_2 "already contained both widened outer columns" and that
-        # dense promotion was re-keying them into the two black bands.
-        #
-        # TESTED ON HARDWARE: the bands were unchanged. The premise was wrong
-        # in its first clause -- fship_2's layer 3 is authored x -160..160 and
-        # contains NO widened outer columns at all; the bars are 53.5 units of
-        # missing GEOMETRY at each edge, not 37 mis-keyed cells. The waiver is
-        # reverted rather than carried, so build 148 changes one thing.
+        # THE BACKDROP'S OWN MARGIN. FINDINGS-284.
+        _pl3 = getattr(field_bg_dense.dense_repack, 'parallax_l3_filled', 0)
+        if _pl3:
+            _dense_line += (
+                ' -- PARALLAX ATLAS MARGIN: %s all-zero 32-unit cell(s) '
+                'referenced ONLY by layer 3 took Cosmos\'s art per texel '
+                'instead of being keyed whole. `bare` asks whether keying a '
+                'cell would hide something, and on the backdrop it cannot -- '
+                'layer 3 is the bottom-most thing on screen. What `bare` '
+                'actually sees at a margin destination is layers 1 and 2 '
+                'drawing ON TOP, because Cosmos widened those to +/-224, so '
+                'it answers False for exactly the cells the 16:9 frame needs. '
+                'MEASURED on fship_2: Cosmos covers the outermost column 67.7%% '
+                'and the next one 100%%, and 67.7%% is not damaged art -- the '
+                'margin is 53.5 units, one whole 32-unit column plus 21.5 of '
+                'the next, and 21.5/32 is 67%%. The 100%% columns already drew; '
+                'the 67%% ones came out BLACK, and they are the bars at the '
+                'left and right edge of the picture. There is deliberately NO '
+                'opacity quota here: build 148\'s withdrawn waiver demanded '
+                'hmask.all(), which passes the columns that already worked and '
+                'refuses the two that are black. The body is per-texel, so a '
+                'two-thirds covered cell stays one-third transparent and '
+                'cannot become a solid block, and zero.all() still proves '
+                'vanilla draws nothing there -- strictly additive over black. '
+                'Layer 4 is excluded: a train, a banner or a keyhole mask does '
+                'not inherit layer 3\'s no-occlusion proof. Set '
+                'SEVENTH_NX_NO_BACKDROP_ATLAS=1 to restore build 149.'
+                % f"{_pl3:,}")
         # IN-PLACE PARALLAX CONVERSION. FINDINGS-249.
         _ip = getattr(field_bg_dense.dense_repack, 'inplace_big', 0)
         if _ip:
