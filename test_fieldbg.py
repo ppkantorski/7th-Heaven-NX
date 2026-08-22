@@ -683,6 +683,17 @@ def test_unkeyed_overlay_alpha():
           getattr(FD.dense_repack, 'modclear_unkeyed_texels', 0) >= 1)
 
 
+# WITHDRAWN WITH THE WAIVER IT TESTED. FINDINGS-281.
+#
+# `test_opaque_parallax_atlas` covered the build-148 candidate that kept
+# Cosmos's opaque DDS colour on all-zero 32-unit cells referenced only by
+# layer 3, on the theory that fship_2's black edge bands were mis-keyed
+# atlas placeholders. Hardware said the bands were unchanged: fship_2's
+# layer 3 is authored x -160..160 and simply has no art in the 16:9 margin.
+# The waiver and `field_bg_dense.parallax_backdrop_keys` are reverted, so
+# the test goes with them rather than being left to fail.
+
+
 def test_compact(flevel):
     """
     Compaction must free textures and change NOTHING a tile can see.
@@ -831,6 +842,7 @@ def main():
     test_quantiser()
     test_art_opacity()
     test_unkeyed_overlay_alpha()
+
     test_remap()
     test_growth_mode()
     test_resolve_base_dump()

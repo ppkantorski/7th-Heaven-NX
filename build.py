@@ -50,6 +50,7 @@ import ff7nx_blackcell
 import ff7nx_marginpage
 import ff7nx_fxmargin
 import ff7nx_fxpages
+import ff7nx_vanillatc
 import ff7nx_parallaxfill
 import ff7nx_fshipart
 import ff7nx_marginpal
@@ -2894,6 +2895,8 @@ def _convert_field_backgrounds(archive, payloads, log, dds_sources=(),
                  'blend_veto': 0, 'base_veto': 0, 'art_veto': 0,
                  'budget_veto': 0,
                  'deferred': 0, 'names': [], 'page_names': []}
+    # THE PAGES THAT WERE ALREADY TRUECOLOR IN 1997. FINDINGS-282.
+    vtc_stats = ff7nx_vanillatc.Stats()
     for name in sorted(archive.index):
         entry = archive.index[name]
         if not archive.is_field(entry):
@@ -3138,6 +3141,31 @@ def _convert_field_backgrounds(archive, payloads, log, dds_sources=(),
         _af = _pf = None
         if art is not None and name.lower() in art.fields():
             _af, _pf = art.open(name), art.palettes
+
+        # ---- THE PAGES THAT WERE ALREADY TRUECOLOR. FINDINGS-282.
+        #
+        # Every pass that puts Cosmos art on a field works by PROMOTING a
+        # paletted page, so a page that was already depth-2 in vanilla has
+        # nothing to promote and falls through all of them. The only thing
+        # that ever touched it is `resize_depth2`, which is honest
+        # nearest-neighbour replication -- so `cosmo`'s canyon shipped as 1997
+        # art with every pixel tripled, 99.2% identical to the raw upscale.
+        #
+        # HERE, and not earlier or later, for three reasons: `_af` is open on
+        # this field so no page is decoded twice; `_pre9` has one coherent
+        # depth-2 size, so a page slice lines up with the mod's; and the dense
+        # repack below then reads Cosmos art out of `source_cell`'s
+        # `from_vanilla` branch without that branch changing at all.
+        if _af is not None:
+            try:
+                _pre9, _vst = ff7nx_vanillatc.apply_to_section9(
+                    _pre9, parts[8], px, _af, field=name,
+                    ambiguous=art.ambiguous_slots)
+                ff7nx_vanillatc.merge(vtc_stats, _vst)
+            except Exception as exc:                           # noqa: BLE001
+                log(f'  ! field background: {name} vanilla-truecolor pass '
+                    f'skipped -- {exc}')
+
         _try9, dst, cst, _dense_ok = _pre9, None, None, False
         # The three-page dense ceiling was measured for ordinary scenery.
         # Existing additive depth-2 pages are page-neutral FX frames; counting
@@ -3753,6 +3781,18 @@ def _convert_field_backgrounds(archive, payloads, log, dds_sources=(),
                    f"{getattr(field_bg_dense.dense_repack, 'blend_texels', 0):,}",
                    f"{getattr(field_bg_dense.dense_repack, 'backdrop_cells', 0):,}",
                    field_bg_dense.BLEND_DARK))
+        # WITHDRAWN -- THE OPAQUE LAYER-3 ATLAS WAIVER. FINDINGS-281.
+        #
+        # The build-148 candidate that shipped here waived the colour key on
+        # all-zero 32-unit cells referenced only by layer 3, on the theory
+        # that fship_2 "already contained both widened outer columns" and that
+        # dense promotion was re-keying them into the two black bands.
+        #
+        # TESTED ON HARDWARE: the bands were unchanged. The premise was wrong
+        # in its first clause -- fship_2's layer 3 is authored x -160..160 and
+        # contains NO widened outer columns at all; the bars are 53.5 units of
+        # missing GEOMETRY at each edge, not 37 mis-keyed cells. The waiver is
+        # reverted rather than carried, so build 148 changes one thing.
         # IN-PLACE PARALLAX CONVERSION. FINDINGS-249.
         _ip = getattr(field_bg_dense.dense_repack, 'inplace_big', 0)
         if _ip:
@@ -4091,6 +4131,9 @@ def _convert_field_backgrounds(archive, payloads, log, dds_sources=(),
     _fxp_line = ff7nx_fxpages.summarise(fxp_stats)
     if _fxp_line:
         log('  ' + _fxp_line)
+    _vtc_line = ff7nx_vanillatc.summarise(vtc_stats)
+    if _vtc_line:
+        log(_vtc_line)
         if fxp_stats['names']:
             log('      fields: ' + ', '.join(fxp_stats['names'][:24])
                 + ('' if len(fxp_stats['names']) <= 24 else ', ...'))
@@ -5574,17 +5617,26 @@ def _build_flevel(archive_path, chunks, field_files, romfs, log,
     # copies rows at +/- the layer's own measured span, which is the repeat
     # the wrap would have made.
     #
-    # WHY LAST: it only ever COPIES a tile record byte for byte, changing
-    # `dst_y` and nothing else, so the copy names whatever page, uv, palette
-    # and blend its source ended up with after every pass above. Running it
-    # earlier would put tiles into the repack, the page cap and the no-growth
-    # accounting that none of those passes have a reason to see.
+    # WHY LAST: it only ever COPIES a tile record byte for byte, changing ONE
+    # destination word and nothing else, so the copy names whatever page, uv,
+    # palette, blend and animation group its source ended up with after every
+    # pass above. Running it earlier would put tiles into the repack, the page
+    # cap and the no-growth accounting that none of those passes have a reason
+    # to see.
     #
     # MEASURED before it was wired in, whole archive: 62 gapped parallax
     # layers -> 2, none made worse, 9,108 tiles added across 80 fields, and
     # the worst per-page IN-FRAME tile count -- FINDINGS-110's real cap --
     # grew on ZERO fields. It cannot, because only one copy of a repeated row
     # is inside a 240-unit window at a time.
+    #
+    # BUILD 148 TRIED TO ADD THE HORIZONTAL MARGIN AND HARDWARE SAID NO.
+    # FINDINGS-283. The margin was already authored -- Cosmos ships
+    # `fship_2.chunk.9` with layer 3 at x -224..224 -- and the engine culls
+    # everything at or past `bg.x + right_offset` with `right_offset` still 0,
+    # so the right half of Cosmos's own parallax is dropped and nothing the
+    # archive writes can put it back. 1,069 of 1,069 encoded tiles were culled.
+    # The arm is off again; the fix is ff7nx_fieldwide's KNOWN GAP.
     pf_stats = ff7nx_parallaxfill.apply_to_flevel(
         archive, payloads, encode=lambda raw: _encode_field_cached(archive, raw),
         log=log)

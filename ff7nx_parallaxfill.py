@@ -75,6 +75,7 @@ SEVENTH_NX_NO_PARALLAX_FILL=1 turns this off.
 """
 from __future__ import annotations
 
+import math
 import os
 import struct
 
@@ -99,23 +100,81 @@ ORIGIN_Y = 232
 PICTURE_TOP = -232
 PICTURE_BOT = 8
 
-# THE HORIZONTAL PICTURE, AND IT IS THE PATCHED CULL WINDOW.
+# THE HORIZONTAL PICTURE. BUILD 128 GOT THIS WRONG BY 160 UNITS AND THAT IS
+# WHY IT FILLED NINE COLUMNS ON THE LEFT AND NONE ON THE RIGHT. FINDINGS-281.
 #
-# `field_layer3_pick_tiles` drops a tile unless
-#     bg.x - left_offset  <  tile.x  <  bg.x + right_offset
-# and `ff7nx_fieldwide.parallax_spec()` already widens those from the stock
-# 352 / 0 to 459 / 107 -- log 127 records all five words applied. So the
-# window the ENGINE will accept is [-459, +107] about `bg.x`, and that is the
-# bound this pass fills to.
+# The old constants (-459 / +107 / -427) treated `left_offset` and
+# `right_offset` as if they were the picture measured from `bg.x`. They are
+# not: they are the WRAP window, and the picture is a different interval on
+# the same axis. FFNx `background.cpp` gives both, exactly:
 #
-# It is deliberately the CULL window rather than a measured picture, which
-# over-covers: the cost is tiles, and being one tile short is a black bar.
-PICTURE_LEFT = -459
-PICTURE_RIGHT = 107
-# What can actually be SEEN, as opposed to what the cull will accept. The
-# tiling fill may over-cover cheaply (it repeats art that exists); the edge
-# extension may not, because it copies a whole column per step.
-PICTURE_SEEN_LEFT = -427
+#     initial_pos.x = (320 - bg.x) * mult          field_layer3_pick_tiles
+#     bg_layer3_pos.x = remainder(bg3_pos_x/16 + bg3_speed_x*dx/256, bg3_width)
+#                       + 320 - field_bg_offset->x - shake
+#
+# so the screen position of a tile, in field units, is
+#
+#     screen(tile.x) = 320 - bg.x + tile.x
+#
+# and the 4:3 viewport is screen 0..320. `field_bg_offset->x` is 160 in every
+# field this archive ships, which the ARCHIVE ITSELF proves: 34 pinned layers
+# are authored at exactly x -160..160 with `bg?_pos_x == 0`, and a 4:3 picture
+# with no black bars forces `bg.x == 160` for them. So
+#
+#     bg.x  = remainder(pos_x/16, width) + 160        (pinned; speed_x == 0)
+#
+# The widescreen viewport is `wide_viewport_x = -107` px wide
+# `wide_viewport_width = 854` px against a 640 px / 320 unit 4:3 frame, i.e.
+# 2 px per unit, so it adds (854 - 640) / 2 / 2 = 53.5 UNITS ON EACH SIDE:
+#
+#     16:9 viewport = screen -53.5 .. +373.5
+#                   = tile.x  bg.x - 373.5 .. bg.x + 53.5
+#
+# For the 34 layers at pos_x 0 that is tile.x -213.5..213.5 against art that
+# stops at +/-160 -- 53.5 units of black on EACH side, which is Patrick's
+# report on `fship_2` to the unit, and it is why COSMOS widened layers 1 and 2
+# to exactly +/-224. Layer 3 is the layer Cosmos did not widen.
+ORIGIN_X = 320                 # `initial_pos.x = (320 - bg.x) * mult`
+BG_OFFSET_X = 160              # `field_bg_offset->x`, measured, see above
+HALF_VIEW_43 = 160.0
+HALF_VIEW_169 = 854 / 4.0      # 213.5 -- ceil() in FFNx, exact here
+PICTURE_MARGIN_X = HALF_VIEW_169 - HALF_VIEW_43        # 53.5 per side
+
+# THE ENGINE'S WRAP WINDOW, WHICH IS A DIFFERENT INTERVAL AND IS WHY THE
+# RIGHT-HAND COLUMNS HAVE TO BE ENCODED RATHER THAN PLACED.
+#
+# `field_layer3_shift_tile_position`, and the port has no cull at all -- the
+# x86 original relies on the viewport to clip, so this conditional is the ONLY
+# thing that moves a parallax tile:
+#
+#     if (tile.x <= bg.x - left_offset || tile.x >= bg.x + right_offset)
+#         tile.x += (tile.x >= bg.x - half_width) ? -width : +width;
+#
+# `ff7nx_fieldwide.PARALLAX_PATCHES` moves left_offset 352 -> 459 and
+# half_width 160 -> 213 in place. It leaves `right_offset` at 0 -- its own
+# KNOWN GAP comment says so, because a zero has no immediate to rewrite -- so
+# ANY tile at `tile.x >= bg.x` is displaced by a whole `width`.
+#
+# The right margin starts at exactly `tile.x == bg.x`. So a right-hand column
+# CANNOT simply be written where it should be drawn: the engine would move it.
+# It has to be written at `x + width`, which this same conditional then brings
+# back to `x`. That is not a trick -- it is the wrap doing its job, and it is
+# what makes the right margin reachable with NO code patch at all.
+ENGINE_LEFT_OFFSET = 459       # patched
+ENGINE_RIGHT_OFFSET = 0        # NOT patched -- ff7nx_fieldwide KNOWN GAP
+ENGINE_HALF_WIDTH = 213        # patched
+# The stock 4:3 triple, used only as a safety assertion: an added column must
+# never land inside the 4:3 picture when the widescreen words are absent.
+ENGINE_43 = (352, 0, 160)
+ENGINE_169 = (ENGINE_LEFT_OFFSET, ENGINE_RIGHT_OFFSET, ENGINE_HALF_WIDTH)
+# ...and the same with `right_offset` patched to 107, so that closing
+# ff7nx_fieldwide's KNOWN GAP later cannot silently invalidate this pass.
+ENGINE_169_FULL = (ENGINE_LEFT_OFFSET, 107, ENGINE_HALF_WIDTH)
+
+# At most this many 32-unit columns per side. 53.5 units is two; `bwhlin`'s
+# off-centre `pos_x` needs three. Four is the refusal point, and a layer that
+# wants more is not the defect this pass was written for.
+MAX_EDGE_COLS = 4
 
 # Refuse rather than bloat. A layer needing more than this many extra rows is
 # not the defect this pass was written for, and quietly tripling a field's
@@ -138,9 +197,35 @@ FILL_X = os.environ.get('SEVENTH_NX_PARALLAX_FILL_X') == '1'
 # The PINNED-layer edge extension. Separate again, because it is a different
 # mechanism with a different risk: `FILL_X` repeats a scrolling layer, this
 # one extends a stationary layer's outermost column outward.
-# DEFAULT OFF, same build, same reason. Extending a pinned layer's outermost
-# column smears that column across the margin, which is a streak wherever the
-# edge is not flat colour.
+#
+# DEFAULT OFF AGAIN AFTER BUILD 148 MEASURED IT ON HARDWARE. FINDINGS-283.
+#
+# Build 148 turned this on with the window corrected. Hardware: `fship_2` was
+# UNCHANGED -- the screenshots from builds 147 and 148 are byte-identical in
+# every edge column. Two things were wrong, and the second one is fatal:
+#
+#   1. THE MARGIN WAS ALREADY AUTHORED. Build 148's census read the VANILLA
+#      dump, where `fship_2` layer 3 is x -160..160. The build does not run on
+#      that: Cosmos Limit Break ships `fship_2.chunk.9` with layer 3 at
+#      x -224..224, 14 columns. Cosmos widened the parallax the same way it
+#      widened layers 1 and 2. There was no missing art.
+#
+#   2. THE ENGINE THROWS THE RIGHT HALF AWAY, AND THE ARCHIVE CANNOT STOP IT.
+#      `field_layer3_pick_tiles` applies the same bound as a CULL after the
+#      shift, and `right_offset` is 0 in this port. Cosmos's columns at
+#      x 160 and 192 wrap to -864/-832 and are dropped. The columns build 148
+#      wrote at x + width DO come back to 160/192 through the wrap -- and are
+#      then dropped by the cull, which is why nothing changed.
+#
+#      It is not addressable. `screen(x) = 320 - bg.x + x` and the cull is
+#      `x < bg.x + 0`, so `screen < 320` for every tile the engine will draw,
+#      whatever `bg?_pos_x` and `dst_x` are set to. 320 is the 4:3 right edge.
+#
+# MEASURED on the shipped build 148: 1,069 tiles encoded for the right margin
+# across 23 fields, and the engine culls 1,069 of them -- 100%. The pass is
+# pure weight. It stays off until `ff7nx_fieldwide`'s KNOWN GAP is closed
+# (`right_offset` 0 -> 107), and once that is closed Cosmos's own columns draw
+# and this pass is very likely not needed at all.
 EDGE_X = os.environ.get('SEVENTH_NX_PARALLAX_EDGE_X') == '1'
 
 # Layers 3/4 normally represent a repeating backdrop, but that is not an
@@ -445,8 +530,13 @@ def plan_layer_x(sec9, first, n, hdr, layer):
         return []
 
     bg_lo, bg_hi = bg_x_span(hdr, layer)
-    need_lo = bg_lo + PICTURE_LEFT
-    need_hi = bg_hi + PICTURE_RIGHT
+    # The PICTURE, on the corrected axis -- see `plan_layer_edge_x`. The old
+    # `bg_lo - 459 .. bg_hi + 107` read the WRAP window as if it were the
+    # picture and asked for eight columns that no camera position can show.
+    # This arm is still OFF by default (`fship_1`'s sea does not tile), but a
+    # dormant pass with a wrong window is a trap for whoever turns it on.
+    need_lo = bg_lo + ORIGIN_X - BG_OFFSET_X - HALF_VIEW_43 - PICTURE_MARGIN_X
+    need_hi = bg_hi + ORIGIN_X - BG_OFFSET_X + HALF_VIEW_43 + PICTURE_MARGIN_X
     have_lo, have_hi = float(cols[0]), float(cols[-1] + PTILE)
 
     add = []
@@ -475,9 +565,126 @@ def plan_layer_x(sec9, first, n, hdr, layer):
     return add
 
 
+def layer_width(hdr, layer):
+    """`layer3_width` / `layer4_width` as the ENGINE computes it.
+
+    The port has no `do_increase_width` -- that is an FFNx addition -- so this
+    is the raw header word and nothing else.
+    """
+    return hdr['bg3_w'] if layer == 3 else hdr['bg4_w']
+
+
+def bg_x_rest(hdr, layer):
+    """`bg_position.x` for a PINNED layer, in tile-x units.
+
+    `set_world_and_background_positions`, with `speed_x == 0` so the camera
+    term vanishes and `field_bg_offset->x` at its measured 160:
+
+        bg.x = remainder(pos_x / 16, width) + 320 - 160
+    """
+    pos = (hdr['bg3_pos_x'] if layer == 3 else hdr['bg4_pos_x']) / 16.0
+    w = layer_width(hdr, layer)
+    if w:
+        pos = math.remainder(pos, w)
+    return pos + ORIGIN_X - BG_OFFSET_X
+
+
+def engine_shift(stored_x, bg_x, width, engine):
+    """Where the ENGINE actually draws a tile whose record says `stored_x`.
+
+    `field_layer3_shift_tile_position` / `field_layer4_shift_tile_position`,
+    transcribed. It fires at most once -- it is a conditional, not a modulo --
+    which is the whole reason a right-hand column can be addressed through it.
+    """
+    left_off, right_off, half_w = engine
+    if stored_x <= bg_x - left_off or stored_x >= bg_x + right_off:
+        stored_x += -width if stored_x >= bg_x - half_w else width
+    return stored_x
+
+
+def encode_dst_x(x, bg_x, width):
+    """The `dst_x` to STORE so that the engine DRAWS the tile at `x`.
+
+    Returns None when no encoding is provably correct, in which case the
+    column is refused rather than guessed at.
+
+    THREE CONFIGURATIONS HAVE TO AGREE, and that is the whole safety argument:
+
+      * `ENGINE_169`      what this build ships today
+      * `ENGINE_169_FULL` the same with ff7nx_fieldwide's KNOWN GAP closed
+                          (`right_offset` 0 -> 107), so a later build that
+                          adds that cave cannot silently move these tiles
+      * `ENGINE_43`       the stock words, i.e. widescreen off. Here the tile
+                          is NOT required to land on `x` -- it is required to
+                          land OUTSIDE the 4:3 picture, so a 4:3 player sees
+                          exactly what build 147 gave them.
+    """
+    if width < PTILE:
+        return None                   # a degenerate wrap cannot be addressed
+    for stored in (x, x + width, x - width):
+        if not -32768 <= stored <= 32767:
+            continue
+        if engine_shift(stored, bg_x, width, ENGINE_169) != x:
+            continue
+        if engine_shift(stored, bg_x, width, ENGINE_169_FULL) != x:
+            continue
+        landed = engine_shift(stored, bg_x, width, ENGINE_43)
+        # the 4:3 picture is tile.x in [bg.x - 320, bg.x); a tile whose whole
+        # 32-unit body is outside it cannot be seen without the widescreen
+        # words applied.
+        if not (landed + PTILE <= bg_x - 2 * HALF_VIEW_43 or landed >= bg_x):
+            continue
+        return stored
+    return None
+
+
+def drawn_map(xs, bg_x, width, engine=None):
+    """{drawn tile-x: [source record offsets]} after the engine's wrap.
+
+    THE AUTHORED EXTENT IS NOT THE DRAWN EXTENT, and reading one for the other
+    is how `bwhlin2` and `woa_1` look covered when they are not. `bwhlin2`'s
+    layer 3 is authored x -288..288 but sits at `bg.x == 16`, so every column
+    from 16 rightwards is past `bg.x + right_offset` and the wrap throws it a
+    thousand units off screen. Its right-hand margin is empty even though its
+    art is 576 units wide.
+    """
+    engine = engine or ENGINE_169
+    out = {}
+    for x, offs in xs.items():
+        out.setdefault(engine_shift(x, bg_x, width, engine), []).extend(offs)
+    return out
+
+
+def _covered(drawn, lo, hi):
+    """Is every unit of [lo, hi) under some 32-unit tile in `drawn`?"""
+    at = lo
+    for d in sorted(drawn):
+        if d > at:
+            break
+        at = max(at, d + PTILE)
+        if at >= hi:
+            return True
+    return at >= hi
+
+
+def covers_43_picture(drawn, bg_x):
+    """Is this layer a full-frame BACKDROP, or is it an object?
+
+    THE GUARD BUILD 128 DID NOT HAVE, and the reason its smear was a
+    regression rather than a fix. Extending the edge of a layer that already
+    fills the 4:3 frame continues sky, sea or a mask by 53.5 units. Extending
+    `blin66_2`'s 96-unit layer 3 -- a lit window, not a backdrop -- would
+    smear that object 165 units across the margin.
+
+    So: what the engine already DRAWS must cover the whole 4:3 picture,
+    `tile.x` in [bg.x - 320, bg.x]. Nothing narrower is touched at all.
+    """
+    return bool(drawn) and _covered(drawn, bg_x - 2 * HALF_VIEW_43, bg_x)
+
+
 def plan_layer_edge_x(sec9, first, n, hdr, layer):
     """
-    [(source_record_offset, new_dst_x)] -- EXTEND a PINNED layer's own edge.
+    [(source_record_offset, stored_dst_x)] -- EXTEND a PINNED layer's own edge.
 
     THIS IS THE OTHER HALF OF THE HORIZONTAL GAP, AND IT IS NOT A TILING
     PROBLEM. `scrolls_x` refuses a speed-0 layer, and it is right to: build
@@ -489,23 +696,43 @@ def plan_layer_edge_x(sec9, first, n, hdr, layer):
          a real problem, but it is the MARGIN problem (FINDINGS-197), and the
          fix there is to extend the mask's own edge, never to tile it."
 
-    That is this function. MEASURED, and it is exactly Patrick's report:
+    That is this function. MEASURED over the archive, and the numbers are the
+    same story in 46 places:
 
-        fship_2   bg3 speed (0, 0)   art x -160..160   16:9 needs -223..223
-                  -> 63 units of black on the LEFT and 63 on the RIGHT
+        fship_2   bg3 speed (0,0)  pos_x 0  art x -160..160
+                  bg.x = 160, 16:9 needs -213.5..213.5
+                  -> 53.5 units of black on the LEFT and 53.5 on the RIGHT
 
-    A pinned layer's `dst_x` is a constant, so the gap is the same at every
-    camera position -- a fixed black bar down each side, which is precisely
-    what a widened frame does to art drawn for a 320-unit one.
+    which is Patrick's report to the unit, and it is why Cosmos widened
+    layers 1 and 2 to exactly +/-224 and no further.
+
+    TWO THINGS BUILD 128 GOT WRONG, BOTH FIXED HERE:
+
+      1. THE WINDOW. It filled to `rest - 427 .. rest + 107`, which is the
+         WRAP window read as if it were the picture. On `fship_2` that asked
+         for nine columns on the left and none at all on the right -- a
+         267-unit smear where 53.5 was needed, and the right-hand bar left
+         exactly as it was. `bg_x_rest` and `PICTURE_MARGIN_X` above are the
+         picture, derived from `initial_pos.x` rather than from the cull.
+
+      2. THE RIGHT-HAND COLUMNS CANNOT BE PLACED, THEY MUST BE ENCODED. The
+         right margin begins at `tile.x == bg.x`, and the wrap conditional
+         displaces every tile at or past that point because `right_offset` is
+         still 0 in this port. `encode_dst_x` writes those records at
+         `x + width` so the wrap brings them back to `x` -- the same journey
+         the header's `bg?_width` was always meant to send them on.
 
     THE COLUMN IS REPEATED, NOT THE LAYER. Only the OUTERMOST column is
-    copied, and only outward, one tile width at a time. For a backdrop whose
-    edge is sky or sea that continues it correctly; for a mask it extends the
-    mask, which is what a mask wants at the frame edge. Nothing is copied
-    inward, so no interior art can be disturbed and the keyhole cannot move.
+    copied, and only outward. For a backdrop whose edge is sky or sea that
+    continues it correctly; for a mask it extends the mask, which is what a
+    mask wants at the frame edge. Nothing is copied inward, so no interior
+    art can be disturbed and the keyhole cannot move.
     """
     if scrolls_x(hdr, layer):
         return []                      # tiling territory, handled above
+    width = layer_width(hdr, layer)
+    if width < PTILE:
+        return []
     xs = {}
     for i in range(n):
         off = first + i * TILE_SIZE
@@ -513,73 +740,107 @@ def plan_layer_edge_x(sec9, first, n, hdr, layer):
         xs.setdefault(x, []).append(off)
     if not xs:
         return []
-    cols = sorted(xs)
-    lo, hi = float(cols[0]), float(cols[-1] + PTILE)
+    bg_x = bg_x_rest(hdr, layer)
+    drawn = drawn_map(xs, bg_x, width)
+    if not covers_43_picture(drawn, bg_x):
+        return []
 
-    # A PINNED layer sits at a fixed `bg.x`, so the window is its resting
-    # position -- no camera travel term, which is the whole point of pinned.
-    rest = (hdr['bg3_pos_x'] if layer == 3 else hdr['bg4_pos_x']) / 16.0
-    # THE VISIBLE PICTURE, NOT THE CULL WINDOW. The cull accepts
-    # [-459, +107] about `bg.x` but only [-427, +107] can ever be SEEN
-    # (`initial_pos.x = (320 - bg.x) * mult` plus the 107 units widescreen
-    # adds on the left). Filling to the cull would copy ~4 extra columns per
-    # side that no camera position can show, and every one of them is a tile
-    # record against the per-page frame cap. FINDINGS-110.
-    need_lo = rest + PICTURE_SEEN_LEFT
-    need_hi = rest + PICTURE_RIGHT
+    # THE PICTURE IN TILE-X, AND IT IS NOT CENTRED ON `bg.x`.
+    #   screen(tile.x) = 320 - bg.x + tile.x,  4:3 viewport = screen 0..320
+    # so the 4:3 picture is tile.x in [bg.x - 320, bg.x] and 16:9 adds
+    # `PICTURE_MARGIN_X` at each end. Writing this as `bg.x -/+ 160` looks
+    # symmetric and is wrong by 160 units in both directions.
+    pic_lo, pic_hi = bg_x - 2 * HALF_VIEW_43, bg_x
+    need_lo = pic_lo - PICTURE_MARGIN_X
+    need_hi = pic_hi + PICTURE_MARGIN_X
+
+    # The column grid this layer is authored on. Every parallax tile is 32
+    # units and every layer's columns share one residue, so the margin
+    # columns land flush against the art rather than half a tile off it.
+    grid = min(xs) % PTILE
+    lo_i = int(math.floor((need_lo - grid) / PTILE)) - 1
+    hi_i = int(math.ceil((need_hi - grid) / PTILE)) + 1
+    cands = [i * PTILE + grid for i in range(lo_i, hi_i + 1)]
+    cands = [p for p in cands if p + PTILE > need_lo and p < need_hi]
+
+    # ONLY THE MARGIN. A candidate that overlaps the 4:3 picture at all is
+    # left alone, so this pass cannot change one 4:3 pixel by construction --
+    # not by a threshold, by the geometry of what it is allowed to consider.
+    left = sorted((p for p in cands if p + PTILE <= pic_lo), reverse=True)
+    right = sorted(p for p in cands if p >= pic_hi)
 
     add = []
-    for k in range(1, MAX_EXTRA_ROWS + 1):
-        if lo <= need_lo and hi >= need_hi:
-            break
-        moved = False
-        if lo > need_lo:
-            x2 = cols[0] - k * PTILE
-            add += [(o, x2) for o in xs[cols[0]]]
-            lo = float(x2)
-            moved = True
-        if hi < need_hi:
-            x2 = cols[-1] + k * PTILE
-            add += [(o, x2) for o in xs[cols[-1]]]
-            hi = float(x2 + PTILE)
-            moved = True
-        if not moved:
-            break
+    for which, side in (('L', left), ('R', right)):
+        for k, p in enumerate(side[:MAX_EDGE_COLS]):
+            if p in drawn:
+                continue               # the engine already puts art here
+            # PREFER THE ARTIST'S OWN TILE. If a record exists at this
+            # coordinate the engine is merely wrapping it out of the frame --
+            # re-encoding it restores authored art with no smear at all.
+            # `woa_1` and every 352-wide layer is this case: their art already
+            # reaches the margin and the wrap is throwing it away.
+            #
+            # Only where nothing was ever authored does this fall back to
+            # extending the nearest DRAWN column outward, which is the margin
+            # fix FINDINGS-197 calls for.
+            src = xs.get(p)
+            if src is None:
+                nearest = min(drawn, key=lambda d: (abs(d - p), d))
+                src = drawn[nearest]
+            stored = encode_dst_x(p, bg_x, width)
+            if stored is None:
+                break                  # cannot address it; nor anything past
+            add += [(o, stored, (which, k)) for o in src]
+            drawn[p] = src
     return add
 
 
-def apply_to_section9(sec9, sec7, field_name=None):
-    """
-    (new_sec9, {layer: tiles_added}) -- or (sec9, {}) if nothing was needed.
+def _vertical_plan(sec9, first, n, hdr, layer):
+    """The build-127 pass, unchanged, as (offset, value, word, group) tuples."""
+    return [(o, v, T_DSTY, None)
+            for o, v in plan_layer(sec9, first, n, hdr, layer)]
 
-    Records are copied byte for byte with only `dst_y` rewritten, so they keep
-    the page, uv, palette and blend of the row they repeat.
+
+def _horizontal_plan(sec9, first, n, hdr, layer):
+    """TWO AXES, TWO PLANS, AND THEY REWRITE DIFFERENT WORDS.
+
+    A vertical copy rewrites `dst_y` and a horizontal one `dst_x`, so they are
+    carried as (offset, value, field) rather than merged -- writing the wrong
+    word would move a tile sideways instead of down and the result is a
+    backdrop that tiles into itself at a right angle.
+
+    The fourth element is the GROUP: ('L'|'R', k), the margin column this
+    record belongs to, counted outward from the picture. The budget below
+    accepts or refuses a whole column at a time and stops at the first one it
+    cannot afford, so a short fill is always a narrower black bar and never a
+    ragged half-column.
     """
+    p = []
+    if FILL_X:
+        p += [(o, v, T_DSTX, ('X', i))
+              for i, (o, v) in enumerate(
+                  plan_layer_x(sec9, first, n, hdr, layer))]
+    if EDGE_X:
+        p += [(o, v, T_DSTX, g)
+              for o, v, g in plan_layer_edge_x(sec9, first, n, hdr, layer)]
+    return p
+
+
+def _apply_plan(sec9, hdr, field_name, planner, budgeted, cap_sec9=None):
+    """(new_sec9, {layer: n_added}) for ONE axis."""
     back = sec9.find(b'BACK')
     tex = sec9.find(b'TEXTURE')
     if back < 0 or tex < 0 or tex < back:
         raise FillError('no BACK/TEXTURE marker')
-    hdr = trigger_header(sec7)
     layers = _layers(sec9, back, tex)
 
-    # TWO AXES, TWO PLANS, AND THE RECORDS THEY REWRITE ARE DIFFERENT WORDS.
-    # A vertical copy rewrites `dst_y` and a horizontal one `dst_x`, so they
-    # are carried as (offset, value, field) rather than merged -- writing the
-    # wrong word would move a tile sideways instead of down and the result is
-    # a backdrop that tiles into itself at a right angle.
     plans = {}
     for layer, _count_at, first, n in layers:
         if layer not in (3, 4) or n == 0:
             continue
         if (field_name, layer) in NON_TILEABLE_OVERLAYS:
             continue
-        p = [(o, v, T_DSTY) for o, v in plan_layer(sec9, first, n, hdr, layer)]
-        if FILL_X:
-            p += [(o, v, T_DSTX)
-                  for o, v in plan_layer_x(sec9, first, n, hdr, layer)]
-        if EDGE_X:
-            p += [(o, v, T_DSTX)
-                  for o, v in plan_layer_edge_x(sec9, first, n, hdr, layer)]
+        p = planner(sec9, first, n, hdr, layer)
         if p:
             plans[layer] = p
     if not plans:
@@ -595,42 +856,60 @@ def apply_to_section9(sec9, sec7, field_name=None):
     # excess, it is three times one.
     #
     # So additions are BUDGETED per page. A tile that would push its page past
-    # the cap is dropped, nearest-to-the-picture first -- a slightly short
-    # fill is a thinner black bar, and overrunning the cap is a page the
-    # engine will not draw at all.
-    if not (FILL_X or EDGE_X):
-        # No horizontal work -> no budget pressure, and the vertical fill must
-        # come out byte-for-byte as build 127 shipped it. Applying the budget
-        # unconditionally would let it drop VERTICAL tiles that build 127 kept,
-        # which is a silent behaviour change in a pass that is meant to be
-        # untouched.
-        counts = None
-    else:
-        counts = {}
-    for _layer, _ca, first, n in (layers if counts is not None else ()):
-        for i in range(n):
-            off = first + i * TILE_SIZE
-            counts[sec9[off + 32]] = counts.get(sec9[off + 32], 0) + 1
-    if counts is None:
-        kept = plans
-    else:
-      cap = max(256, max(counts.values()) if counts else 256)
-      budget = {slot: cap - k for slot, k in counts.items()}
-      kept, dropped = {}, 0
-      for layer, p in plans.items():
-        out_p = []
-        for off, val, word in p:
-            slot = sec9[off + 32]
-            if budget.get(slot, cap) <= 0:
-                dropped += 1
-                continue
-            budget[slot] = budget.get(slot, cap) - 1
-            out_p.append((off, val, word))
-        if out_p:
-            kept[layer] = out_p
-    plans = kept
-    if not plans:
-        return sec9, {}
+    # the cap is dropped -- a slightly short fill is a thinner black bar, and
+    # overrunning the cap is a page the engine will not draw at all.
+    #
+    # ONLY THE HORIZONTAL PASS IS BUDGETED. The vertical fill has been on
+    # hardware since build 100 and must come out byte-for-byte as build 127
+    # shipped it; budgeting it too would silently drop rows that build 127
+    # kept, in a pass that is meant to be untouched.
+    if budgeted:
+        def _slot_counts(s):
+            c = {}
+            b, t = s.find(b'BACK'), s.find(b'TEXTURE')
+            for _l, _ca, f, m in _layers(s, b, t):
+                for i in range(m):
+                    k = s[f + i * TILE_SIZE + 32]
+                    c[k] = c.get(k, 0) + 1
+            return c
+
+        # THE CAP IS VANILLA'S, NOT THIS SECTION'S. `field_bg_pagecap`'s rule
+        # is `ours <= max(256, VANILLA's worst page)`; reading the ceiling off
+        # the section the vertical fill has just grown lets that fill raise
+        # its own limit on some fields and exhaust it on others.
+        vc = _slot_counts(cap_sec9 if cap_sec9 is not None else sec9)
+        counts = _slot_counts(sec9)
+        cap = max(256, max(vc.values()) if vc else 256)
+        budget = {slot: cap - k for slot, k in counts.items()}
+        kept = {}
+        for layer, p in plans.items():
+            groups, order = {}, []
+            for item in p:
+                key = item[3]
+                if key not in groups:
+                    groups[key] = []
+                    order.append(key)
+                groups[key].append(item)
+            out_p, stopped = [], set()
+            for key in order:
+                side = key[0] if isinstance(key, tuple) else key
+                if side in stopped:
+                    continue
+                need = {}
+                for off, _v, _w, _g in groups[key]:
+                    slot = sec9[off + 32]
+                    need[slot] = need.get(slot, 0) + 1
+                if any(budget.get(s, cap) < c for s, c in need.items()):
+                    stopped.add(side)          # and nothing further out
+                    continue
+                for s, c in need.items():
+                    budget[s] = budget.get(s, cap) - c
+                out_p += groups[key]
+            if out_p:
+                kept[layer] = out_p
+        plans = kept
+        if not plans:
+            return sec9, {}
 
     total = sum(len(p) for p in plans.values())
     if total > MAX_EXTRA_TILES:
@@ -644,7 +923,7 @@ def apply_to_section9(sec9, sec7, field_name=None):
         if not p:
             continue
         blob = bytearray()
-        for off, val, word in p:
+        for off, val, word, _group in p:
             rec = bytearray(sec9[off:off + TILE_SIZE])
             struct.pack_into('<h', rec, word, int(val))
             blob += rec
@@ -653,6 +932,39 @@ def apply_to_section9(sec9, sec7, field_name=None):
         struct.pack_into('<H', buf, count_at, n + len(p))
         added[layer] = len(p)
     return bytes(buf), added
+
+
+def apply_to_section9(sec9, sec7, field_name=None):
+    """
+    (new_sec9, {layer: tiles_added}) -- or (sec9, {}) if nothing was needed.
+
+    Records are copied byte for byte with only ONE destination word rewritten,
+    so they keep the page, uv, palette, blend and animation group of the row or
+    column they repeat.
+
+    THE TWO AXES RUN IN SEQUENCE, NOT TOGETHER, AND THE ORDER MATTERS.
+    `wcrimb_2`'s layer 3 is pinned horizontally and scrolls vertically, so both
+    passes fire on it. Planning them both against the ORIGINAL section -- which
+    is what build 128 did -- makes the new edge column exactly as tall as the
+    art was BEFORE the vertical fill extended it, and the margin then shows the
+    black band the vertical fill had just removed. Running vertical first and
+    planning horizontal against the result copies the filled column entire.
+    """
+    if sec9.find(b'BACK') < 0 or sec9.find(b'TEXTURE') < 0:
+        raise FillError('no BACK/TEXTURE marker')
+    hdr = trigger_header(sec7)
+    vanilla = sec9
+    added = {}
+    sec9, a = _apply_plan(sec9, hdr, field_name, _vertical_plan,
+                          budgeted=False)
+    for k, v in a.items():
+        added[k] = added.get(k, 0) + v
+    if FILL_X or EDGE_X:
+        sec9, a = _apply_plan(sec9, hdr, field_name, _horizontal_plan,
+                              budgeted=True, cap_sec9=vanilla)
+        for k, v in a.items():
+            added[k] = added.get(k, 0) + v
+    return sec9, added
 
 
 # --------------------------------------------------------------------------
@@ -739,23 +1051,43 @@ def summarise(stats):
             'layer as well as its repeat. WATCH FOR: the backdrop now '
             'genuinely tiles, so art that does not join to itself shows a '
             'seam where it used to show black. Biggest: %s. Off with %s=1.'
-            ' -- HORIZONTAL, BUILD 128: bg3_WIDTH is worse than the height '
-            'ever was. MEASURED over the 46 fields with a layer 3: it is <= 1 '
-            'in 34 of them and smaller than the art in 9 more, so 43 of 46 '
-            'are wrong, while bg3_height is degenerate in NONE. Two '
-            'mechanisms, because a layer that SCROLLS and a layer that is '
-            'PINNED need opposite treatment: a scrolling layer has its '
-            'columns repeated at +/- its own span, exactly as the rows are '
-            'above; a PINNED layer (bg speed_x == 0) is never tiled -- build '
-            '101 tiled one and put onna_5\'s keyhole where the artist never '
-            'drew it -- and instead has its OUTERMOST COLUMN extended '
-            'outward, which is the margin fix FINDINGS-197 calls for. '
-            'fship_2 is pinned and 267 units short on the left; its bars are '
-            'this. Additions are BUDGETED against the per-page frame cap '
-            '(max(256, vanilla\'s worst page)) and dropped rather than '
-            'allowed to overrun it -- junonl2 would otherwise have gone 308 '
-            '-> 703 tiles on one page. Off with %s=1 (tiling) or %s=1 '
-            '(pinned edge).'
+            ' -- HORIZONTAL MARGIN, BUILD 148, AND BUILD 128 WAS WRONG BY 160 '
+            'UNITS: it read the engine\'s WRAP window as if it were the '
+            'picture and asked fship_2 for nine extra columns on the LEFT and '
+            'none at all on the RIGHT. FFNx background.cpp gives both numbers '
+            'exactly: initial_pos.x = (320 - bg.x) * mult, so a tile is on '
+            'screen at 320 - bg.x + tile.x, the 4:3 viewport is 0..320 of '
+            'that, and wide_viewport_width 854 against 640 adds 53.5 UNITS ON '
+            'EACH SIDE. bg.x for a pinned layer is remainder(pos_x/16, width) '
+            '+ 160, which the archive proves: 34 pinned layers are authored '
+            'at exactly x -160..160 with pos_x 0, and no black bars in 4:3 '
+            'forces bg.x = 160 for them. So the margin is 53.5 units per '
+            'side, both sides -- which is why COSMOS widened layers 1 and 2 '
+            'to exactly +/-224 and is fship_2\'s two bars to the unit. THE '
+            'RIGHT-HAND COLUMNS ARE ENCODED, NOT PLACED: this port never '
+            'patched right_offset (ff7nx_fieldwide KNOWN GAP), so the wrap '
+            'displaces every tile at or past bg.x, and a right margin column '
+            'is written at x + bg?_width for the wrap to bring back to x -- '
+            'no code patch, no cave, the header\'s own period doing its job. '
+            'Where a record already exists at that coordinate it is that '
+            'record that is re-encoded, so no smear at all; only where the '
+            'artist drew nothing is the nearest DRAWN column extended '
+            'outward, which is the margin fix FINDINGS-197 calls for. SCOPED: '
+            'pinned layers only (a scrolling layer is FILL_X, still off -- '
+            'fship_1\'s sea does not tile), and only where what the engine '
+            'ALREADY DRAWS covers the whole 4:3 picture, so blin66_2\'s '
+            '96-unit lit window is not smeared 165 units across the margin. '
+            'A candidate column that overlaps 4:3 at all is never considered, '
+            'so the 4:3 picture cannot change by construction; GATED '
+            '(_kpx.py) over all 96 parallax layers -- 29 margins closed, zero '
+            '4:3 tiles gained or lost, and identical whether right_offset is '
+            '0 or 107. Additions are BUDGETED against the per-page frame cap '
+            '(max(256, VANILLA\'s worst page)) a WHOLE COLUMN at a time and '
+            'stop at the first one that does not fit, so a short fill is a '
+            'narrower bar and never a ragged half-column: MEASURED, zero '
+            'fields had their worst per-page tile count rise. Off with %s=1 '
+            '(tiling, already off) or %s=1 (pinned margin, restores build '
+            '147).'
             % (stats['tiles'], stats['layers'], stats['fields'], worst,
-               OFF_ENV, 'SEVENTH_NX_NO_PARALLAX_FILL_X',
+               OFF_ENV, 'SEVENTH_NX_PARALLAX_FILL_X',
                'SEVENTH_NX_NO_PARALLAX_EDGE_X'))
