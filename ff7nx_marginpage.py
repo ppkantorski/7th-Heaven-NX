@@ -221,7 +221,17 @@ def split_section9(sec9, log=None, field=''):
         plist[slot] = FN.Page(slot, 0, 1, arr.tobytes(), 256)
     out = FN.replace_texture_block(bytes(buf), plist, tex_start, tex_end)
     if field and st['origin']:
-        ORIGIN[field] = st['origin']
+        # MERGE, DO NOT REPLACE. FINDINGS-292.
+        #
+        # `ff7nx_blackcell` runs BEFORE this pass and now records its own
+        # copies here, so assigning the dict wholesale would throw that trail
+        # away and put its cells back to having no art. Compose while merging:
+        # if this split moved a cell blackcell had already copied, the origin
+        # that matters is the ORIGINAL page the mod ships art for, not the
+        # intermediate one.
+        _o = ORIGIN.setdefault(field, {})
+        for _dst, _src in st['origin'].items():
+            _o[_dst] = _o.get(_src, _src)
     if log:
         log('    margin page split: %d cell(s) -> %d new page(s), %d tile(s) '
             'repointed' % (st['cells'], st['pages'], st['tiles']))

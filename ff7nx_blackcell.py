@@ -100,12 +100,19 @@ import field_bg_pagecap as PC                                  # noqa: E402
 import field_bg_repack as RP                                   # noqa: E402
 import ff7nx_marginart as MA                                   # noqa: E402
 import ff7nx_marginblack as MB                                 # noqa: E402
+import ff7nx_marginpage as _MPG                                # noqa: E402
 
 SECTION9 = 8
 SECTION_PALETTE = 3
 TILE = 16
 # Layers 3 and 4 set a tile's width to 32 (offsets 18/20). FINDINGS-189.
 BIG_TILE = 32
+
+
+# See the ORIGIN block in `fill_field`. Publishing the trail is what lets the
+# dense repack give a copied cell the mod's own art instead of the flat index
+# this pass had to quantise.
+BLACKCELL_ORIGIN = os.environ.get('SEVENTH_NX_NO_BLACKCELL_ORIGIN') != '1'
 
 
 def disabled():
@@ -624,7 +631,7 @@ def fill_field(name, raw, art, log=lambda *_: None, overlay=False):
 
     st = {'black': 0, 'fixed': 0, 'in_place': 0, 'copied': 0,
           'no_art': 0, 'no_room': 0, 'depth2': 0, 'reverted': 0,
-          'ov_cells': 0, 'ov_filled': 0, 'ov_no_art': 0}
+          'ov_cells': 0, 'ov_filled': 0, 'ov_no_art': 0, 'origin': {}}
     parts = lgp.split_sections(raw)
     sec9 = parts[SECTION9]
     surv = DC.survey(sec9)
@@ -821,6 +828,32 @@ def fill_field(name, raw, art, log=lambda *_: None, overlay=False):
                     # other representation and cannot move a tile.
                     buf[t['off'] + RP.T_SRC_X] = tx & 0xFF
                     buf[t['off'] + RP.T_SRC_Y] = ty & 0xFF
+                # ---- LEAVE A TRAIL BACK TO THE ART. FINDINGS-292.
+                #
+                # THE COPY BREAKS THE SAME TRAIL `ff7nx_marginpage` WAS TAUGHT
+                # TO PRESERVE. Cosmos names its DDS `<field>_<page>_<pal>.dds`
+                # and the art for this surface lives at the page and cell the
+                # tile pointed at BEFORE this line -- `_art_block` above reads
+                # it at exactly `(page, sx, sy)`. After the repoint the tile
+                # names a cell the mod ships NOTHING for, so every later pass
+                # that asks `art_for(new_slot, pal)` gets an empty block and
+                # falls back to the paletted page.
+                #
+                # That is `woa_3`'s square, measured end to end: the tile
+                # moves slot 0 (0,0) -> slot 1 (176,176), the quantise
+                # collapses five sky colours onto palette entry 43, the repack
+                # then PROMOTES the cell to truecolor and faithfully bakes the
+                # flat index because the art it would have preferred is no
+                # longer findable. Shipped result: one colour, 0xA7DF, which
+                # is entry 43 in 565.
+                #
+                # `ORIGIN` is exactly the mechanism for this and `source_cell`
+                # and `hue_broken` already follow it (FINDINGS-150). Compose
+                # rather than overwrite, so a cell that was already moved once
+                # still resolves to the page the art is actually on.
+                if BLACKCELL_ORIGIN:
+                    _src = st['origin'].get((slot, sx, sy), (slot, sx, sy))
+                    st['origin'][(tslot, tx, ty)] = _src
                 # the copy is now occupied; do not hand it out twice
                 by_cell[(tslot, tx, ty)] = []
                 st['copied'] += len(group)
@@ -927,6 +960,18 @@ def apply_to_flevel(archive, payloads, art, encode=None, log=print,
             st['ov_fields'] += 1
         if one.get('depth2'):
             st['depth2_fields'].append(nm)
+        # PUBLISH THE TRAIL, AND ONLY FROM THE PRE-REPACK CALL SITE.
+        #
+        # `overlay=True` marks build.py's FIRST call, the one that still runs
+        # in Cosmos's page numbering -- which is the only numbering `ORIGIN`
+        # and `art_for` agree on. The second call runs after the repack, the
+        # compactor and the page cap have renumbered everything, so entries
+        # recorded there would name pages the art provider cannot resolve and
+        # would be read by nothing. See FINDINGS-292.
+        if overlay and BLACKCELL_ORIGIN and one.get('origin'):
+            _org = _MPG.ORIGIN.setdefault(nm, {})
+            for _dst, _src in one['origin'].items():
+                _org[_dst] = _org.get(_src, _src)
         if new is not None:
             payloads[nm] = encode(new)
             st['fields'] += 1

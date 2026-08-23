@@ -832,6 +832,7 @@ class Stats:
                  'borrow_refused', 'origin', 'atlas_gap', 'bare',
                  'margin_l2', 'margin_l2_filled',
                  'parallax_l3', 'parallax_l3_filled', 'filler_exact',
+                 'fullblack_art',
                  'subunit_cells', 'subunit_units', 'subunit_texels',
                  'modclear_cells', 'modclear_texels', 'modclear_whole',
                  'blend_cells', 'blend_texels', 'backdrop_cells',
@@ -854,6 +855,7 @@ class Stats:
         self.parallax_l3 = 0          # layer-3-only 32-unit atlas cells
         self.parallax_l3_filled = 0   # ...of those, took Cosmos's art
         self.filler_exact = 0         # shared-cell layer-1 keys admitted
+        self.fullblack_art = 0        # 100%-black layer-1 cells with lit art
         self.subunit_cells = 0    # layer-2 cut-outs refined below unit size
         self.subunit_units = 0    # ...units in them the mod cuts partially
         self.subunit_texels = 0   # ...texels that stopped being keyed
@@ -1031,6 +1033,99 @@ def hue_broken(k, arrays, pal565, art_for, _cache=None, origin=None):
     if not col.size:
         return 0.0
     return float(np.linalg.norm(_chroma(b.mean(0)) - _chroma(col.mean(0))))
+
+
+def _art_block(k, art_for, _cache=None, origin=None):
+    """
+    The mod's 565 art for cell `k` as a (TILE*f, TILE*f) view, or None.
+
+    Deliberately a SEPARATE function from `hue_broken` rather than an
+    extraction out of it, and with its OWN cache dict. `hue_broken` decides
+    which cells are promoted first and has been wrong twice for reasons that
+    took a build each to find; it is not worth refactoring to save thirty
+    lines. The origin indirection and the palette-0 fallback are the same
+    rules and are documented there.
+    """
+    if art_for is None:
+        return None
+    slot, sx, sy, pal = k
+    if pal < 0:
+        pal = 0
+    if _cache is None:
+        _cache = {}
+    aslot, asx, asy = slot, sx, sy
+    if origin:
+        _o = origin.get((slot, sx, sy))
+        if _o:
+            aslot, asx, asy = _o
+    ck = (aslot, pal)
+    if ck not in _cache:
+        got = None
+        for _p in (pal, 0) if pal != 0 else (pal,):
+            try:
+                got = art_for(aslot, _p)
+            except Exception:                                  # noqa: BLE001
+                got = None
+            if got is not None:
+                break
+        _cache[ck] = got[0] if isinstance(got, tuple) else got
+    img = _cache[ck]
+    if img is None:
+        return None
+    try:
+        f = img.px // 256
+        page = np.frombuffer(img.buf, '<u2').reshape(img.px, img.px)
+    except Exception:                                          # noqa: BLE001
+        return None
+    if f < 1:
+        return None
+    return page[asy * f:(asy + TILE) * f, asx * f:(asx + TILE) * f]
+
+
+def _page_all_black(pages, arrays, pal565, k, _cache=None):
+    """
+    True when EVERY texel of this cell's page renders black through the
+    palette the cell names -- i.e. the page carries no art at all, so a black
+    cell on it is not an outlier.
+
+    Cached per (slot, pal): a page is 65,536 indices and the caller asks once
+    per candidate cell on it.
+    """
+    slot, _sx, _sy, pal = k
+    if pal >= len(pal565):
+        pal = len(pal565) - 1
+    if pal < 0:
+        pal = 0
+    if _cache is None:
+        _cache = {}
+    ck = (slot, pal)
+    if ck not in _cache:
+        try:
+            _cache[ck] = bool((pal565[pal][arrays[slot]] == 0).all())
+        except Exception:                                      # noqa: BLE001
+            # Unreadable is not "all black": returning True here would refuse
+            # the cell, which is the conservative direction for this caller.
+            _cache[ck] = True
+    return _cache[ck]
+
+
+def art_lit_fraction(k, art_for, _cache=None, origin=None):
+    """
+    Fraction of the mod's art for this cell that is LIT -- max channel > 24,
+    the same threshold `hue_broken` uses to decide a texel carries colour.
+
+    Returns 0.0 when the art cannot be read, so "I could not look" and "the
+    art is black" both refuse, which is the safe direction for every caller
+    below.
+    """
+    blk = _art_block(k, art_for, _cache, origin)
+    if blk is None or not blk.size:
+        return 0.0
+    av = blk.reshape(-1).astype(np.int64)
+    m = np.maximum(np.maximum(((av >> 11) & 31) << 3,
+                              ((av >> 5) & 63) << 2),
+                   (av & 31) << 3)
+    return float((m > 24).mean())
 
 
 def _pal_distance(pal565, pal, idx):
@@ -2809,6 +2904,49 @@ def source_cell(k, rec, pages, arrays, pal565, art_for, pals_for, st,
 # together, exactly as NEAR_BLACK and HD_BLACK_POINT do.
 TRUE_BLACK = 1.0
 
+# ---- THE FILTER ABOVE HAS ONE ESCAPE HATCH AND IT IS UNDEFINED EXACTLY WHERE
+# IT IS NEEDED. FINDINGS-291.
+#
+# A cell survives `TRUE_BLACK` if it is hue-broken. `hue_broken` measures the
+# chromaticity of what the PALETTED page renders, over the texels that carry
+# colour:
+#
+#     col = col[(idx != 0) & (col.max(1) > 24)]
+#     if not col.size: return 0.0
+#
+# When the cell renders ENTIRELY black there are no such texels, so the
+# distance is 0.0 -- "sound" -- and the cell is vetoed. The one case where
+# blackness is CERTAINLY not art is the one case the escape hatch cannot see.
+#
+# `woa_3`'s square is that cell exactly. Source cell (0,0) of page 0 is the
+# atlas FILLER: vanilla's indices are 251 everywhere and palette 0 entry 251
+# is 0x0000, so `black_fraction` is 1.0 to the texel. Cosmos ships five
+# colours of sky for it, 100% opaque. The chain, measured end to end:
+#
+#   SHARED-CELL LAYER-1 KEY admits it   ->  TRUE_BLACK vetoes it one step
+#   later  ->  it stays paletted and pure black  ->  `ff7nx_blackcell` finds a
+#   black layer-1 square, copies the cell and quantises the art against
+#   palette 0  ->  four of the five colours land on entry 43 and it comes out
+#   FLAT, at rgb(160,248,248) against art that wants (140..165, 251, 255).
+#
+# That is the teal square, and why it still reads as a square after being
+# recoloured: the recolour was the bandaid, this is the cause.
+#
+# TRUE_BLACK exists so a cell of DARK ART keeps its exact black instead of
+# being lifted to 0x0001 and drawing a blue seam against unpromoted
+# neighbours. A cell that is black in EVERY texel has no dark art to protect
+# -- there is no detail in it to preserve and no gradient to seam against.
+# Requiring the mod's art to be fully LIT on top of that is what separates
+# "an unused atlas coordinate" from "an authored black occluder": an occluder
+# has black art too, scores 0.0 here, and is still refused.
+#
+# MONOTONIC: exempted keys join `_newly`, which sorts to the BACK of the
+# queue, so they can only ever take capacity nothing else wanted.
+FULLBLACK_ART = os.environ.get('SEVENTH_NX_NO_FULLBLACK_ART') != '1'
+# The art must be lit essentially throughout. Not 1.0 -- a 768px cell is 2,304
+# texels and one dark texel at a corner is antialiasing, not an occluder.
+FULLBLACK_ART_LIT = 0.99
+
 # ------------------------------------------------------------- FINDINGS-171
 # SETTLED. BOTH NOTES ARE RIGHT, AND THE DISPUTED SET IS FIVE TILES.
 #
@@ -3856,6 +3994,7 @@ def dense_repack(sec3, sec9, field='', art_for=None, pals_for=None, px=256,
     if HUE_FIRST and art_for is not None:
         _hb = {k: hue_broken(k, arrays, pal565, art_for, _hc, _org)
                for k in cand}
+    _fbx = set()
     if TRUE_BLACK > 0.0:
         # See TRUE_BLACK. A mostly-black cell keeps its paletted page so that
         # its black stays exactly black, instead of being lifted to 0x0001 and
@@ -3875,9 +4014,47 @@ def dense_repack(sec3, sec9, field='', art_for=None, pals_for=None, px=256,
         # and refusing costs the entire hue, which is what the user
         # photographed. So blackness only wins the argument when the paletted
         # version is otherwise faithful.
-        cand = [k for k in cand
-                if black_fraction(pages, arrays, pal565, k) < TRUE_BLACK
-                or _hb.get(k, 0.0) > HUE_BROKEN_DIST]
+        #
+        # ...AND UNLESS THERE IS NOTHING THERE BUT BLACK. See FULLBLACK_ART.
+        # The hue escape above cannot fire on a cell that renders black in
+        # every texel, because it has no coloured texel to measure -- so the
+        # fully-black case is decided by the ART instead.
+        _fbc = {}
+        _pbb = {}
+        _kept_tb = []
+        for k in cand:
+            _bf = black_fraction(pages, arrays, pal565, k)
+            if _bf < TRUE_BLACK or _hb.get(k, 0.0) > HUE_BROKEN_DIST:
+                _kept_tb.append(k)
+                continue
+            # Layer 1 only. On layers 2+ index 0 is the colour key and a black
+            # cell draws nothing, so there is no square to fix and no reason
+            # to spend a truecolor cell on one.
+            #
+            # AND THE PAGE MUST NOT BE BLACK THROUGHOUT. The defect is a black
+            # SQUARE -- one dead atlas coordinate showing through on a page
+            # that otherwise carries art. A page that is black in every texel
+            # is not filler, it is the content, and `whitebg3` is the field
+            # that proves it: all four of its pages are index 1 from edge to
+            # edge and palette entry 1 is 0x0000, so without this test the arm
+            # promotes 1,024 cells and repaints the whole backdrop with
+            # Cosmos's 0xFFDF. Whether that backdrop is meant to be black is
+            # not a question this arm gets to answer.
+            if (FULLBLACK_ART and art_for is not None and _bf >= 1.0
+                    and not keys[k]['l2']
+                    and not _page_all_black(pages, arrays, pal565, k, _pbb)
+                    and art_lit_fraction(k, art_for, _fbc,
+                                         _org) >= FULLBLACK_ART_LIT):
+                _kept_tb.append(k)
+                _fbx.add(k)
+                continue
+        if _fbx:
+            dense_repack.fullblack_art = (
+                getattr(dense_repack, 'fullblack_art', 0) + len(_fbx))
+            dense_repack.fullblack_fields = (
+                getattr(dense_repack, 'fullblack_fields', 0) + 1)
+            st.fullblack_art += len(_fbx)
+        cand = _kept_tb
     # HUE-BROKEN CELLS GO FIRST. FINDINGS-149, and see HUE_FIRST above.
     # Tile reuse remains the tie-breaker inside each group, so within the
     # broken set and within the sound set the old ordering is unchanged.
@@ -3914,7 +4091,7 @@ def dense_repack(sec3, sec9, field='', art_for=None, pals_for=None, px=256,
     # item 2, "no field's truecolor tile count goes DOWN".
     _newly = ({k for k in cand
                if keys[k]['key'] and not keys[k]['l2']} if PROMOTE_LAYER1_KEY
-              else set()) | _crosslayer_exact
+              else set()) | _crosslayer_exact | _fbx
 
     def _rank(k):
         return (1 if k in _newly else 0,

@@ -2899,6 +2899,7 @@ def _convert_field_backgrounds(archive, payloads, log, dds_sources=(),
     vtc_stats = ff7nx_vanillatc.Stats()
     # (field, pages_with_filler_arm, pages_without) -- see FINDINGS-288.
     filler_pageback = []
+    fullblack_pageback = []           # fields that gave the black cell back
     for name in sorted(archive.index):
         entry = archive.index[name]
         if not archive.is_field(entry):
@@ -3235,6 +3236,51 @@ def _convert_field_backgrounds(archive, payloads, log, dds_sources=(),
                     break
                 if _live <= before:
                     break
+                # ---- GIVE BACK THE FULLY-BLACK EXEMPTION FIRST. FINDINGS-291.
+                #
+                # Same trade as the filler cell below and the same shape of
+                # arm, so the same answer: re-run this one field with the arm
+                # off at the SAME ceiling rather than paying a truecolor page
+                # for one square. Tried BEFORE the filler arm because it is
+                # the cheaper concession -- it is one cell per field, where
+                # `FILLER_EXACT` also carries whatever else the multi-palette
+                # rule was holding. MEASURED over 699 fields: exactly one
+                # field grows a page for it, `trnad_3` 11 -> 12.
+                #
+                # If this succeeds the block below sees the RE-RUN's `dst`
+                # and a lower `_live`, and it only ever accepts a further
+                # improvement, so the two cannot fight.
+                if (getattr(dst, 'fullblack_art', 0)
+                        and field_bg_dense.FULLBLACK_ART):
+                    field_bg_dense.FULLBLACK_ART = False
+                    try:
+                        _r9, _rdst = field_bg_dense.dense_repack(
+                            parts[3], _pre9, name, _af, _pf, px,
+                            max_tc=_tc + _fx_tc)
+                    except Exception:                          # noqa: BLE001
+                        _r9, _rdst = None, None
+                    finally:
+                        field_bg_dense.FULLBLACK_ART = True
+                    if _rdst is not None and not _rdst.refused:
+                        _rc = None
+                        if field_bg_compact.enabled():
+                            try:
+                                _r9, _rc = field_bg_compact.compact_section9(
+                                    _r9, src_px=px)
+                            except Exception:                  # noqa: BLE001
+                                _rc = None
+                        try:
+                            _rp, _rx, _ry = (
+                                field_bg_native.parse_texture_block(_r9, px))
+                            _rlive = sum(1 for p in _rp if p is not None)
+                        except Exception:                      # noqa: BLE001
+                            _rlive = _live + 1
+                        if _rlive < _live:
+                            fullblack_pageback.append((name, _live, _rlive))
+                            _try9, dst, cst = _r9, _rdst, _rc
+                            _live = _rlive
+                            if _live <= before:
+                                break
                 # ---- GIVE BACK THE FILLER CELL BEFORE GIVING UP A CEILING.
                 # FINDINGS-288.
                 #
@@ -3877,6 +3923,42 @@ def _convert_field_backgrounds(archive, payloads, log, dds_sources=(),
                 'ceiling for it. Set SEVENTH_NX_NO_FILLER_EXACT=1 to restore '
                 'build 151.' % f"{_fe:,}")
 
+        # THE CELL THAT IS BLACK IN EVERY TEXEL. FINDINGS-291.
+        _fba = getattr(field_bg_dense.dense_repack, 'fullblack_art', 0)
+        if _fba:
+            _dense_line += (
+                ' -- FULLY-BLACK EXEMPTION: %s layer-1 cell(s) that render '
+                'black in EVERY texel were promoted instead of being held on '
+                'the paletted page by TRUE_BLACK. That filter has one escape '
+                'hatch, `hue_broken`, and it measures the chromaticity of the '
+                'texels that CARRY COLOUR -- so on a cell with none it '
+                'returns 0.0, "sound", and the one case where blackness is '
+                'certainly not art is the one case it cannot see. MEASURED on '
+                'woa_3: source cell (0,0) of page 0 is the atlas FILLER, '
+                'vanilla is index 251 everywhere and palette 0 entry 251 is '
+                '0x0000, so black_fraction is 1.0 to the texel while Cosmos '
+                'ships five colours of sky at 100%% alpha. It was admitted by '
+                'SHARED-CELL LAYER-1 KEY and vetoed here one step later, left '
+                'paletted and pure black, and ff7nx_blackcell then quantised '
+                'the art against a palette whose bluest teal is 248 -- four '
+                'of the five colours landed on entry 43 and it came out FLAT. '
+                'That is the teal square, and the recolour was the bandaid. '
+                'THE PAGE MUST NOT BE BLACK THROUGHOUT: a page that is black '
+                'edge to edge is content, not filler -- whitebg3 is index 1 '
+                'on all four pages and without that test the arm repaints the '
+                'whole backdrop with Cosmos\'s 0xFFDF. The art must also be '
+                'LIT throughout, which is what refuses an authored black '
+                'occluder: its art is black too and scores 0.0. GATED over '
+                '701 fields in the REAL pass order: 13 fields, 1,018 cells, '
+                'ZERO fields lose a truecolor cell and ZERO gain a page; '
+                'every tile that changes goes BLACK -> ART and no other tile '
+                'on any layer moves. rootmap gains 77 and gidun_4 14, both '
+                'black bars down the left of the 16:9 frame. MONOTONIC: these '
+                'join `_newly` and sort to the BACK of the queue, and where '
+                'the arm would cost a page the field is re-run once with it '
+                'off. Set SEVENTH_NX_NO_FULLBLACK_ART=1 to restore build 153.'
+                % f"{_fba:,}")
+
         # THE BACKDROP'S OWN MARGIN. FINDINGS-284.
         _pl3 = getattr(field_bg_dense.dense_repack, 'parallax_l3_filled', 0)
         if _pl3:
@@ -4248,6 +4330,11 @@ def _convert_field_backgrounds(archive, payloads, log, dds_sources=(),
             'than gain a page (%s)'
             % (len(filler_pageback),
                ', '.join('%s %d->%d' % r for r in filler_pageback[:4])))
+    if fullblack_pageback:
+        log('  fully-black exemption: %d field(s) gave the cell back rather '
+            'than gain a page (%s)'
+            % (len(fullblack_pageback),
+               ', '.join('%s %d->%d' % r for r in fullblack_pageback[:4])))
     _vtc_line = ff7nx_vanillatc.summarise(vtc_stats)
     if _vtc_line:
         log(_vtc_line)
