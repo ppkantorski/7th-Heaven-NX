@@ -43,12 +43,30 @@ layout(location = 0) out vec4 pColor;
 // to vanilla and the backgrounds still get their blacks back.
 // ---------------------------------------------------------------------------
 
-// Pulls the bottom of the range back down. 0.014 (= 3.5/255) undoes exactly
-// the lift the quantiser fix introduced. 0.0 is neutral.
-const float HD_BLACK_POINT = 0.014;
+// Pulls the bottom of the range back down. It must equal the lift the
+// repack is forced to put on black, or the residue is visible -- and for
+// three revisions it did not.
+//
+// A truecolor field page has no index channel, so 0x0000 has to mean
+// TRANSPARENT (x86 0x6470E0) and a black pixel is stored as the dimmest
+// non-zero value the format has. R5G6B5's blue LSB is 255/31 = 8.2, so that
+// lift is 8/255 = 0.0314. This constant was 0.014 (3.5/255), which undoes
+// less than half of it:
+//
+//     stored 0x0001 = RGB(0,0,8)  ->  graded (0, 0, 4.5)   a BLUE residue
+//     stored 0x0841 = RGB(8,8,8)  ->  graded (4.5,4.5,4.5) a GREY residue
+//
+// 4.5/255 of pure blue on every black outline in a promoted cell is the blue
+// linework reported in Men's Hall. At 8/255 both land on exactly (0,0,0) and
+// the lift becomes invisible whatever colour it is stored in -- which is why
+// `field_bg_native.NEAR_BLACK` can stay the 0x0001 the rest of the project
+// documents rather than being changed to hide a shader mismatch.
+//
+// 0.0 is neutral.
+const float HD_BLACK_POINT = 0.04705882353;   // 8/255, the R5G6B5 LSB
 
 // 1.0 is untouched. 1.05 counters the slight desaturation of AI upscales.
-const float HD_SATURATION = 1.05;
+const float HD_SATURATION = 1.00;
 
 vec3 hd_grade_rgb(vec3 rgb, vec2 ts)
 {
