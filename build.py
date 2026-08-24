@@ -52,6 +52,10 @@ import ff7nx_fxmargin
 import ff7nx_fxpages
 import ff7nx_vanillatc
 import ff7nx_parallaxfill
+import ff7nx_parallaxwide
+import ff7nx_fxedge
+import ff7nx_fxart
+import ff7nx_fxbake
 import ff7nx_fshipart
 import ff7nx_marginpal
 import ff7nx_palkey
@@ -5851,6 +5855,64 @@ def _build_flevel(archive_path, chunks, field_files, romfs, log,
         log('  ! parallax fill: %d field(s) not changed (%s)'
             % (len(pf_stats['refused']),
                ', '.join('%s: %s' % r for r in pf_stats['refused'][:3])))
+
+    # AFTER the fill, and it is a different problem. The fill REPEATS a layer
+    # that does not reach the frame; this WIDENS one that is narrower than the
+    # frame can ever be covered by. It also adds a page, so it has to see the
+    # section the fill produced rather than plan against a stale one.
+    pw_stats = ff7nx_parallaxwide.apply_to_flevel(
+        archive, payloads,
+        encode=lambda raw: _encode_field_cached(archive, raw), log=log)
+    pw_line = ff7nx_parallaxwide.summarise(pw_stats)
+    if pw_line:
+        log(pw_line)
+    if pw_stats['refused']:
+        log('  ! parallax widescreen fill: %d layer(s) not changed (%s)'
+            % (len(pw_stats['refused']),
+               ', '.join('%s L%s: %s' % r for r in pw_stats['refused'][:3])))
+
+    # The LIGHTING's own margin, which is layers 1/2 and therefore disjoint
+    # from both parallax passes above -- they move layers 3/4. Ordered here
+    # so it sees the final tile array and its own budget is measured against
+    # what actually ships.
+    fe_stats = ff7nx_fxedge.apply_to_flevel(
+        archive, payloads,
+        encode=lambda raw: _encode_field_cached(archive, raw), log=log)
+    fe_line = ff7nx_fxedge.summarise(fe_stats)
+    if fe_line:
+        log(fe_line)
+    if fe_stats.get('capped'):
+        log('  ! FX edge: %d tile(s) refused by the per-page binding cap'
+            % fe_stats['capped'])
+
+    # LAST ART PASS, after every repack/page move has decided the final FX
+    # references. Some palette-specific Cosmos DDS files contain only their
+    # original 4:3 cells while an unambiguous sibling DDS carries the complete
+    # atlas. Restore only blank cells referenced exclusively by margin FX
+    # records, quantised through the record's own game palette. This changes
+    # no record, page slot/count, UV, palette or 4:3-referenced cell.
+    fxa_stats = None
+    if _bc_art is not None:
+        fxa_stats = ff7nx_fxart.apply_to_flevel(
+            archive, payloads, _bc_art,
+            encode=lambda raw: _encode_field_cached(archive, raw), log=log)
+        fxa_line = ff7nx_fxart.summarise(fxa_stats)
+        if fxa_line:
+            log('  ' + fxa_line)
+        if fxa_stats.get('refused'):
+            log('  ! FX margin art: %d field(s) left unchanged (%s)'
+                % (len(fxa_stats['refused']),
+                   ', '.join('%s: %s' % r
+                             for r in fxa_stats['refused'][:3])))
+
+    # Withdrawn build-160 experiment. It is default-off; retained only so an
+    # old environment setting has an explicit, logged owner.
+    fb_stats = ff7nx_fxbake.apply_to_flevel(
+        archive, payloads,
+        encode=lambda raw: _encode_field_cached(archive, raw), log=log)
+    fb_line = ff7nx_fxbake.summarise(fb_stats)
+    if fb_line:
+        log(fb_line)
 
     # AFTER that, so the camera range is the last thing written into section
     # 8 and cannot be reverted by a field the background pass rebuilt. The

@@ -180,6 +180,25 @@ MAX_EDGE_COLS = 4
 # not the defect this pass was written for, and quietly tripling a field's
 # tile count is how the per-page frame cap (FINDINGS-110) gets overrun.
 MAX_EXTRA_ROWS = 12
+
+# ---- WITHDRAWN. Build 156 shipped this ON and it was WRONG. FINDINGS-294.
+#
+# The reasoning was that the shift fires once, so art beyond one period cannot
+# be corrected and must alias. EXECUTING the port's own shift block over the
+# camera's whole travel says the opposite: the fold depends on `bg.x`, so a
+# copy at `x + width` and the original at `x` land in DIFFERENT places at a
+# given camera position, and the copies are what close the frame.
+#
+#   trnad_4 layer 3, uncovered units of the 427-unit 16:9 picture, measured
+#   on the port's own words (`_kl3shift.run_one`), worst camera position:
+#
+#       11 columns, as shipped        149.5      <- what build 156 leaves
+#       +/- 1 period   (33 columns)    53.5
+#       +/- 2 periods  (55 columns)     0.0
+#
+# So clamping to one period REMOVES coverage and cannot help. Default OFF;
+# set SEVENTH_NX_PARALLAX_CLAMP=1 to get build 156's behaviour back.
+PERIOD_CLAMP = os.environ.get('SEVENTH_NX_PARALLAX_CLAMP') == '1'
 MAX_EXTRA_TILES = 1400
 
 OFF_ENV = 'SEVENTH_NX_NO_PARALLAX_FILL'
@@ -410,27 +429,78 @@ def plan_layer(sec9, first, n, hdr, layer):
     need_bot = bg_hi + PICTURE_BOT
     have_top, have_bot = float(rows[0]), float(rows[-1] + PTILE)
 
+    # ---- NEVER GROW A LAYER PAST ITS OWN WRAP PERIOD. FINDINGS-293.
+    #
+    # `field_layer3_shift_tile_position` FIRES AT MOST ONCE -- it is a
+    # conditional, not a modulo, which is stated at `engine_shift` and was
+    # established by executing the port's own words. So the engine can place
+    # a tile at `y` or at `y +/- period`, and no further. A layer whose art
+    # spans one period has a unique tile for every residue and every one of
+    # them is reachable; a layer that spans TWO has two tiles per residue,
+    # both get drawn, and the engine cannot correct the second one -- it
+    # lands a whole period from where it belongs.
+    #
+    # MEASURED on `trnad_4`, the Whirlwind Maze green backdrop. Vanilla and
+    # Cosmos ship layer 3 as EXACTLY one period, 352 x 256 against
+    # `bg3_w`/`bg3_h` of 352/256, with zero residue collisions. This pass
+    # grew it to 352 x 480 and introduced 77. `bg3_speed_y` is 256, i.e. the
+    # layer tracks the camera 1:1, so the misplaced block slides across the
+    # screen as you walk -- the horizontal and vertical edges on the green
+    # that were reported from hardware.
+    #
+    # THE ARM IS STILL RIGHT WHERE IT WAS WRITTEN TO BE. FINDINGS-266's
+    # population is the layers whose `bg3_height` is the 1024 PLACEHOLDER:
+    # nothing is ever 1024 units out of place, so the shift never fires,
+    # nothing repeats the layer, and the copies this pass adds are the only
+    # coverage there is. Those layers are far short of 1024 and the clamp
+    # never binds on them. It binds on exactly the layers that already tile
+    # themselves, where the engine was doing the job all along.
+    #
+    # 25 layers across 25 fields are at their period before the fill --
+    # the whole `hyou*` Great Glacier set, the `move_*` set, `kuro_1`,
+    # `trnad_2`, `trnad_3` layer 4, `trnad_4` and `loslake1`.
+    #
+    # AND THE ONE CASE WHERE NO CLAMP CAN HELP. Each tile is drawn ONCE, at
+    # `y` or at `y +/- period`, so a single period of art covers at most
+    # `2 * period` of window. Where the camera can show more than that, one
+    # period is genuinely not enough and the old behaviour is kept -- it is
+    # not right, but it is not worse than today either. MEASURED: `move_d`
+    # and `move_u`, window 560 against 2 x 256, are the only two layers in
+    # the archive in that position. Every other clamped layer has a window
+    # inside `2 * period` and is covered by the engine alone.
+    period = hdr['bg3_h'] if layer == 3 else hdr['bg4_h']
+    clamp = (PERIOD_CLAMP and bool(period)
+             and (need_bot - need_top) <= 2 * period)
+    if clamp and span >= period:
+        return []
+
     add = []
     for k in range(1, MAX_EXTRA_ROWS + 1):
         if have_top <= need_top and have_bot >= need_bot:
             break
         moved = False
         if have_top > need_top:
+            _t = rows[0] - k * span
+            if clamp and (have_bot - _t) > period:
+                break
             for y in rows:
                 y2 = y - k * span
                 if y2 + PTILE <= need_top - PTILE or y2 >= have_top:
                     continue
                 add += [(o, y2) for o in ys[y]]
                 moved = True
-            have_top = min(have_top, rows[0] - k * span)
+            have_top = min(have_top, _t)
         if have_bot < need_bot:
+            _b = rows[-1] + PTILE + k * span
+            if clamp and (_b - have_top) > period:
+                break
             for y in rows:
                 y2 = y + k * span
                 if y2 >= need_bot + PTILE or y2 + PTILE <= have_bot:
                     continue
                 add += [(o, y2) for o in ys[y]]
                 moved = True
-            have_bot = max(have_bot, rows[-1] + PTILE + k * span)
+            have_bot = max(have_bot, _b)
         if not moved:
             break
     return add
@@ -536,27 +606,42 @@ def plan_layer_x(sec9, first, n, hdr, layer):
     need_hi = bg_hi + ORIGIN_X - BG_OFFSET_X + HALF_VIEW_43 + PICTURE_MARGIN_X
     have_lo, have_hi = float(cols[0]), float(cols[-1] + PTILE)
 
+    # The same clamp as `plan_layer`, one axis over. See FINDINGS-293. This
+    # arm is dormant, but a dormant pass that would tear the layer the moment
+    # it is switched on is exactly the trap the note above complains about.
+    period = layer_width(hdr, layer)
+    clamp = (PERIOD_CLAMP and bool(period)
+             and (need_hi - need_lo) <= 2 * period)
+    if clamp and span >= period:
+        return []
+
     add = []
     for k in range(1, MAX_EXTRA_ROWS + 1):
         if have_lo <= need_lo and have_hi >= need_hi:
             break
         moved = False
         if have_lo > need_lo:
+            _l = cols[0] - k * span
+            if clamp and (have_hi - _l) > period:
+                break
             for x in cols:
                 x2 = x - k * span
                 if x2 + PTILE <= need_lo - PTILE or x2 >= have_lo:
                     continue
                 add += [(o, x2) for o in xs[x]]
                 moved = True
-            have_lo = min(have_lo, cols[0] - k * span)
+            have_lo = min(have_lo, _l)
         if have_hi < need_hi:
+            _h = cols[-1] + PTILE + k * span
+            if clamp and (_h - have_lo) > period:
+                break
             for x in cols:
                 x2 = x + k * span
                 if x2 >= need_hi + PTILE or x2 + PTILE <= have_hi:
                     continue
                 add += [(o, x2) for o in xs[x]]
                 moved = True
-            have_hi = max(have_hi, cols[-1] + PTILE + k * span)
+            have_hi = max(have_hi, _h)
         if not moved:
             break
     return add
@@ -1085,6 +1170,31 @@ def summarise(stats):
             'fields had their worst per-page tile count rise. Off with %s=1 '
             '(tiling, already off) or %s=1 (pinned margin, restores build '
             '147).'
+            ' -- PERIOD CLAMP, FINDINGS-293: the vertical repeat above now '
+            'STOPS at the layer\'s own wrap period. field_layer3_shift_tile_'
+            'position fires AT MOST ONCE -- it is a conditional, not a modulo '
+            '-- so the engine can put a tile at y or at y +/- period and no '
+            'further. A layer whose art spans one period has one tile per '
+            'residue and every one is reachable; a layer grown to TWO periods '
+            'has two, both are drawn, and the engine cannot correct the '
+            'second: it lands a whole period from where it belongs. MEASURED '
+            'on trnad_4, the Whirlwind Maze green backdrop, which is the '
+            'field this was reported on: vanilla and Cosmos ship layer 3 as '
+            'exactly 352 x 256 against bg3_w/bg3_h of 352/256 with ZERO '
+            'residue collisions, this pass grew it to 352 x 480 and made 77, '
+            'and bg3_speed_y is 256 so the misplaced block tracks the camera '
+            '1:1 and slides across the screen. The arm keeps its original '
+            'population untouched -- the 1024-PLACEHOLDER layers wcrimb_2 and '
+            'mtcrl_4 are nowhere near their period and the clamp never binds '
+            'on them. It binds on the 26 layers that already tiled '
+            'themselves: the whole hyou* Great Glacier set, move_f/i/r/s, '
+            'kuro_1, loslake1, trnad_2, trnad_3 layer 4, trnad_4, and it '
+            'trims crater_1, midgal and mtcrl_5 back to one period. 1,676 '
+            'rows removed, ZERO layers gain one, pages and layers 1/2 '
+            'byte-identical. move_d and move_u are EXEMPT and unchanged: '
+            'their window is 560 against 2 x 256, so one period genuinely '
+            'cannot cover them and no clamp helps. Off with %s=1.'
             % (stats['tiles'], stats['layers'], stats['fields'], worst,
                OFF_ENV, 'SEVENTH_NX_PARALLAX_FILL_X',
-               'SEVENTH_NX_NO_PARALLAX_EDGE_X'))
+               'SEVENTH_NX_NO_PARALLAX_EDGE_X',
+               'SEVENTH_NX_NO_PARALLAX_CLAMP'))

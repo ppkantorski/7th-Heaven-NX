@@ -23,6 +23,7 @@ byte-identical.
 from __future__ import annotations
 
 import collections
+import os
 
 import numpy as np
 
@@ -53,6 +54,9 @@ DEFER_FIELDS = FXM.TARGET_FIELDS
 # Two pages still leave ujunon1's four smoke frames admitted (34.06 MB final)
 # while keeping the general pass from spending downstream's safety margin.
 DOWNSTREAM_D2_RESERVE = 2
+
+# See the 32-unit note in `upgrade_section9`. FINDINGS-297.
+BIG_FX = os.environ.get('SEVENTH_NX_NO_BIG_FX') != '1'
 
 
 def enabled():
@@ -158,7 +162,29 @@ def upgrade_section9(name, sec9, art, px, max_raw_delta=None,
     for slot in range(FX_LO, FX_HI):
         page = pages.get(slot)
         refs = fx_refs.get(slot, ())
-        if (page is None or page.depth != 1 or page.size_flag
+        # ---- 32-UNIT FX PAGES QUALIFY TOO. FINDINGS-297.
+        #
+        # `page.size_flag` used to be refused here. Nothing below needs it:
+        # the whole page is replaced at the same resolution, the UVs never
+        # move, and `FN.Page(slot, page.size_flag, 2, ...)` already carries
+        # the flag through unchanged. The exclusion was caution, and it cost
+        # the one place where an FX page IS the backdrop.
+        #
+        # A 32-unit depth-2 page is proven on this port twice over: the
+        # IN-PLACE PARALLAX arm ships 35 of them across 8 fields, and build
+        # 119 ships `mtcrl_4`'s on slots 12/13/14. Additive behaviour in this
+        # band comes from the FINDINGS-194 ladder, which keys off the page
+        # TYPE in section 9 and not off its cell size.
+        #
+        # MEASURED on `trnad_4`, the Whirlwind Maze: layer 3 -- the green
+        # lifestream, the whole backdrop -- binds FX pages 17 and 18, both
+        # 32-unit. Every other page in the field is 768px truecolor and those
+        # two were still 1997 8-bit at 256px, which is why the effect banded
+        # and looked blocky against FFNx's smooth gradient. Both pass every
+        # other test already: FX-only (no base ref), blend mode 1 on all 165
+        # records, and complete Cosmos art at 768x768.
+        if (page is None or page.depth != 1
+                or (page.size_flag and not BIG_FX)
                 or page.px != FN.D1_PAGE_PX or not refs):
             continue
         # A page used through texture_id is a resting/base frame somewhere in
