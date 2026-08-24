@@ -1170,31 +1170,6 @@ def summarise(stats):
             'fields had their worst per-page tile count rise. Off with %s=1 '
             '(tiling, already off) or %s=1 (pinned margin, restores build '
             '147).'
-            ' -- PERIOD CLAMP, FINDINGS-293: the vertical repeat above now '
-            'STOPS at the layer\'s own wrap period. field_layer3_shift_tile_'
-            'position fires AT MOST ONCE -- it is a conditional, not a modulo '
-            '-- so the engine can put a tile at y or at y +/- period and no '
-            'further. A layer whose art spans one period has one tile per '
-            'residue and every one is reachable; a layer grown to TWO periods '
-            'has two, both are drawn, and the engine cannot correct the '
-            'second: it lands a whole period from where it belongs. MEASURED '
-            'on trnad_4, the Whirlwind Maze green backdrop, which is the '
-            'field this was reported on: vanilla and Cosmos ship layer 3 as '
-            'exactly 352 x 256 against bg3_w/bg3_h of 352/256 with ZERO '
-            'residue collisions, this pass grew it to 352 x 480 and made 77, '
-            'and bg3_speed_y is 256 so the misplaced block tracks the camera '
-            '1:1 and slides across the screen. The arm keeps its original '
-            'population untouched -- the 1024-PLACEHOLDER layers wcrimb_2 and '
-            'mtcrl_4 are nowhere near their period and the clamp never binds '
-            'on them. It binds on the 26 layers that already tiled '
-            'themselves: the whole hyou* Great Glacier set, move_f/i/r/s, '
-            'kuro_1, loslake1, trnad_2, trnad_3 layer 4, trnad_4, and it '
-            'trims crater_1, midgal and mtcrl_5 back to one period. 1,676 '
-            'rows removed, ZERO layers gain one, pages and layers 1/2 '
-            'byte-identical. move_d and move_u are EXEMPT and unchanged: '
-            'their window is 560 against 2 x 256, so one period genuinely '
-            'cannot cover them and no clamp helps. Off with %s=1.'
             % (stats['tiles'], stats['layers'], stats['fields'], worst,
                OFF_ENV, 'SEVENTH_NX_PARALLAX_FILL_X',
-               'SEVENTH_NX_NO_PARALLAX_EDGE_X',
-               'SEVENTH_NX_NO_PARALLAX_CLAMP'))
+               'SEVENTH_NX_NO_PARALLAX_EDGE_X'))

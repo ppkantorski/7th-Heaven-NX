@@ -53,6 +53,7 @@ import ff7nx_fxpages
 import ff7nx_vanillatc
 import ff7nx_parallaxfill
 import ff7nx_trnad4
+import ff7nx_trnaddetail
 import ff7nx_parallaxwide
 import ff7nx_fxedge
 import ff7nx_fxart
@@ -5857,11 +5858,12 @@ def _build_flevel(archive_path, chunks, field_files, romfs, log,
             % (len(pf_stats['refused']),
                ', '.join('%s: %s' % r for r in pf_stats['refused'][:3])))
 
-    # `trnad_4` is one seamless 352x256 layer-3 period. The generic vertical
-    # fill duplicates residues past its 256-unit wrap. FFNx draws a 2x2 copy
-    # for widescreen+uncrop and shifts it against local dimensions 704x512.
-    # Encode that exact four-quadrant period after the generic fill, removing
-    # its colliding rows before the general widescreen pass sees the field.
+    # Twenty-one fields use an exact seamless 352x256 scrolling grid: trnad_4
+    # layer 3, the Great Glacier hyou* set and the six move_* fields on layer
+    # 4. The generic vertical fill duplicates residues past the 256-unit wrap.
+    # Encode FFNx's exact 2x2 population as one collision-free 704x512 period,
+    # but only after proving the complete 11x8 source grid and byte-identical
+    # generic copies. Irregular/animated near-matches are excluded.
     tr4_stats = ff7nx_trnad4.apply_to_flevel(
         archive, payloads,
         encode=lambda raw: _encode_field_cached(archive, raw), log=log)
@@ -5869,8 +5871,9 @@ def _build_flevel(archive_path, chunks, field_files, romfs, log,
     if tr4_line:
         log(tr4_line)
     if tr4_stats.get('refused'):
-        log('  ! trnad_4 seamless lifestream: unchanged (%s)'
-            % ', '.join('%s: %s' % r for r in tr4_stats['refused'][:3]))
+        log('  ! exact scrolling-grid repeat: %d field(s) unchanged (%s)'
+            % (len(tr4_stats['refused']),
+               ', '.join('%s: %s' % r for r in tr4_stats['refused'][:3])))
 
     # AFTER the fill, and it is a different problem. The fill REPEATS a layer
     # that does not reach the frame; this WIDENS one that is narrower than the
@@ -5920,6 +5923,23 @@ def _build_flevel(archive_path, chunks, field_files, romfs, log,
                 % (len(fxa_stats['refused']),
                    ', '.join('%s: %s' % r
                              for r in fxa_stats['refused'][:3])))
+
+        # ``trnad_4`` has 47 whole native layer-2 pixels which Cosmos marks
+        # opaque but the dense conversion leaves keyed. At 3x they are the
+        # tiny square/step holes visible along the rock silhouettes. Restore
+        # only those small connected components after every general art pass;
+        # the field-specific pass fingerprints and preserves the five large,
+        # authored transparent atlas regions.
+        td_stats = ff7nx_trnaddetail.apply_to_flevel(
+            archive, payloads, _bc_art,
+            encode=lambda raw: _encode_field_cached(archive, raw), log=log)
+        td_line = ff7nx_trnaddetail.summarise(td_stats)
+        if td_line:
+            log('  ' + td_line)
+        if td_stats.get('refused'):
+            log('  ! trnad_4 rock detail: unchanged (%s)'
+                % ', '.join('%s: %s' % r
+                            for r in td_stats['refused'][:3]))
 
     # Withdrawn build-160 experiment. It is default-off; retained only so an
     # old environment setting has an explicit, logged owner.

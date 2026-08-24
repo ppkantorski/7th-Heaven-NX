@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Make ``trnad_4`` layer 3 repeat exactly as FFNx does.
+"""Make exact 352x256 scrolling grids repeat exactly as FFNx does.
 
 The authored lifestream is one seamless 352x256 period (11x8 32-unit tiles).
 The generic vertical filler grew it to 352x480 while the engine still wrapped
@@ -14,10 +14,11 @@ identical quadrants as one 704x512 period. Because the art itself repeats every
 352x256, the wider remainders select identical pixels; they only prevent the
 copies from folding onto each other.
 
-This is deliberately field-specific.  It changes only layer-3 destination
-records and bg3_width after proving the exact authored 11x8 population and
-every generic-fill record byte-for-byte.  Pages, UVs, palettes, animation
-state, layers 1/2/4, bg3_height, and scroll speeds remain unchanged.
+The same authored grid and the same generic-fill collision occur on the Great
+Glacier ``hyou*`` set and the six ``move_*`` fields. The correction is limited
+to those named fields and still proves the exact authored 11x8 population plus
+every generic-fill record byte-for-byte. Irregular grids with intentional
+animation duplicates are not candidates.
 """
 from __future__ import annotations
 
@@ -30,6 +31,7 @@ import ff7nx_parallaxfill as PF
 
 TARGET = "trnad_4"
 OFF_ENV = "SEVENTH_NX_NO_TRNAD4_REPEAT"
+OFF_ENV_ALL = "SEVENTH_NX_NO_EXACT_REPEAT"
 TILE = 32
 WIDTH = 352
 HEIGHT = 256
@@ -38,11 +40,21 @@ WIDE_HEIGHT = HEIGHT * 2
 X0 = -176
 Y0 = -128
 
+TARGETS = {
+    **{name: 4 for name in (
+        "hyou1", "hyou2", "hyou3", "hyou4", "hyou5_1", "hyou5_2",
+        "hyou5_4", "hyou6", "hyou7", "hyou8_1", "hyou9", "hyou10",
+        "hyou11", "hyou13_1")},
+    **{name: 4 for name in (
+        "move_d", "move_f", "move_i", "move_r", "move_s", "move_u")},
+    TARGET: 3,
+}
+
 
 def disabled():
-    return os.environ.get(OFF_ENV, "").strip().lower() in (
-        "1", "true", "yes", "on"
-    )
+    values = (os.environ.get(OFF_ENV, ""), os.environ.get(OFF_ENV_ALL, ""))
+    return any(v.strip().lower() in ("1", "true", "yes", "on")
+               for v in values)
 
 
 def _same_except_y(record, canonical):
@@ -51,23 +63,28 @@ def _same_except_y(record, canonical):
     return a == b
 
 
-def apply_to_sections(sec7, sec9):
+def apply_to_sections(sec7, sec9, field=TARGET):
     """Return ``(new7, new9, stats)`` or both inputs unchanged on refusal."""
     st = {"fields": 0, "removed": 0, "added": 0, "tiles": 0,
           "refusal": "", "names": []}
     if disabled():
         return sec7, sec9, st
+    layer = TARGETS.get(field)
+    if layer is None:
+        st["refusal"] = "field is not an exact-repeat candidate"
+        return sec7, sec9, st
     try:
         hdr = PF.trigger_header(sec7)
-        if (hdr["bg3_w"], hdr["bg3_h"], hdr["bg3_speed_x"],
-                hdr["bg3_speed_y"]) != (WIDTH, HEIGHT, 256, 256):
-            st["refusal"] = "unexpected layer-3 header"
+        if (hdr["bg%d_w" % layer], hdr["bg%d_h" % layer],
+                hdr["bg%d_speed_x" % layer],
+                hdr["bg%d_speed_y" % layer]) != (WIDTH, HEIGHT, 256, 256):
+            st["refusal"] = "unexpected layer-%d header" % layer
             return sec7, sec9, st
         survey = DC.survey(sec9)
         layers = PF._layers(sec9, survey["back_start"], survey["tex_start"])
-        hits = [row for row in layers if row[0] == 3]
+        hits = [row for row in layers if row[0] == layer]
         if len(hits) != 1:
-            st["refusal"] = "expected one layer-3 array"
+            st["refusal"] = "expected one layer-%d array" % layer
             return sec7, sec9, st
         _layer, count_at, first, count = hits[0]
         records = [sec9[first + i * PF.TILE_SIZE:
@@ -124,8 +141,9 @@ def apply_to_sections(sec7, sec9):
     out9[first:first + count * PF.TILE_SIZE] = blob
     struct.pack_into("<H", out9, count_at, len(canonical_order) * 4)
     out7 = bytearray(sec7)
-    struct.pack_into("<h", out7, 0x18, WIDE_WIDTH)
-    struct.pack_into("<h", out7, 0x1A, WIDE_HEIGHT)
+    header_at = 0x18 if layer == 3 else 0x1C
+    struct.pack_into("<h", out7, header_at, WIDE_WIDTH)
+    struct.pack_into("<h", out7, header_at + 2, WIDE_HEIGHT)
 
     # The new population must stay below the console's binding-page ceiling.
     try:
@@ -142,7 +160,7 @@ def apply_to_sections(sec7, sec9):
 
     st.update(fields=1, removed=count - len(canonical_order),
               added=len(canonical_order) * 3, tiles=len(canonical_order) * 4,
-              names=[TARGET])
+              names=[field])
     return bytes(out7), bytes(out9), st
 
 
@@ -153,31 +171,32 @@ def apply_to_flevel(archive, payloads, encode=None, log=lambda *_a: None):
              "refused": [], "names": []}
     if disabled():
         return total
-    entry = archive.index.get(TARGET)
-    if entry is None or not archive.is_field(entry):
-        total["refused"].append((TARGET, "field missing"))
-        return total
     encode = encode or archive.encode_field
-    try:
-        payload = payloads.get(TARGET)
-        raw = (lgp.lzs_decompress(payload[4:]) if payload
-               else archive.decompressed(entry))
-        parts = list(lgp.split_sections(raw))
-        new7, new9, one = apply_to_sections(parts[7], parts[8])
-    except Exception as exc:
-        total["refused"].append(
-            (TARGET, "%s: %s" % (type(exc).__name__, str(exc)[:80])))
-        return total
-    if one["refusal"]:
-        total["refused"].append((TARGET, one["refusal"]))
-        return total
-    if not one["fields"]:
-        return total
-    parts[7], parts[8] = new7, new9
-    payloads[TARGET] = encode(lgp.join_sections(parts))
-    for key in ("fields", "removed", "added", "tiles"):
-        total[key] += one[key]
-    total["names"].extend(one["names"])
+    for field in sorted(TARGETS):
+        entry = archive.index.get(field)
+        if entry is None or not archive.is_field(entry):
+            total["refused"].append((field, "field missing"))
+            continue
+        try:
+            payload = payloads.get(field)
+            raw = (lgp.lzs_decompress(payload[4:]) if payload
+                   else archive.decompressed(entry))
+            parts = list(lgp.split_sections(raw))
+            new7, new9, one = apply_to_sections(parts[7], parts[8], field)
+        except Exception as exc:
+            total["refused"].append(
+                (field, "%s: %s" % (type(exc).__name__, str(exc)[:80])))
+            continue
+        if one["refusal"]:
+            total["refused"].append((field, one["refusal"]))
+            continue
+        if not one["fields"]:
+            continue
+        parts[7], parts[8] = new7, new9
+        payloads[field] = encode(lgp.join_sections(parts))
+        for key in ("fields", "removed", "added", "tiles"):
+            total[key] += one[key]
+        total["names"].extend(one["names"])
     return total
 
 
@@ -185,10 +204,11 @@ def summarise(st):
     if not st or not st.get("fields"):
         return ""
     return (
-        "  trnad_4 seamless lifestream: removed %d colliding vertical "
-        "repeat tile(s), encoded FFNx's 2x2 repeat as one 704x512 period "
-        "(%d layer-3 tiles total). Pages, UVs, palettes, "
-        "animation state, layers 1/2/4 and scroll speed unchanged. Set "
-        "%s=1 to disable."
-        % (st["removed"], st["tiles"], OFF_ENV)
+        "  exact scrolling-grid repeat: %d field(s) (%s), removed %d "
+        "colliding generic-fill tile(s), encoded FFNx's 2x2 repeats as "
+        "collision-free 704x512 periods (%d tiles total). Pages, UVs, "
+        "palettes, animation state, other layers and scroll speeds "
+        "unchanged. Set %s=1 to disable."
+        % (st["fields"], ", ".join(st["names"]), st["removed"],
+           st["tiles"], OFF_ENV_ALL)
     )
