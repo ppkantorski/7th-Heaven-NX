@@ -52,6 +52,7 @@ import ff7nx_fxmargin
 import ff7nx_fxpages
 import ff7nx_vanillatc
 import ff7nx_parallaxfill
+import ff7nx_trnad4
 import ff7nx_parallaxwide
 import ff7nx_fxedge
 import ff7nx_fxart
@@ -5855,6 +5856,21 @@ def _build_flevel(archive_path, chunks, field_files, romfs, log,
         log('  ! parallax fill: %d field(s) not changed (%s)'
             % (len(pf_stats['refused']),
                ', '.join('%s: %s' % r for r in pf_stats['refused'][:3])))
+
+    # `trnad_4` is one seamless 352x256 layer-3 period. The generic vertical
+    # fill duplicates residues past its 256-unit wrap. FFNx draws a 2x2 copy
+    # for widescreen+uncrop and shifts it against local dimensions 704x512.
+    # Encode that exact four-quadrant period after the generic fill, removing
+    # its colliding rows before the general widescreen pass sees the field.
+    tr4_stats = ff7nx_trnad4.apply_to_flevel(
+        archive, payloads,
+        encode=lambda raw: _encode_field_cached(archive, raw), log=log)
+    tr4_line = ff7nx_trnad4.summarise(tr4_stats)
+    if tr4_line:
+        log(tr4_line)
+    if tr4_stats.get('refused'):
+        log('  ! trnad_4 seamless lifestream: unchanged (%s)'
+            % ', '.join('%s: %s' % r for r in tr4_stats['refused'][:3]))
 
     # AFTER the fill, and it is a different problem. The fill REPEATS a layer
     # that does not reach the frame; this WIDENS one that is narrower than the
