@@ -5834,10 +5834,13 @@ def _build_flevel(archive_path, chunks, field_files, romfs, log,
     # AFTER dense packing has made the final page decision and AFTER the sky
     # requantisation above, but BEFORE a possible build-wide depth-1 lift.
     # fship_2's last 74 lower-deck cells are the sole active users of paletted
-    # slot 0.  Replace that page IN PLACE with Cosmos's exact 768px page:
-    # unlike Build 164 this allocates no new slot, moves no record/UV, and
-    # cannot turn the animated sky into black rectangles.  The pass is
-    # content- and record-fingerprinted across all four matching scene states.
+    # slot 0, so that exclusive page can be replaced IN PLACE with Cosmos's
+    # exact 768px page.  Three one-tile residuals elsewhere are different:
+    # their slot 0 is also the dormant base of scripted layer-2 FX records,
+    # so the page must remain paletted.  Seat only the isolated layer-1 tile
+    # in a proven-unused cell on an EXISTING opaque page.  Both paths are
+    # content-, record- and destination-fingerprinted; neither adds a page or
+    # slot, and the isolated path changes no texture allocation at all.
     sp_stats = ff7nx_staticpage.apply_to_flevel(
         archive, payloads, _bc_art,
         encode=lambda raw: _encode_field_cached(archive, raw), log=log)

@@ -21,7 +21,8 @@ import ff7nx_staticpage as SP                                 # noqa: E402
 class FakeProvider:
     def __init__(self, art):
         self.art = art
-        self.by_page = {('fship_2', 0): {0}}
+        self.by_page = {(name, 0): {0}
+                        for name in tuple(SP.TARGETS) + tuple(SP.CELL_TARGETS)}
         self.ambiguous_slots = set()
 
     def open(self, name):
@@ -125,6 +126,120 @@ class TestStaticPage(unittest.TestCase):
         finally:
             del os.environ[SP.NO_ENV]
         self.assertTrue(SP.enabled())
+
+
+class TestStaticCellRelocation(unittest.TestCase):
+
+    NAME = 'mds7plr1'
+
+    def setUp(self):
+        self.old_plan = SP.CELL_TARGETS[self.NAME]
+        self.parts, self.source, self.dest, self.target_off, self.fx_off = \
+            self.fixture()
+        target = self.parts[8][self.target_off:
+                               self.target_off + FN.TILE_SIZE]
+        self.plan = {
+            'source_sha': hashlib.sha256(self.source).hexdigest(),
+            'record_sha': hashlib.sha256(target).hexdigest(),
+            'field_xy': (-96, -240), 'dest_slot': 14,
+            'dest_cell': (3, 6),
+            'dest_sha': hashlib.sha256(self.dest).hexdigest(),
+        }
+        SP.CELL_TARGETS[self.NAME] = self.plan
+        n = SP.PAGE_PX * SP.PAGE_PX
+        art = SimpleNamespace(
+            px=SP.PAGE_PX,
+            buf=np.arange(n, dtype='<u2').reshape(-1).clip(1).tobytes(),
+            tmask=np.zeros((SP.PAGE_PX, SP.PAGE_PX), bool),
+            hmask=np.ones((SP.PAGE_PX, SP.PAGE_PX), bool),
+        )
+        self.provider = FakeProvider(art)
+        self.art = lambda *_args: None
+        self.art.provider = self.provider
+
+    def tearDown(self):
+        SP.CELL_TARGETS[self.NAME] = self.old_plan
+
+    @staticmethod
+    def _record(field_xy, base, fx=0, use_fx=0, layer2=False):
+        r = bytearray(FN.TILE_SIZE)
+        struct.pack_into('<hh', r, 2, *field_xy)
+        struct.pack_into('<hh', r, 6, 0, 0)
+        struct.pack_into('<HH', r, 18, 0, 0)
+        r[22] = 1 if layer2 else 0
+        r[26] = r[27] = 0
+        struct.pack_into('<H', r, 28, use_fx)
+        r[30] = 1 if layer2 else 0
+        r[32], r[34] = base, fx
+        struct.pack_into('<ii', r, 42, 0, 0)
+        return bytes(r)
+
+    @classmethod
+    def fixture(cls):
+        target = cls._record((-96, -240), 0)
+        dormant_fx = cls._record((0, 0), 0, 15, 1, layer2=True)
+        back = (b'BACK' + struct.pack('<HHHHH', 0, 0, 1, 0, 0)
+                + target + b'\0\0'
+                + b'\x01' + struct.pack('<HHH', 0, 0, 1)
+                + bytes(18) + dormant_fx + b'\0\0'
+                + b'\0\0')
+        source = bytes([3]) * (256 * 256)
+        dest = bytes([4]) * (SP.PAGE_PX * SP.PAGE_PX * 2)
+        pages = [None] * FN.BG_MAX_PAGES
+        pages[0] = FN.Page(0, 0, 1, source, 256)
+        pages[14] = FN.Page(14, 0, 2, dest, SP.PAGE_PX)
+        pages[15] = FN.Page(15, 0, 1, bytes([5]) * (256 * 256), 256)
+        sec9 = back + FN.build_texture_block(pages) + b'END'
+        target_off = 4 + 10
+        fx_off = target_off + FN.TILE_SIZE + 2 + 1 + 6 + 18
+        parts = [b''] * 9
+        parts[8] = sec9
+        return parts, source, dest, target_off, fx_off
+
+    def test_moves_only_static_record_and_one_unused_cell(self):
+        old9 = self.parts[8]
+        old_pages, old_start, _end, _px = DC.parse_pages(old9)
+        old_fx = old9[self.fx_off:self.fx_off + FN.TILE_SIZE]
+        out, stats = SP.improve_field(self.NAME, self.parts, self.art)
+        pages, start, _end, _px = DC.parse_pages(out[8])
+
+        self.assertEqual(stats['tiles'], 1)
+        self.assertEqual(stats['relocated'], 1)
+        self.assertEqual(pages[0].data, self.source)
+        self.assertEqual(out[8][self.fx_off:self.fx_off + FN.TILE_SIZE], old_fx)
+        self.assertEqual([i for i, p in enumerate(pages) if p],
+                         [i for i, p in enumerate(old_pages) if p])
+        self.assertEqual(sum(SP._page_bytes(p.px, p.depth) for p in pages if p),
+                         sum(SP._page_bytes(p.px, p.depth)
+                             for p in old_pages if p))
+        moved = out[8][self.target_off:self.target_off + FN.TILE_SIZE]
+        self.assertEqual(moved[SP.T_BASE], 14)
+        step = SP.UV_SCALE // 16
+        self.assertEqual(struct.unpack_from('<ii', moved, SP.T_BIG_X),
+                         (3 * step, 6 * step))
+        self.assertEqual(SP._cell_bytes(pages[14].data, (3, 6)),
+                         SP._cell_bytes(self.provider.art.buf, (0, 0)))
+        # Exactly the destination cell changed in the page.
+        expected = SP._write_cell(self.dest, (3, 6),
+                                  SP._cell_bytes(self.provider.art.buf, (0, 0)))
+        self.assertEqual(pages[14].data, expected)
+        self.assertEqual(start, old_start)
+
+        again, second = SP.improve_field(self.NAME, out, self.art)
+        self.assertIsNone(again)
+        self.assertEqual(second['already'], 1)
+
+    def test_declared_destination_consumer_fails_closed(self):
+        parts = list(self.parts)
+        sec9 = bytearray(parts[8])
+        sec9[self.fx_off + SP.T_BASE] = self.plan['dest_slot']
+        step = SP.UV_SCALE // 16
+        struct.pack_into('<ii', sec9, self.fx_off + SP.T_BIG_X,
+                         self.plan['dest_cell'][0] * step,
+                         self.plan['dest_cell'][1] * step)
+        parts[8] = bytes(sec9)
+        with self.assertRaises(SP.StaticPageError):
+            SP.improve_field(self.NAME, parts, self.art)
 
 
 if __name__ == '__main__':
