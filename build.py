@@ -47,6 +47,7 @@ import ff7nx_credits
 import ff7nx_uncrop
 import ff7nx_marginblack
 import ff7nx_palettedart
+import ff7nx_staticpage
 import ff7nx_blackcell
 import ff7nx_marginpage
 import ff7nx_fxmargin
@@ -5829,6 +5830,25 @@ def _build_flevel(archive_path, chunks, field_files, romfs, log,
         log('  ! paletted art: %d field(s) unchanged (%s)'
             % (len(pa_stats['refused']),
                ', '.join('%s: %s' % r for r in pa_stats['refused'][:3])))
+
+    # AFTER dense packing has made the final page decision and AFTER the sky
+    # requantisation above, but BEFORE a possible build-wide depth-1 lift.
+    # fship_2's last 74 lower-deck cells are the sole active users of paletted
+    # slot 0.  Replace that page IN PLACE with Cosmos's exact 768px page:
+    # unlike Build 164 this allocates no new slot, moves no record/UV, and
+    # cannot turn the animated sky into black rectangles.  The pass is
+    # content- and record-fingerprinted across all four matching scene states.
+    sp_stats = ff7nx_staticpage.apply_to_flevel(
+        archive, payloads, _bc_art,
+        encode=lambda raw: _encode_field_cached(archive, raw), log=log)
+    sp_line = ff7nx_staticpage.summarise(sp_stats)
+    if sp_line:
+        log(sp_line)
+    if sp_stats.get('refused'):
+        log('  ! static page promotion: %d field(s) unchanged (%s)'
+            % (len(sp_stats['refused']),
+               ', '.join('%s: %s' % r
+                         for r in sp_stats['refused'][:4])))
 
     # ------------------------------------------ DEPTH-1 RESOLUTION LIFT
     # FINDINGS-223. DEAD LAST, and that is the design rather than a
