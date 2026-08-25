@@ -683,6 +683,64 @@ def test_unkeyed_overlay_alpha():
           getattr(FD.dense_repack, 'modclear_unkeyed_texels', 0) >= 1)
 
 
+def test_stale_key_units():
+    """Tiny atlas-edge keys yield to hard-opaque replacement coverage."""
+    print('stale atlas-edge key units')
+    import numpy as np
+    import field_bg_dense as FD
+    import field_bg_repack as RP
+
+    class Page:
+        depth = 1
+
+    src = np.ones((256, 256), np.uint8)
+    # The onna_5 signature: two joined key units on one cell edge.
+    src[15:17, 0] = 0
+    # A genuine clear unit must remain keyed.
+    src[5, 5] = 0
+    pal = np.zeros((1, 256), np.uint16)
+    pal[0, 1] = np.uint16(0x1234)
+
+    px = 768
+    alpha = np.full((px, px), 255, np.uint8)
+    alpha[15:18, 15:18] = 0
+    art = RP.PageArt.__new__(RP.PageArt)
+    art.px = px
+    art.buf = np.full((px, px), np.uint16(0x1234)).tobytes()
+    art.alpha = alpha
+    art.tmask = alpha < 8
+    art.hmask = alpha >= 128
+    art.bmask = np.zeros((px, px), bool)
+    art.amax = art.cmax = None
+    art._op = {}
+
+    rec = {'pal': 0, 'l2': True, 'l4': True, 'key': True}
+    keep = FD.STALE_KEY_UNITS
+    try:
+        FD.STALE_KEY_UNITS = False
+        old = FD.source_cell((1, 0, 0, 0), rec, {1: Page()}, {1: src},
+                             pal, lambda _page, _pal: art, None, FD.Stats(),
+                             scale=3, edge=32)
+        st = FD.Stats()
+        FD.STALE_KEY_UNITS = True
+        new = FD.source_cell((1, 0, 0, 0), rec, {1: Page()}, {1: src},
+                             pal, lambda _page, _pal: art, None, st,
+                             scale=3, edge=32)
+    finally:
+        FD.STALE_KEY_UNITS = keep
+    check('old path preserves the 3x6 vanilla rectangle',
+          bool((old[45:51, 0:3] == FN.EMPTY).all()))
+    check('hard-opaque art closes the two-unit seam sliver',
+          bool((new[45:51, 0:3] != FN.EMPTY).all()))
+    check('a source-transparent unit remains a real cut-out',
+          bool((new[15:18, 15:18] == FN.EMPTY).all()))
+    check('repair reports exactly two units / eighteen texels',
+          (st.stale_key_cells, st.stale_key_units, st.stale_key_texels)
+          == (1, 2, 18),
+          repr((st.stale_key_cells, st.stale_key_units,
+                st.stale_key_texels)))
+
+
 # WITHDRAWN WITH THE WAIVER IT TESTED. FINDINGS-281.
 #
 # `test_opaque_parallax_atlas` covered the build-148 candidate that kept
@@ -842,6 +900,7 @@ def main():
     test_quantiser()
     test_art_opacity()
     test_unkeyed_overlay_alpha()
+    test_stale_key_units()
 
     test_remap()
     test_growth_mode()

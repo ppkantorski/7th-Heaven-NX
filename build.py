@@ -3729,6 +3729,27 @@ def _convert_field_backgrounds(archive, payloads, log, dds_sources=(),
                 % (f"{_suc:,}",
                    f"{getattr(field_bg_dense.dense_repack, 'subunit_units', 0):,}",
                    f"{getattr(field_bg_dense.dense_repack, 'subunit_texels', 0):,}"))
+        # TINY HARD-OPAQUE ATLAS-SEAM KEYS. The counter is deliberately
+        # visible: the archive census proves the exact rule has one owner,
+        # onna_5, so any future value other than 1 cell / 2 units / 18 texels
+        # means the source set changed and deserves review.
+        _skc = getattr(field_bg_dense.dense_repack, 'stale_key_cells', 0)
+        if _skc:
+            _dense_line += (
+                ' -- STALE ATLAS KEY: %s 32-unit layer-4 cell(s) had %s '
+                'joined vanilla key unit(s) removed, restoring %s texel(s) '
+                'that Cosmos paints at alpha 255. This is onna_5\'s tiny '
+                '3x6 rectangular bite at the lower-right keyhole edge: the '
+                'pristine mask keys two units at page 5 (0,175..176), while '
+                'the replacement art is fully opaque there. The rule is '
+                'field-independent but admits only exactly two connected '
+                'units on one edge of a 32-unit cell; a 683-field census '
+                'finds one cell, in onna_5, and exact-chain A/B changes only '
+                'those 18 zero texels to art. Set '
+                'SEVENTH_NX_NO_STALE_KEY_UNITS=1 to restore build 170.'
+                % (f"{_skc:,}",
+                   f"{getattr(field_bg_dense.dense_repack, 'stale_key_units', 0):,}",
+                   f"{getattr(field_bg_dense.dense_repack, 'stale_key_texels', 0):,}"))
         # MOD-CLEAR KEY. FINDINGS-253. Same reason as the block above: a pass
         # that silently never fires is HANDOFF-246's second trap, and the log
         # is the only place it can be checked after the fact.

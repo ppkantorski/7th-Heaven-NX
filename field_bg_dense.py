@@ -330,6 +330,36 @@ INPLACE_EDGE_FIRST = os.environ.get('SEVENTH_NX_NO_INPLACE_EDGE') != '1'
 # `SEVENTH_NX_NO_SUBUNIT_KEY=1` restores build 118 exactly.
 SUBUNIT_KEY = os.environ.get('SEVENTH_NX_NO_SUBUNIT_KEY') != '1'
 
+# A TINY VANILLA KEY SLIVER MUST NOT OVERRIDE FULLY-OPAQUE MOD ART.
+#
+# SUBUNIT_KEY fixes a different case: one old logical unit straddles the
+# replacement art's silhouette, so its repeated 2x2/3x3 key is refined by the
+# high-resolution alpha. It deliberately leaves a unit alone when the art is
+# opaque over the WHOLE footprint. Normally that is conservative; at an atlas
+# cell seam it can preserve a one- or two-unit alias from the 320x240 mask as
+# a conspicuous rectangular bite in the HD silhouette.
+#
+# The Honey Bee Inn keyhole (`onna_5`) is the measured case. Its pristine
+# page-5 mask keys two vertically adjacent units at source x=0,y=175..176.
+# Cosmos is alpha 255 over all 18 destination texels, yet the emitted page
+# keys a 3x6 rectangle. This is not an edge-filter artefact: the two units are
+# already keyed in the unmodified archive, while the current sub-unit repair
+# merely trims three neighbouring antialias texels.
+#
+# The admission rule is intentionally much narrower than "Cosmos wins over
+# every vanilla key":
+#   * layer 4 and an already-keyed, promoted cell (the enclosing branch);
+#   * exactly two disagreeing LOGICAL units in one 32-unit parallax cell;
+#   * alpha == 255 over every destination texel in each unit;
+#   * the units are 4-connected and form a sliver on exactly one cell edge;
+#   * never a corner, whole-cell placeholder, soft edge, or interior hole.
+#
+# This recognizes the atlas-seam failure mode rather than the field name or a
+# coordinate. It can therefore repair the same signature elsewhere without
+# reopening the broad dark-edge population that PAINT_MAXPOOL deliberately
+# refuses. `SEVENTH_NX_NO_STALE_KEY_UNITS=1` restores build 170 exactly.
+STALE_KEY_UNITS = os.environ.get('SEVENTH_NX_NO_STALE_KEY_UNITS') != '1'
+
 # BUILD 121 -- THE MOD'S ALPHA IS THE AUTHORITY ON ITS OWN SILHOUETTE.
 # FINDINGS-253. THIS IS THE OPPOSITE DIRECTION FROM SUBUNIT_KEY ABOVE.
 #
@@ -834,6 +864,7 @@ class Stats:
                  'parallax_l3', 'parallax_l3_filled', 'filler_exact',
                  'fullblack_art',
                  'subunit_cells', 'subunit_units', 'subunit_texels',
+                 'stale_key_cells', 'stale_key_units', 'stale_key_texels',
                  'modclear_cells', 'modclear_texels', 'modclear_whole',
                  'blend_cells', 'blend_texels', 'backdrop_cells',
                  'wire_texels', 'l1key_cells', 'l1key_texels',
@@ -859,6 +890,9 @@ class Stats:
         self.subunit_cells = 0    # layer-2 cut-outs refined below unit size
         self.subunit_units = 0    # ...units in them the mod cuts partially
         self.subunit_texels = 0   # ...texels that stopped being keyed
+        self.stale_key_cells = 0  # tiny hard-opaque seam slivers repaired
+        self.stale_key_units = 0  # ...logical source units
+        self.stale_key_texels = 0 # ...destination texels that stopped keying
         self.modclear_cells = 0   # cut-out cells where the mod paints nothing
         self.modclear_texels = 0  # ...texels that STARTED being keyed
         self.modclear_whole = 0   # ...cells the mod leaves entirely clear
@@ -1728,10 +1762,13 @@ def collect(sec9, pages, tiles):
         rec = keys.get(k)
         if rec is None:
             rec = keys[k] = {'band': _band_of(t.slot, p.depth),
-                             'key': False, 'l2': False, 'l1_over': False,
+                             'key': False, 'l2': False, 'l4': False,
+                             'l1_over': False,
                              'tiles': []}
         if t.layer >= 2:
             rec['l2'] = True
+        if t.layer == 4:
+            rec['l4'] = True
         if t.layer == 1 and t.off in _on_top:
             rec['l1_over'] = True
         rec['tiles'].append(t.off)
@@ -1842,9 +1879,12 @@ def collect(sec9, pages, tiles):
             if fk not in keys:
                 keys[fk] = {'band': _band_of(f, pages[f].depth),
                             'key': rec['key'], 'l2': rec['l2'],
-                            'l1_over': rec['l1_over'], 'tiles': []}
+                            'l4': rec['l4'], 'l1_over': rec['l1_over'],
+                            'tiles': []}
             elif rec['l2']:
                 keys[fk]['l2'] = True
+            if rec['l4']:
+                keys[fk]['l4'] = True
             fx_of.setdefault(k, set()).add(fk)
     return keys, fx_of
 
@@ -2537,6 +2577,32 @@ def source_cell(k, rec, pages, arrays, pal565, art_for, pals_for, st,
                          _asx * s:_asx * s + t * step:step]
                 if _c.shape == out.shape:
                     _clear = ~_c
+            # A fully opaque two-unit sliver at ONE atlas-cell edge is a
+            # stale low-resolution key, not an HD silhouette. Keep this mask
+            # separate from `_clear`: SUBUNIT_KEY handles partial units at
+            # alpha >= 128, while this arm requires alpha == 255 everywhere
+            # and removes only the tiny seam signature documented above.
+            _stale = None
+            _alp = getattr(art, 'alpha', None) if art is not None else None
+            if (STALE_KEY_UNITS and scale > 1 and edge == BIG_TILE
+                    and bool(rec.get('l4'))
+                    and _alp is not None and idx.shape == (edge, edge)):
+                _af = _alp[_asy * s:_asy * s + t * step:step,
+                           _asx * s:_asx * s + t * step:step]
+                if _af.shape == out.shape:
+                    _solid = (_af == 255).reshape(
+                        edge, scale, edge, scale).all(axis=(1, 3))
+                    _cand = (idx == 0) & _solid
+                    _ncan = int(_cand.sum())
+                    if _ncan == 2:
+                        _xy = np.argwhere(_cand)
+                        _joined = int(np.abs(_xy[0] - _xy[1]).sum()) == 1
+                        _one_edge = sum((bool((_xy[:, 1] == 0).all()),
+                                         bool((_xy[:, 1] == edge - 1).all()),
+                                         bool((_xy[:, 0] == 0).all()),
+                                         bool((_xy[:, 0] == edge - 1).all()))) == 1
+                        if _joined and _one_edge:
+                            _stale = _up(_cand, scale)
             _sub = (SUBUNIT_KEY and art is not None and scale > 1
                     and bool(rec.get('l2'))
                     and _clear is not None
@@ -2623,6 +2689,18 @@ def source_cell(k, rec, pages, arrays, pal565, art_for, pals_for, st,
             # function may re-key a texel the mod paints at full strength.
             if _wire is not None and _wire.shape == keep.shape:
                 keep = keep & ~_wire
+            if _stale is not None and _stale.shape == keep.shape:
+                keep = keep & ~_stale
+                _ns = int(_stale.sum())
+                st.stale_key_cells += 1
+                st.stale_key_units += _ncan
+                st.stale_key_texels += _ns
+                dense_repack.stale_key_cells = (
+                    getattr(dense_repack, 'stale_key_cells', 0) + 1)
+                dense_repack.stale_key_units = (
+                    getattr(dense_repack, 'stale_key_units', 0) + _ncan)
+                dense_repack.stale_key_texels = (
+                    getattr(dense_repack, 'stale_key_texels', 0) + _ns)
             if _mck is not None:
                 _final = keep | _mck
                 _added = int(_final.sum() - keep.sum())
