@@ -546,6 +546,89 @@ def clamped_range(rng, wide):
 
 
 # --------------------------------------------------------------------------
+# THE ONE DIAGONAL CAMERA RAIL. `ship_1`, AND ONLY `ship_1`, HAS
+# field_trigger_header.field_14[0] == 2 IN THE VANILLA ARCHIVE.
+#
+# A normal field has a rectangular camera box. Tightening that box to the
+# painted 16:9 canvas is safe: the player cannot need the camera outside the
+# picture. A mode-2 field is different. The four range edges are the TWO END
+# POINTS of a diagonal rail, and the walkmesh was authored against that rail.
+# Replacing them with Cosmos's art-tight rectangle changes both the rail's
+# length and its slope.
+#
+# Measured on ship_1:
+#
+#   vanilla trigger envelope       L -320  T -224  R 296  B 184
+#   Cosmos + clamp identity        L -266  T -176  R 168  B 176
+#   current lower-left / upper-right          (-106,56) / (8,-56)
+#   vanilla envelope + identity lower-left              (-106,64)
+#   wanted upper-right endpoint                          (82,-104)
+#
+# Build 173 restored all four edges and hardware proved why that is wrong:
+# changing bottom 176 -> 184 moved the already-correct lower-left anchor from
+# y=56 to y=64, revealing an eight-unit black band below the painted ship.
+# FFNx's mode-2 formula makes the ownership explicit: left/bottom describe
+# that lower-left endpoint, while right/top describe the upper-right one.
+# Preserve the proven left/bottom pair and restore ONLY right/top.
+#
+# The walkmesh reaches projected x ~= 228. At x=8 the 427-unit 16:9 frame
+# ends at x=221, so the controllable character genuinely crosses the screen
+# edge. This is not a rounding error and not the normal clamp: the config has
+# shortened the only diagonal rail in the game.
+#
+# The correction runs AFTER camera-fit, because camera-fit intentionally
+# tightens to art and would otherwise put the bad endpoint back. It is gated
+# by the field's own structural byte, not by its name, and is monotonic: a
+# future config that already preserves at least the original upper-right
+# endpoint is left alone. With one mode-2 field in the archive that means one
+# field changes today and ordinary fields cannot regress.
+DIAGONAL_RAIL_MODE = 2
+DIAGONAL_RAIL_OFF_ENV = 'SEVENTH_NX_NO_DIAGONAL_RAIL'
+
+
+def preserve_diagonal_rail(before, plan, resolved, field_modes):
+    """
+    Return (new_plan, changes), preserving a mode-2 field's original rail.
+
+    `field_modes` is `{field: section8[0x14]}`. `changes` holds
+    `(name, old_endpoint, new_endpoint)` and is deliberately sufficient for
+    the build log and the regression test without re-reading the archive.
+    """
+    out = dict(plan)
+    changes = []
+    if os.environ.get(DIAGONAL_RAIL_OFF_ENV) == '1':
+        return out, changes
+
+    for name, flag in sorted(field_modes.items()):
+        if flag != DIAGONAL_RAIL_MODE:
+            continue
+        if resolved.get(name, {}).get('mode') == W.WM_DISABLED:
+            continue
+        base = before.get(name)
+        if base is None:
+            continue
+        target = clamped_range(base, True)
+        if target is None:
+            continue
+        current = out.get(name, base)
+        old_ep = (int(current['right']) - HALF_WIDTH_43,
+                  int(current['top']) + 120)
+        repaired = dict(current)
+        repaired['right'] = int(target['right'])
+        repaired['top'] = int(target['top'])
+        new_ep = (int(repaired['right']) - HALF_WIDTH_43,
+                  int(repaired['top']) + 120)
+        # Mode 2 runs from lower-left to upper-right. Only replace a rail the
+        # config made shorter on that end; never override a future, better
+        # authored envelope.
+        if new_ep[0] <= old_ep[0] and new_ep[1] >= old_ep[1]:
+            continue
+        out[name] = {k: int(repaired[k]) for k in W.RANGE_ORDER}
+        changes.append((name, old_ep, new_ep))
+    return out, changes
+
+
+# --------------------------------------------------------------------------
 # the plan
 # --------------------------------------------------------------------------
 def plan_ranges(before, config, movie_config=None, clamp=False):
@@ -634,6 +717,7 @@ def apply_to_flevel(archive, payloads, config, movie_config=None,
     # the field -- is the difference between two seconds and thirty-five for
     # the whole archive.
     before = {}
+    field_modes = {}
     for name in archive.names():
         entry = archive.index.get(name)
         if entry is None or not archive.is_field(entry):
@@ -645,9 +729,13 @@ def apply_to_flevel(archive, payloads, config, movie_config=None,
             head = W._lzss_head(payload, 42)
             starts = struct.unpack('<9I', head[6:42])
             body = starts[W.SECTION_TRIGGERS] + 4      # skip section length
-            data = W._lzss_head(payload, body + W.SECTION8_MIN_LEN)
+            # One byte beyond the four range shorts carries field_14[0]. It
+            # is the engine's diagonal-rail discriminator and costs no full
+            # section-9 decompression to retain here.
+            data = W._lzss_head(payload, body + max(W.SECTION8_MIN_LEN, 0x15))
             before[name] = W.read_section8_range(
                 data[body:body + W.SECTION8_MIN_LEN])
+            field_modes[name] = data[body + 0x14]
         except Exception:                                      # noqa: BLE001
             continue
 
@@ -720,6 +808,21 @@ def apply_to_flevel(archive, payloads, config, movie_config=None,
                 log('    %s: range is far wider than its art (%d units bare) '
                     '-- left alone, that range is not describing this '
                     'background' % (nm, band))
+
+    # A rectangular art fit cannot describe the one diagonal camera rail.
+    # Restore that rail from the field's own trigger envelope after every
+    # generic range transform has finished. See preserve_diagonal_rail().
+    plan, diagonal = preserve_diagonal_rail(before, plan, resolved,
+                                            field_modes)
+    stats['diagonal_rail'] = diagonal
+    if diagonal:
+        log('  widescreen: diagonal camera rail -- %d field(s) kept the '
+            'playable upper-right endpoint the art-tight rectangle removed '
+            '(set %s=1 to disable)' %
+            (len(diagonal), DIAGONAL_RAIL_OFF_ENV))
+        for name, old_ep, new_ep in diagonal:
+            log('    %s: upper-right endpoint (%d,%d) -> (%d,%d)'
+                % (name, old_ep[0], old_ep[1], new_ep[0], new_ep[1]))
 
     # The wide/not-wide table the FRAMING stage will need. Emitted here
     # because `resolved` exists here and nowhere else, and having it on disk

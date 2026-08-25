@@ -434,6 +434,42 @@ def test_config_report():
           'keys FFNx does not read are surfaced rather than ignored')
 
 
+def test_diagonal_rail_preservation():
+    group('the unique diagonal camera rail')
+    base = {'left': -320, 'top': -224, 'right': 296, 'bottom': 184,
+            'width': 616, 'height': 408}
+    current = {'left': -266, 'top': -176, 'right': 168, 'bottom': 176}
+    resolved = {'ship_1': {'mode': W.WM_EXTEND_ONLY}}
+    got, changes = WS.preserve_diagonal_rail(
+        {'ship_1': base}, {'ship_1': current}, resolved, {'ship_1': 2})
+    check(got['ship_1'] == {'left': -266, 'top': -224,
+                            'right': 242, 'bottom': 176},
+          'ship_1 restores only the shortened upper-right endpoint and '
+          'keeps the proven lower-left endpoint')
+    check(changes == [('ship_1', (8, -56), (82, -104))],
+          'the measured upper-right endpoint is 74 units farther right and '
+          '48 units farther up')
+    lower_before = (current['left'] + WS.HALF_WIDTH_43,
+                    current['bottom'] - 120)
+    lower_after = (got['ship_1']['left'] + WS.HALF_WIDTH_43,
+                   got['ship_1']['bottom'] - 120)
+    check(lower_before == lower_after == (-106, 56),
+          'the lower-left anchor stays at (-106,56), avoiding build 173\'s '
+          'eight-unit black band')
+
+    plain, plain_changes = WS.preserve_diagonal_rail(
+        {'ordinary': base}, {'ordinary': current},
+        {'ordinary': {'mode': W.WM_EXTEND_ONLY}}, {'ordinary': 0})
+    check(plain == {'ordinary': current} and not plain_changes,
+          'an ordinary rectangular field is byte-for-byte outside the rule')
+
+    better = {'left': -266, 'top': -240, 'right': 260, 'bottom': 176}
+    future, future_changes = WS.preserve_diagonal_rail(
+        {'ship_1': base}, {'ship_1': better}, resolved, {'ship_1': 2})
+    check(future == {'ship_1': better} and not future_changes,
+          'a future config with a better endpoint is not overwritten')
+
+
 # ======================================================================
 def find_flevel():
     """The same search test_wsdata.py does, so both run in the same tree."""
@@ -596,6 +632,7 @@ def main():
     test_uncrop_geometry()
     test_3d_patches_against_the_binary()
     test_config_report()
+    test_diagonal_rail_preservation()
 
     flevel, _tmp = find_flevel()
     if not flevel:

@@ -46,6 +46,7 @@ import ff7nx_uiclip
 import ff7nx_credits
 import ff7nx_uncrop
 import ff7nx_marginblack
+import ff7nx_palettedart
 import ff7nx_blackcell
 import ff7nx_marginpage
 import ff7nx_fxmargin
@@ -5812,6 +5813,22 @@ def _build_flevel(archive_path, chunks, field_files, romfs, log,
     mb_line = ff7nx_marginblack.summarise(mb_stats)
     if mb_line:
         log('  ' + mb_line)
+
+    # AFTER the dense conversion has made the final page/slot decision, but
+    # BEFORE an optional build-wide depth-1 lift changes the physical size of
+    # every paletted page.  This pass changes only the index array and its
+    # exclusive existing palette; in particular it allocates none of the
+    # pages which caused fship_2's Build-164 black rectangles.
+    pa_stats = ff7nx_palettedart.apply_to_flevel(
+        archive, payloads, _bc_art,
+        encode=lambda raw: _encode_field_cached(archive, raw), log=log)
+    pa_line = ff7nx_palettedart.summarise(pa_stats)
+    if pa_line:
+        log(pa_line)
+    if pa_stats.get('refused'):
+        log('  ! paletted art: %d field(s) unchanged (%s)'
+            % (len(pa_stats['refused']),
+               ', '.join('%s: %s' % r for r in pa_stats['refused'][:3])))
 
     # ------------------------------------------ DEPTH-1 RESOLUTION LIFT
     # FINDINGS-223. DEAD LAST, and that is the design rather than a
