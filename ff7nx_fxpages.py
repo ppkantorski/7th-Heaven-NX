@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import collections
 import os
+import struct
 
 import numpy as np
 
@@ -38,6 +39,8 @@ FX_LO = 0x0F
 FX_HI = 0x18
 T_BLEND_MODE = 30
 T_FX = FN.TILE_TEXTURE_ID2
+T_SRC_X_BIG = 42
+UV_SCALE = 10_000_000
 
 # These fields already have a complete-effect migration with hardware-observed
 # palette/cell handling in ff7nx_fxmargin. Running both mechanisms would
@@ -58,10 +61,23 @@ DOWNSTREAM_D2_RESERVE = 2
 # See the 32-unit note in `upgrade_section9`. FINDINGS-297.
 BIG_FX = os.environ.get('SEVENTH_NX_NO_BIG_FX') != '1'
 
+# Mask repair is intentionally much narrower than a DDS-alpha replacement.
+# It can close one-source-texel dither holes along already-authored colour,
+# but a page with broad disagreement is not an edge repair and is refused.
+MAX_MASK_FILL_FRACTION = 0.10
+MASK_ON_ENV = 'SEVENTH_NX_FX_MASK_REPAIR'
+NO_MASK_ENV = 'SEVENTH_NX_NO_FX_MASK_REPAIR'
+
 
 def enabled():
     """One rollback disables both the archive pages and binary blend ladder."""
     return FXM.truecolor_enabled()
+
+
+def mask_enabled():
+    """The Build-165 mask experiment is comparison-only, never default."""
+    return (enabled() and os.environ.get(MASK_ON_ENV) == '1'
+            and os.environ.get(NO_MASK_ENV) != '1')
 
 
 def _selected_palette(provider, field, page, palette):
@@ -118,6 +134,134 @@ def _page_image(art, name, page, palettes, px):
     return first, None
 
 
+def _state_alpha(provider, field, page, palette, px, cache):
+    """Return alpha shared byte-for-byte by every DDS runtime state.
+
+    The RGB may animate; only an invariant alpha plane licenses an indexed
+    mask repair. Returning ``None`` is a refusal, never a fallback to one
+    arbitrarily resolved state.
+    """
+    q = _selected_palette(provider, field, page, palette)
+    if q is None:
+        return None
+    key = (field.lower(), page, q)
+    if key in cache:
+        return cache[key]
+    states = getattr(provider, 'state_slots', {}).get(key, ())
+    if not states:
+        cache[key] = None
+        return None
+    out = None
+    try:
+        import dds_decode
+        for path, entry in states:
+            reader = provider.readers.get(path)
+            if reader is None:
+                reader = provider.readers[path] = FR.IroReader(path)
+            blob = reader.read(entry)
+            if not blob:
+                cache[key] = None
+                return None
+            rgba, w, h = dds_decode.decode_dds(blob)
+            raw = FR.resample_rgba(rgba, w, h, px)
+            alpha = np.frombuffer(raw, np.uint8).reshape(px, px, 4)[..., 3]
+            alpha = np.ascontiguousarray(alpha)
+            if out is None:
+                out = alpha
+            elif not np.array_equal(out, alpha):
+                cache[key] = None
+                return None
+    except Exception:                                          # noqa: BLE001
+        out = None
+    cache[key] = out
+    return out
+
+
+def _fill_mask_component(cell, target):
+    """Close only one-texel indexed dither holes proven by DDS alpha.
+
+    Existing indices -- including pixels outside the DDS cutoff -- are never
+    cleared. A hole inherits a cardinally adjacent ORIGINAL index, so repair
+    cannot grow recursively across a missing region or invent a disconnected
+    alpha island. This keeps every palette animation and limits the change to
+    the pixelated edge pattern this pass is meant to remove.
+    """
+    out = np.ascontiguousarray(cell, np.uint8).copy()
+    seeds = (cell != 0) & target
+    if target.any() and not seeds.any():
+        return None
+    for y, x in np.argwhere((cell == 0) & target):
+        for yy, xx in ((y - 1, x), (y, x - 1), (y, x + 1), (y + 1, x)):
+            if (0 <= yy < out.shape[0] and 0 <= xx < out.shape[1]
+                    and seeds[yy, xx]):
+                out[y, x] = cell[yy, xx]
+                break
+    return out
+
+
+def _repair_ambiguous_mask(name, sec9, page, refs, palettes, art):
+    """Repair one animated paletted FX page without freezing its RGB state.
+
+    FFNx hash variants may differ in colour while sharing one exact alpha
+    plane. In that case the page's existing non-zero indices already carry
+    the runtime palette animation; only its old spatial index-0 dither is
+    wrong. The entire page is admitted or refused as one effect.
+    """
+    provider = getattr(art, 'provider', None)
+    if provider is None or not getattr(provider, 'state_slots', None):
+        return None, None
+    alpha_cache = {}
+    alpha_by_pal = {}
+    for pal in sorted(palettes):
+        alpha = _state_alpha(provider, name, page.slot, pal, 256, alpha_cache)
+        if alpha is None:
+            return None, 'runtime-state alpha differs or is unreadable'
+        alpha_by_pal[pal] = alpha
+
+    grid = 8 if page.size_flag else 16
+    edge = 256 // grid
+    requested = collections.defaultdict(set)
+    for tile in refs:
+        u, v = struct.unpack_from('<II', sec9, tile.off + T_SRC_X_BIG)
+        cx = int(round(u / UV_SCALE * grid))
+        cy = int(round(v / UV_SCALE * grid))
+        if cx < 0 or cy < 0 or cx >= grid or cy >= grid:
+            return None, 'FX UV is outside its page grid'
+        sx, sy = cx * edge, cy * edge
+        alpha = alpha_by_pal.get(tile.pal)
+        if alpha is None:
+            return None, 'tile palette has no proven alpha state'
+        target = alpha[sy:sy + edge, sx:sx + edge] >= 128
+        if target.shape != (edge, edge):
+            return None, 'DDS alpha cell is incomplete'
+        requested[(sx, sy)].add(target.tobytes())
+
+    source = np.frombuffer(page.data, np.uint8).reshape(256, 256)
+    out = source.copy()
+    holes = cleared = changed_cells = 0
+    for (sx, sy), masks in requested.items():
+        if len(masks) != 1:
+            return None, 'palette variants disagree on the cell mask'
+        target = np.frombuffer(next(iter(masks)), bool).reshape(edge, edge)
+        before = source[sy:sy + edge, sx:sx + edge]
+        repaired = _fill_mask_component(before, target)
+        if repaired is None:
+            return None, 'an opaque alpha cell has no palette seed'
+        if not np.array_equal(before, repaired):
+            holes += int(((before == 0) & (repaired != 0)).sum())
+            changed_cells += 1
+            out[sy:sy + edge, sx:sx + edge] = repaired
+    if not changed_cells:
+        return None, 'no one-texel DDS-proven dither holes'
+    covered = len(requested) * edge * edge
+    if holes > covered * MAX_MASK_FILL_FRACTION:
+        return None, 'mask disagreement is too broad for edge repair'
+    return (out.tobytes(), {
+        'cells': changed_cells, 'holes': holes, 'cleared': cleared,
+        'tiles': len(refs),
+    }), None
+
+
 def upgrade_section9(name, sec9, art, px, max_raw_delta=None,
                      max_runtime_delta=None):
     """Return ``(section9, stats)`` after page-neutral additive conversion.
@@ -129,6 +273,9 @@ def upgrade_section9(name, sec9, art, px, max_raw_delta=None,
         'fields': 0, 'pages': 0, 'tiles': 0, 'bytes': 0,
         'blend_veto': 0, 'base_veto': 0, 'art_veto': 0, 'budget_veto': 0,
         'deferred': 0, 'names': [], 'page_names': [],
+        'mask_fields': 0, 'mask_pages': 0, 'mask_cells': 0,
+        'mask_tiles': 0, 'mask_holes': 0, 'mask_cleared': 0,
+        'mask_veto': 0, 'mask_names': [], 'mask_page_names': [],
     }
     if not enabled() or name.lower() in DEFER_FIELDS:
         st['deferred'] = int(name.lower() in DEFER_FIELDS)
@@ -159,6 +306,7 @@ def upgrade_section9(name, sec9, art, px, max_raw_delta=None,
             all_pals[fx].add(t.pal)
 
     candidates = []
+    mask_repairs = []
     for slot in range(FX_LO, FX_HI):
         page = pages.get(slot)
         refs = fx_refs.get(slot, ())
@@ -202,11 +350,27 @@ def upgrade_section9(name, sec9, art, px, max_raw_delta=None,
             continue
         image, _why = _page_image(art, name, slot, all_pals[slot], px)
         if image is None:
+            # A multi-state page cannot become one frozen truecolor page. It
+            # can still keep every RGB/palette state and repair only the
+            # index-0 mask when all those states prove the SAME alpha plane.
+            _ambiguous = any(
+                (name.lower(), slot,
+                 _selected_palette(provider, name, slot, pal))
+                in getattr(provider, 'ambiguous_slots', ())
+                for pal in all_pals[slot])
+            if _ambiguous and mask_enabled():
+                repaired, _mask_why = _repair_ambiguous_mask(
+                    name, sec9, page, refs, all_pals[slot], art)
+                if repaired is not None:
+                    data, mst = repaired
+                    mask_repairs.append((slot, page, data, mst))
+                    continue
+                st['mask_veto'] += 1
             st['art_veto'] += 1
             continue
         candidates.append((slot, page, refs, image))
 
-    if not candidates:
+    if not candidates and not mask_repairs:
         return sec9, st
 
     # Most-used effects first if an exceptionally large field reaches a hard
@@ -233,35 +397,71 @@ def upgrade_section9(name, sec9, art, px, max_raw_delta=None,
         raw_used += raw_delta
         runtime_used += runtime_delta
 
-    if not converted:
+    for slot, page, data, mst in mask_repairs:
+        pages_list[slot] = FN.Page(slot, page.size_flag, 1, data, page.px)
+
+    if not converted and not mask_repairs:
         return sec9, st
     out = FN.replace_texture_block(sec9, pages_list, tex_start, tex_end)
-    st['fields'] = 1
+    st['fields'] = int(bool(converted))
     st['pages'] = len(converted)
     st['tiles'] = sum(len(refs) for _slot, refs in converted)
     st['bytes'] = raw_used
-    st['names'] = [name]
+    st['names'] = [name] if converted else []
     st['page_names'] = ['%s:%d' % (name, slot) for slot, _ in converted]
+    if mask_repairs:
+        st['mask_fields'] = 1
+        st['mask_pages'] = len(mask_repairs)
+        st['mask_cells'] = sum(row[3]['cells'] for row in mask_repairs)
+        st['mask_tiles'] = sum(row[3]['tiles'] for row in mask_repairs)
+        st['mask_holes'] = sum(row[3]['holes'] for row in mask_repairs)
+        st['mask_cleared'] = sum(row[3]['cleared'] for row in mask_repairs)
+        st['mask_names'] = [name]
+        st['mask_page_names'] = [
+            '%s:%d' % (name, slot) for slot, _page, _data, _mst
+            in mask_repairs]
     return out, st
 
 
 def merge(total, one):
     """Accumulate one field's stats into an archive summary."""
     for key in ('fields', 'pages', 'tiles', 'bytes', 'blend_veto', 'base_veto',
-                'art_veto', 'budget_veto', 'deferred'):
+                'art_veto', 'budget_veto', 'deferred', 'mask_fields',
+                'mask_pages', 'mask_cells', 'mask_tiles', 'mask_holes',
+                'mask_cleared', 'mask_veto'):
         total[key] = total.get(key, 0) + one.get(key, 0)
     total.setdefault('names', []).extend(one.get('names', ()))
     total.setdefault('page_names', []).extend(one.get('page_names', ()))
+    total.setdefault('mask_names', []).extend(one.get('mask_names', ()))
+    total.setdefault('mask_page_names', []).extend(
+        one.get('mask_page_names', ()))
     return total
 
 
 def summarise(st):
-    if not st or not st.get('pages'):
+    if not st or not (st.get('pages') or st.get('mask_pages')):
         return ''
-    return ('ADDITIVE FX PAGES: %d complete Cosmos page(s), %d FX tile '
+    line = ('ADDITIVE FX PAGES: %d complete Cosmos page(s), %d FX tile '
             'reference(s), in place across %d field(s); slots, page count, '
             'UVs, palettes, base pages and animation records unchanged. '
             'Vetoed: %d mixed-blend, %d also-used-as-base, %d '
             'missing/different art, %d budget.'
             % (st['pages'], st['tiles'], st['fields'], st['blend_veto'],
                st['base_veto'], st['art_veto'], st['budget_veto']))
+    if st.get('mask_pages'):
+        line += (' -- ANIMATED FX MASK: %d paletted page(s), %d cell(s), %d '
+                 'tile reference(s) in %d field(s) kept every RGB/palette '
+                 'runtime state while closing %d one-source-texel index-0 '
+                 'dither hole(s); %d existing texel(s) were cleared. '
+                 'Admission requires byte-identical alpha across all runtime '
+                 'DDS states and palettes, FX-only use, blend mode 1, '
+                 'per-cell agreement, an adjacent existing animated palette '
+                 'index, and at most %.0f%% page-cell coverage; %d ambiguous '
+                 'page(s) were refused. No page, depth, slot, UV, palette, '
+                 'animation record or byte budget changes. Set %s=1 to '
+                 'disable only this mask repair.'
+                 % (st['mask_pages'], st['mask_cells'], st['mask_tiles'],
+                    st['mask_fields'], st['mask_holes'], st['mask_cleared'],
+                    MAX_MASK_FILL_FRACTION * 100, st['mask_veto'],
+                    NO_MASK_ENV))
+    return line

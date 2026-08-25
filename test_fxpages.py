@@ -103,6 +103,48 @@ class AdditiveFxPages(unittest.TestCase):
             self.assertEqual(st['pages'], 0)
             self.assertFalse(FP.enabled())
 
+    def test_mask_repair_has_an_independent_rollback(self):
+        with mock.patch.dict(os.environ, {FP.NO_MASK_ENV: '1'}, clear=False):
+            self.assertTrue(FP.enabled())
+            self.assertFalse(FP.mask_enabled())
+
+    def test_failed_build165_mask_experiment_is_default_off(self):
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(FP.MASK_ON_ENV, None)
+            os.environ.pop(FP.NO_MASK_ENV, None)
+            self.assertFalse(FP.mask_enabled())
+
+    def test_animated_mask_fill_uses_only_existing_palette_indices(self):
+        import numpy as np
+
+        cell = np.zeros((5, 7), np.uint8)
+        cell[1, 1] = 4
+        cell[3, 5] = 9
+        cell[0, 0] = 12                 # stale colour outside target
+        target = np.zeros_like(cell, bool)
+        target[1:3, 1:3] = True
+        target[3:5, 4:7] = True         # disconnected alpha island
+
+        out = FP._fill_mask_component(cell, target)
+        self.assertIsNotNone(out)
+        self.assertEqual(out[0, 0], 12)       # existing texels are preserved
+        outside = out[~target].copy()
+        self.assertEqual(int(np.count_nonzero(outside)), 1)
+        self.assertEqual(out[1, 1], 4)
+        self.assertEqual(out[1, 2], 4)
+        self.assertEqual(out[2, 1], 4)
+        self.assertEqual(out[2, 2], 0)  # no recursive growth from new pixels
+        self.assertEqual(out[3, 5], 9)
+        self.assertEqual(int(np.count_nonzero(out[3:5, 4:7])), 4)
+        self.assertLessEqual(set(np.unique(out)), {0, 4, 9, 12})
+
+    def test_animated_mask_fill_refuses_a_cell_without_colour_seed(self):
+        import numpy as np
+
+        cell = np.zeros((4, 4), np.uint8)
+        target = np.ones_like(cell, bool)
+        self.assertIsNone(FP._fill_mask_component(cell, target))
+
 
 if __name__ == '__main__':
     unittest.main()

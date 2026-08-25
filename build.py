@@ -55,7 +55,8 @@ import ff7nx_parallaxfill
 import ff7nx_trnad4
 import ff7nx_trnaddetail
 import ff7nx_parallaxwide
-import ff7nx_fxedge
+import ff7nx_fxpalette
+import ff7nx_fxcoverage
 import ff7nx_fxart
 import ff7nx_fxbake
 import ff7nx_fshipart
@@ -5890,19 +5891,43 @@ def _build_flevel(archive_path, chunks, field_files, romfs, log,
             % (len(pw_stats['refused']),
                ', '.join('%s L%s: %s' % r for r in pw_stats['refused'][:3])))
 
+    # Live paletted FX cannot be promoted to one truecolor frame without
+    # freezing animation. Reconstruct only the archive-wide, fingerprinted
+    # opaque-black populations from each slot's own Cosmos state trajectories.
+    fxpal_stats = None
+    if _bc_art is not None:
+        fxpal_stats = ff7nx_fxpalette.apply_to_flevel(
+            archive, payloads, _bc_art,
+            encode=lambda raw: _encode_field_cached(archive, raw), log=log)
+        fxpal_line = ff7nx_fxpalette.summarise(fxpal_stats)
+        if fxpal_line:
+            log(fxpal_line)
+        if fxpal_stats.get('refused'):
+            log('  ! animated FX palette: %d field(s) unchanged (%s)'
+                % (len(fxpal_stats['refused']),
+                   ', '.join('%s: %s' % r
+                             for r in fxpal_stats['refused'][:3])))
+
     # The LIGHTING's own margin, which is layers 1/2 and therefore disjoint
     # from both parallax passes above -- they move layers 3/4. Ordered here
     # so it sees the final tile array and its own budget is measured against
     # what actually ships.
-    fe_stats = ff7nx_fxedge.apply_to_flevel(
-        archive, payloads,
-        encode=lambda raw: _encode_field_cached(archive, raw), log=log)
-    fe_line = ff7nx_fxedge.summarise(fe_stats)
-    if fe_line:
-        log(fe_line)
-    if fe_stats.get('capped'):
-        log('  ! FX edge: %d tile(s) refused by the per-page binding cap'
-            % fe_stats['capped'])
+    fxc_stats = None
+    if _bc_art is not None:
+        fxc_stats = ff7nx_fxcoverage.apply_to_flevel(
+            archive, payloads, _bc_art,
+            encode=lambda raw: _encode_field_cached(archive, raw), log=log)
+        fxc_line = ff7nx_fxcoverage.summarise(fxc_stats)
+        if fxc_line:
+            log(fxc_line)
+        if fxc_stats.get('capped'):
+            log('  ! animated FX coverage: %d tile(s) refused by the '
+                'per-page binding/atlas cap' % fxc_stats['capped'])
+        if fxc_stats.get('refused'):
+            log('  ! animated FX coverage: %d field(s) unchanged (%s)'
+                % (len(fxc_stats['refused']),
+                   ', '.join('%s: %s' % r
+                             for r in fxc_stats['refused'][:3])))
 
     # LAST ART PASS, after every repack/page move has decided the final FX
     # references. Some palette-specific Cosmos DDS files contain only their

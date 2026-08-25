@@ -2089,6 +2089,12 @@ class ArtProvider:
         self.page_px = page_px
         self.log = log
         self.slots = {}                     # (field, page, pal) -> (path, e)
+        # Every runtime DDS state for a logical slot, not just the resolved
+        # base/arbitrary state in `slots`. Additive paletted FX can sometimes
+        # preserve its animation while repairing a common alpha mask shared
+        # by every state; ff7nx_fxpages uses this read-only index for that
+        # proof. Later art sources replace earlier ones exactly as `slots` do.
+        self.state_slots = {}               # key -> ((path, entry), ...)
         self.by_page = {}                   # (field, page) -> {palette, ...}
         self.readers = {}
         self.ambiguous = 0
@@ -2107,6 +2113,9 @@ class ArtProvider:
                 log('! field art: cannot read %s (%s)' % (path, exc))
                 continue
             idx = index_field_dds(entries, allowed)
+            for key, candidates in idx.items():
+                self.state_slots[key] = tuple((path, entry)
+                                              for entry in candidates)
             self.ambiguous += sum(1 for v in idx.values() if len(v) > 1)
             self.ambiguous_slots.update(k for k, v in idx.items()
                                         if len(v) > 1)
