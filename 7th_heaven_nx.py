@@ -100,6 +100,21 @@ FIELD_TEX_CAP_CHOICES = [
     (128, 'Cap at 128px'),
 ]
 
+# World-map texture dimension cap -- see build.WORLD_TEX_CAP_ENV for the
+# measurements. Unlike the field cap this defaults ON, at 512px, because
+# vanilla world_us.lgp tops out at 256px and nothing above that has ever
+# been through this port's world texture bind. It is NOT a memory limit:
+# ff7nx_heap raises the guest heap to 256 MB on every build, and a paletted
+# world set is under 10% of that at 512px.
+WORLD_TEX_CAP_CHOICES = [
+    (512, 'Cap at 512px — recommended'),
+    (1024, 'Cap at 1024px'),
+    (768, 'Cap at 768px'),
+    (256, 'Cap at 256px — vanilla’s own maximum'),
+    (128, 'Cap at 128px'),
+    (0, 'Off — full size, as shipped'),
+]
+
 # Battle background texture cap -- see build.BATTLE_BG_TEX_CAP_ENV. Scoped
 # to ONLY the tiles this tool synthesizes from Avalanche Arisen's DDS mod
 # (matched to their real battle.lgp entries via battle_bg_dds_map.json);
@@ -917,7 +932,11 @@ def run_build(mods, enabled, settings_by_mod, log, progress,
     log('')
     log(f'portable files : {plan.total_portable()}')
     if plan.skipped_ffnx:
-        log(f'FFNx textures  : {plan.skipped_ffnx} (skipped, no Switch loader)')
+        log(f'FFNx textures  : {plan.skipped_ffnx} unsupported external '
+            'image(s) skipped')
+    if plan.world_dds_native_names:
+        log(f'Gaia world TEX : {len(plan.world_dds_native_names)} DDS '
+            'source(s) queued for native world_us.lgp conversion')
     if plan.music:
         extra = (f' ({plan.music_from_vgmstream} from vgmstream/)'
                  if plan.music_from_vgmstream else '')
@@ -994,6 +1013,12 @@ def run_build(mods, enabled, settings_by_mod, log, progress,
     # _build_flevel, well before any of this.
     produced += ff7nx_field169.apply(SDOUT_DIR, DUMP, log, produced)
     produced += build.ff7nx_ws.apply_module(SDOUT_DIR, DUMP, log, produced)
+    # Gaia's archive conversion enlarges native indexed world TEX files by
+    # one uniform factor. The stock mesh still carries native pixel UVs, so
+    # its six normalisations must receive that same factor or every polygon
+    # stretches only the upper-left crop of its texture. Gated automatically
+    # by the active Gaia DDS plan; vanilla/non-Gaia builds do nothing here.
+    produced += build.apply_gaia_world_uv(SDOUT_DIR, DUMP, log, produced)
     # Field background page size, last of all, for the same reason again --
     # and note _build_flevel has ALREADY rewritten section 9 to match, so if
     # this pass cannot run the SD tree is inconsistent and says so.
@@ -1073,6 +1098,13 @@ def launch_ui():
     initial_cap_value = global_saved.get('field_tex_cap', 0)
     if initial_cap_value not in cap_label_by_value:
         initial_cap_value = 0
+
+    world_cap_label_by_value = dict(WORLD_TEX_CAP_CHOICES)
+    world_value_by_cap_label = {v: k for k, v in WORLD_TEX_CAP_CHOICES}
+    initial_world_cap_value = global_saved.get(
+        'world_tex_cap', build.WORLD_TEX_CAP_DEFAULT)
+    if initial_world_cap_value not in world_cap_label_by_value:
+        initial_world_cap_value = build.WORLD_TEX_CAP_DEFAULT
 
     bg_cap_label_by_value = dict(BATTLE_BG_TEX_CAP_CHOICES)
     bg_value_by_cap_label = {v: k for k, v in BATTLE_BG_TEX_CAP_CHOICES}
@@ -1343,6 +1375,13 @@ def launch_ui():
 
     def current_field_tex_cap():
         return value_by_cap_label.get(cap_var.get(), 0)
+
+    world_cap_var = tk.StringVar(
+        value=world_cap_label_by_value[initial_world_cap_value])
+
+    def current_world_tex_cap():
+        return world_value_by_cap_label.get(
+            world_cap_var.get(), build.WORLD_TEX_CAP_DEFAULT)
 
     bg_cap_var = tk.StringVar(value=bg_cap_label_by_value[initial_bg_cap_value])
 
@@ -2029,8 +2068,38 @@ def launch_ui():
              True),
             ('combo', 'Field model texture cap', cap_var,
              [l for _, l in FIELD_TEX_CAP_CHOICES],
-             'Downscales oversized char.lgp / world_us.lgp model textures.',
+             'Downscales oversized char.lgp model textures. World-map '
+             'textures use the separate control below.',
              False),
+            ('combo', 'World map texture cap', world_cap_var,
+             [l for _, l in WORLD_TEX_CAP_CHOICES],
+             'Downscales oversized world_us.lgp textures, separately from '
+             'the field cap above.\n\n'
+             'Cosmos Gaia support: the build maps its active frame-zero DDS '
+             'files to exact native .tex names, creates fresh 256-colour '
+             'indexed palettes, and rebuilds world_us.lgp. It also patches '
+             'the native world mesh\u2019s pixel-space UV normalisation to match '
+             'the selected uniform scale; without that paired correction an '
+             'enlarged TEX displays only its upper-left crop. This native '
+             'indexed format is required by the Switch world renderer. Gaia '
+             'UI/effect assets (including the soft shadow, snow overlays, '
+             'cloud, and meteor) remain native because they use independent '
+             'sprite UV, blend, palette, or FFNx external-mesh state. Mesh '
+             'files remain separate and can never collide '
+             'with similarly named event scripts.\n\n'
+             'MEASURED: vanilla world_us.lgp has 415 textures. Gaia provides '
+             'one exact frame-zero source for all 415. Two sky-only sources '
+             'and two multi-palette runtime effects are held back. The '
+             'remaining textures and all six terrain U/V calculations use '
+             'one matching scale (512 = 2x, 768 = 3x, 1024/off = 4x).'
+             '\n\n'
+             'ff7nx_heap raises the guest heap to 256 MB. The recommended '
+             '512px cap keeps the indexed set compact while retaining more '
+             'spatial detail than the 32\u2013256px native sources.\n\n'
+             'For fast world-map iteration after one normal build, launch '
+             'the GUI with SEVENTH_NX_REUSE_FLEVEL=1. The builder verifies '
+             'and preserves the existing sdout flevel.lgp while rebuilding '
+             'everything else.', False),
             ('combo', 'Battle background cap (Avalanche Arisen)', bg_cap_var,
              [l for _, l in BATTLE_BG_TEX_CAP_CHOICES],
              'Scoped to Arisen\u2019s own tiles. Everything else in '
@@ -2229,6 +2298,7 @@ def launch_ui():
                 'options': settings_by_mod.get(mod.filename, {}),
             }
         persist['__global__'] = {'field_tex_cap': current_field_tex_cap(),
+                                 'world_tex_cap': current_world_tex_cap(),
                                  'battle_bg_tex_cap': current_battle_bg_tex_cap(),
                                  'field_bg_page_px':
                                      current_field_bg_page_px(),
@@ -2351,6 +2421,7 @@ def launch_ui():
     fps_var.trace_add('write', save_settings_now)
     ws_var.trace_add('write', save_settings_now)
     cap_var.trace_add('write', save_settings_now)
+    world_cap_var.trace_add('write', save_settings_now)
     bg_cap_var.trace_add('write', save_settings_now)
     fbg_var.trace_add('write', save_settings_now)
     fbud_var.trace_add('write', save_settings_now)
@@ -3049,6 +3120,7 @@ def launch_ui():
         open_btn.state(['disabled'])
         statuslabel.configure(text='working…')
         cap_value = current_field_tex_cap()
+        world_cap_value = current_world_tex_cap()
         bg_cap_value = current_battle_bg_tex_cap()
         fbg_px_value = current_field_bg_page_px()
         # DEPTH-1 PAGE SIZE -- NOW A DIALOG CONTROL. FINDINGS-223, 225.
@@ -3201,8 +3273,16 @@ def launch_ui():
         os.environ[build.FIELD_TEX_CAP_ENV] = str(cap_value)
         if cap_value:
             log_write(f'field texture cap: {cap_value}px '
-                      '(char.lgp/world_us.lgp model textures larger than '
+                      '(char.lgp model textures larger than '
                       'this will be downscaled)')
+        os.environ[build.WORLD_TEX_CAP_ENV] = str(world_cap_value)
+        if world_cap_value:
+            log_write(f'world map texture cap: {world_cap_value}px '
+                      '(world_us.lgp textures larger than this will be '
+                      'downscaled; vanilla’s own maximum is 256px)')
+        else:
+            log_write('world map texture cap: OFF -- an HD world set can '
+                      'decode to 53 MB paletted against a 64 MB heap')
         os.environ[build.BATTLE_BG_TEX_CAP_ENV] = str(bg_cap_value)
         if bg_cap_value != 256:
             log_write(f'Arisen battle background texture cap: '
@@ -3291,6 +3371,10 @@ def main():
         if build.FIELD_TEX_CAP_ENV not in os.environ:
             cap_value = saved.get('__global__', {}).get('field_tex_cap', 0)
             os.environ[build.FIELD_TEX_CAP_ENV] = str(cap_value)
+        if build.WORLD_TEX_CAP_ENV not in os.environ:
+            world_cap_value = saved.get('__global__', {}).get(
+                'world_tex_cap', build.WORLD_TEX_CAP_DEFAULT)
+            os.environ[build.WORLD_TEX_CAP_ENV] = str(world_cap_value)
         if build.BATTLE_BG_TEX_CAP_ENV not in os.environ:
             bg_cap_value = saved.get('__global__', {}).get(
                 'battle_bg_tex_cap', 256)

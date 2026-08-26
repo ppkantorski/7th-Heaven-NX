@@ -130,6 +130,25 @@ def _patch_flevel(sdout, dump, log, produced):
     fresh = {os.path.normpath(os.path.abspath(p)) for p in produced}
     built = os.path.normpath(os.path.abspath(dest)) in fresh
 
+    # A verified flevel reused by build.apply_plan already contains this
+    # camera-clamp data from its normal build.  Re-running the archive pass
+    # here would defeat SEVENTH_NX_REUSE_FLEVEL, take the same minutes the
+    # user is trying to avoid, and change the file's mtime so the next fast
+    # run could no longer verify it against the cache record.  Keep the data
+    # half byte-for-byte while `_patch_main` above still refreshes the module
+    # half alongside all the other requested executable patches.
+    if os.environ.get(build.REUSE_FLEVEL_ENV, '').strip().lower() in (
+            '1', 'true', 'yes', 'on'):
+        if not os.path.isfile(dest):
+            # Normally unreachable because apply_plan validates first, but
+            # retain a local refusal if this helper is called independently.
+            log('! 16:9 field: fast flevel reuse requested but the existing '
+                'sdout archive is missing; camera clamp not touched')
+            return None
+        log('  camera clamp: kept from the verified reused flevel.lgp '
+            '(data-side rebuild skipped)')
+        return dest
+
     if built or os.path.exists(dest):
         src = dest
         log('  base flevel %s   (%s)'

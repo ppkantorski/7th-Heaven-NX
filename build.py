@@ -28,6 +28,7 @@ import p as pfile
 import tex
 import battle_stage_bg
 import ff7nx_widescreen
+import ff7nx_gaia
 import ff7nx_ws
 import ff7nx_shaders
 import ff7nx_fieldbuf
@@ -274,6 +275,34 @@ ROMFS_FF7 = 'romfs/ff7'
 # FFNx external textures. No Switch loader exists for these.
 FFNX_EXT = {'.dds', '.png', '.jpg', '.jpeg', '.bmp', '.tga', '.webp'}
 META_EXT = {'.xml', '.txt', '.md', '.toml', '.cfg', '.ini', '.gif', '.html'}
+import re as _re
+
+# FFNx world textures use ``<native TEX stem>_<frame>.dds``.  Frame zero is
+# the authored base image and is the only frame the native world renderer can
+# consume as an LGP texture.  The stem itself may contain underscores and
+# digits (``fld_02_00.dds`` -> ``fld_02.tex``), so strip exactly the FINAL
+# frame suffix -- never every ``_NN`` suffix.
+WORLD_DDS_RE = _re.compile(
+    r'^(?P<stem>.+)_(?P<frame>[0-9]{2})(?:_[0-9a-f]+)?\.dds$',
+    _re.IGNORECASE)
+WORLD_DDS_CACHE = os.path.join(HERE, 'cache', '_world_dds')
+WORLD_DDS_POLICY = 'world-dds-v1'
+
+
+def _world_dds_name(name):
+    """Return ``(native_tex_name, frame)`` for an FFNx world DDS."""
+    m = WORLD_DDS_RE.match(os.path.basename(name))
+    if not m:
+        return None
+    return m.group('stem').lower() + '.tex', int(m.group('frame'))
+
+
+def _switch_world_dds(name):
+    """True only for a world DDS this build can convert to a native TEX."""
+    low = name.replace('\\', '/').lower()
+    parts = low.split('/')
+    parsed = _world_dds_name(parts[-1])
+    return bool(parsed and parsed[1] == 0 and 'world' in parts[:-1])
 
 # Battle background stage textures: STAGE<NN>_T<NN>_<variant>.DDS under a
 # "battle" folder in the mod. These are NOT a real FFNx external-texture
@@ -282,7 +311,6 @@ META_EXT = {'.xml', '.txt', '.md', '.toml', '.cfg', '.ini', '.gif', '.html'}
 # writeup); they must be downsampled/quantized and spliced into the
 # native data/battle/stage<NN>.dat container at build time instead of
 # being written out as loose files.
-import re as _re
 BATTLE_STAGE_RE = _re.compile(r'stage0*(\d+)_t0*(\d+)_\d+\.dds$',
                               _re.IGNORECASE)
 
@@ -292,12 +320,12 @@ def _no_switch_loader(name):
     True for an .iro entry this build can never use, judged from its PATH
     ALONE, so it need not be extracted at all.
 
-    Deliberately narrower than the skip in build_plan, and derived from it:
-    build_plan drops every FFNX_EXT file EXCEPT a .dds under a `battle`
-    folder, so that is exactly the carve-out here, widened by also keeping
-    anything whose name matches BATTLE_STAGE_RE wherever it sits. Nothing
-    else is judged -- a file kept here can still be dropped later, but a
-    file dropped here was already guaranteed to be dropped later.
+    Deliberately narrower than the skip in build_plan, and derived from it.
+    Two FFNx image families have a build-time native conversion path and are
+    therefore retained: battle-stage DDS tiles, and frame-zero DDS files
+    under a ``world`` folder. Nothing else is judged -- a file kept here can
+    still be dropped later, but a file dropped here was already guaranteed to
+    be dropped later.
 
     This is not a tidiness measure. Cosmos Limit Break is a 3.1 GB .iro
     carrying 18,350 field .dds files against 683 usable flevel.lgp
@@ -307,6 +335,12 @@ def _no_switch_loader(name):
     low = name.replace('\\', '/').lower()
     base = low.rsplit('/', 1)[-1]
     if os.path.splitext(base)[1] not in FFNX_EXT:
+        return False
+    # Cosmos Gaia's frame-zero world DDS files now have a build-time path:
+    # decode, quantize and replace their real world_us.lgp TEX entries.  Keep
+    # precisely those files in the cache; every other external image remains
+    # excluded before decompression as before.
+    if _switch_world_dds(name):
         return False
     if BATTLE_STAGE_RE.search(base):
         return False
@@ -392,23 +426,50 @@ class Mod:
         return self._entries
 
     def ensure_extracted(self, log=lambda *_: None, progress=None):
-        # The stamp is two lines now: the .iro signature, then how many
-        # entries _no_switch_loader() held back. Line two is what lets the
+        # The stamp is three lines now: the .iro signature, how many entries
+        # _no_switch_loader() held back, and the extraction-policy version.
+        # Line two is what lets the
         # count survive into a cached run, where nothing is extracted at
-        # all. A one-line stamp from an older build reads as "0 skipped"
-        # and forces no re-extraction, because line one still matches.
+        # all.  The policy line matters specifically for Cosmos Gaia: older
+        # builds deliberately excluded every world DDS, while this one keeps
+        # frame zero for native conversion.  Do not invalidate every other
+        # mod's cache just because this policy changed; only a mod that
+        # actually contains a supported world DDS needs the extra check.
         stamp = os.path.join(self.cache, '.iro-signature')
         want = _sig(self.path)
         if os.path.exists(stamp):
             with open(stamp) as f:
                 lines = f.read().splitlines()
             if lines and lines[0].strip() == want:
+                world_entries = [e for e in self.entries()
+                                 if _switch_world_dds(e)]
+                policy_ok = (not world_entries or
+                             (len(lines) > 2 and
+                              lines[2].strip() == WORLD_DDS_POLICY))
+                # A hand-extracted/current cache may already contain every
+                # newly-supported file even though its old stamp has no policy
+                # line.  Preserve it and upgrade the stamp in place instead of
+                # deleting and re-extracting hundreds of megabytes.
+                if world_entries and not policy_ok:
+                    policy_ok = all(os.path.isfile(os.path.join(
+                        self.cache, e.replace('\\', os.sep)))
+                                    for e in world_entries)
                 try:
                     self.skipped_images = int(lines[1]) if len(lines) > 1 else 0
                 except ValueError:
                     self.skipped_images = 0
-                self._load_manifest()
-                return False
+                if policy_ok:
+                    if world_entries and len(lines) <= 2:
+                        # Recompute the exclusion count: a one-line legacy
+                        # stamp did not retain it, and reporting zero would make
+                        # the build summary lie about the FFNx-only files.
+                        self.skipped_images = sum(
+                            1 for e in self.entries() if _no_switch_loader(e))
+                        with open(stamp, 'w') as f:
+                            f.write(f'{want}\n{self.skipped_images}\n'
+                                    f'{WORLD_DDS_POLICY}\n')
+                    self._load_manifest()
+                    return False
             shutil.rmtree(self.cache, ignore_errors=True)
         log(f'extracting {self.filename} ...')
         os.makedirs(self.cache, exist_ok=True)
@@ -420,12 +481,12 @@ class Mod:
             log(f'  ! {len(failures)} entries failed to extract')
         self.skipped_images = excluded
         with open(stamp, 'w') as f:
-            f.write(f'{want}\n{excluded}\n')
+            f.write(f'{want}\n{excluded}\n{WORLD_DDS_POLICY}\n')
         log(f'  {written} files extracted')
         if excluded:
-            log(f'  {excluded} FFNx external texture(s) not extracted -- '
-                'this port has no loader for them, so they would be dead '
-                'files taking up cache space')
+            log(f'  {excluded} unsupported FFNx external texture(s) not '
+                'extracted (supported frame-zero world DDS files are kept '
+                'for native TEX conversion)')
         self._load_manifest()
         return True
 
@@ -688,6 +749,9 @@ class Plan:
         self.battle_bg_native_names = set()  # battle.lgp lownames synthesized
                                               # from Avalanche Arisen's DDS
                                               # tiles -- see BATTLE_BG_TEX_CAP
+        self.world_dds_native_names = set()  # world_us.lgp TEX names whose
+                                              # active FFNx frame-zero DDS is
+                                              # converted at archive build time
         self.widescreen = None       # (config.toml, movie_config.toml, mod)
                                      # -- FFNx's per-field widescreen table,
                                      # baked into flevel.lgp section 8 by
@@ -1018,6 +1082,32 @@ def build_plan(mods, settings_by_mod, catalogs, log=lambda *_: None,
                             })
                     continue
 
+            # Cosmos Gaia / FFNx world textures.  There is no live DDS loader
+            # on Switch, but frame zero has an exact, safe native destination:
+            # ``foo_00.dds`` replaces ``foo.tex`` in world_us.lgp.  Require the
+            # destination to exist in the game's own catalog and force that
+            # one archive explicitly.  This is intentionally NOT basename
+            # routing: mesh/world/wm0.gltf must never be allowed to collide
+            # with the unrelated world-map event script wm0.ev.
+            if ext == '.dds' and 'world' in dirs_l:
+                parsed = _world_dds_name(low)
+                native = parsed[0] if parsed and parsed[1] == 0 else None
+                world_names = catalogs.get('world_us.lgp', set())
+                if native and native in world_names:
+                    plan.world_dds_native_names.add(native)
+                    candidates.append({
+                        'mod': mod,
+                        'rel': rel,
+                        'base': native,
+                        'low': native,
+                        'full': full,
+                        'direct': 'world_us.lgp',
+                        'hits': ['world_us.lgp'],
+                        'route': (mod.filename, os.path.dirname(rel)),
+                        'option': option,
+                    })
+                    continue
+
             if ext in FFNX_EXT:
                 plan.skipped_ffnx += 1
                 continue
@@ -1146,6 +1236,10 @@ def build_plan(mods, settings_by_mod, catalogs, log=lambda *_: None,
                 f'   (referenced by {why} in {os.path.dirname(rel)})')
         if len(rerouted) > 8:
             log(f'      ... and {len(rerouted) - 8} more')
+    if plan.world_dds_native_names:
+        log('  world textures: %d frame-zero DDS file(s) mapped to exact '
+            'world_us.lgp TEX entries; conversion runs during archive build'
+            % len(plan.world_dds_native_names))
     _warn_frankenstein(plan, log)
     return plan
 
@@ -1260,6 +1354,222 @@ def _synthesize_battle_bg_tex_cached(dds_path, native_name, log=lambda *_: None)
             except OSError:
                 pass
     return staged
+
+
+# These archive entries are not submitted by the terrain-mesh renderer whose
+# six U/V normalisations ff7nx_gaia patches.  They are UI sprites, blended
+# effects, or external-sky assets with independent UV/blend/animation state.
+# Treating them as terrain caused the opaque rectangular Highwind shadow in
+# build 181: shadow_00.dds carries 256 alpha levels, while native shadow.tex
+# is a colour-keyed, blend-mode-0 sprite.  Binary TEX colour-key conversion
+# cannot represent that FFNx alpha asset.  The other names are protected for
+# the same renderer-role reason, not because one screenshot happened to show
+# them broken.
+WORLD_NATIVE_RUNTIME_TEXTURES = frozenset({
+    'dfx.tex',       # 26 runtime palettes / vehicle effects
+    'map.tex',       # blended world-map marker texture
+    'meteo.tex',     # FFNx external meteor mesh
+    'midg.tex',      # 8 runtime palettes / Midgar Zolom effect
+    'midlmap.tex',   # large-map UI sprite
+    'midlmap2.tex',  # alternate large-map UI sprite
+    'radar.tex',     # radar UI sprite
+    'shadow.tex',    # soft world-object shadow sprite
+    'snow4.tex',     # snowfield overlay sprite
+    'snow5.tex',     # snowfield overlay sprite
+    'wm_kumo.tex',   # FFNx external cloud mesh and mirrored wrap
+})
+
+
+def _convert_world_dds(mod_files, van, log=lambda *_: None):
+    """
+    Convert active FFNx ``world/*_00.dds`` replacements into native
+    paletted TEX files for ``world_us.lgp``.
+
+    ``build_plan`` has already performed the security/correctness boundary:
+    each DDS is keyed by an exact native ``*.tex`` name that exists in the
+    game's catalog.  Re-check the vanilla payload here anyway, because this
+    function is also directly testable and a bad cache/input must fall back to
+    vanilla -- never let DDS bytes enter an LGP under a TEX filename.
+
+    Hardware established two constraints which are easy to miss here:
+
+      * the Switch WORLD renderer rejects 32-bit TEX even though the field
+        and model renderers accept it (build 179 rendered every replacement
+        black), and
+      * the terrain mesh stores pixel-space UVs.  The renderer subtracts the
+        native atlas origin and then multiplies by the loaded texture's
+        inverse width/height.  Merely changing a 64px TEX header to 256px
+        therefore samples only its upper-left quarter and stretches it across
+        the polygon.  Build 178/180's square patches were this UV error, not a
+        reason to keep the 16-colour destination palette.
+
+    Every Gaia terrain DDS is exactly 4x its native slot.  Use one UNIFORM
+    scale for the entire set, selected by the world cap (512 -> 2x, 768 -> 3x,
+    1024/off -> 4x), and emit a fresh standard 256-colour indexed TEX.  The
+    matching Gaia-only module pass multiplies all six terrain UV results by
+    the same scale.  A uniform factor is what keeps neighbouring world tiles
+    continuous; independently capping each DDS is not equivalent.
+
+    Native UI/effect textures stay native.  They use separate sprite UV,
+    blend, or animation paths, and a frame-zero DDS cannot reconstruct the
+    multi-palette cases.  This includes the continuously alpha-blended
+    Highwind shadow; forcing it through a binary TEX colour key creates an
+    opaque rectangle.
+
+    Gaia's clouds and meteor are a separate exception.  They are authored for
+    FFNx's replacement ``clouds.gltf``/``meteo.gltf`` draws: FFNx enables
+    mirrored wrap for the cloud mesh, and Gaia's meteor is 2:1 while the native
+    meteor slot and its UVs are 4:1.  Feeding either image to the stock strips
+    produces the repeated sky panels / rectangular meteor seen in build 178.
+    Leave those two native textures untouched until an external mesh renderer
+    exists on Switch.
+    """
+    os.makedirs(WORLD_DDS_CACHE, exist_ok=True)
+    cap = _world_tex_cap()
+    scale = _world_gaia_scale(cap)
+    out = {}
+    converted = failed = held_native = 0
+    source_bytes = output_bytes = 0
+    for low, pair in mod_files.items():
+        src, mod = pair
+        try:
+            with open(src, 'rb') as f:
+                raw = f.read()
+        except OSError:
+            out[low] = pair
+            continue
+        if raw[:4] != b'DDS ':
+            out[low] = pair
+            continue
+        vanilla_path = van.get(low)
+        if not vanilla_path:
+            failed += 1
+            log('  ! Gaia world texture %s has no exact vanilla TEX slot; '
+                'dropping it so the archive stays unchanged' % low)
+            continue
+        if low in WORLD_NATIVE_RUNTIME_TEXTURES:
+            held_native += 1
+            log('  Gaia world %s: kept vanilla (runtime sprite/effect uses '
+                'independent UV, blend, mesh, or palette state)' % low)
+            continue
+        try:
+            with open(vanilla_path, 'rb') as f:
+                vanilla_data = f.read()
+            vanilla_tex = tex.parse(vanilla_data)
+            if vanilla_tex is None:
+                raise ValueError('native destination is not a TEX')
+        except (OSError, ValueError) as exc:
+            failed += 1
+            log('  ! Gaia world texture %s: %s; keeping vanilla' % (low, exc))
+            continue
+
+        if vanilla_tex['num_palettes'] > 1:
+            held_native += 1
+            log('  Gaia world %s: kept vanilla (%d runtime palettes cannot '
+                'be reconstructed from frame zero)'
+                % (low, vanilla_tex['num_palettes']))
+            continue
+
+        key = ('WORLD-DDS-V4-UNIFORM-UV-256PAL-' + _sig(src) + '-'
+               + _sig(vanilla_path)
+               + '-scale%s' % scale)
+        cached = os.path.join(
+            WORLD_DDS_CACHE,
+            '%s.%s' % (low, hashlib.sha1(key.encode()).hexdigest()[:16]))
+        if not os.path.isfile(cached):
+            try:
+                truecolor = _synthesize_battle_bg_tex(raw)
+                source_tex = tex.parse(truecolor)
+                if source_tex is None or source_tex['bytes_per_pixel'] != 4:
+                    raise ValueError('DDS decoder did not produce 32-bit TEX')
+                if (not vanilla_tex['palette_flag'] or
+                        vanilla_tex['bytes_per_pixel'] != 1 or
+                        vanilla_tex['colors_per_palette'] <= 0):
+                    raise ValueError('native destination is not indexed TEX')
+                if (source_tex['width'] * vanilla_tex['height'] !=
+                        source_tex['height'] * vanilla_tex['width']):
+                    raise ValueError(
+                        'source aspect %dx%d differs from native slot %dx%d'
+                        % (source_tex['width'], source_tex['height'],
+                           vanilla_tex['width'], vanilla_tex['height']))
+                sw, sh = source_tex['width'], source_tex['height']
+                nw = max(1, int(round(vanilla_tex['width'] * scale)))
+                nh = max(1, int(round(vanilla_tex['height'] * scale)))
+                image = Image.frombytes(
+                    'RGBA', (sw, sh), source_tex['pixels'], 'raw', 'BGRA')
+                if (nw, nh) != (sw, sh):
+                    image = image.resize((nw, nh), Image.Resampling.LANCZOS)
+
+                colorkey = bool(struct.unpack_from(
+                    '<I', vanilla_data, tex.O_COLORKEY)[0])
+                usable = 255 if colorkey else 256
+                indexed = image.convert('RGB').quantize(
+                    colors=usable, method=Image.Quantize.MEDIANCUT,
+                    dither=Image.Dither.NONE)
+                raw_indices = bytearray(indexed.tobytes())
+                if colorkey:
+                    alpha = image.getchannel('A').tobytes()
+                    raw_indices = bytearray(
+                        0 if a < 128 else i + 1
+                        for i, a in zip(raw_indices, alpha))
+
+                pillow_pal = indexed.getpalette() or []
+                entries = [(0, 0, 0, 0)] if colorkey else []
+                used = (max(indexed.tobytes()) + 1
+                        if indexed.tobytes() else 0)
+                for i in range(used):
+                    o = i * 3
+                    entries.append((pillow_pal[o], pillow_pal[o + 1],
+                                    pillow_pal[o + 2], 255))
+                palette_used = len(entries)
+                entries += [(0, 0, 0, 255)] * (256 - len(entries))
+                pal_bytes = bytearray()
+                for r, g, b, a in entries[:256]:
+                    pal_bytes += bytes((b, g, r, a))
+                if colorkey:
+                    edge = tex._boundary_colour(raw_indices, nw, nh,
+                                                pal_bytes, 256, 0)
+                    if edge is not None:
+                        pal_bytes[0:4] = bytes((edge[2], edge[1], edge[0], 0))
+
+                hdr = tex._paletted_header(vanilla_data, nw, nh, 1, 256)
+                struct.pack_into('<I', hdr, tex.O_COLORKEY, int(colorkey))
+                converted_tex = bytes(hdr) + bytes(pal_bytes) + bytes(raw_indices)
+                checked = tex.parse(converted_tex)
+                if checked is None:
+                    raise ValueError('converted payload failed TEX validation')
+                note = ('%dx%d -> %dx%d, uniform %sx native, %d/256 colours'
+                        % (sw, sh, nw, nh, scale, palette_used))
+                tmp = cached + '.tmp'
+                with open(tmp, 'wb') as f:
+                    f.write(converted_tex)
+                os.replace(tmp, cached)
+                log('  Gaia world %s: %s' % (low, note))
+            except Exception as exc:                           # noqa: BLE001
+                failed += 1
+                log('  ! Gaia world texture %s failed conversion: %s; '
+                    'keeping vanilla' % (low, exc))
+                continue
+        out[low] = (cached, mod)
+        converted += 1
+        source_bytes += len(raw)
+        output_bytes += os.path.getsize(cached)
+
+    if converted:
+        log('  world_us.lgp: %d Gaia DDS texture(s) converted to native '
+            'indexed TEX at uniform %sx scale (cap %s), fresh 256-colour '
+            'palettes '
+            '(%.1f MiB DDS -> %.1f MiB TEX)'
+            % (converted, scale, cap or 'off', source_bytes / (1024 * 1024),
+               output_bytes / (1024 * 1024)))
+    if held_native:
+        log('  world_us.lgp: %d Gaia runtime sprite/effect texture(s) use '
+            'independent UV, blend, mesh, or palette state; kept native'
+            % held_native)
+    if failed:
+        log('  ! world_us.lgp: %d Gaia DDS texture(s) rejected; their '
+            'vanilla entries remain in use' % failed)
+    return out
 
 
 _HRC_PIECE = re.compile(r'^\d+[ \t]+(.+)$', re.MULTILINE)
@@ -1715,9 +2025,9 @@ TEXCONV_CACHE = os.path.join(HERE, 'cache', '_texconv')
 TEXCAP_CACHE = os.path.join(HERE, 'cache', '_texcap')
 DEBLEED_CACHE = os.path.join(HERE, 'cache', '_debleed')
 
-# Field/world texture dimension cap, in pixels. Off (None) by default --
-# the field/world modules are documented above as fine with full-size
-# truecolor, proven on hardware with the mod sizes tested so far. This is
+# Field/world texture dimension cap, in pixels. Off (None) by default.
+# Field model textures are proven with full-size truecolor; world textures
+# use the separate native indexed conversion in `_convert_world_dds`. This is
 # an OPT-IN escape valve for mod sets that push field model textures far
 # past what was tested (some Nino-style packs upscale every NPC skin to
 # 512-1024px; a scene that loads a dozen-plus of them at once multiplies
@@ -1725,6 +2035,75 @@ DEBLEED_CACHE = os.path.join(HERE, 'cache', '_debleed')
 # turning it on is a deliberate, visible trade of texture fidelity for
 # headroom. 0 or unset disables it -- exact current behaviour.
 FIELD_TEX_CAP_ENV = 'SEVENTH_NX_FIELD_TEX_CAP'
+
+# World-map texture dimension cap, in pixels. Separate from the field cap
+# because the two archives are nothing like each other in size.
+#
+# MEASURED, vanilla world_us.lgp: 415 .tex, every one 8-bit paletted, and
+# the largest is 256x256. 225 of them are 32x32. The whole set decodes to
+# 6.70 MB at 32bpp -- 1.68 MB as shipped.
+#
+# MEASURED, Cosmos Gaia's world texture set (442 DDS): 30 files at
+# 1024x1024, 3 at 1024x512, and a long tail below. Decoded:
+#
+#     cap        @32bpp     @8bpp     @8bpp as % of the 256 MB heap
+#     none       212.0 MB    53.0 MB     20.7%
+#     1024px     200.0 MB    50.0 MB     19.5%
+#      768px     142.2 MB    35.6 MB     13.9%
+#      512px     101.0 MB    25.2 MB      9.8%
+#      256px      53.5 MB    13.4 MB      5.2%
+#      128px      24.1 MB     6.0 MB      2.3%
+#
+# The port hardcodes a 64 MB guest heap, but `ff7nx_heap` raises it to
+# HEAP_MB = 256 and `apply_heap` runs on every build (FINDINGS-106), so the
+# ceiling these numbers are measured against is 256 MB, not 64. That is a
+# much looser budget than the world set needs: paletted, even uncapped is
+# ~20% of it.
+#
+# So this default is NOT a memory emergency. It is set to a real number
+# rather than Off because vanilla world_us.lgp tops out at 256px and 512 is
+# the smallest cap that is unambiguously generous against it -- a clean 2:1
+# halving of the largest thing anyone ships, twice vanilla's own maximum,
+# and it rewrites nothing vanilla contains (test_texcap.py proves that).
+# 768 is affordable too at 256 MB; the reason not to reach further is that
+# nothing above 256px has ever been rendered by this port's world texture
+# bind, not that the bytes are unavailable.
+#
+# What the heap does still rule out is TRUECOLOR at full size: 212 MB of a
+# 256 MB pool, on top of field backgrounds, which FINDINGS-106 5.2 names as
+# the allocation that actually killed builds. HeapAlloc is first fit, so
+# what has to fit is the largest contiguous request plus a session's
+# fragmentation, not just the total.
+#
+# UNSET falls back to the field cap, so a CLI build that knows nothing
+# about this variable behaves exactly as it did before it existed. An
+# explicit 0 turns it off for world_us.lgp even when the field cap is on.
+WORLD_TEX_CAP_ENV = 'SEVENTH_NX_WORLD_TEX_CAP'
+WORLD_TEX_CAP_DEFAULT = 512
+# Internal contract between the Gaia archive conversion and the matching
+# exefs/main UV correction. It is populated from the active plan; users do
+# not need to set it by hand.
+WORLD_GAIA_SCALE_ENV = 'SEVENTH_NX_WORLD_GAIA_SCALE'
+
+
+def _world_gaia_scale(cap=None):
+    """Uniform native->Gaia terrain scale selected by the world cap.
+
+    Native world textures top out at 256px and Gaia's terrain replacements
+    are 4x their native slots.  A single factor is required because the stock
+    mesh carries pixel-space UVs shared across the whole atlas.  128 is the
+    one supported downscale; every other GUI choice is an integer upscale.
+    """
+    cap = _world_tex_cap() if cap is None else cap
+    if cap == 128:
+        return 0.5
+    if not cap or cap >= 1024:
+        return 4
+    if cap >= 768:
+        return 3
+    if cap >= 512:
+        return 2
+    return 1
 
 # Colour-key de-fringing for field/world model textures. ON by default: it is
 # the one texture change in this file that provably cannot alter the image --
@@ -2348,6 +2727,24 @@ def _field_tex_cap():
         val = int(raw)
     except ValueError:
         return None
+    return val if val > 0 else None
+
+
+def _world_tex_cap():
+    """
+    Current world_us.lgp cap in pixels, or None if disabled.
+
+    Unset -> whatever the field cap says, which is what world_us.lgp always
+    followed before this setting existed. An explicit 0 disables it here
+    even when the field cap is on; anything else positive wins.
+    """
+    raw = os.environ.get(WORLD_TEX_CAP_ENV, '').strip()
+    if not raw:
+        return _field_tex_cap()
+    try:
+        val = int(raw)
+    except ValueError:
+        return _field_tex_cap()
     return val if val > 0 else None
 
 
@@ -5115,8 +5512,9 @@ def _build_model_archive(name, archive_path, mod_files, romfs, pack_lgp,
     # The Switch battle module needs paletted textures (the enemy death
     # dissolve and some magic effects are palette-driven; truecolor mod
     # textures vanish instead of fading, or render white). Convert them.
-    # The field/world modules are fine with truecolor -- proven on
-    # hardware -- so only battle.lgp and magic.lgp are converted.
+    # Field/model textures are fine with truecolor.  The world module is not;
+    # its Gaia path below has a separate destination-palette conversion.
+    # Battle and magic use this battle-specific converter.
     if name == 'battle.lgp':
         mod_files = _apply_battle_experiments(mod_files, folder_of, log)
         mod_files = _battle_enemy_report(mod_files, van, folder_of, log)
@@ -5129,12 +5527,25 @@ def _build_model_archive(name, archive_path, mod_files, romfs, pack_lgp,
             name, mod_files, van, log, folder_of,
             battle_bg_native_names=battle_bg_native_names)
 
+    # FFNx/Cosmos Gaia ships world replacements as loose DDS files.  The
+    # Switch has no external-texture loader, so convert the narrowly-routed
+    # frame-zero files before the normal world texture cap/debleed passes.
+    # A failed conversion removes that replacement and therefore leaves the
+    # vanilla TEX from ``filemap`` untouched.
+    if name == 'world_us.lgp':
+        mod_files = _convert_world_dds(mod_files, van, log)
+
     # Opt-in only (see FIELD_TEX_CAP_ENV above) -- disabled by default, so
     # a build with nothing set behaves exactly as before this was added.
     if name in ('char.lgp', 'world_us.lgp'):
         mod_files = _drop_stray_model_parts(name, mod_files, van, log)
         _field_model_report(name, mod_files, van, log)
-        cap = _field_tex_cap()
+        # world_us.lgp has its own cap. Vanilla's largest world texture is
+        # 256px against char.lgp's model skins, and an HD world set is two
+        # orders of magnitude bigger than the archive it replaces, so the
+        # two archives cannot share one number sensibly. Unset, the world
+        # cap returns the field cap and nothing changes.
+        cap = _world_tex_cap() if name == 'world_us.lgp' else _field_tex_cap()
         if cap:
             mod_files = _cap_field_textures(name, mod_files, log, cap)
 
@@ -6884,6 +7295,13 @@ def _emplace_battle_bg(plan, romfs, dump, log, produced):
 
 ARCHIVE_FP_CACHE = os.path.join(HERE, 'cache', '_archive_fp')
 NO_ARCHIVE_CACHE_ENV = 'SEVENTH_NX_NO_ARCHIVE_CACHE'
+# Fast iteration switch for world/model/module work.  This is intentionally an
+# environment-only expert control: the field archive and exefs/main have
+# coupled background-buffer settings, so blindly skipping flevel would be
+# unsafe.  `_reuse_existing_flevel` verifies that the existing sdout file is
+# exactly the one recorded by this packer's cache and restores its measured
+# maximum field size before any module patch runs.
+REUSE_FLEVEL_ENV = 'SEVENTH_NX_REUSE_FLEVEL'
 
 
 def _stat_sig(path):
@@ -6960,7 +7378,9 @@ def _archive_fingerprint(name, archive_path, files, extra):
             continue
         h.update(('%s|%r' % (low, _stat_sig(src))).encode())
     for k in sorted(os.environ):
-        if k.startswith('SEVENTH_NX'):
+        # This flag changes build scheduling, not archive bytes.  Including it
+        # would needlessly invalidate every other archive on a fast test run.
+        if k.startswith('SEVENTH_NX') and k != REUSE_FLEVEL_ENV:
             h.update(('%s=%s\0' % (k, os.environ[k])).encode())
     for fn in sorted(os.listdir(HERE)):
         if fn.endswith('.py'):
@@ -7011,6 +7431,50 @@ def _archive_cache_store(name, dest, fp, payload=''):
             f.write('%s\n%d\n%d\n%s\n' % (fp, sig[0], sig[1], payload))
     except OSError:
         pass
+
+
+def _reuse_existing_flevel(sdout, log=lambda *_: None):
+    """Validate and preserve sdout's current flevel.lgp for a fast build.
+
+    Returns its absolute path and restores ``FIELD_BG_MAX_RAW`` from the
+    metadata written when that exact file was built.  Refusing on a missing
+    or externally changed file is deliberate: without the cached measurement,
+    later exefs/main passes could size the field decompression buffer for a
+    different archive and turn a time-saving option into a crash.
+    """
+    dest = os.path.join(sdout, 'atmosphere', 'contents', TITLE_ID, ROMFS,
+                        ARCHIVES['flevel.lgp'])
+    sig = _stat_sig(dest)
+    if sig is None:
+        raise RuntimeError(
+            '%s=1 requires an existing sdout flevel.lgp; run one normal '
+            'build first' % REUSE_FLEVEL_ENV)
+    rec = os.path.join(ARCHIVE_FP_CACHE, 'flevel.lgp.fp')
+    try:
+        with open(rec) as f:
+            parts = f.read().split('\n')
+        size, mtime, payload = int(parts[1]), int(parts[2]), int(parts[3])
+    except (OSError, IndexError, TypeError, ValueError):
+        raise RuntimeError(
+            '%s=1 cannot verify this flevel.lgp because its build metadata '
+            'is missing; run one normal build first' % REUSE_FLEVEL_ENV)
+    if sig != (size, mtime):
+        raise RuntimeError(
+            '%s=1 refused: sdout flevel.lgp no longer matches the exact file '
+            'recorded by the build cache; run one normal build first'
+            % REUSE_FLEVEL_ENV)
+    if payload <= 0:
+        raise RuntimeError(
+            '%s=1 refused: cached flevel decompression size is invalid; run '
+            'one normal build first' % REUSE_FLEVEL_ENV)
+    global FIELD_BG_MAX_RAW
+    FIELD_BG_MAX_RAW = payload
+    log('flevel.lgp: FAST REUSE enabled -- kept the existing sdout archive '
+        'without rebuilding it')
+    log('      verified %s bytes and restored largest field %s bytes for '
+        'matching exefs/main buffer patches'
+        % (format(sig[0], ','), format(FIELD_BG_MAX_RAW, ',')))
+    return dest
 
 
 SDOUT_MANIFEST = os.path.join(HERE, 'cache', '_sdout_manifest')
@@ -7094,10 +7558,29 @@ def apply_plan(plan, archive_paths, sdout, log=lambda *_: None,
     romfs = os.path.join(sdout, 'atmosphere', 'contents', TITLE_ID, ROMFS)
     produced = []
 
+    # Keep the archive and renderer halves of Gaia inseparable.  The archive
+    # converter emits every world tile at this one scale; the later module
+    # pass reads the same value and corrects the six pixel-UV normalisations.
+    # Clear it explicitly when Gaia is absent so a second build in the same
+    # GUI process cannot inherit the previous build's patch.
+    if plan.world_dds_native_names:
+        os.environ[WORLD_GAIA_SCALE_ENV] = str(_world_gaia_scale())
+        log('Gaia native world scale: %sx (archive and terrain UV correction)'
+            % os.environ[WORLD_GAIA_SCALE_ENV])
+    else:
+        os.environ.pop(WORLD_GAIA_SCALE_ENV, None)
+
     model_targets = sorted(a for a in plan.archive_files if a != 'flevel.lgp')
     flevel_fields = plan.archive_files.get('flevel.lgp', {})
     do_flevel = bool(plan.chunks) or bool(flevel_fields)
-    total = len(model_targets) + (1 if do_flevel else 0)
+    reuse_flevel = os.environ.get(REUSE_FLEVEL_ENV, '').strip().lower() in (
+        '1', 'true', 'yes', 'on')
+    if reuse_flevel:
+        # Add it to `produced` even though this invocation did not write it.
+        # prune_stale() only knows that list; omitting the reused archive here
+        # would make the fast mode delete the very file it promised to keep.
+        produced.append(_reuse_existing_flevel(sdout, log))
+    total = len(model_targets) + (1 if do_flevel and not reuse_flevel else 0)
     step = 0
 
     pack_lgp = ensure_pyff7(log) if model_targets else None
@@ -7127,7 +7610,7 @@ def apply_plan(plan, archive_paths, sdout, log=lambda *_: None,
             produced.append(dest)
             _archive_cache_store(name, dest, fp)
 
-    if do_flevel:
+    if do_flevel and not reuse_flevel:
         progress(step, total, 'flevel.lgp')
         step += 1
         if 'flevel.lgp' in archive_paths:
@@ -7445,6 +7928,55 @@ def apply_widescreen(sdout, dump, log=lambda *_: None, produced=()):
         'projection matrix is a separate, unsolved patch). The world map has '
         'its own verified terrain, sky, cloud, and meteor 16:9 bounds in this '
         'same pass.')
+    return [dest] if not built else []
+
+
+def apply_gaia_world_uv(sdout, dump, log=lambda *_: None, produced=()):
+    """Pair Gaia's uniformly enlarged TEX files with their mesh UV scale.
+
+    This follows the same no-clobber composition rule as every other module
+    pass: use the module produced earlier in THIS build, or a stock dump, and
+    refuse to overwrite an unrelated/stale patched destination.
+    """
+    if not ff7nx_gaia.enabled():
+        return []
+    if dump is None or not dump.nso:
+        raise RuntimeError(
+            'Gaia world UV correction needs exefs/main from a full game '
+            'dump. The build was stopped rather than emitting enlarged '
+            'terrain TEX files with uncorrected native UVs.')
+    dest = os.path.join(sdout, 'atmosphere', 'contents', TITLE_ID, 'exefs',
+                        'main')
+    fresh = {os.path.normpath(os.path.abspath(p)) for p in produced}
+    built = os.path.normpath(os.path.abspath(dest)) in fresh
+    src = dest if built else dump.nso
+    log('')
+    log('applying Cosmos Gaia native world UV correction (%sx) ...'
+        % ff7nx_gaia.scale())
+    if not built and os.path.exists(dest):
+        try:
+            same = (os.path.getsize(dest) == os.path.getsize(dump.nso)
+                    and open(dest, 'rb').read() == open(dump.nso, 'rb').read())
+        except OSError:
+            same = False
+        if not same:
+            raise RuntimeError(
+                'Gaia world UV correction found an exefs/main this build '
+                'did not produce and refused to clobber it. The build was '
+                'stopped so world_us.lgp and the renderer cannot disagree.')
+    log('  base main   %s%s' %
+        (src, '   (previous patch output)' if built else '   (from dump)'))
+    tmp = dest + '.gaia-tmp'
+    if not ff7nx_gaia.apply_to_nso(src, tmp, log):
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        raise RuntimeError(
+            'Gaia world UV correction failed. The build was stopped because '
+            'testing an enlarged archive without its matching UV correction '
+            'would reproduce the square/cropped terrain regression.')
+    os.replace(tmp, dest)
+    log('  all three U and three V coordinates now cover the complete Gaia '
+        'texture instead of stretching its upper-left crop')
     return [dest] if not built else []
 
 

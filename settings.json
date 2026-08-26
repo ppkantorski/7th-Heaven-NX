@@ -211,13 +211,14 @@
   }
  },
  "CosmosGaia.iro": {
-  "enabled": false,
+  "enabled": true,
   "options": {
    "CG": 1
   }
  },
  "__global__": {
   "field_tex_cap": 512,
+  "world_tex_cap": 768,
   "battle_bg_tex_cap": 768,
   "field_bg_page_px": 768,
   "field_bg_budget_mb": 0.0,
