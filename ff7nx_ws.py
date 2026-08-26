@@ -1166,7 +1166,7 @@ UNCROP_PATCHES = [
 # --------------------------------------------------------------------------
 # the framing stage -- environment only, and unproven
 # --------------------------------------------------------------------------
-def world_sky_cave_spec(main, log=lambda *_: None):
+def world_sky_cave_spec(main, log=lambda *_: None, pool=None):
     """Return the verified padding-cave spec for the first sky lower edge.
 
     ``ff7nx_widescreen.spec()`` can change the second lower-edge store in
@@ -1174,13 +1174,26 @@ def world_sky_cave_spec(main, log=lambda *_: None):
     emitted here. Build 177 applied the direct spec without this cave,
     leaving the two vertices at 0 and 20 and making the rotating horizon
     diagonal.
+
+    `pool` MUST be supplied by any caller that also emits ff7nx_wsclamp's
+    camera caves into the same module. Two HolePools built over the same
+    image are independent and both hand out the lowest hole first, so a
+    private pool here collides with the clamp's `bottom1` on the very first
+    allocation. The framing transaction verifies before it writes, so the
+    symptom was a build that refused outright with
+
+        cave word: verification failed at 0x6dd4; have 97 02 80 52
+
+    -- `movz w23, #20`, this cave's own first word, already sitting where
+    the clamp expected padding.
     """
     import struct
     import ff7nx_cave
     import ff7nx_widescreen
 
     starts = set(main.arm_starts)
-    pool = ff7nx_cave.HolePool(main.img, starts=starts)
+    if pool is None:
+        pool = ff7nx_cave.HolePool(main.img, starts=starts)
     words = ff7nx_widescreen.world_cave_patches(
         main.img, starts, log=log, pool=pool)
 
@@ -1358,11 +1371,20 @@ def apply_module(sdout, dump, log=lambda *_: None, produced=()):
         #    extents are hardware-confirmed; the RIGHT and BOTTOM biases are
         #    new and are what HANDOFF-48 §4 asked for.
         m = nxmap.Main(src)
+        # ONE hole pool for every cave in this transaction. HolePool hands
+        # out the lowest usable hole first and two pools over the same image
+        # know nothing about each other, so a second pool re-issues the first
+        # one's holes. The sky cave and the clamp's camera caves both landed
+        # on +0x6dd4 and the whole framing stage refused to write. Every cave
+        # emitter below takes this pool.
+        import ff7nx_cave
+        cave_pool = ff7nx_cave.HolePool(m.img, starts=set(m.arm_starts))
         # WORLD_PATCHES above changes the second lower sky vertex from 0 to
         # 20. The first is a WZR store, so it requires this matching cave.
         # Keep it in the same verified transaction: either both endpoints
         # ship or neither one does.
-        applied += nso_patcher.apply_spec(nso, world_sky_cave_spec(m, log))
+        applied += nso_patcher.apply_spec(
+            nso, world_sky_cave_spec(m, log, pool=cave_pool))
         ff7nx_wsclamp.check_all(m.img)
         clamp_values = ff7nx_wsclamp.defaults(scale)
         # E. THE PARALLAX RIGHT EDGE. Layers 3 and 4 WRAP rather than cull,
@@ -1429,7 +1451,8 @@ def apply_module(sdout, dump, log=lambda *_: None, produced=()):
                     'bottom edge. A/B only.')
         applied += nso_patcher.apply_spec(
             nso, ff7nx_wsclamp.spec(m.img, clamp_values,
-                                    starts=set(m.arm_starts), log=log))
+                                    starts=set(m.arm_starts), log=log,
+                                    pool=cave_pool))
         # D. The field render target. Same transaction as everything else,
         #    so a module that does not match leaves `dest` untouched rather
         #    than shipping the buffer without the extents that go with it.

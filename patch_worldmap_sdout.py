@@ -82,9 +82,19 @@ TITLE_ID = '0100A5B00BDC6000'
 DEFAULT_MAIN = (HERE / 'sdout' / 'atmosphere' / 'contents' / TITLE_ID /
                 'exefs' / 'main')
 SUBMIT_VAS = (0x00F58668, 0x00F58674)
-MANAGED_VAS = (W.WORLD_EDGE_BLOCK_HOOK,) + SUBMIT_VAS
+NEIGHBOURHOOD_VAS = (0x00F525BC, 0x00F52670)
+CLOUD_STABILIZE_VA = 0x00F39654
+METEOR_VAS = (0x00F3A370, 0x00F3A374)
+# In ff7nx_widescreen.WORLD_PATCHES order; final_patches() enforces that.
+MANAGED_VAS = ((W.WORLD_EDGE_BLOCK_HOOK,) + SUBMIT_VAS + NEIGHBOURHOOD_VAS +
+               (CLOUD_STABILIZE_VA,) + METEOR_VAS)
 NOP = bytes.fromhex('1F 20 03 D5')
 SKY_MOVZ_W23_20 = 0x52800297
+# Accept the one-word intermediate attempts so this incremental patcher can
+# move a tested sdout forward without rebuilding flevel or Cosmos content.
+PREVIOUS_DIRECT = {
+    0x00F3A374: (bytes.fromhex('A8 1A 80 12'),),  # ineffective -214 attempt
+}
 
 
 def patch_bytes(patch, key):
@@ -153,8 +163,12 @@ def state(nso):
     direct = []
     for patch in final_patches():
         have = current_bytes(nso, patch['va'])
-        direct.append(classify(have, patch_bytes(patch, 'expect'),
-                               patch_bytes(patch, 'set')))
+        old = patch_bytes(patch, 'expect')
+        prior = PREVIOUS_DIRECT.get(patch['va'], ())
+        if have in prior:
+            direct.append('old')
+        else:
+            direct.append(classify(have, old, patch_bytes(patch, 'set')))
     null_have = current_bytes(nso, W.WORLD_NULL_MESH_GUARD)
     null_state = classify(
         null_have, NOP, W.WORLD_NULL_MESH_GUARD_WORD.to_bytes(4, 'little'))
@@ -196,7 +210,7 @@ def main(argv=None):
             return 0
         if ('unknown' in direct_state or null_state == 'unknown'):
             raise RuntimeError('refusing a partial/unrecognised world-map '
-                               'state: edge/submit=%s, null-guard=%s, '
+                               'state: direct=%s, null-guard=%s, '
                                'sky-hook=%s' %
                                (direct_state, null_state, hook_state))
         verify_common_baseline(nso)
@@ -213,11 +227,17 @@ def main(argv=None):
             })
         for patch, patch_state in zip(final_patches(), direct_state):
             if patch_state == 'old':
-                pending.append(patch)
+                # A meteor-left word may be stock or one of the exact
+                # one-word intermediate states.  Fingerprint whichever recognised
+                # source is actually present before applying the final word.
+                current = current_bytes(nso, patch['va'])
+                queued = dict(patch)
+                queued['expect'] = ' '.join('%02X' % b for b in current)
+                pending.append(queued)
         direct_log = []
         if pending:
             direct_log = nso_patcher.apply_spec(nso, {
-                'name': 'world-map corrected terrain guards/submission',
+                'name': 'world-map corrected terrain/cloud behavior',
                 'patches': pending,
             })
         cave_log = []
@@ -229,16 +249,16 @@ def main(argv=None):
     except Exception as exc:  # noqa: BLE001 - command must fail closed
         raise SystemExit('world-map sdout patch refused: %s' % exc)
 
-    print('verified %d terrain correction word(s) and %d sky cave word(s)' %
+    print('verified %d world-map correction word(s) and %d sky cave word(s)' %
           (len(direct_log), len(cave_log)))
     if args.dry_run:
         print('dry run complete; no files changed')
         return 0
 
-    # Keep the earlier pre-horizon backup as a separate recovery point.  This
-    # one captures the user's known-good horizon build immediately before the
-    # corrected terrain-guard mapping is installed.
-    backup = target.with_name(target.name + '.pre-worldmap-mesh-guard-fix')
+    # Preserve the last hardware-tested build as its own recovery point before
+    # correcting the meteor's translated signed compare and the block
+    # streaming neighbourhood.
+    backup = target.with_name(target.name + '.pre-worldmap-streaming-fix')
     if not backup.exists():
         shutil.copy2(target, backup)
         print('backup: %s' % backup)

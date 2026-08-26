@@ -306,6 +306,21 @@ class Cpu:
             return None
         if (w & 0xFFE00C00) == 0x1A800000:                    # csel Wd,Wn,Wm,c
             return s(rd, gz(rn) if self.cond((w >> 12) & 0xF) else gz(rm), True)
+        if (w & 0xFFE00C00) == 0x1A800400:                    # csinc Wd,Wn,Wm,c
+            # if cond then Wd = Wn else Wd = Wm + 1.
+            #
+            # ADDED FOR THE DEPTH-2 BLEND LADDER (FINDINGS-194). The stock
+            # module already uses this at +0x10DC41C to pick blend 4 or 1 from
+            # one compare -- `csinc w4, w25, wzr, ls` -- so any emulation of
+            # `field_load_textures` needs it, and without it the verification
+            # of a patch AT that site cannot run at all.
+            #
+            # It is a separate arm from `csel` rather than a widened mask
+            # because they differ in exactly one bit (10) and merging them
+            # would silently make every csinc behave as a csel.
+            return s(rd,
+                     gz(rn) if self.cond((w >> 12) & 0xF)
+                     else (gz(rm) + 1) & M32, True)
         if (w & 0xFF000000) == 0xB4000000:                    # cbz Xt
             if g(rd) == 0:
                 off = (w >> 5) & 0x7FFFF
@@ -382,6 +397,20 @@ class Cpu:
             self._setflags32(a, b, res, True)
             s(rd, res, True)
             return None
+        if (w & 0xFF800000) in (0xF1000000, 0xF1800000):      # subs Xd,Xn,#i
+            # THE 64-BIT `cmp Xn, #imm`, which the module uses to bound the
+            # page slot -- `cmp x23, #0x18` at +0x10DC3E0 and `cmp x23, #0xe`
+            # at +0x10DC418, i.e. the whole depth-1 blend ladder. Only the
+            # register form (0xEB) was here, so any attempt to emulate that
+            # ladder stopped on the first instruction.
+            #
+            # `imm12` above already folds the sh bit, so this needs no shift
+            # of its own -- same as the 0xD1 sub arm four lines up.
+            a, b = self.get(rn), imm12
+            res = (a - b) & M64
+            self._setflags64(a, b, res, True)
+            s(rd, res)
+            return None
         if (w & 0xFF800000) in (0x31000000, 0x31800000):      # adds Wd,Wn,#i
             a, b = g(rn, True), imm12
             res = (a + b) & M32
@@ -448,6 +477,18 @@ class Cpu:
             if (w >> 22) & 3:
                 raise Unsupported('and shift type at 0x%X' % pc)
             return s(rd, g(rn, True) & ((g(rm, True) << amt) & M32), True)
+        if (w & 0xFF200000) == 0x4A000000 and ((w >> 10) & 0x3F) != 0:
+            # eor Wd,Wn,Wm,LSL #sh -- shifted form only, so the unshifted
+            # `eor Wd,Wn,Wm` decoded above keeps its own arm. The translated
+            # signed compares reconstruct the x86 overflow flag with
+            # `eor Wd, Wa, Whigh, lsl #16`, which is the whole reason the
+            # meteor's left bound could not be corrected by its value alone.
+            amt = (w >> 10) & 0x3F
+            if (w >> 22) & 3:
+                raise Unsupported('eor shift type at 0x%X' % pc)
+            a = 0 if rn == 31 else g(rn, True)
+            b = 0 if rm == 31 else g(rm, True)
+            return s(rd, (a ^ ((b << amt) & M32)) & M32, True)
 
         # ---- logical immediate: AND / ORR Wd, Wn, #mask -----------------
         # Register 31 is the ZERO register for these, not SP -- `mov Wd,#imm`
@@ -491,14 +532,51 @@ class Cpu:
                 return s(rd, (v >> immr) & ((1 << width) - 1), True)
             return s(rd, ((v & ((1 << (imms + 1)) - 1)) << (32 - immr)) & M32,
                      True)
-        if (w & 0xFFC00000) == 0x13000000:                    # SBFM (asr)
+        if (w & 0xFFC00000) == 0x13000000:                    # SBFM, 32-bit
+            # The general form, not only the `asr` alias (imms == 31). The
+            # recompiler also emits `sxth`/`sxtb` here -- sbfm Wd,Wn,#0,#15
+            # and #0,#7 -- to widen the guest's 16- and 8-bit values, and the
+            # world-map block loops are written in shorts.
             immr = (w >> 16) & 0x3F
             imms = (w >> 10) & 0x3F
-            if imms != 31:
-                raise Unsupported('unsupported SBFM imms=%d at 0x%X' % (imms, pc))
-            return s(rd, (s32(g(rn, True)) >> immr) & M32, True)
+            v = g(rn, True)
+            if imms >= immr:
+                width = imms - immr + 1
+                f = (v >> immr) & ((1 << width) - 1)
+            else:                                             # sbfiz
+                width = imms + 1
+                f = (v & ((1 << width) - 1)) << (32 - immr)
+                width += 32 - immr
+            if f & (1 << (width - 1)):                        # sign extend
+                f -= 1 << width
+            return s(rd, f & M32, True)
+        if (w & 0xFFC00000) == 0x33000000:                    # BFM, 32-bit
+            # The 32-bit twin of the BFM arm further down. The recompiler
+            # emits it constantly: every x86 dword load of a guest address is
+            # `ldrh lo / ldrh hi / bfi lo, hi, #16, #16`, and the meteor and
+            # terrain comparisons are built on exactly that pair, so a suite
+            # that could not execute it could not test them at all.
+            immr = (w >> 16) & 0x3F
+            imms = (w >> 10) & 0x3F
+            src, dst = g(rn, True), g(rd, True)
+            if imms >= immr:                                  # bfxil
+                width = imms - immr + 1
+                m = (1 << width) - 1
+                return s(rd, (dst & ~m) | ((src >> immr) & m), True)
+            width = imms + 1                                  # bfi
+            lsb = 32 - immr
+            m = ((1 << width) - 1) << lsb
+            return s(rd, (dst & ~m & M32)
+                     | (((src & ((1 << width) - 1)) << lsb) & M32), True)
 
         # ---- moves -------------------------------------------------------
+        if (w & 0xFF800000) == 0x12800000:                    # movn Wd,#i{,lsl}
+            # How every negative widescreen constant in ff7nx_widescreen.py is
+            # materialised, so leaving it out meant no suite could execute one.
+            hw = (w >> 21) & 3
+            if hw > 1:
+                raise Unsupported('movn hw=%d at 0x%X' % (hw, pc))
+            return s(rd, (~(((w >> 5) & 0xFFFF) << (16 * hw))) & M32, True)
         if (w & 0xFFE00000) == 0x52800000:                    # movz Wd,#i
             return s(rd, (w >> 5) & 0xFFFF, True)
         if (w & 0xFFE00000) == 0x52A00000:                    # movz Wd,#i,lsl16

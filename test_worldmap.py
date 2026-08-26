@@ -88,8 +88,46 @@ def main(argv=None):
     cloud_left, cloud_join, cloud_right = -256, 0, 256
     ok(cloud_join - cloud_left == cloud_right - cloud_join,
        'cloud halves share one equal -256..0..256 boundary')
-    ok(width // 2 == 427,
-       'meteor rejection uses the same 427-pixel wide half-viewport')
+    cloud_roll = next(p for p in W.WORLD_PATCHES
+                      if p['name'] == 'world cloud ignore turn-bank roll')
+    ok(int.from_bytes(bytes.fromhex(cloud_roll['set']), 'little') ==
+       A.mov_reg(23, 31),
+       'cloud transform discards only the copied camera-bank value')
+    meteor_left = -107
+    meteor_right = width // 2
+    ok((meteor_left, meteor_right) == (-107, 427),
+       'meteor cull uses the exact 16:9 edges')
+    meteor_sign = next(p for p in W.WORLD_PATCHES
+                       if p['name'] ==
+                       'world meteor left cull sign high 0 -> -1')
+    ok(int.from_bytes(bytes.fromhex(meteor_sign['set']), 'little') ==
+       A.movz(9, 0xFFFF),
+       'meteor left compare carries the negative operand high half')
+    ok(((meteor_left & 0xFFFFFFFF) >> 16) == 0xFFFF,
+       'the companion high half matches signed -107')
+
+    print('\nblock streaming neighbourhood')
+    # The caller's own loops run -2..2 on both axes (0x751C13 / 0x751C34), so
+    # moving the unconditional core to |d| <= 2 asks for the whole 5x5 and
+    # leaves the +/-78.75 degree wedge test unreachable.  Anything larger
+    # would exceed the engine's fixed pools, which is the point of the last
+    # two checks here.
+    neigh = [p for p in W.WORLD_PATCHES
+             if p['name'].startswith('world block neighbourhood')]
+    ok(len(neigh) == 2, 'both neighbourhood axes are corrected')
+    for p in neigh:
+        old = int.from_bytes(bytes.fromhex(p['expect']), 'little')
+        new = int.from_bytes(bytes.fromhex(p['set']), 'little')
+        ok(old == 0x71000528,          # subs w8, w9, #1
+           '%s replaces the stock subs w8, w9, #1' % p['name'])
+        ok(new == old + (1 << 10),
+           '%s changes only the compared immediate, 1 -> 2' % p['name'])
+        ok(new >> 22 == old >> 22 and (new >> 5) & 0x1F == (old >> 5) & 0x1F
+           and new & 0x1F == old & 0x1F,
+           '%s keeps the same opcode and registers' % p['name'])
+    ok(5 * 5 <= 32, 'a 5x5 working set fits the 32-entry block descriptor pool')
+    ok(0x00E04970 + 32 * 0x1200 == 0x00E28970,
+       'the per-block mesh pool really is 32 slots and ends at the next global')
 
     print('\nsky lower-edge cave')
     pool = ff7nx_cave.HolePool(m.img, starts=set(m.arm_starts))
@@ -106,6 +144,44 @@ def main(argv=None):
     ok(all(word(m.img, va) == 0 for va in patches
            if va != W.WORLD_SKY_BOTTOM_HOOK),
        'every cave word occupies verified zero padding')
+
+    print('\ncave allocation is shared across the framing transaction')
+    # HolePool hands out the lowest usable hole first, and two pools built
+    # over the same image know nothing about each other. The sky cave and
+    # ff7nx_wsclamp's camera caves are emitted into ONE module in one
+    # verified transaction, so they have to draw from one pool -- otherwise
+    # the second spec re-issues the first one's holes and the whole framing
+    # stage refuses to write:
+    #
+    #   cave word: verification failed at 0x6dd4; have 97 02 80 52
+    #
+    # which is `movz w23, #20`, the sky cave's own first word.
+    import ff7nx_wsclamp          # ff7nx_cave is already imported at module
+                                  # scope; re-importing it here would make the
+                                  # name local to this whole function and
+                                  # break the sky-cave section above.
+    starts = set(m.arm_starts)
+    values = ff7nx_wsclamp.defaults(ff7nx_wsclamp.WS_SCALE)
+
+    shared = ff7nx_cave.HolePool(m.img, starts=starts)
+    sky = {p['va'] for p in
+           WS.world_sky_cave_spec(m, pool=shared)['patches']}
+    clamp = {p['va'] for p in
+             ff7nx_wsclamp.spec(m.img, values, starts=starts,
+                                pool=shared)['patches']}
+    ok(not (sky & clamp),
+       'one shared pool gives the sky cave and the clamp caves disjoint words')
+
+    # The mutation: prove the check above can actually fail, so it is not
+    # quietly passing because both sets came out empty or the plumbing
+    # stopped reaching the pool at all.
+    sky_private = {p['va'] for p in WS.world_sky_cave_spec(m)['patches']}
+    clamp_private = {p['va'] for p in
+                     ff7nx_wsclamp.spec(m.img, values, starts=starts)['patches']}
+    ok(bool(sky_private & clamp_private),
+       'caught: two private pools DO collide, so the shared pool is load-bearing')
+    ok(len(sky) > 1 and len(clamp) > 1,
+       'both cave sets are non-trivial')
 
     print('\nactive widescreen composition')
     active = WS.world_sky_cave_spec(m)

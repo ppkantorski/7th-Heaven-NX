@@ -1148,9 +1148,14 @@ def expand(values):
     return out
 
 
-def build(img, values, starts=None, log=lambda *_: None):
+def build(img, values, starts=None, log=lambda *_: None, pool=None):
     """
     Every word this module wants to change, as {va: word}.
+
+    `pool` lets a caller that is emitting OTHER caves into the same module
+    share one allocator with this one. Passing None builds a private pool,
+    which is correct only when nothing else in the same transaction takes
+    holes -- see the note on the shared pool in ff7nx_ws.apply_module.
 
     `values` maps knob name -> extent; anything absent is left alone. Nothing
     is written here -- the caller hands the result to nso_patcher, which
@@ -1161,7 +1166,8 @@ def build(img, values, starts=None, log=lambda *_: None):
     if unknown:
         raise ValueError('unknown knob(s): %s' % ', '.join(sorted(unknown)))
     out = dict(immediate_patches(img, values))
-    caves, _pool = cave_patches(img, values, starts=starts, log=log)
+    caves, _pool = cave_patches(img, values, starts=starts, pool=pool,
+                                log=log)
     clash = set(out) & set(caves)
     if clash:
         raise SiteMismatch('immediate and cave both want +0x%07X'
@@ -1202,9 +1208,9 @@ def revert_spec(img):
     }
 
 
-def spec(img, values, starts=None, log=lambda *_: None):
+def spec(img, values, starts=None, log=lambda *_: None, pool=None):
     """An nso_patcher spec for `build`'s output."""
-    words = build(img, values, starts=starts, log=log)
+    words = build(img, values, starts=starts, log=log, pool=pool)
     hooks = {s['va'] for s in CAVE_SITES.values()}
     return {
         'name': 'field background tile window, 16:9',

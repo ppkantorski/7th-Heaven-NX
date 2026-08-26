@@ -145,6 +145,51 @@ WORLD_PATCHES = [
     {'name': 'world terrain submit origin 0 -> -107',
      'va': 0x00F58674, 'expect': '08 00 40 B9', 'set': '48 0D 80 12'},
 
+    # Terrain STREAMING, which is a different thing from terrain culling and
+    # is why widening the cull rectangle alone left the far horizon changing
+    # shape at the sides.
+    #
+    # world_stream_blocks_75164A only asks for the blocks that
+    # world_compute_block_visibility_751AC4 marked wanted.  That routine marks
+    # the 3x3 core unconditionally and then admits each block of the outer
+    # ring only if its CENTRE falls inside a +/-0x380 wedge about the camera
+    # heading.  0x380 is 896 units and the engine's angle scale is
+    # 0.087890625 degrees per unit (4096 = 360), so the wedge is +/-78.75
+    # degrees -- a 4:3-era approximation that tests a block's centre and
+    # ignores its 8192-unit extent.  On a 16:9 viewport the extra field of
+    # view at the left and right screen edges reaches blocks the wedge
+    # rejects, so they are never streamed in; they appear only once the
+    # camera has moved far enough for their centres to enter the wedge, which
+    # is the horizon repeatedly changing shape as you fly forward.
+    #
+    # FFNx's memset at world_sub_751EFC + 0xC89 (below) only stops the
+    # RENDERER consulting the same table.  It cannot help with a block that
+    # was never loaded, which is why that fix alone did not settle this.
+    #
+    # Widening the wedge would still be a centre test.  Ask for the whole 5x5
+    # instead, by moving the unconditional core from |d| <= 1 to |d| <= 2:
+    # the caller's loops only ever run -2..2, so the wedge path becomes dead
+    # and the requested set stops depending on camera yaw altogether.
+    #
+    # This stays inside the engine's own fixed pools, which is the reason it
+    # is safe where enlarging the +/-2 neighbourhood itself would not be:
+    #
+    #   * block descriptors: 32 (world_init_block_pool_750641 links 0..0x1E
+    #     and terminates at 0x1F), against a new working set of 25;
+    #   * per-block mesh slots: (desc - 0xE04610)/0x18 * 0x1200 + 0xE04970,
+    #     which ends at 0xE28970, the next global -- exactly 32 slots;
+    #   * streaming requests: 19 (world_init_request_pool_7505D7 ... 0x13),
+    #     throttled to 16 in flight, and unchanged here anyway because
+    #     requests are per 4x4 SECTOR ((by>>2)*9 + (bx>>2)), of which a 5x5
+    #     neighbourhood spans at most four whichever way it straddles.
+    #
+    # Descriptor exhaustion is also not a new failure mode: world_alloc_block
+    # _751E43 already falls back to evicting the tail of the resident list.
+    {'name': 'world block neighbourhood dx 1 -> 2',
+     'va': 0x00F525BC, 'expect': '28 05 00 71', 'set': '28 09 00 71'},
+    {'name': 'world block neighbourhood dy 1 -> 2',
+     'va': 0x00F52670, 'expect': '28 05 00 71', 'set': '28 09 00 71'},
+
     # Sky dome: FFNx uses +/- (wide_width/4 + 20) = +/-233.  The extra
     # vertical guard changes 24 -> 44 and 0 -> 20 so an angled camera cannot
     # expose a triangular corner after the dome is widened.
@@ -178,9 +223,56 @@ WORLD_PATCHES = [
     {'name': 'world cloud phase offset 192 -> 0',
      'va': 0x00F39A7C, 'expect': '29 01 03 11', 'set': 'E9 03 09 2A'},
 
+    # The native cloud quad separately applies world_camera_rotation_z after
+    # it has built the horizon strip.  That value is the Highwind's temporary
+    # turn-bank, not cloud animation.  At 60 render Hz its integer-smoothed
+    # 30 Hz updates make the otherwise screen-aligned strip rock vertically
+    # while yaw is held, then become still as soon as yaw stops.  FFNx avoids
+    # the artifact by replacing world_sub_74D319 with a zero-return helper for
+    # its world renderer.  Keep the correction narrower here: preserve the
+    # camera-bank update and the call's side effects, but discard only the
+    # value copied into this cloud transform.  Terrain, models, meteor, cloud
+    # phase/scroll, and the stationary cloud height are therefore unchanged.
+    {'name': 'world cloud ignore turn-bank roll',
+     'va': 0x00F39654, 'expect': 'D7 02 40 79', 'set': 'F7 03 1F 2A'},
+
     # The meteor graphic has its own viewport rejection at the tail of the
-    # same function.  It is infrequent, but leaving it at x=0 / halfwidth=320
-    # would make it disappear as soon as it entered either added side region.
+    # same function.  FFNx redirects x86 +0x5A5 to &wide_viewport_x and
+    # +0x5B5 to wide_viewport_width / 2, i.e. -107 and 427.
+    #
+    # The right-hand half of that is a one-word change and works.  The left
+    # half is not, because of how the recompiler translated
+    #
+    #     cmp <meteor right x>, [viewport_x] ; jle reject
+    #
+    # It loads the operand as two halfwords, joins them with BFI for the
+    # SUBS, and then keeps the HIGH halfword in w9 to reconstruct the x86
+    # overflow flag:
+    #
+    #     ldrh w8, [x0]          ; low  half of viewport_x
+    #     ldrh w9, [x0, #2]      ; high half -- also the operand's sign
+    #     bfi  w8, w9, #16, #16
+    #     subs w8, w10, w8
+    #     eor  w9, w10, w9, lsl #16      ; (a ^ b), sign bit only
+    #     eor  w12, w8, w10              ; (a ^ result)
+    #     and  w9, w12, w9
+    #     lsr  w9, w9, #31               ; OF
+    #     ...  b.ne / cbz -> reject      ; jle
+    #
+    # Overwriting the BFI alone -- both -107 and, in build b1f92809, -214 --
+    # sets the VALUE but leaves w9 holding the stock high half, zero.  The
+    # overflow term is then computed as though the bound were positive, so as
+    # soon as the meteor's own x goes negative SF and OF disagree and the jle
+    # is taken.  That is exactly the reported behaviour: the meteor vanishes
+    # the instant it crosses x = 0, the old 4:3 left edge, and never early on
+    # the right, whose translation carries the sign in w10 instead and is
+    # therefore correct for any bound.
+    #
+    # So materialise the sign as well: w9 = 0xFFFF makes w9 << 16 negative,
+    # matching -107.  verify_worldmap_emu.py executes these encoded words and
+    # reports the x at which the quad is dropped.
+    {'name': 'world meteor left cull sign high 0 -> -1',
+     'va': 0x00F3A370, 'expect': '09 04 40 79', 'set': 'E9 FF 9F 52'},
     {'name': 'world meteor cull left 0 -> -107',
      'va': 0x00F3A374, 'expect': '28 3D 10 33', 'set': '48 0D 80 12'},
     {'name': 'world meteor cull halfwidth 320 -> 427',
