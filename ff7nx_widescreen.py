@@ -96,6 +96,102 @@ PATCHES = [
 ]
 
 
+# ---------------------------------------------------------------- world map
+#
+# The world map does not use the field tile renderer.  It has three separate
+# 4:3 assumptions of its own:
+#
+#   * world_culling_bg_meshes_75F263 rejects terrain outside x=0..640;
+#   * world_submit_draw_bg_meshes_75F68C prepares only the stock 320-pixel
+#     half-span from an origin of zero, even if the culler admits more;
+#   * world_compute_skybox_data_754100 builds a sky dome only to +/-180;
+#   * world_submit_draw_clouds_and_meteor_7547A6 builds/splits the cloud strip
+#     at +/-160 and at the legacy 192-pixel seam.
+#
+# On a 16:9 viewport the corresponding game-space rectangle is -107..747
+# (854 pixels).  These are the AArch64 equivalents of FFNx's world-map
+# widescreen corrections in src/ff7/widescreen.cpp.  They deliberately do not
+# touch the vertical cull, camera, projection, minimap, or world geometry.
+# Every stock word is fingerprinted, like the logical-width patches above.
+WORLD_NULL_MESH_GUARD = 0x00F4E9B8
+WORLD_NULL_MESH_GUARD_WORD = 0x34002268   # cbz w8, common skip
+WORLD_EDGE_BLOCK_HOOK = 0x00F4EA14
+WORLD_EDGE_BLOCK_WORD = 0x34001F88       # cbz w8, same common skip
+
+WORLD_PATCHES = [
+    # Terrain mesh culling: left=-107, width=854, right=-107+854.
+    {'name': 'world terrain cull left 0 -> -107',
+     'va': 0x00F56F90, 'expect': '13 00 40 B9', 'set': '53 0D 80 12'},
+    {'name': 'world terrain cull width 640 -> 854',
+     'va': 0x00F56FD8, 'expect': '08 00 40 B9', 'set': 'C8 6A 80 52'},
+    {'name': 'world terrain cull right origin 0 -> -107',
+     'va': 0x00F56FE8, 'expect': '08 00 40 B9', 'set': '48 0D 80 12'},
+    # world_sub_751EFC has two consecutive null tests that branch to the same
+    # skip block.  FFNx removes x86 +0xC89, the SECOND test (the neighbouring
+    # edge-block availability check).  The first is the current-mesh pointer
+    # guard and must remain.  Build 177 incorrectly NOPed the first translated
+    # CBZ at F4E9B8; that submitted a null mesh as stale geometry and produced
+    # the floating terrain reported after the first world-map test.
+    {'name': 'world terrain keep widescreen edge blocks',
+     'va': WORLD_EDGE_BLOCK_HOOK,
+     'expect': '88 1F 00 34', 'set': '1F 20 03 D5'},
+    # The later submit routine has its own copy of the viewport.  FFNx patches
+    # both world_submit_draw_bg_meshes operands; widening only the culler lets
+    # a fast-moving camera admit a block before this path prepares it, which
+    # appears as transient edge pop-in.  Keep the centre invariant:
+    # stock 0 + 320 == widescreen -107 + 427 == 320.
+    {'name': 'world terrain submit halfwidth 320 -> 427',
+     'va': 0x00F58668, 'expect': '08 7D 01 53', 'set': '68 35 80 52'},
+    {'name': 'world terrain submit origin 0 -> -107',
+     'va': 0x00F58674, 'expect': '08 00 40 B9', 'set': '48 0D 80 12'},
+
+    # Sky dome: FFNx uses +/- (wide_width/4 + 20) = +/-233.  The extra
+    # vertical guard changes 24 -> 44 and 0 -> 20 so an angled camera cannot
+    # expose a triangular corner after the dome is widened.
+    {'name': 'world sky left -180 -> -233',
+     'va': 0x00F38858, 'expect': '95 E9 9F 52', 'set': 'F5 E2 9F 52'},
+    {'name': 'world sky upper guard -24 -> -44',
+     'va': 0x00F38870, 'expect': 'F7 02 80 12', 'set': '77 05 80 12'},
+    {'name': 'world sky right 180 -> 233',
+     'va': 0x00F389A4, 'expect': '96 16 80 52', 'set': '36 1D 80 52'},
+    # The first 0 -> 20 store is a tiny cave (WORLD_SKY_BOTTOM_HOOK below).
+    # That cave leaves w23=20 live; the translated function does not write
+    # w23 before this second bottom edge consumes it.
+    {'name': 'world sky second lower guard 0 -> 20',
+     'va': 0x00F38C28, 'expect': '1F 00 00 79', 'set': '17 00 00 79'},
+
+    # Cloud strip: widen the two horizontal halves and remove the stock
+    # 192-pixel split/phase offset.  Keeping that split after widening is what
+    # leaves a visible vertical discontinuity at the side of the 4:3 region.
+    {'name': 'world cloud left -160 -> -256',
+     'va': 0x00F39278, 'expect': '08 EC 9F 52', 'set': '08 E0 9F 52'},
+    {'name': 'world cloud first span 352 -> 256',
+     'va': 0x00F392B0, 'expect': '19 81 05 51', 'set': '19 01 04 51'},
+    {'name': 'world cloud second origin -96 -> 0',
+     'va': 0x00F392F8, 'expect': '19 81 01 51', 'set': 'F9 03 08 2A'},
+    {'name': 'world cloud right 160 -> 256',
+     'va': 0x00F39340, 'expect': '08 14 80 52', 'set': '08 20 80 52'},
+    {'name': 'world cloud split threshold 192 -> 0 (lower test)',
+     'va': 0x00F39878, 'expect': 'E8 17 80 52', 'set': '08 00 80 12'},
+    {'name': 'world cloud split threshold 192 -> 0 (upper test)',
+     'va': 0x00F39890, 'expect': '2A 01 03 51', 'set': 'EA 03 09 2A'},
+    {'name': 'world cloud phase offset 192 -> 0',
+     'va': 0x00F39A7C, 'expect': '29 01 03 11', 'set': 'E9 03 09 2A'},
+
+    # The meteor graphic has its own viewport rejection at the tail of the
+    # same function.  It is infrequent, but leaving it at x=0 / halfwidth=320
+    # would make it disappear as soon as it entered either added side region.
+    {'name': 'world meteor cull left 0 -> -107',
+     'va': 0x00F3A374, 'expect': '28 3D 10 33', 'set': '48 0D 80 12'},
+    {'name': 'world meteor cull halfwidth 320 -> 427',
+     'va': 0x00F3A3BC, 'expect': '08 01 05 11', 'set': '08 AD 06 11'},
+]
+
+WORLD_SKY_BOTTOM_HOOK = 0x00F38AFC
+WORLD_SKY_BOTTOM_ORIG = 0x7900001F       # strh wzr, [x0]
+WORLD_SKY_BOTTOM_STORE = 0x79000017      # strh w23, [x0]
+
+
 # ---------------------------------------------------------------- mode 2
 #
 # `gfx_drv_setviewport` is module +0x10D6760 (driver master table index 142).
@@ -220,11 +316,11 @@ def spec():
     """A patch spec for nso_patcher, which verifies every original byte."""
     return {
         'name': '16:9 (%s)' % (mode() or 'off'),
-        'patches': [dict(p) for p in PATCHES],
+        'patches': [dict(p) for p in PATCHES + WORLD_PATCHES],
     }
 
 
-def cave_patches(img, starts, log=lambda *_: None):
+def cave_patches(img, starts, log=lambda *_: None, pool=None):
     """
     Word patches for the `fit` cave, placed in reclaimed padding so the
     60 FPS cave budget is untouched. Returns {va: word}.
@@ -234,12 +330,33 @@ def cave_patches(img, starts, log=lambda *_: None):
     ~7,800 available.
     """
     import ff7nx_cave
-    pool = ff7nx_cave.HolePool(img, starts=starts)
+    if pool is None:
+        pool = ff7nx_cave.HolePool(img, starts=starts)
     out, entry = ff7nx_cave.emit_hooked(pool, HOOK_VA, HOOK_ORIG, cave_body())
     runs = sorted({va for va in out if va != HOOK_VA})
     log('  setviewport cave: %d word(s) across %d padding hole(s), '
         'entry +%#x' % (len(cave_body()) + 2, len(pool.used), entry))
     log('  (the 60 FPS cave region is not touched)')
+    return out
+
+
+def world_cave_patches(img, starts, log=lambda *_: None, pool=None):
+    """Emit the one non-destructive sky guard that needs two instructions.
+
+    The stock first lower-edge store writes zero directly from WZR, so there
+    is no immediate field to change to 20.  Hook that single store, load 20
+    into w23, perform the equivalent store through w23, and return.  w23 is
+    then intentionally reused by WORLD_PATCHES at the second lower edge.
+    """
+    import a64 as A
+    import ff7nx_cave
+    if pool is None:
+        pool = ff7nx_cave.HolePool(img, starts=starts)
+    out, entry = ff7nx_cave.emit_hooked(
+        pool, WORLD_SKY_BOTTOM_HOOK, WORLD_SKY_BOTTOM_STORE,
+        [A.movz(23, 20)])
+    log('  world sky lower guard: 0 -> 20 via %d-word padding cave, '
+        'entry +%#x' % (3, entry))
     return out
 
 
@@ -281,21 +398,27 @@ def apply_to_nso(src, dest, log=lambda *_: None):
     try:
         nso = nso_patcher.read_nso(Path(src))
         applied = nso_patcher.apply_spec(nso, spec())
+        # Both widescreen caves go in reclaimed alignment padding, NOT in the
+        # 2,464-byte tail gap used by the 60 FPS caves.  One shared HolePool is
+        # mandatory: creating two pools from the same input could allocate the
+        # same padding twice.  Placement sees the module after the 60 FPS pass,
+        # and every selected word is re-verified as zero at that moment.
+        import ff7nx_cave
+        import nxmap
+        m = nxmap.Main(src)
+        pool = ff7nx_cave.HolePool(m.img, starts=set(m.arm_starts))
+        words = world_cave_patches(
+            m.img, set(m.arm_starts), log, pool=pool)
         if mode() == 'fit':
-            # The cave goes in reclaimed alignment padding, NOT in the
-            # 2,464-byte tail gap the 60 FPS caves live in -- so this adds
-            # nothing to that budget and cannot displace anything already
-            # there. Placement is computed against the module as it stands
-            # after the 60 FPS pass, and every hole is re-verified as still
-            # zero at that moment.
-            import nxmap
-            m = nxmap.Main(src)
-            words = cave_patches(m.img, set(m.arm_starts), log)
+            words.update(cave_patches(
+                m.img, set(m.arm_starts), log, pool=pool))
+        if words:
             applied += nso_patcher.apply_spec(nso, {
-                'name': 'setviewport 4:3-in-16:9 cave',
+                'name': '16:9 padding caves',
                 'patches': [
-                    {'name': ('cave word' if va != HOOK_VA
-                              else 'hook -> cave'),
+                    {'name': ('hook -> cave' if va in
+                              (HOOK_VA, WORLD_SKY_BOTTOM_HOOK)
+                              else 'cave word'),
                      'va': va,
                      'expect': _hex(struct.unpack_from('<I', m.img, va)[0]),
                      'set': _hex(word)}

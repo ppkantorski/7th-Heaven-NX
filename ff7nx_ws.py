@@ -1166,6 +1166,41 @@ UNCROP_PATCHES = [
 # --------------------------------------------------------------------------
 # the framing stage -- environment only, and unproven
 # --------------------------------------------------------------------------
+def world_sky_cave_spec(main, log=lambda *_: None):
+    """Return the verified padding-cave spec for the first sky lower edge.
+
+    ``ff7nx_widescreen.spec()`` can change the second lower-edge store in
+    place, but the first store writes WZR and therefore needs the tiny cave
+    emitted here. Build 177 applied the direct spec without this cave,
+    leaving the two vertices at 0 and 20 and making the rotating horizon
+    diagonal.
+    """
+    import struct
+    import ff7nx_cave
+    import ff7nx_widescreen
+
+    starts = set(main.arm_starts)
+    pool = ff7nx_cave.HolePool(main.img, starts=starts)
+    words = ff7nx_widescreen.world_cave_patches(
+        main.img, starts, log=log, pool=pool)
+
+    def word_hex(word):
+        return ' '.join('%02X' % byte for byte in struct.pack('<I', word))
+
+    return {
+        'name': 'world sky lower-edge padding cave',
+        'patches': [
+            {'name': ('world sky lower-edge hook -> cave'
+                      if va == ff7nx_widescreen.WORLD_SKY_BOTTOM_HOOK
+                      else 'world sky lower-edge cave word'),
+             'va': va,
+             'expect': word_hex(struct.unpack_from('<I', main.img, va)[0]),
+             'set': word_hex(word)}
+            for va, word in sorted(words.items())
+        ],
+    }
+
+
 def apply_module(sdout, dump, log=lambda *_: None, produced=()):
     """
     Patch exefs/main for the framing stage. Returns newly-produced paths.
@@ -1323,6 +1358,11 @@ def apply_module(sdout, dump, log=lambda *_: None, produced=()):
         #    extents are hardware-confirmed; the RIGHT and BOTTOM biases are
         #    new and are what HANDOFF-48 §4 asked for.
         m = nxmap.Main(src)
+        # WORLD_PATCHES above changes the second lower sky vertex from 0 to
+        # 20. The first is a WZR store, so it requires this matching cave.
+        # Keep it in the same verified transaction: either both endpoints
+        # ship or neither one does.
+        applied += nso_patcher.apply_spec(nso, world_sky_cave_spec(m, log))
         ff7nx_wsclamp.check_all(m.img)
         clamp_values = ff7nx_wsclamp.defaults(scale)
         # E. THE PARALLAX RIGHT EDGE. Layers 3 and 4 WRAP rather than cull,

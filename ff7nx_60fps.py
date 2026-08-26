@@ -43,13 +43,18 @@ def d(x):
 # Each limiter computes  frame_time = countspersecond / divisor  once at mode
 # init, then busy-waits against it. These divisors are dedicated constants:
 # 0x7B7840 has exactly one reference in .text; 0x7C0B00 has two and both are
-# inside the battle limiter's own setup.
+# inside the battle limiter's own setup; 0x969958 is referenced only by the
+# world-map limiter setup at x86 0x74BCFC.  The world map does NOT share the
+# field limiter -- leaving this third constant at 30.0 is why a build can be
+# 60 FPS in fields and battles while the world map remains exactly 30 FPS.
 # --------------------------------------------------------------------------
-# Confirmed on hardware: the user observed 60 FPS in both field and battle
-# with exactly these three bytes changed.
+# Field and battle are confirmed on hardware.  The world divisor is derived
+# from its single x86 reference and binary-verified below; it awaits this
+# build's first hardware run.
 EXE_CONFIRMED = [
     ('field limiter divisor 30.0 -> 60.0',  0x7B7840, d(30.0), d(60.0)),
     ('battle limiter divisor 15.0 -> 60.0', 0x7C0B00, d(15.0), d(60.0)),
+    ('world limiter divisor 30.0 -> 60.0',  0x969958, d(30.0), d(60.0)),
     ('60fps mod compatibility flag',        0x914B21, b'\x00', b'\x01'),
 ]
 
@@ -2992,6 +2997,7 @@ LIMITER_DIVISORS = (
     # (label, address, the value the 60 FPS set writes there)
     ('field limiter divisor',  0x7B7840, 60.0),
     ('battle limiter divisor', 0x7C0B00, 60.0),
+    ('world limiter divisor',  0x969958, 60.0),
 )
 
 
@@ -3050,7 +3056,7 @@ def retarget_limiters(exe_patches, fps):
     """
     Rewrite the limiter divisors in an already-built patch list.
 
-    Rewrites rather than appends: the 60 FPS set already patches both of these
+    Rewrites rather than appends: the 60 FPS set already patches all of these
     addresses, and two patches on one address would fail the "expected old
     bytes" check on the second. Aborts if either is missing, so a future
     reshuffle of EXE_CONFIRMED cannot leave this silently doing half its job.
@@ -4467,7 +4473,7 @@ def main():
         return 0
 
     if a.list_groups:
-        print('confirmed on hardware, always applied:')
+        print('base set, always applied (world limiter pending hardware):')
         print('  exe %d bytes, main %d words'
               % (len(EXE_CONFIRMED), len(NSO_CONFIRMED)))
         print('\nunverified groups (--enable NAME):')
@@ -4770,7 +4776,7 @@ def main():
                          % ', '.join(sorted(scaler_names & set(SCALER_GROUPS))))
 
     print(capability_banner(want, a))
-    print('build: confirmed base + %d group(s)%s'
+    print('build: verified base + %d group(s)%s'
           % (len(want), (': ' + ', '.join(sorted(want))) if want else
              '  (nothing unverified enabled)'))
     print('       %d exe byte-patches, %d main word-patches, %d code cave(s)'

@@ -5,10 +5,10 @@ test_frame_pacing.py -- the limiter divisor retarget.
     python3 test_frame_pacing.py [--exe path/to/ff7_en]
 
 Checks the arithmetic and, if the exe is available, every claim the patch
-rests on: that both divisors are where they are said to be, that each is
+rests on: that all three divisors are where they are said to be, that each is
 referenced only from its own limiter's setup, that the field setup subtracts
 the early-exit margin and the battle setup does not, and that retargeting
-rewrites exactly two patches and leaves the rest alone.
+rewrites exactly three patches and leaves the rest alone.
 """
 import argparse
 import struct
@@ -47,8 +47,9 @@ def main(argv=None):
         if va not in {x[1] for x in F.LIMITER_DIVISORS}:
             ok(by[va] == orig[va], 'the patch at 0x%X is untouched' % va)
     ok(struct.unpack('<d', by[0x7B7840][0])[0] == 30.0
-       and struct.unpack('<d', by[0x7C0B00][0])[0] == 15.0,
-       'and both still expect the STOCK bytes, not the 60 FPS ones')
+       and struct.unpack('<d', by[0x7C0B00][0])[0] == 15.0
+       and struct.unpack('<d', by[0x969958][0])[0] == 30.0,
+       'and all three still expect the STOCK bytes, not the 60 FPS ones')
 
     for bad in (10, 2000):
         try:
@@ -91,6 +92,7 @@ def main(argv=None):
     print('the stock exe says what the patch assumes')
     ok(dbl(0x7B7840) == 30.0, 'field divisor 0x7B7840 is 30.0')
     ok(dbl(0x7C0B00) == 15.0, 'battle divisor 0x7C0B00 is 15.0')
+    ok(dbl(0x969958) == 30.0, 'world divisor 0x969958 is 30.0')
     ok(dbl(0x7B7848) == 10000.0, 'the field early-exit margin is 10000 counts')
     ok(dbl(0x7B7898) == 2000000.0, 'and the debt bail-out is 2000000 counts')
 
@@ -116,6 +118,12 @@ def main(argv=None):
     ok(len(refs(0x7C0B00)) == 2 and all(0x41B6A0 < r < 0x41B6E0
                                         for r in refs(0x7C0B00)),
        'the battle divisor has two, both inside the battle limiter setup')
+    ok(refs(0x969958) == [0x74BCFE],
+       'the world divisor has exactly one reference, in its own setup')
+    ok(dbl(0x969960) == 22.0,
+       'the adjacent world catch-up threshold remains the stock 22.0')
+    ok(refs(0x969960) == [0x74BD42],
+       'and that 22.0 value is a separate world limiter input')
 
     # field subtracts the margin, battle does not
     ok(rd(0x60E428, 12)[:2] == b'\xdc\x35' and rd(0x60E42E, 2) == b'\xdc\x25',

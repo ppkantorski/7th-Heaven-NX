@@ -7384,7 +7384,7 @@ def apply_widescreen(sdout, dump, log=lambda *_: None, produced=()):
     reason, as apply_fps_patches.
 
     Unlike the 60 FPS set this IS idempotent-safe in the only way that
-    matters: nso_patcher verifies all four original words, so re-running it
+    matters: nso_patcher verifies every original word, so re-running it
     over an already-patched module fails cleanly rather than corrupting it.
     """
     if not ff7nx_widescreen.enabled():
@@ -7442,7 +7442,9 @@ def apply_widescreen(sdout, dump, log=lambda *_: None, produced=()):
         'expect UI to shift. The background is FITTED to it -- without a '
         'mod that ships wider backgrounds it will stretch rather than '
         'extend. 3D models and the battle camera are unaffected (the '
-        'projection matrix is a separate, unsolved patch).')
+        'projection matrix is a separate, unsolved patch). The world map has '
+        'its own verified terrain, sky, cloud, and meteor 16:9 bounds in this '
+        'same pass.')
     return [dest] if not built else []
 
 
