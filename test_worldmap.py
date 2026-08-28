@@ -106,6 +106,31 @@ def main(argv=None):
     ok(((meteor_left & 0xFFFFFFFF) >> 16) == 0xFFFF,
        'the companion high half matches signed -107')
 
+    print('\nworld transition fade geometry')
+    fade = [p for p in W.WORLD_PATCHES
+            if p['name'].startswith('world transition fade')]
+    ok(len(fade) == 6,
+       'the distinct world-map fade has one origin and five width results')
+    ok([p['va'] for p in fade] ==
+       [0x00F3A6F0, 0x00F3AD6C, 0x00F3B404,
+        0x00F3B6CC, 0x00F3BFA0, 0x00F3C190],
+       'all six results stay inside mapped x86 world_draw_fade_quad_75551A')
+    ok(m.x86_to_arm[0x75551A] == 0x00F3A670,
+       'world_draw_fade_quad_75551A maps to the measured ARM64 body')
+    ok(int.from_bytes(bytes.fromhex(fade[0]['set']), 'little') == 0x12800D54,
+       'fade origin materialises signed -107 in the original result register')
+    ok(int.from_bytes(bytes.fromhex(fade[1]['set']), 'little') ==
+       A.movz(22, 854),
+       'first fade width materialises 854 in its original result register')
+    ok(all(int.from_bytes(bytes.fromhex(p['set']), 'little') ==
+           A.movz(19, 854) for p in fade[2:]),
+       'remaining fade widths materialise 854 in their original result register')
+    ok(left == -107 and left + width == 747,
+       'world fade covers the same full -107..747 span as terrain and meteor')
+    shipped = {p['va'] for p in W.spec()['patches']}
+    ok({p['va'] for p in fade}.issubset(shipped),
+       'the normal widescreen build spec includes all six tested fade words')
+
     print('\nblock streaming neighbourhood')
     # The caller's own loops run -2..2 on both axes (0x751C13 / 0x751C34), so
     # moving the unconditional core to |d| <= 2 asks for the whole 5x5 and

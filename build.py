@@ -8372,8 +8372,8 @@ def apply_widescreen(sdout, dump, log=lambda *_: None, produced=()):
         'mod that ships wider backgrounds it will stretch rather than '
         'extend. 3D models and the battle camera are unaffected (the '
         'projection matrix is a separate, unsolved patch). The world map has '
-        'its own verified terrain, sky, cloud, and meteor 16:9 bounds in this '
-        'same pass.')
+        'its own verified terrain, sky, cloud, meteor, and transition-fade '
+        '16:9 bounds in this same pass.')
     return [dest] if not built else []
 
 

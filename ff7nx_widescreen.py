@@ -101,6 +101,8 @@ PATCHES = [
 # The world map does not use the field tile renderer.  It has three separate
 # 4:3 assumptions of its own:
 #
+#   * world_draw_fade_quad_75551A builds the transition overlay at x=0 with
+#     width=640, so a fade to/from a town covers only the centred 4:3 area;
 #   * world_culling_bg_meshes_75F263 rejects terrain outside x=0..640;
 #   * world_submit_draw_bg_meshes_75F68C prepares only the stock 320-pixel
 #     half-span from an origin of zero, even if the culler admits more;
@@ -236,6 +238,32 @@ WORLD_PATCHES = [
     {'name': 'world cloud ignore turn-bank roll',
      'va': 0x00F39654, 'expect': 'D7 02 40 79', 'set': 'F7 03 1F 2A'},
 
+    # The SAME turn-bank value has a second consumer, and fixing only the
+    # first is why the sky started moving again once Gaia made it detailed
+    # enough to see. `world_get_camera_tilt_74D319` (translated to +0xF24D40)
+    # is called from exactly two places in the world draw path, and both
+    # copy its result straight into a rotation vector's Z:
+    #
+    #   +0xF3964C  bl   #0xf24d40     x86 0x7547A6, clouds and meteor
+    #   +0xF39650  ldr  w8, [x22, #0x14]
+    #   +0xF39654  ldrh w23, [x22]         <- the word above
+    #   +0xF39660  strh w23, [x0]
+    #
+    #   +0xF386CC  bl   #0xf24d40     x86 0x754100, the SKY DOME
+    #   +0xF386D0  ldr  w8, [x20, #0x14]
+    #   +0xF386D4  ldrh w21, [x20]         <- this one, still stock
+    #   +0xF386E0  strh w21, [x0]
+    #
+    # Structurally identical; only the register and the stack slot differ.
+    # FFNx neutralises this by replacing world_sub_74D319 outright so every
+    # caller gets zero, but it does that only in its analogue-controls path.
+    # Keep the narrow form that hardware already validated on the clouds and
+    # apply it to the second consumer as well: the sky dome stops rolling
+    # with the Highwind's bank, and terrain, models, the snake, camera
+    # behaviour and cloud scrolling are all still reading the real value.
+    {'name': 'world sky dome ignore turn-bank roll',
+     'va': 0x00F386D4, 'expect': '95 02 40 79', 'set': 'F5 03 1F 2A'},
+
     # The meteor graphic has its own viewport rejection at the tail of the
     # same function.  FFNx redirects x86 +0x5A5 to &wide_viewport_x and
     # +0x5B5 to wide_viewport_width / 2, i.e. -107 and 427.
@@ -277,6 +305,27 @@ WORLD_PATCHES = [
      'va': 0x00F3A374, 'expect': '28 3D 10 33', 'set': '48 0D 80 12'},
     {'name': 'world meteor cull halfwidth 320 -> 427',
      'va': 0x00F3A3BC, 'expect': '08 01 05 11', 'set': '08 AD 06 11'},
+
+    # Town-entry/exit fade: this is NOT the field fade quad.  The world map
+    # owns a separate routine, x86 world_draw_fade_quad_75551A, and FFNx
+    # widens one viewport-x read plus five viewport-width reads in it.  The
+    # recompiler kept those same six results in the translated body at
+    # +0xF3A670.  Replace only the value loaded at each result site; the
+    # original address lookup, alpha progression, colour, height, draw order,
+    # and all three fade channels remain untouched.  Both fade directions use
+    # this shared geometry, so one bounded set covers entering and leaving.
+    {'name': 'world transition fade left 0 -> -107',
+     'va': 0x00F3A6F0, 'expect': '14 00 40 B9', 'set': '54 0D 80 12'},
+    {'name': 'world transition fade width 640 -> 854, v0',
+     'va': 0x00F3AD6C, 'expect': '16 00 40 B9', 'set': 'D6 6A 80 52'},
+    {'name': 'world transition fade width 640 -> 854, v1',
+     'va': 0x00F3B404, 'expect': '13 00 40 B9', 'set': 'D3 6A 80 52'},
+    {'name': 'world transition fade width 640 -> 854, v2',
+     'va': 0x00F3B6CC, 'expect': '13 00 40 B9', 'set': 'D3 6A 80 52'},
+    {'name': 'world transition fade width 640 -> 854, v3',
+     'va': 0x00F3BFA0, 'expect': '13 00 40 B9', 'set': 'D3 6A 80 52'},
+    {'name': 'world transition fade width 640 -> 854, v4',
+     'va': 0x00F3C190, 'expect': '13 00 40 B9', 'set': 'D3 6A 80 52'},
 ]
 
 WORLD_SKY_BOTTOM_HOOK = 0x00F38AFC

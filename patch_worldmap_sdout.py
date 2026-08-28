@@ -84,10 +84,14 @@ DEFAULT_MAIN = (HERE / 'sdout' / 'atmosphere' / 'contents' / TITLE_ID /
 SUBMIT_VAS = (0x00F58668, 0x00F58674)
 NEIGHBOURHOOD_VAS = (0x00F525BC, 0x00F52670)
 CLOUD_STABILIZE_VA = 0x00F39654
+SKY_DOME_STABILIZE_VA = 0x00F386D4
 METEOR_VAS = (0x00F3A370, 0x00F3A374)
+WORLD_FADE_VAS = (0x00F3A6F0, 0x00F3AD6C, 0x00F3B404,
+                  0x00F3B6CC, 0x00F3BFA0, 0x00F3C190)
 # In ff7nx_widescreen.WORLD_PATCHES order; final_patches() enforces that.
 MANAGED_VAS = ((W.WORLD_EDGE_BLOCK_HOOK,) + SUBMIT_VAS + NEIGHBOURHOOD_VAS +
-               (CLOUD_STABILIZE_VA,) + METEOR_VAS)
+               (CLOUD_STABILIZE_VA, SKY_DOME_STABILIZE_VA) + METEOR_VAS +
+               WORLD_FADE_VAS)
 NOP = bytes.fromhex('1F 20 03 D5')
 SKY_MOVZ_W23_20 = 0x52800297
 # Accept the one-word intermediate attempts so this incremental patcher can
@@ -256,9 +260,8 @@ def main(argv=None):
         return 0
 
     # Preserve the last hardware-tested build as its own recovery point before
-    # correcting the meteor's translated signed compare and the block
-    # streaming neighbourhood.
-    backup = target.with_name(target.name + '.pre-worldmap-streaming-fix')
+    # extending the distinct world-map transition fade into the 16:9 margins.
+    backup = target.with_name(target.name + '.pre-worldmap-transition-fade')
     if not backup.exists():
         shutil.copy2(target, backup)
         print('backup: %s' % backup)

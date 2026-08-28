@@ -220,6 +220,27 @@ SINGLES = [
      {0xF9440742: '[x26,#0x808]  stock, as the cave requires',
       0xF943FF42: '[x26,#0x7F8]  <-- the RETIRED two-word patch'},
      '[x26,#0x808]  stock, as the cave requires'),
+    # The world map owns a fade quad separate from the field and credits
+    # quads.  One shared origin plus five width results cover all three world
+    # fade channels and both directions of a town transition.
+    ('worldfade',  'transition left', 0xF3A6F0,
+     {0xB9400014: 'guest viewport x (0)  <-- fade is 4:3 only',
+      0x12800D54: '-107  (16:9 correct)'}, '-107  (16:9 correct)'),
+    ('worldfade',  'transition width v0', 0xF3AD6C,
+     {0xB9400016: 'guest width (640)  <-- fade is 4:3 only',
+      0x52806AD6: '854  (16:9 correct)'}, '854  (16:9 correct)'),
+    ('worldfade',  'transition width v1', 0xF3B404,
+     {0xB9400013: 'guest width (640)  <-- fade is 4:3 only',
+      0x52806AD3: '854  (16:9 correct)'}, '854  (16:9 correct)'),
+    ('worldfade',  'transition width v2', 0xF3B6CC,
+     {0xB9400013: 'guest width (640)  <-- fade is 4:3 only',
+      0x52806AD3: '854  (16:9 correct)'}, '854  (16:9 correct)'),
+    ('worldfade',  'transition width v3', 0xF3BFA0,
+     {0xB9400013: 'guest width (640)  <-- fade is 4:3 only',
+      0x52806AD3: '854  (16:9 correct)'}, '854  (16:9 correct)'),
+    ('worldfade',  'transition width v4', 0xF3C190,
+     {0xB9400013: 'guest width (640)  <-- fade is 4:3 only',
+      0x52806AD3: '854  (16:9 correct)'}, '854  (16:9 correct)'),
     # HANDOFF-104. The credits fade quad's left/right x. Stock loads the
     # guest globals (0 and 640 -- the 4:3 core); patched materialises -107
     # and 747 straight into d0. The y pair is deliberately NOT listed: it

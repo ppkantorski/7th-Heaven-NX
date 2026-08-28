@@ -1218,8 +1218,9 @@ def apply_module(sdout, dump, log=lambda *_: None, produced=()):
     """
     Patch exefs/main for the framing stage. Returns newly-produced paths.
 
-    NOTHING happens unless BOTH `SEVENTH_NX_WIDESCREEN=ws` and
-    `SEVENTH_NX_WS_FRAMING=1` are set. There is no GUI path to this.
+    The normal GUI path sets `SEVENTH_NX_WIDESCREEN=ws-3d`. A scripted
+    diagnostic may instead set BOTH `SEVENTH_NX_WIDESCREEN=ws` and
+    `SEVENTH_NX_WS_FRAMING=1`.
 
     WHAT IT SHIPS
     -------------
@@ -1365,7 +1366,10 @@ def apply_module(sdout, dump, log=lambda *_: None, produced=()):
         # every previous attempt turned out to be.
         #
         # A. The render target and the presentation blit. Four words. This is
-        #    the only part that was ever measured correct on its own.
+        #    the only part that was ever measured correct on its own. The
+        #    shared spec also owns the verified world-map bounds, including
+        #    all six town-entry/exit fade results; keeping them here makes the
+        #    GUI build and the fast standalone tester consume one definition.
         applied += nso_patcher.apply_spec(nso, ff7nx_widescreen.spec())
         # B. The field background's tile window, all four sides. The two LEFT
         #    extents are hardware-confirmed; the RIGHT and BOTTOM biases are
@@ -1496,6 +1500,8 @@ def apply_module(sdout, dump, log=lambda *_: None, produced=()):
             os.remove(tmp)
     for line in applied:
         log('  ' + line)
+    log('  world transition fade: full 16:9 origin/width included '
+        '(6 verified words)')
     produced_now = [dest] if not built else []
     produced_now += _install_shaders(sdout, log)
 

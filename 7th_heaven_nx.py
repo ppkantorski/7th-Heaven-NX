@@ -706,17 +706,14 @@ MOVIE_COLOUR_CHOICES = [
 #   * It does NOT open exefs/main. The picture stays 4:3 until the framing
 #     stage lands, which is why the label says "content".
 #
-# The framing stage is deliberately not a dropdown entry. A drawn control
-# is a recommendation, and four hardware builds have been spent learning
-# that this one is not ready to be recommended. It is reachable by
-# SEVENTH_NX_WS_FRAMING=1 for a measurement run. See README-46.
-# The labels used to call the DATA-ONLY entry "16:9 -- recommended" and the
-# real one "+ wide frame". That was true when the framing stage was unproven;
-# it is not any more, and it sent a build to the wrong stage: `ws` bakes
-# camera ranges and never opens exefs/main, so the console still shows 4:3
-# and nothing in the log said why. The label now says what each one DOES.
-# Values are unchanged, so a saved settings.json still selects the same
-# build as before.
+# The framing stage is the recommended `ws-3d` dropdown entry now. Plain
+# `ws` remains as a data-only diagnostic, and SEVENTH_NX_WS_FRAMING=1 can
+# still force framing on top of it for scripted measurements. The labels
+# used to call the DATA-ONLY entry "16:9 -- recommended" and the real one
+# "+ wide frame". That was true when the framing stage was unproven; it is
+# not any more, and it sent a build to the wrong stage: `ws` bakes camera
+# ranges and never opens exefs/main, so the console still shows 4:3 and
+# nothing in the log said why. The label now says what each one DOES.
 WIDESCREEN_CHOICES = [
     ('', 'Off \u2014 4:3 with black bars'),
     ('ws', 'Data only \u2014 camera ranges; picture stays 4:3'),
@@ -1053,14 +1050,15 @@ def run_build(mods, enabled, settings_by_mod, log, progress,
     # exefs/main too, and it edits flevel.lgp, so it has to see whatever the
     # passes above just wrote.
     #
-    # These three are mutually exclusive by construction and none of them
-    # can be selected from the dropdown any more:
+    # These three are mutually exclusive by construction. The first two are
+    # historical diagnostic-only modes; the last is the GUI's recommended
+    # `ws-3d` mode (or plain `ws` plus the explicit framing override):
     #   apply_widescreen     fires only for 'stretch' / 'fit'
     #   ff7nx_field169       fires only for 'field'
-    #   ff7nx_ws.apply_module fires only for 'ws' AND SEVENTH_NX_WS_FRAMING
-    # All three are reachable by environment variable for a diagnostic run.
-    # The 16:9 the dropdown offers is the DATA half and lands inside
-    # _build_flevel, well before any of this.
+    #   ff7nx_ws.apply_module fires for GUI `ws-3d`, or `ws` AND the override
+    # All three remain reachable by environment variable for a diagnostic
+    # run. The GUI's `ws-3d` mode bakes the data half inside _build_flevel and
+    # reaches the framing transaction here afterward.
     produced += ff7nx_field169.apply(SDOUT_DIR, DUMP, log, produced)
     produced += build.ff7nx_ws.apply_module(SDOUT_DIR, DUMP, log, produced)
     # Gaia's archive conversion enlarges native indexed world TEX files by
