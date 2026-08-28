@@ -1138,6 +1138,76 @@ SMOOTH_SCRATCH_OFF  = 0x2008
 
 
 # --------------------------------------------------------------------------
+# WORLD MAP SCRIPT MOTION -- 30 Hz script timing on a 60 Hz renderer.
+#
+# Raising the world limiter divisor (0x969958, 30.0 -> 60.0, above) doubles
+# how often the world loop runs. Nothing else in this file compensates for
+# that: the world map has exactly ONE site here, and it is that divisor.
+#
+# For most of the world map that is invisible, because movement is driven by
+# held input and re-derived each frame. Scripted sequences are not. The world
+# script's "move for N frames" opcode (x86 0x306) is a FRAME COUNT:
+#
+#     wait_frames--;                       (a BYTE at entity+0x56)
+#     if (wait_frames) rewind the script;  else is_wait_frames_zero = 1
+#     delta.z = movement_speed;  rotate by direction;  move the model
+#     offset_y   -= vertical_speed;        (entity+0x5C)
+#     position.y += vertical_speed_2;      (entity+0x5F)
+#
+# At 60 Hz that count is consumed twice as fast, so the sequence covers the
+# same distance in half the time. That is the Highwind takeoff and landing,
+# and every other scripted world movement with it.
+#
+# The first Switch implementation gated the WHOLE opcode body every other
+# frame. Its duration and total distance were right, but the actor was held
+# for one rendered frame and jumped on the next. Ultimate Weapon's flee is
+# the clearest case: the held/jump cadence looks like a flickering afterimage.
+# It also used one parity word toggled once PER OPCODE INVOCATION, so two
+# scripted actors could steal one another's phase.
+#
+# FFNx supplies the correct matched behavior:
+#
+#   * halve the four values which set movement_speed / vertical_speed;
+#   * decrement wait_frames every other WORLD FRAME;
+#   * still execute the movement body on every rendered frame.
+#
+# We mirror that exactly. world_mode_loop_sub_74DB8C increments one shared
+# frame counter once per world tick. The opcode hook reads that counter: one
+# phase enters the wait_frames-- block, the other skips ONLY that decrement
+# and joins at +0xF9BFE8. Both phases then execute movement. A waiting opcode
+# (w22 != 0) still takes the stock rewind/return path.
+#
+#     +0xF9B46C  cbz  w22, #0xF9BFB4   ; w22 = is_wait_frames_zero
+#                                      ;   0 -> +0xF9BFB4, do the work
+#                                      ; !=0 -> fall through, rewind + return 1
+#
+# The fall-through already IS "repeat this opcode next frame without doing
+# anything", which is exactly what a skipped frame needs. So the cave sends
+# odd frames down the path the function already has.
+WORLD_SCRIPT_TICK_HOOK   = 0x00F9B46C
+WORLD_SCRIPT_TICK_ORIG   = 0x34005A56    # cbz w22, #0xF9BFB4
+WORLD_SCRIPT_NORMAL_PATH = 0x00F9BFB4    # add w0, w8, #0x56 -> wait_frames--
+WORLD_SCRIPT_CONTINUE_PATH = 0x00F9BFE8  # skip decrement, continue movement
+WORLD_SCRIPT_REWIND_PATH = 0x00F9B470    # rewind script position, return 1
+WORLD_FRAME_TICK_HOOK    = 0x00F29100    # world_mode_loop_sub_74DB8C entry
+WORLD_FRAME_TICK_ORIG    = 0xA9BA6FFC    # stp x28,x27,[sp,#-0x60]!
+WORLD_FRAME_COUNTER_OFF  = 0x3000
+
+# The four FFNx pop_world_script_stack_divide_wrapper call sites, translated
+# to ARM64. All call the same translated pop function and can share one
+# wrapper. Dividing the full signed guest EAX before the following STRB is
+# important: doing LSR on the byte would turn a negative vertical speed into
+# a large positive one.
+WORLD_SCRIPT_POP_TARGET = 0x00F9C3C0
+WORLD_SCRIPT_SPEED_CALLS = (
+    (0x00F99D24, 0x940009A7, 'movement speed (loop)'),
+    (0x00F9ABFC, 0x940005F1, 'movement speed'),
+    (0x00F9B164, 0x94000497, 'vertical speed'),
+    (0x00F9B5A0, 0x94000388, 'vertical speed 2'),
+)
+
+
+# --------------------------------------------------------------------------
 # Battle attack movement -- battle_move_character_sub_426F58's ARM64 body
 # (module offset 0xC3D90-0xC4200, 1136 bytes, mapped through the recompilation
 # table from stock x86 0x426F58 -- confirmed via nxmap.Main.extent()).
@@ -1297,6 +1367,91 @@ def _walk_tick_incr_cave(cave, counter, hook):
     return w
 
 
+def _cbnz_rel(rt, words):
+    """cbnz wRt, <this instruction + `words` instructions>."""
+    return 0x35000000 | ((words & 0x7FFFF) << 5) | rt
+
+
+def _cmp_imm(rn, imm):
+    """cmp wRn, #imm  (subs wzr, wRn, #imm)."""
+    return 0x71000000 | ((imm & 0xFFF) << 10) | (rn << 5) | 31
+
+
+def _cset_eq(rd):
+    """cset wRd, eq  (csinc wRd, wzr, wzr, ne)."""
+    return 0x1A9F17E0 | rd
+
+
+def _orr_reg(rd, rn, rm):
+    """orr wRd, wRn, wRm."""
+    return 0x2A000000 | (rm << 16) | (rn << 5) | rd
+
+
+def _world_frame_tick_words(addr, counter_addr):
+    """Increment a counter exactly once per world frame.
+
+    This hooks the world-mode loop entry, replays its displaced stack-frame
+    prologue, and touches only the standard x16/x17 intra-procedure scratch.
+    `addr(i)` is the real address of logical word i in the scattered cave.
+    """
+    page, off = counter_addr & ~0xFFF, counter_addr & 0xFFF
+    return [
+        WORLD_FRAME_TICK_ORIG,
+        _adrp(16, addr(1), page),
+        _ldr_w(17, 16, off),
+        _add_imm(17, 17, 1),
+        _str_w(17, 16, off),
+        _b(addr(5), WORLD_FRAME_TICK_HOOK + 4),
+    ]
+
+
+def _world_script_tick_words(addr, counter_addr):
+    """Halve only opcode 0x306's wait decrement, never its movement.
+
+    w22 is the stock `is_wait_frames_zero` value. A set value still takes the
+    stock rewind/return path. Otherwise the world-frame parity selects either
+    the stock decrement block or +0xF9BFE8 immediately after it; both paths
+    then execute the stock movement body on this rendered frame.
+    """
+    page, off = counter_addr & ~0xFFF, counter_addr & 0xFFF
+    return [
+        # 0: waiting opcodes do not enter either live movement path.
+        0x35000000
+        | ((((addr(6) - addr(0)) >> 2) & 0x7FFFF) << 5) | 22,
+        _adrp(16, addr(1), page),
+        _ldr_w(17, 16, off),
+        _tbz(17, 0, addr(3), addr(5)),
+        _b(addr(4), WORLD_SCRIPT_CONTINUE_PATH),
+        _b(addr(5), WORLD_SCRIPT_NORMAL_PATH),
+        _b(addr(6), WORLD_SCRIPT_REWIND_PATH),
+    ]
+
+
+def _sdiv(rd, rn, rm):
+    """sdiv wRd,wRn,wRm (signed, truncates toward zero)."""
+    return 0x1AC00C00 | (rm << 16) | (rn << 5) | rd
+
+
+def _world_script_speed_words(addr):
+    """Shared FFNx-equivalent pop_world_script_stack / 2 wrapper.
+
+    The translated pop routine leaves guest EAX at [x21]. Divide the full
+    signed value before each caller truncates it to its destination byte.
+    Saving LR is mandatory because this wrapper itself calls the real pop.
+    """
+    import a64
+    return [
+        a64.stp64_pre(30, 31, 31, -16),
+        a64.bl(addr(1), WORLD_SCRIPT_POP_TARGET),
+        _ldr_w(16, 21, 0),
+        _movz(17, 2),
+        _sdiv(16, 16, 17),
+        _str_w(16, 21, 0),
+        a64.ldp64_post(30, 31, 31, 16),
+        a64.ret(),
+    ]
+
+
 def _walk_pflag_set_cave(cave, flag_addr, hook):
     """Runs immediately before the player's own call into
     field_update_single_model_position. Replays the displaced instruction
@@ -1410,6 +1565,7 @@ def build_walk_gate_caves(text, ro_base, segs, data, verify_only, log,
     base_ctr = data_end + bss
     counter = base_ctr + WALK_TICK_OFF
     flag_addr = base_ctr + WALK_PFLAG_OFF
+    world_counter = base_ctr + WORLD_FRAME_COUNTER_OFF
 
     # The smooth-scripted helpers go in reclaimed padding, NOT the tail gap:
     # the whole point of the design is that the five caves below keep the
@@ -1531,10 +1687,98 @@ def build_walk_gate_caves(text, ro_base, segs, data, verify_only, log,
                          0x14000000 | (((cave - hook) >> 2) & 0x3FFFFFF))
         log('  ok  +0x%06X  -> cave 0x%06X (%d words)  %s'
             % (hook, cave, len(words), label))
-    _BSS_GROW = max(_BSS_GROW, WALK_PFLAG_OFF + 4)
+    # ------------------------------------------------------------------
+    # WORLD SCRIPT MOTION. Placed in RECLAIMED PADDING, never the tail gap.
+    #
+    # The tail gap between .text and .rodata is 2464 bytes shared by every
+    # cave in this file AND the dispatcher scalers that run after it, and it
+    # was already down to 16 spare bytes. Putting a 36-byte cave there aborted
+    # the whole 60 FPS pass with "dispatcher cave overflows .rodata".
+    #
+    # No padding hole is longer than 3 words, so emit_laid_out scatters all
+    # three helpers (world-frame counter, opcode gate, shared signed divide
+    # wrapper) and resolves their branches against the real addresses. The
+    # pool is built from `text` as it stands now, so earlier caves cannot be
+    # handed out twice.
+    #
+    # It fails SOFT: a build that cannot place this still ships, at stock
+    # (doubled) world script speed, rather than dying. Losing one timing
+    # correction is not worth losing the build.
+    world_sites = [
+        (WORLD_FRAME_TICK_HOOK, WORLD_FRAME_TICK_ORIG, 'world frame tick'),
+        (WORLD_SCRIPT_TICK_HOOK, WORLD_SCRIPT_TICK_ORIG,
+         'world script move-for-N-frames'),
+    ] + [(va, orig, label) for va, orig, label in WORLD_SCRIPT_SPEED_CALLS]
+    bad_world = []
+    for va, expected, label in world_sites:
+        have, = struct.unpack_from('<I', text, va)
+        if have != expected:
+            bad_world.append((va, expected, have, label))
+    if bad_world:
+        for va, expected, have, label in bad_world:
+            log('  !   +0x%06X  %s: reads %08X, expected %08X -- not applied'
+                % (va, label, have, expected))
+    elif verify_only:
+        for va, _expected, label in world_sites:
+            log('  ok  +0x%06X  cave hook            %s' % (va, label))
+    elif not nso_path:
+        log('  !   world script motion needs the padding-hole map; not applied')
+    else:
+        import a64, ff7nx_cave, cave_space, nxmap
+        try:
+            _wm = nxmap.Main(nso_path)
+            wpool = ff7nx_cave.HolePool(
+                text, starts=set(_wm.arm_starts),
+                named=cave_space.named_targets(_wm.img[cave_space.RODATA:]))
+            frame_entry, frame_placed = ff7nx_cave.emit_laid_out(
+                wpool,
+                lambda entry_va, addr: _world_frame_tick_words(
+                    addr, world_counter))
+            tick_entry, tick_placed = ff7nx_cave.emit_laid_out(
+                wpool,
+                lambda entry_va, addr: _world_script_tick_words(
+                    addr, world_counter))
+            speed_entry, speed_placed = ff7nx_cave.emit_laid_out(
+                wpool,
+                lambda entry_va, addr: _world_script_speed_words(addr))
+
+            patches = {}
+            for placed in (frame_placed, tick_placed, speed_placed):
+                patches.update(placed)
+            patches[WORLD_FRAME_TICK_HOOK] = a64.b(
+                WORLD_FRAME_TICK_HOOK, frame_entry)
+            patches[WORLD_SCRIPT_TICK_HOOK] = a64.b(
+                WORLD_SCRIPT_TICK_HOOK, tick_entry)
+            for va, _orig, _label in WORLD_SCRIPT_SPEED_CALLS:
+                patches[va] = a64.bl(va, speed_entry)
+
+            # Nothing is written until every cave has placed successfully,
+            # so a NoRoom failure cannot leave a half-installed timing pair.
+            cave_vas = set(frame_placed) | set(tick_placed) | set(speed_placed)
+            for va in cave_vas:
+                if struct.unpack_from('<I', text, va)[0] != 0:
+                    raise RuntimeError('wanted padding at +0x%X and it is '
+                                       'not zero' % va)
+            for va, word in patches.items():
+                struct.pack_into('<I', text, va, word)
+                _WALK_SMOOTH_WORDS[va] = word
+            log('  ok  +0x%06X  -> cave 0x%06X (%d placed words)  '
+                'world frame tick' % (WORLD_FRAME_TICK_HOOK, frame_entry,
+                                      len(frame_placed)))
+            log('  ok  +0x%06X  -> cave 0x%06X (%d placed words)  '
+                'world script decrement-only gate'
+                % (WORLD_SCRIPT_TICK_HOOK, tick_entry, len(tick_placed)))
+            log('  ok  4 world script speed calls -> wrapper 0x%06X '
+                '(%d placed words)' % (speed_entry, len(speed_placed)))
+        except Exception as exc:                              # noqa: BLE001
+            log('  !   world script motion: %s -- matched timing pair not '
+                'applied' % exc)
+
+    _BSS_GROW = max(_BSS_GROW, WALK_PFLAG_OFF + 4,
+                    WORLD_FRAME_COUNTER_OFF + 4)
     log('      walk-tick counter at module +0x%X, player flag at +0x%X, '
-        'bssSize grown by >= 0x%X'
-        % (counter, flag_addr, WALK_PFLAG_OFF + 4))
+        'world-frame counter at +0x%X, bssSize grown by >= 0x%X'
+        % (counter, flag_addr, world_counter, WORLD_FRAME_COUNTER_OFF + 4))
 
 
 def opcode_scaler_cave(cave, site, mult, shift):
@@ -4127,6 +4371,16 @@ def selfcheck_nso(blob, patches, log=print, extra=(), dispatch=(), batt_mult=4):
         cur, = struct.unpack('<I', raw[0][off:off + 4])
         if cur != new:
             log('  !! +0x%X reads %08X, wanted %08X' % (off, cur, new))
+            ok = False
+    # Padding caves are scattered rather than contiguous, so following only
+    # their entry branch cannot validate the complete helper. The builder
+    # records every word it owns (including all world scripted-motion hooks);
+    # compare that exact map after NSO recompression and decompression.
+    for off, want in sorted(_WALK_SMOOTH_WORDS.items()):
+        cur, = struct.unpack_from('<I', raw[0], off)
+        if cur != want:
+            log('  !! padding/helper word +0x%X reads %08X, wanted %08X'
+                % (off, cur, want))
             ok = False
     # Each dispatcher hook must now be an unconditional B into .text, and the
     # cave it lands in must start with the instruction the cave is supposed to
