@@ -794,6 +794,19 @@ _HEADLESS_GFX_ENV = 'SEVENTH_NX_GFX_POOL_MB'
 # checked against ff7nx_texcache.MODE_ENV by test_texcache.py.
 _HEADLESS_TEXCACHE_ENV = 'SEVENTH_NX_TEX_CACHE'
 
+# Freeing a texture on this port parks the surface in a table keyed on its
+# (width, height), ten per size, and only a later texture of exactly those
+# dimensions ever takes it back out. Nothing else empties it. 137.6 MB of
+# corpses on this build against 16.5 MB in vanilla, out of a 256 MB pool --
+# that was the FPS sag and the texture corruption. FINDINGS-306.
+TEX_CACHE_CHOICES = [
+    ('small', 'Bounded small — ≤256px, 10/size, 64 total (recommended)'),
+    ('nocache', 'Off — no recycling at all (confirmed fix, costs FPS)'),
+    ('off', 'Stock — ⚠ leaks 137 MB, corrupts textures'),
+]
+TEX_CACHE_LABELS = dict(TEX_CACHE_CHOICES)
+TEX_CACHE_BY_LABEL = {v: k for k, v in TEX_CACHE_CHOICES}
+
 # The background scaler and the full-screen AA. Both are PIXEL shaders the
 # port already loads from romfs; these are drop-in replacements that used to
 # have to be copied onto the card by hand. See ff7nx_shaders.py.
@@ -1594,8 +1607,17 @@ def launch_ui():
     m30_var = tk.BooleanVar(value=bool(global_saved.get('movie_30fps', False)))
     a360_var = tk.BooleanVar(value=bool(global_saved.get('analog_360', False)))
     norun_var = tk.BooleanVar(value=bool(global_saved.get('no_autorun', False)))
-    texcache_var = tk.BooleanVar(
-        value=bool(global_saved.get('no_texture_cache', False)))
+    import ff7nx_texcache as _texcache
+    _tc_saved = str(global_saved.get('texture_cache', _texcache.MODE))
+    if _tc_saved not in TEX_CACHE_LABELS:
+        # Migrates the old boolean, and survives a settings.json written by
+        # any build that predates the three-way choice.
+        _tc_saved = ('nocache' if global_saved.get('no_texture_cache')
+                     else _texcache.MODE)
+    texcache_var = tk.StringVar(value=TEX_CACHE_LABELS[_tc_saved])
+
+    def current_texture_cache():
+        return TEX_CACHE_BY_LABEL.get(texcache_var.get(), _texcache.MODE)
     # REMOVED: bgclr_var ('bg_clear', "Black 16:9 margins") and mclip_var
     # ('movie_clip', "Clip models to the movie"). Both retired -- FINDINGS-92
     # §6. A stale key left in settings.json by an older build is ignored: the
@@ -1980,36 +2002,47 @@ def launch_ui():
              'click fills HP, MP and the limit gauge, and one accidental '
              'press can spoil a playthrough. Left stick click (3× speed) '
              'is left alone.', True),
-            ('check', 'Disable texture cache (fixes the slow FPS sag)',
-             texcache_var, None,
-             'TRY THIS IF THE FRAMERATE DECAYS AS YOU PLAY AND TEXTURES '
-             'EVENTUALLY CORRUPT.\n\n'
-             'WHAT IT IS. Freeing a texture on this port does not destroy '
+            ('combo', 'Texture cache', texcache_var,
+             [l for _, l in TEX_CACHE_CHOICES],
+             'THIS IS THE FIX FOR THE FRAMERATE SAG AND THE TEXTURE '
+             'CORRUPTION. Confirmed on hardware.\n\n'
+             'WHAT IS WRONG. Freeing a texture on this port does not destroy '
              'it. It parks the surface in a table keyed on its WIDTH AND '
              'HEIGHT ONLY, ten per size, and only a later texture of exactly '
              'those dimensions ever takes it back out. Nothing else empties '
              'it — not leaving the field, not ending the battle, not the '
-             'world map. Visit an area whose sizes you never revisit again '
-             'and its surfaces stay resident until you close the game.\n\n'
-             'WHY IT MATTERS HERE AND NOT IN THE STOCK GAME. The bound is '
-             'per size, and this mod pushes on both axes at once: bigger '
-             'textures AND more distinct sizes (battle alone goes from 17 to '
-             '32). Counted off the built archives, the worst case goes from '
-             '16.5 MB in vanilla to 166.5 MB here — out of a 256 MB graphics '
-             'pool that also has to hold everything actually on screen.\n\n'
-             'WHAT IT DOES. One word: the check that stops caching once a '
-             'size holds ten becomes unconditional, so freeing always '
-             'destroys. That is the same branch the stock game already takes '
-             'whenever a size fills up, so it is well-travelled code, not '
-             'new code.\n\n'
-             'THE COST. Texture creation can no longer recycle, so loading a '
-             'field or a battle does a little more allocation work. That is '
-             'the trade: a little load time against up to 166 MB of pool.\n\n'
-             'OFF by default — the graphics-memory setting above was also '
-             'believed on good grounds and shipped as a default, and three '
-             'builds of evidence were then collected through it. Turn this '
-             'on deliberately and compare against a build without it. '
-             'FINDINGS-306.', True),
+             'world map. Visit an area whose sizes you never revisit and its '
+             'surfaces stay resident until you close the game.\n\n'
+             'WHY IT MATTERS HERE. The bound is per size, and this mod '
+             'pushes both axes: bigger textures AND more distinct sizes '
+             '(battle alone goes 17 → 32). Worst case counted off the built '
+             'archives is 137.6 MB, against 16.5 MB in vanilla — out of a '
+             '256 MB pool that also holds everything on screen. That is the '
+             'framerate decaying as you play, and then textures corrupting.'
+             '\n\n'
+             'BOUNDED SMALL (recommended). Recycling is a real '
+             'optimisation for short-lived textures that churn — water, '
+             'spell effects, animation frames — and that is where turning '
+             'the cache fully off costs you frames. This keeps recycling for '
+             'every surface up through 256×256, including the Wutai/FX '
+             'class, while retaining the stock limit of ten freed surfaces per exact '
+             'size and 64 globally. Larger and excess surfaces are destroyed '
+             'on free. The archive-backed ceiling is about 8.1 MiB and the '
+             'absolute runtime bound is 16 MiB. This matters because '
+             'the first “small” implementation removed the count cap and '
+             'could still grow without bound; it reproduced corruption and '
+             'has been replaced. Build 195 proved the four-per-size bounded '
+             'revision corruption-free; ten restores the port\'s original '
+             'same-size reuse without raising the 64-surface/16 MiB hard '
+             'limit.\n\n'
+             'OFF. No recycling at all. One word. This is the version that '
+             'was confirmed on hardware to stop the corruption, so it is the '
+             'known-good fallback if “small” ever misbehaves — but it is '
+             'also the one that cost framerate in Wutai.\n\n'
+             'STOCK. The port as shipped. Leaks.\n\n'
+             'Every mode branches to the same destroy path the stock game '
+             'already takes whenever a size fills up — well-travelled code, '
+             'not new code. FINDINGS-306.', True),
         ]),
         ('Textures', [
             ('combo', 'Field backgrounds', fpre_var,
@@ -2547,7 +2580,7 @@ def launch_ui():
                                  'movie_30fps': bool(m30_var.get()),
                                  'analog_360': bool(a360_var.get()),
                                  'no_autorun': bool(norun_var.get()),
-                                 'no_texture_cache': bool(texcache_var.get()),
+                                 'texture_cache': current_texture_cache(),
                                  'field_frame': bool(frame_var.get()),
                                  'no_cheats': bool(nocheat_var.get()),
                                  'limiter_fps': current_limiter_fps(),
@@ -3376,10 +3409,7 @@ def launch_ui():
         os.environ[build.MOVIE_30FPS_ENV] = '1' if m30_var.get() else '0'
         os.environ[build.ANALOG_360_ENV] = '1' if a360_var.get() else '0'
         os.environ[build.NO_AUTORUN_ENV] = '1' if norun_var.get() else '0'
-        # 'nocache'/'off' rather than '1'/'0' -- ff7nx_texcache.mode() takes
-        # both, but the words are what the build log and --show print.
-        os.environ[_HEADLESS_TEXCACHE_ENV] = ('nocache' if texcache_var.get()
-                                              else 'off')
+        os.environ[_HEADLESS_TEXCACHE_ENV] = current_texture_cache()
         os.environ[build.NO_CHEATS_ENV] = '1' if nocheat_var.get() else '0'
         os.environ[build.LIMITER_FPS_ENV] = str(current_limiter_fps())
         os.environ[build.ff7nx_ws.WIDESCREEN_ENV] = current_widescreen()
@@ -3675,9 +3705,14 @@ def main():
                 '1' if saved.get('__global__', {}).get('analog_360') else '0')
         os.environ[build.NO_AUTORUN_ENV] = (
                 '1' if saved.get('__global__', {}).get('no_autorun') else '0')
-        os.environ[_HEADLESS_TEXCACHE_ENV] = (
-                'nocache' if saved.get('__global__', {}).get('no_texture_cache')
-                else 'off')
+        if _HEADLESS_TEXCACHE_ENV not in os.environ:
+            import ff7nx_texcache as _tc_h
+            _g = saved.get('__global__', {})
+            _tc = str(_g.get('texture_cache', '') or '')
+            if _tc not in TEX_CACHE_LABELS:
+                _tc = ('nocache' if _g.get('no_texture_cache')
+                       else _tc_h.MODE)
+            os.environ[_HEADLESS_TEXCACHE_ENV] = _tc
         os.environ[build.NO_CHEATS_ENV] = (
                 '1' if saved.get('__global__', {}).get('no_cheats') else '0')
         os.environ[build.LIMITER_FPS_ENV] = str(

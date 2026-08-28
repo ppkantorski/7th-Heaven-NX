@@ -8914,28 +8914,47 @@ def apply_texcache(sdout, dump, log=lambda *_: None, produced=()):
     pool size barely moves it in either direction -- 128, 256 and 384 MB all
     get filled by the same 166 MB, only the time changes.
 
-    The patch is one word: the `b.hi` at +0x4364 that skips caching once a
-    key holds ten becomes unconditional, so `free` always destroys. That
-    destroy path is not new code -- it is the branch the stock game already
-    takes every time a key fills, and it releases both surfaces, nulls both
-    pointers, frees the container and clears the slot (+0x43D4..+0x4430).
-    With nothing ever inserted the tree stays empty, so the creator's lookup
-    always misses and every texture is made fresh.
+    CONFIRMED ON HARDWARE, build 192: with the cache off, the corruption
+    stops completely. It also cost framerate in Wutai, which has heavy water
+    effects and a lot of characters -- recycling is a real optimisation for
+    short-lived textures that churn, and turning it off gives that up.
 
-    DEFAULT OFF. The mechanism is measured and the branch is well-trodden,
-    which makes this far better supported than the graphics pool ever was --
-    and the graphics pool was also believed on good grounds, shipped as a
-    default, and became the baseline three builds of evidence were collected
-    through (FINDINGS-304 §6). One switch, thrown deliberately, with a before
-    and an after.
+    So the shipping mode is bounded `small`, not `nocache`:
+
+        mode        worst case      recycling for
+        off (stock)   137.6 MB      everything        <- leaks, corrupts
+        nocache         0.0 MB      nothing           <- costs FPS
+        small           8.1 MB      <=256, max 10/key, 64 total <- default
+
+    Build 193's first `small` mode replaced the count check with only a size
+    check. That removed the per-key limit entirely, and hardware reproduced
+    corruption. The corrected mode keeps BOTH constraints: each dimension
+    must be <=256 (inclusive, because Wutai churns 256x256 surfaces), and no
+    exact size may hold more than the stock ten freed surfaces, and the whole cache may
+    not exceed 64. Large textures cannot hoard the pool, total growth has a
+    hard 16 MiB bound, and small high-churn textures retain useful recycling.
+    Build 195 proved the four-per-key form corruption-free. Restoring the
+    stock ten-per-key reuse can improve the dominant 256x256 churn without
+    changing the 64-surface global limit or its 16 MiB absolute bound.
+
+    Every mode branches to the SAME destroy path at +0x43D4, which is not new
+    code: it is the branch the stock game already takes whenever a key fills.
+    It releases both surfaces, nulls both pointers, frees the container and
+    clears the slot (+0x43D4..+0x4430).
 
     Runs after `apply_glerror` on its output, by the rule every module pass
     follows: whoever edits `exefs/main` last has to see what everyone else
-    wrote. One in-place word, no cave, no archive built to match it.
+    wrote. `small` uses a verified inter-function-padding cave, preserves the
+    original equal_range call, and returns to the original insertion path.
     """
     import ff7nx_texcache
     m = ff7nx_texcache.mode()
-    if m != 'nocache':
+    if m == 'off':
+        log('')
+        log('! texture cache: LEFT STOCK (%s=off). That is the configuration '
+            'that leaks 137.6 MB of the 256 MB graphics pool on this build '
+            'and corrupts textures -- see FINDINGS-306.'
+            % ff7nx_texcache.MODE_ENV)
         return []
     if dump is None or not dump.nso:
         log('! texture cache: needs exefs/main from a full game dump; skipped')
@@ -8946,7 +8965,9 @@ def apply_texcache(sdout, dump, log=lambda *_: None, produced=()):
     built = os.path.normpath(os.path.abspath(dest)) in fresh
     src = dest if built else dump.nso
     log('')
-    log('disabling the texture cache (free() destroys instead of hoarding) ...')
+    log('texture cache -> %s ...'
+        % ('bounded small surfaces (<=256, max 10/size, 64 total)'
+           if m == 'small' else 'disabled'))
     if not built and os.path.exists(dest):
         try:
             same = (os.path.getsize(dest) == os.path.getsize(dump.nso)
@@ -8968,8 +8989,9 @@ def apply_texcache(sdout, dump, log=lambda *_: None, produced=()):
     if not ff7nx_texcache.apply_to_nso(src, tmp, log, m):
         if os.path.exists(tmp):
             os.remove(tmp)
-        if ff7nx_texcache.read_state(src) != 'nocache':
-            log('! texture cache: FAILED -- the cache is still live. Fix the '
+        import nxmap
+        if ff7nx_texcache.read_state(nxmap.Main(str(src)).img) != m:
+            log('! texture cache: FAILED -- the leak is still live. Fix the '
                 'cause above before testing.')
         return []
     os.replace(tmp, dest)

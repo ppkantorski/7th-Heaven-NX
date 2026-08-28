@@ -10,23 +10,23 @@ SKIPPED rather than failed when no dump is present.
 
 WHAT EACH GROUP IS FOR
 ----------------------
-1. table     -- the two words the patch chooses between, and the fact that
-                both branch to the SAME destination. If they ever did not,
-                the "patched" build would be jumping somewhere arbitrary.
-2. mode      -- the environment override, and that the DEFAULT IS OFF. That
-                last one is the FINDINGS-304 lesson expressed as a test: a
-                plain build must not quietly ship this.
-3. signature -- verify() against the real module and against mutations of
-                it. Every anchor is load-bearing, and the gate is accepted
-                in BOTH resting states so the pass is re-runnable over its
-                own output.
-4. write     -- exactly one word changes, it is the right one, every mode
-                round-trips, and stock comes back byte-identical.
-5. destroy   -- the branch we force is REACHABLE IN STOCK and complete: it
+1. table     -- the stock/nocache words and the bounded cave control flow.
+2. policy    -- size is inclusive through 256 in BOTH dimensions, the stock
+                ten-per-(w,h) reuse is retained, and the global cap is 64.
+3. mode      -- the environment override, including the old boolean spelling
+                so a settings.json from build 192 still means what it meant.
+4. signature -- verify() against the real module and against mutations of
+                it. Every anchor is load-bearing, every mode is accepted at
+                rest so the pass is re-runnable over its own output, and a
+                MIXTURE of two modes is refused.
+5. write     -- each mode changes exactly the words it should, every one of
+                the nine mode transitions lands where it says, and stock
+                comes back byte-identical.
+6. destroy   -- the branch we force is REACHABLE IN STOCK and complete: it
                 releases both surfaces, nulls both pointers, frees the
                 container and clears the slot. This is the group that says
                 the patch is safe rather than merely small.
-6. wiring    -- the build pass exists, the GUI calls it, it runs after
+7. wiring    -- the build pass exists, the GUI calls it, it runs after
                 apply_glerror, and the env names agree.
 """
 from __future__ import annotations
@@ -74,8 +74,8 @@ def find_main(explicit=None):
 
 
 def _target(word, va):
-    """Where an A64 B / B.cond at `va` lands."""
-    if (word >> 26) == 0x05:                       # unconditional B
+    """Where an A64 B / BL / B.cond at `va` lands."""
+    if (word & 0xFC000000) in (0x14000000, 0x94000000):
         imm = word & 0x3FFFFFF
         if imm & 0x2000000:
             imm -= 0x4000000
@@ -89,25 +89,70 @@ def _target(word, va):
 def test_table():
     print('\ntable')
     check('selftest', T.selftest(lambda *_: None))
-    check('two modes', set(T.MODES) == {'nocache', 'off'})
-    check('the stock word is a b.hi', (T.GATE_STOCK >> 24) == 0x54
-          and (T.GATE_STOCK & 0xF) == 8)
-    check('the patched word is an unconditional b',
-          (T.GATE_NOCACHE >> 26) == 0x05)
-    # The whole safety argument rests on this: we are not redirecting the
-    # branch, only making it always taken.
-    check('both words branch to the SAME address',
-          _target(T.GATE_STOCK, T.GATE_VA)
-          == _target(T.GATE_NOCACHE, T.GATE_VA) == T.DESTROY_VA,
-          '%X / %X' % (_target(T.GATE_STOCK, T.GATE_VA),
-                       _target(T.GATE_NOCACHE, T.GATE_VA)))
-    check('the cap really is ten per key (cmp x0, #9)',
-          T.CMP_WORD == 0xF100241F)
+    check('three modes', set(T.MODES) == {'off', 'nocache', 'small'})
+    check('stock is a b.hi', (T.SITE['off'][T.GATE_VA] >> 24) == 0x54
+          and (T.SITE['off'][T.GATE_VA] & 0xF) == 8)
+    check('nocache is an unconditional b',
+          (T.SITE['nocache'][T.GATE_VA] >> 26) == 0x05)
+    for m in ('off', 'nocache'):
+        check('%s branches to the same destroy path' % m,
+              _target(T.SITE[m][T.GATE_VA], T.GATE_VA) == T.DESTROY_VA,
+              hex(_target(T.SITE[m][T.GATE_VA], T.GATE_VA)))
+    check('nocache touches ONE word',
+          sum(1 for va in (T.CALL_VA, T.CMP_VA, T.GATE_VA)
+              if T.SITE['nocache'][va] != T.SITE['off'][va]) == 1)
+    base = 0x10000
+    cave = T._small_words(lambda i: base + i * 4)
+    check('bounded small cave has seventeen payload words', len(cave) == 17)
+    for i in (3, 7, 11, 15):
+        check('small reject %d reaches the stock destroy path' % i,
+              _target(cave[i], base + i * 4) == T.DESTROY_VA)
+    check('small calls the original equal_range',
+          _target(cave[12], base + 48) == T.EQUAL_RANGE_VA)
+    check('small returns to the original insert path',
+          _target(cave[16], base + 64) == T.RETURN_VA)
+    check('the stock cap really is ten per key (cmp x0, #9)',
+          T.SITE['off'][T.CMP_VA] == 0xF100241F)
+    check('legacy unbounded small is recognized only for migration',
+          'small_legacy' in T.SITE and 'small' not in T.SITE)
     check('anchor addresses are unique',
           len({a for a, _, _ in T.ANCHORS}) == len(T.ANCHORS))
-    check('word_for round-trips',
-          T.word_for('nocache') == T.GATE_NOCACHE
-          and T.word_for('off') == T.GATE_STOCK)
+    check('no anchor sits on a mutable word',
+          not ({a for a, _, _ in T.ANCHORS}
+               & {T.CALL_VA, T.CMP_VA, T.GATE_VA}))
+
+
+def test_threshold():
+    """The two-dimensional, per-key bounded policy."""
+    print('\nthe bounded policy')
+
+    def cached(wd, ht, already, total=0):
+        return (wd <= T.SMALL_MAX and ht <= T.SMALL_MAX
+                and already < T.SMALL_PER_KEY
+                and total < T.SMALL_GLOBAL)
+
+    for wd, ht in ((1, 1), (64, 128), (255, 255), (256, 256),
+                   (256, 8), (8, 256)):
+        check('%dx%d is recycled' % (wd, ht), cached(wd, ht, 0))
+    # The ones that were eating the pool.
+    for wd, ht in ((257, 257), (512, 512), (768, 192), (192, 768),
+                   (257, 8), (8, 257)):
+        check('%dx%d is destroyed, not cached' % (wd, ht),
+              not cached(wd, ht, 0))
+    check('the threshold matches SMALL_MAX', T.SMALL_MAX == 256)
+    # A tall-thin surface must not sneak through on its small dimension --
+    # that is the bug a width-only test would have had.
+    check('the gate tests BOTH dimensions, not just width',
+          not cached(8, 1024, 0) and not cached(1024, 8, 0))
+    for n in range(10):
+        check('small key population %d accepts one more' % n,
+              cached(256, 256, n))
+    check('small key population 10 is destroyed', not cached(256, 256, 10))
+    check('global population 63 accepts one more', cached(256, 256, 0, 63))
+    check('global population 64 is destroyed', not cached(1, 1, 0, 64))
+    check('the threshold is inclusive', T.SMALL_MAX == 256)
+    check('the population cap is stock ten', T.SMALL_PER_KEY == 10)
+    check('the global population cap is 64', T.SMALL_GLOBAL == 64)
 
 
 def test_mode():
@@ -115,15 +160,14 @@ def test_mode():
     E = T.MODE_ENV
     check('unset -> the code constant', T.mode({}) == T.MODE)
     check('empty -> the code constant', T.mode({E: ''}) == T.MODE)
+    check('"small" -> small', T.mode({E: 'small'}) == 'small')
     check('"nocache" -> nocache', T.mode({E: 'nocache'}) == 'nocache')
-    check('"1" -> nocache', T.mode({E: '1'}) == 'nocache')
+    check('"1" -> nocache (the old boolean)', T.mode({E: '1'}) == 'nocache')
     check('"ON" -> nocache (case folded)', T.mode({E: 'ON'}) == 'nocache')
     check('"off" -> off', T.mode({E: 'off'}) == 'off')
-    check('"0" -> off', T.mode({E: '0'}) == 'off')
+    check('"0" -> off (the old boolean)', T.mode({E: '0'}) == 'off')
     check('garbage -> the code constant', T.mode({E: 'banana'}) == T.MODE)
-    # FINDINGS-304 §6, as a test rather than a paragraph.
-    check('THE DEFAULT IS OFF (a plain build writes nothing)',
-          T.MODE == 'off')
+    check('the default is small', T.MODE == 'small')
 
 
 def test_signature(main):
@@ -148,12 +192,22 @@ def test_signature(main):
     keep = bytes(img[T.GATE_VA:T.GATE_VA + 4])
     struct.pack_into('<I', img, T.GATE_VA, 0xD503201F)          # nop
     check('a NOP at the gate is refused', bool(T.verify(bytes(img))))
-    struct.pack_into('<I', img, T.GATE_VA, T.GATE_NOCACHE)
-    check('the patched word is accepted (re-runnable over its own output)',
-          not T.verify(bytes(img)))
-    check('read_state says nocache once patched',
-          T.read_state(bytes(img)) == 'nocache')
     img[T.GATE_VA:T.GATE_VA + 4] = keep
+
+    # Inline states, including the broken Build 193 state, must be accepted
+    # so the pass can migrate them without forcing a clean rebuild.
+    for m in ('off', 'nocache', 'small_legacy'):
+        keep3 = bytes(img[T.CALL_VA:T.GATE_VA + 4])
+        for va in (T.CALL_VA, T.CMP_VA, T.GATE_VA):
+            struct.pack_into('<I', img, va, T.SITE[m][va])
+        ok = (not T.verify(bytes(img))) and T.read_state(bytes(img)) == m
+        check('%s is accepted at rest and reads back' % m, ok)
+        other = 'nocache' if m != 'nocache' else 'small_legacy'
+        struct.pack_into('<I', img, T.CALL_VA, T.SITE[other][T.CALL_VA])
+        if T.SITE[other][T.CALL_VA] != T.SITE[m][T.CALL_VA]:
+            check('%s + %s call is refused as a mixture' % (m, other),
+                  bool(T.verify(bytes(img))))
+        img[T.CALL_VA:T.GATE_VA + 4] = keep3
 
 
 def test_destroy(main):
@@ -171,7 +225,7 @@ def test_destroy(main):
     text = [(i.address, i.mnemonic, i.op_str) for i in ins]
 
     check('stock reaches it whenever a key holds ten',
-          _target(T.GATE_STOCK, T.GATE_VA) == T.DESTROY_VA)
+          _target(T.SITE['off'][T.GATE_VA], T.GATE_VA) == T.DESTROY_VA)
     # Two virtual destructor calls, one per surface.
     blrs = [t for t in text if t[1] == 'blr']
     check('it makes two virtual calls (one destructor per surface)',
@@ -198,25 +252,148 @@ def test_write(main):
         skip('write', 'the source module is not stock at this gate')
         return
     with tempfile.TemporaryDirectory() as td:
-        out = os.path.join(td, 'main.nocache')
-        check('apply nocache',
-              T.apply_to_nso(main, out, lambda *_: None, 'nocache'))
-        new = nxmap.Main(out).img
-        check('images are the same length', len(new) == len(stock))
-        diff = [i for i in range(0, min(len(new), len(stock)), 4)
-                if new[i:i + 4] != stock[i:i + 4]]
-        check('exactly ONE word changed', diff == [T.GATE_VA],
-              [hex(d) for d in diff])
-        check('and it is the gate', T.read_state(new) == 'nocache')
-        check('it still verifies', not T.verify(new))
-        check('re-running writes nothing',
-              T.apply_to_nso(out, os.path.join(td, 'x'),
-                             lambda *_: None, 'nocache') is False)
-        back = os.path.join(td, 'main.back')
-        check('round trip back to stock wrote a module',
-              T.apply_to_nso(out, back, lambda *_: None, 'off'))
-        check('round trip restores the original image exactly',
-              bytes(nxmap.Main(back).img) == bytes(stock))
+        built = {'off': str(main)}
+        for m in ('nocache', 'small'):
+            out = os.path.join(td, 'main.' + m)
+            if not check('apply %s' % m,
+                         T.apply_to_nso(main, out, lambda *_: None, m)):
+                continue
+            built[m] = out
+            new = nxmap.Main(out).img
+            check('%s: same length' % m, len(new) == len(stock))
+            diff = [i for i in range(0, min(len(new), len(stock)), 4)
+                    if new[i:i + 4] != stock[i:i + 4]]
+            if m == 'nocache':
+                check('nocache: changed exactly the gate word',
+                      diff == [T.GATE_VA], [hex(d) for d in diff])
+            else:
+                cave = T._small_cave(new)
+                check('small: hook and cave are recognized', cave is not None)
+                physical = set(cave[1]) if cave else set()
+                check('small: diff is exactly hook plus cave/chaining words',
+                      set(diff) == physical | {T.CALL_VA},
+                      [hex(d) for d in diff])
+                check('small: stock cmp and gate remain unchanged',
+                      T.CMP_VA not in diff and T.GATE_VA not in diff)
+                # Execute the exact scattered words, including every chain
+                # branch. equal_range is the one native call and returns the
+                # bucket population supplied by each case.
+                import arm64emu
+                code = {va: struct.unpack_from('<I', new, va)[0]
+                        for va in physical}
+                entry = T._branch_target(
+                    struct.unpack_from('<I', new, T.CALL_VA)[0], T.CALL_VA)
+
+                def decision(wd, ht, population, total=0):
+                    mem = arm64emu.Mem()
+                    sp = 0x800000
+                    cache = 0x900000
+                    mem.setu(sp + 8, wd, 4)
+                    mem.setu(sp + 12, ht, 4)
+                    mem.setu(cache + 0x10, total, 8)
+                    calls = []
+
+                    def equal_range(cpu):
+                        calls.append(True)
+                        cpu.set(0, population)
+
+                    cpu = arm64emu.Cpu(
+                        mem, native={T.EQUAL_RANGE_VA: equal_range})
+                    cpu.sp = sp
+                    cpu.set(20, cache)
+                    return (cpu.run(entry, [], code=code, start_pc=entry),
+                            len(calls))
+
+                cases = [
+                    (1, 1, 0, 0, T.RETURN_VA, 1),
+                    (256, 256, 9, 63, T.RETURN_VA, 1),
+                    (256, 256, 10, 63, T.DESTROY_VA, 1),
+                    (1, 1, 0, 64, T.DESTROY_VA, 0),
+                    (257, 1, 0, 0, T.DESTROY_VA, 0),
+                    (1, 257, 0, 0, T.DESTROY_VA, 0),
+                ]
+                for wd, ht, pop, total, want, calls in cases:
+                    got = decision(wd, ht, pop, total)
+                    check('execute %dx%d key %d total %d -> +0x%X'
+                          % (wd, ht, pop, total, want),
+                          got == (want, calls),
+                          repr(got))
+            check('%s: reads back' % m, T.read_state(new) == m)
+            check('%s: still verifies' % m, not T.verify(new))
+            check('%s: re-running writes nothing' % m,
+                  T.apply_to_nso(out, os.path.join(td, 'x'),
+                                 lambda *_: None, m) is False)
+        # Every transition, not just from stock. A user flipping the combo
+        # rebuilds from whatever the last build left behind.
+        for a in T.MODES:
+            for b in T.MODES:
+                if a not in built:
+                    continue
+                dst = os.path.join(td, 'trans')
+                wrote = T.apply_to_nso(built[a], dst, lambda *_: None, b)
+                img = nxmap.Main(dst if wrote else built[a]).img
+                check('%-7s -> %-7s' % (a, b), T.read_state(img) == b,
+                      repr(T.read_state(img)))
+                if os.path.exists(dst):
+                    os.remove(dst)
+        for m in ('nocache', 'small'):
+            if m not in built:
+                continue
+            back = os.path.join(td, 'back.' + m)
+            check('%s -> off wrote a module' % m,
+                  T.apply_to_nso(built[m], back, lambda *_: None, 'off'))
+            check('%s -> off restores stock byte-for-byte' % m,
+                  bytes(nxmap.Main(back).img) == bytes(stock))
+
+        # Explicitly prove that the corrupting old small mode migrates to the
+        # new bounded cave rather than being mistaken for it.
+        import nso_patcher
+        legacy = os.path.join(td, 'main.legacy')
+        nso = nso_patcher.read_nso(Path(main))
+        legacy_spec = {'name': 'legacy small fixture', 'patches': [
+            {'name': 'legacy +%x' % va, 'va': va,
+             'expect': struct.pack('<I', T.SITE['off'][va]).hex(),
+             'set': struct.pack('<I', T.SITE['small_legacy'][va]).hex()}
+            for va in (T.CALL_VA, T.CMP_VA, T.GATE_VA)]}
+        nso_patcher.apply_spec(nso, legacy_spec)
+        Path(legacy).write_bytes(nso_patcher.rebuild(nso))
+        check('legacy fixture reads as small_legacy',
+              T.read_state(nxmap.Main(legacy).img) == 'small_legacy')
+        migrated = os.path.join(td, 'main.migrated')
+        check('legacy small migrates',
+              T.apply_to_nso(legacy, migrated, lambda *_: None, 'small'))
+        check('legacy small reads back as bounded small',
+              T.read_state(nxmap.Main(migrated).img) == 'small')
+
+        # Build 195's safe four-per-key cave must also migrate. It has the
+        # same size/global bounds; only the equal_range population compare
+        # differs, so rewriting it cannot increase the hard 16 MiB ceiling.
+        bounded4 = os.path.join(td, 'main.bounded4')
+        nso = nso_patcher.read_nso(Path(built['small']))
+        current_img = nxmap.Main(built['small']).img
+        cave = T._small_cave(current_img)
+        old_cmp = cave[0][13][0]
+        bounded4_spec = {'name': 'Build 195 bounded-four fixture', 'patches': [{
+            'name': 'per-key ten -> four', 'va': old_cmp,
+            'expect': struct.pack('<I', cave[0][13][1]).hex(),
+            'set': struct.pack('<I',
+                0xF100001F | ((T.SMALL_PER_KEY_V1 - 1) << 10)).hex()}]}
+        nso_patcher.apply_spec(nso, bounded4_spec)
+        Path(bounded4).write_bytes(nso_patcher.rebuild(nso))
+        check('Build 195 fixture reads as small_bounded4',
+              T.read_state(nxmap.Main(bounded4).img) == 'small_bounded4')
+        migrated4 = os.path.join(td, 'main.migrated4')
+        check('Build 195 bounded-four migrates',
+              T.apply_to_nso(bounded4, migrated4, lambda *_: None, 'small'))
+        check('Build 195 migration reads as current bounded small',
+              T.read_state(nxmap.Main(migrated4).img) == 'small')
+        for target_mode in T.MODES:
+            transitioned4 = os.path.join(td, 'main.bounded4.' + target_mode)
+            wrote = T.apply_to_nso(
+                bounded4, transitioned4, lambda *_: None, target_mode)
+            got_path = transitioned4 if wrote else bounded4
+            check('Build 195 bounded-four -> %s' % target_mode,
+                  T.read_state(nxmap.Main(got_path).img) == target_mode)
 
 
 def test_wiring():
@@ -233,10 +410,18 @@ def test_wiring():
           gui.index('build.apply_texcache(') > gui.index('build.apply_glerror('))
     check('the GUI env name matches the module',
           "_HEADLESS_TEXCACHE_ENV = '%s'" % T.MODE_ENV in gui)
-    check('there is a checkbox bound to it', 'texcache_var' in gui)
-    check('the setting is saved', "'no_texture_cache'" in gui)
-    check('and restored headlessly',
+    check('there is a combo bound to it', 'texcache_var' in gui
+          and "('combo', 'Texture cache'" in gui)
+    check('it offers every mode',
+          all("'%s'" % m in gui.split('TEX_CACHE_CHOICES')[1][:400]
+              for m in T.MODES))
+    check('the setting is saved', "'texture_cache': current_texture_cache()"
+          in gui)
+    check('the old boolean still migrates', "'no_texture_cache'" in gui)
+    check('and it is restored headlessly',
           gui.count('_HEADLESS_TEXCACHE_ENV') >= 3)
+    check('the build refuses stock loudly rather than silently',
+          'LEFT STOCK' in src)
 
 
 def main_(argv=None):
@@ -246,6 +431,7 @@ def main_(argv=None):
 
     print('== the texture cache')
     test_table()
+    test_threshold()
     test_mode()
     test_wiring()
     m = find_main(a.main)

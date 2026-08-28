@@ -244,7 +244,7 @@
   "movie_30fps": true,
   "analog_360": true,
   "no_autorun": true,
-  "no_texture_cache": true,
+  "texture_cache": "small",
   "field_frame": true,
   "no_cheats": true,
   "limiter_fps": 66,
