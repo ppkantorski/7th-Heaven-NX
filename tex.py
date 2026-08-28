@@ -109,7 +109,16 @@ def _median_cut(pixels, max_colors):
     Fully transparent input pixels are excluded; caller maps them to the
     reserved transparent index."""
     from collections import Counter
-    hist = Counter(p for p in pixels if p[3] >= 128)
+    return _median_cut_hist(Counter(p for p in pixels if p[3] >= 128),
+                            max_colors)
+
+
+def _median_cut_hist(hist, max_colors):
+    """The body of _median_cut, over a prebuilt {colour: count} histogram.
+
+    Split out so a palette can be derived from SEVERAL images at once --
+    see shared_palette(). The algorithm is unchanged; feeding it a union
+    histogram is exactly how one palette comes to describe a whole stage."""
     if not hist:
         return [], {}
     boxes = [list(hist.items())]
@@ -332,7 +341,167 @@ def cap_dimensions(data, max_dim):
     return out, note
 
 
-def convert_for_battle(data, vanilla_data=None, cap=256):
+def _sample_hist(t, stride):
+    """{(r,g,b,255): count} sampled from a truecolor TEX, every `stride`th
+    pixel. Sampling rather than counting every pixel keeps the union
+    histogram for a whole stage small enough to median-cut quickly, and a
+    palette is a summary anyway -- it does not need every texel to have
+    voted."""
+    from collections import Counter
+    px, bypp = t['pixels'], t['bytes_per_pixel']
+    out = Counter()
+    n = t['width'] * t['height']
+    for i in range(0, n, stride):
+        o = i * bypp
+        if bypp == 4 and px[o + 3] < 128:
+            continue
+        out[(px[o + 2], px[o + 1], px[o], 255)] += 1     # stored BGR(A)
+    return out
+
+
+def shared_palette(sources, max_colors=255, stride=7):
+    """ONE palette for a group of images that are drawn adjacent to each other.
+
+    THE PROBLEM THIS SOLVES. `convert_for_battle` quantises each TEX on its
+    own, so two tiles of the same battle background end up with two unrelated
+    256-colour ramps -- measured on the shipped archive, adjacent tiles of
+    stage 03 share between 0 and 12 of their 256 entries. A sky gradient
+    crossing that boundary lands on different colours either side and steps
+    visibly at the seam. That is the discontinuity, and it is an artefact of
+    quantising the tiles SEPARATELY, not of quantising at all.
+
+    Feeding the union of their colours to one median cut makes neighbours
+    agree. The banding a 256-colour ramp gives a photographic sky is still
+    there; it stops being *mismatched* banding, which is the part the eye
+    reads as broken.
+
+    `sources` is a list of TEX byte strings. Anything that is not truecolor
+    is ignored -- it has a palette already and is not ours to unify.
+    """
+    from collections import Counter
+    hist = Counter()
+    for data in sources:
+        t = parse(data)
+        if t is None or t['palette_flag'] or t['bytes_per_pixel'] < 3:
+            continue
+        hist.update(_sample_hist(t, stride))
+    if not hist:
+        return []
+    pal, _ = _median_cut_hist(hist, max_colors)
+    return pal
+
+
+_LUT_CACHE = {}
+
+
+def _palette_lut(palette, bits=5):
+    """Nearest-entry lookup over a coarse RGB grid, built once per palette.
+
+    A per-pixel linear scan of 256 entries is ~150 million distance
+    evaluations for one 768x768 tile, which is not a thing pure Python can
+    do. The grid is 2**bits per channel, so the table costs
+    (2**bits)**3 * 256 evaluations ONCE and every pixel afterwards is an
+    index. At 5 bits the grid is coarser than the palette, and the residual
+    error that introduces is exactly what the dither below diffuses.
+    """
+    # Memoised on the palette itself. A stage's tiles all share one palette,
+    # so without this the table is rebuilt once per TILE instead of once per
+    # STAGE -- measured at 3.2 s of every tile's 3.5 s. Two entries is
+    # enough: the converter finishes a stage before it starts the next.
+    key = (bits, tuple((p[0], p[1], p[2]) for p in palette))
+    hit = _LUT_CACHE.get(key)
+    if hit is not None:
+        return hit
+    n = 1 << bits
+    shift = 8 - bits
+    half = 1 << (shift - 1)
+    pal = [(p[0], p[1], p[2]) for p in palette]
+    lut = bytearray(n * n * n)
+    for ri in range(n):
+        r = (ri << shift) + half
+        for gi in range(n):
+            g = (gi << shift) + half
+            base = (ri * n + gi) * n
+            for bi in range(n):
+                b = (bi << shift) + half
+                best, bd = 0, 1 << 30
+                for k, (pr, pg, pb) in enumerate(pal):
+                    d = (r - pr) ** 2 + (g - pg) ** 2 + (b - pb) ** 2
+                    if d < bd:
+                        bd, best = d, k
+                lut[base + bi] = best
+    if len(_LUT_CACHE) > 2:
+        _LUT_CACHE.clear()
+    _LUT_CACHE[key] = lut
+    return lut
+
+
+def _map_to_palette(rgba, w, h, palette, dither=True, bits=5):
+    """Per-pixel 0-based palette index, or -1 for transparent.
+
+    With `dither`, Floyd-Steinberg error diffusion. On a sky that is the
+    difference between visible steps every few rows and a smooth gradient
+    with fine noise in it -- the same trade the field background pass makes.
+    """
+    lut = _palette_lut(palette, bits)
+    n = 1 << bits
+    shift = 8 - bits
+    pal = [(p[0], p[1], p[2]) for p in palette]
+    out = [0] * (w * h)
+    if not dither:
+        for i, px in enumerate(rgba):
+            if px[3] < 128:
+                out[i] = -1
+                continue
+            out[i] = lut[(((px[0] >> shift) * n) + (px[1] >> shift)) * n
+                         + (px[2] >> shift)]
+        return out
+    err = [0.0] * (w * h * 3)
+    for y in range(h):
+        row = y * w
+        for x in range(w):
+            i = row + x
+            px = rgba[i]
+            if px[3] < 128:
+                out[i] = -1
+                continue
+            e = i * 3
+            r = px[0] + err[e]
+            g = px[1] + err[e + 1]
+            b = px[2] + err[e + 2]
+            r = 0 if r < 0 else (255 if r > 255 else int(r))
+            g = 0 if g < 0 else (255 if g > 255 else int(g))
+            b = 0 if b < 0 else (255 if b > 255 else int(b))
+            k = lut[(((r >> shift) * n) + (g >> shift)) * n + (b >> shift)]
+            out[i] = k
+            pr, pg, pb = pal[k]
+            er, eg, eb = r - pr, g - pg, b - pb
+            if x + 1 < w:
+                j = (i + 1) * 3
+                err[j] += er * 0.4375
+                err[j + 1] += eg * 0.4375
+                err[j + 2] += eb * 0.4375
+            if y + 1 < h:
+                nrow = i + w
+                if x:
+                    j = (nrow - 1) * 3
+                    err[j] += er * 0.1875
+                    err[j + 1] += eg * 0.1875
+                    err[j + 2] += eb * 0.1875
+                j = nrow * 3
+                err[j] += er * 0.3125
+                err[j + 1] += eg * 0.3125
+                err[j + 2] += eb * 0.3125
+                if x + 1 < w:
+                    j = (nrow + 1) * 3
+                    err[j] += er * 0.0625
+                    err[j + 1] += eg * 0.0625
+                    err[j + 2] += eb * 0.0625
+    return out
+
+
+def convert_for_battle(data, vanilla_data=None, cap=256,
+                       palette=None, dither=None):
     """
     Convert a truecolor mod TEX for the battle module, which renders enemy
     textures WHITE unless they are paletted (hardware-established: the
@@ -347,6 +516,13 @@ def convert_for_battle(data, vanilla_data=None, cap=256):
       <=cap and Floyd-Steinberg dither -- the undithered 64x64 16-color
       output read as a black blob on hardware.
     - no vanilla / vanilla truecolor: standard 1x256 paletted header.
+
+    `palette`, when supplied, is used INSTEAD of quantising this file on its
+    own -- see shared_palette(). That is what makes a battle background stop
+    stepping at its tile seams. `dither` defaults to True whenever a shared
+    palette is in use (a supplied palette is by definition not tuned to this
+    one image, so error diffusion is doing real work) and to False otherwise,
+    which keeps every existing conversion byte-identical.
 
     Returns (new_bytes, note) or (None, reason).
     """
@@ -401,8 +577,18 @@ def convert_for_battle(data, vanilla_data=None, cap=256):
     else:
         nw, nh = _cap_size(w, h, cap)
     rgba = _resample_rgba(t['pixels'], w, h, bypp, nw, nh)
-    palette, mapping = _median_cut(rgba, 255)
-    idx = bytearray(0 if p[3] < 128 else mapping[p] + 1 for p in rgba)
+    if palette:
+        # SHARED PALETTE PATH. The colours were decided across every tile of
+        # this stage, so neighbours agree and the seam disappears.
+        if dither is None:
+            dither = True
+        mapped = _map_to_palette(rgba, nw, nh, palette, dither=dither)
+        idx = bytearray(0 if k < 0 else k + 1 for k in mapped)
+        shared = True
+    else:
+        palette, mapping = _median_cut(rgba, 255)
+        idx = bytearray(0 if p[3] < 128 else mapping[p] + 1 for p in rgba)
+        shared = False
     # The reserved transparent entry gets the average of the opaque colours
     # that BORDER transparency, not black. Once the palette is expanded to
     # RGBA the GPU cannot tell index 0 apart, so it bilinear-filters straight
@@ -425,8 +611,11 @@ def convert_for_battle(data, vanilla_data=None, cap=256):
         pal_bytes += bytes((b, g, r, a))              # BGRA on disk
     hdr = _paletted_header(data, nw, nh, 1, 256)
     out = bytes(hdr) + bytes(pal_bytes) + bytes(idx)
+    _tag = ''
+    if shared:
+        _tag = ', SHARED stage palette' + (' + dither' if dither else '')
     note = (f'{w}x{h}x{bypp * 8}bit -> {nw}x{nh} paletted '
-            f'({len(palette) + 1}/256 colors) '
+            f'({len(palette) + 1}/256 colors{_tag}) '
             f'{len(data):,} -> {len(out):,} bytes')
     return out, note
 

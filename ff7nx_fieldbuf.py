@@ -89,10 +89,17 @@ import struct
 import sys
 from pathlib import Path
 
+# ONLY this directory. The parent used to be on this list and it is a trap:
+# it puts any superseded loose copy sitting beside the project folder ahead
+# of the real module, and the shadowing CASCADES -- a stale module imported
+# from the parent then inserts ITS own directory, so one wrong entry drags in
+# every other stale file next to it. That is what broke `import build` here
+# (a 2026-08-08 ff7nx_uiclip with no UICLIP_ENV). Everything this module
+# needs -- a64, nxmap, nso_patcher -- lives beside it. Same note as
+# ff7nx_heap and ff7nx_glerror.
 _HERE = os.path.dirname(os.path.abspath(__file__))
-for _p in (_HERE, os.path.join(_HERE, '..')):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
 
 STOCK_WIDTH = 320
 STOCK_HEIGHT = 240

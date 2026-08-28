@@ -1356,28 +1356,82 @@ def _synthesize_battle_bg_tex_cached(dds_path, native_name, log=lambda *_: None)
     return staged
 
 
-# These archive entries are not submitted by the terrain-mesh renderer whose
-# six U/V normalisations ff7nx_gaia patches.  They are UI sprites, blended
-# effects, or external-sky assets with independent UV/blend/animation state.
-# Treating them as terrain caused the opaque rectangular Highwind shadow in
-# build 181: shadow_00.dds carries 256 alpha levels, while native shadow.tex
-# is a colour-keyed, blend-mode-0 sprite.  Binary TEX colour-key conversion
-# cannot represent that FFNx alpha asset.  The other names are protected for
-# the same renderer-role reason, not because one screenshot happened to show
-# them broken.
+# A frame-zero DDS cannot replace an effect whose animation is encoded as
+# several runtime palettes.  These are the only entries that must remain
+# native. Other non-terrain entries are converted below with renderer-aware
+# alpha/aspect rules instead of being silently downgraded to vanilla.
 WORLD_NATIVE_RUNTIME_TEXTURES = frozenset({
     'dfx.tex',       # 26 runtime palettes / vehicle effects
-    'map.tex',       # blended world-map marker texture
-    'meteo.tex',     # FFNx external meteor mesh
     'midg.tex',      # 8 runtime palettes / Midgar Zolom effect
-    'midlmap.tex',   # large-map UI sprite
-    'midlmap2.tex',  # alternate large-map UI sprite
-    'radar.tex',     # radar UI sprite
-    'shadow.tex',    # soft world-object shadow sprite
-    'snow4.tex',     # snowfield overlay sprite
-    'snow5.tex',     # snowfield overlay sprite
-    'wm_kumo.tex',   # FFNx external cloud mesh and mirrored wrap
 })
+
+# These use sprite/UI renderers rather than the terrain mesh. Preserve each
+# DDS's authored aspect ratio under the GUI cap. `object_uv` means that the
+# stock path stores native pixel UVs and needs a matching inverse-size fix in
+# exefs/main. The map UI textures already use normalized constants.
+WORLD_GAIA_SPECIAL_TEXTURES = {
+    'wm_kumo.tex': {'mask': 'sky_black', 'object_uv': True},
+    'meteo.tex': {'mask': 'sky_black', 'object_uv': True},
+    'shadow.tex': {'mask': 'shadow_alpha', 'object_uv': True},
+    'map.tex': {'mask': 'alpha', 'object_uv': True},
+    'midlmap.tex': {'mask': 'rgb', 'object_uv': False},
+    'midlmap2.tex': {'mask': 'rgb', 'object_uv': False},
+    'radar.tex': {'mask': 'rgb', 'object_uv': False},
+    # The snow renderer uses normalized 1/256 constants already. Premultiply
+    # Gaia's five alpha levels into RGB for its native additive blend.
+    'snow4.tex': {'mask': 'alpha_premultiply', 'object_uv': False},
+    'snow5.tex': {'mask': 'alpha_premultiply', 'object_uv': False},
+}
+
+
+def _shadow_alpha_cutoff(alpha, vanilla_tex):
+    """
+    Alpha below which a Gaia shadow pixel becomes colour-key transparent.
+
+    The native shadow is COLOUR-KEYED, not alpha-blended: index 0 is
+    transparent and every other index is drawn. There is no partial
+    coverage, so a cutoff has to be chosen, and choosing 1 -- "anything
+    that is not exactly zero is drawn" -- is what produced the grey haze
+    around the Highwind.
+
+    Gaia's shadow_00.dds carries a long faint tail: 21,575 of its 65,536
+    pixels have alpha >= 1, but only 16,294 have alpha >= 56. Rendered
+    through a colour key the whole tail becomes SOLID light grey, which is
+    32% more opaque area than vanilla covers and is exactly the halo that
+    shows up over dark ground.
+
+    So match vanilla's own coverage instead of guessing a constant: find the
+    cutoff whose surviving pixel count is closest to the native shadow's
+    opaque fraction, scaled to this image. On the shipped assets that lands
+    at 56 and reproduces vanilla's footprint to within 0.4%, while keeping
+    Gaia's 4x edge detail and interior falloff.
+    """
+    if not vanilla_tex or not vanilla_tex.get('pixels'):
+        return 1
+    native_on = sum(1 for x in vanilla_tex['pixels'] if x)
+    native_total = vanilla_tex['width'] * vanilla_tex['height']
+    if not native_total or not native_on:
+        return 1
+    want = len(alpha) * native_on / float(native_total)
+    best, best_err = 1, None
+    for cut in range(1, 256):
+        keep = sum(1 for x in alpha if x >= cut)
+        err = abs(keep - want)
+        if best_err is None or err < best_err:
+            best, best_err = cut, err
+        if keep < want:                  # counts fall monotonically
+            break
+    return best
+
+
+def _world_special_size(width, height, cap):
+    """Return aspect-preserving dimensions for a Gaia sprite/UI texture."""
+    largest = max(width, height)
+    if not cap or largest <= cap:
+        return width, height
+    ratio = float(cap) / float(largest)
+    return (max(1, int(round(width * ratio))),
+            max(1, int(round(height * ratio))))
 
 
 def _convert_world_dds(mod_files, van, log=lambda *_: None):
@@ -1410,24 +1464,19 @@ def _convert_world_dds(mod_files, van, log=lambda *_: None):
     the same scale.  A uniform factor is what keeps neighbouring world tiles
     continuous; independently capping each DDS is not equivalent.
 
-    Native UI/effect textures stay native.  They use separate sprite UV,
-    blend, or animation paths, and a frame-zero DDS cannot reconstruct the
-    multi-palette cases.  This includes the continuously alpha-blended
-    Highwind shadow; forcing it through a binary TEX colour key creates an
-    opaque rectangle.
-
-    Gaia's clouds and meteor are a separate exception.  They are authored for
-    FFNx's replacement ``clouds.gltf``/``meteo.gltf`` draws: FFNx enables
-    mirrored wrap for the cloud mesh, and Gaia's meteor is 2:1 while the native
-    meteor slot and its UVs are 4:1.  Feeding either image to the stock strips
-    produces the repeated sky panels / rectangular meteor seen in build 178.
-    Leave those two native textures untouched until an external mesh renderer
-    exists on Switch.
+    Sprite/UI assets are not terrain. They preserve their DDS aspect ratio
+    under the same GUI cap and use format-specific transparency. Gaia's soft
+    shadow stores its useful signal in alpha while the native path blends
+    indexed greys, so alpha is converted into that greyscale falloff instead
+    of the opaque black rectangle seen in build 181. Cloud/meteor black
+    backgrounds are colour-keyed, and their independent X/Y UV factors are
+    passed to the paired module patch.
     """
     os.makedirs(WORLD_DDS_CACHE, exist_ok=True)
     cap = _world_tex_cap()
     scale = _world_gaia_scale(cap)
     out = {}
+    special_scales = {}
     converted = failed = held_native = 0
     source_bytes = output_bytes = 0
     for low, pair in mod_files.items():
@@ -1449,8 +1498,8 @@ def _convert_world_dds(mod_files, van, log=lambda *_: None):
             continue
         if low in WORLD_NATIVE_RUNTIME_TEXTURES:
             held_native += 1
-            log('  Gaia world %s: kept vanilla (runtime sprite/effect uses '
-                'independent UV, blend, mesh, or palette state)' % low)
+            log('  Gaia world %s: kept vanilla (runtime palette animation '
+                'cannot be reconstructed from frame zero)' % low)
             continue
         try:
             with open(vanilla_path, 'rb') as f:
@@ -1470,9 +1519,17 @@ def _convert_world_dds(mod_files, van, log=lambda *_: None):
                 % (low, vanilla_tex['num_palettes']))
             continue
 
-        key = ('WORLD-DDS-V4-UNIFORM-UV-256PAL-' + _sig(src) + '-'
+        special = WORLD_GAIA_SPECIAL_TEXTURES.get(low)
+        # V6: the shadow's colour-key cutoff moved off 1 to the value that
+        # matches vanilla's coverage. The key has to change with the CODE,
+        # not just the inputs -- V5 entries were converted by the old cutoff
+        # and a rebuild silently reused them, so the halo survived a build
+        # that had the fix in it.
+        key = ('WORLD-DDS-V6-GAIA-RENDERER-AWARE-256PAL-' + _sig(src) + '-'
                + _sig(vanilla_path)
-               + '-scale%s' % scale)
+               + '-cap%s-scale%s-special%s'
+               % (cap or 'off', scale,
+                  special['mask'] if special else 'terrain'))
         cached = os.path.join(
             WORLD_DDS_CACHE,
             '%s.%s' % (low, hashlib.sha1(key.encode()).hexdigest()[:16]))
@@ -1486,15 +1543,19 @@ def _convert_world_dds(mod_files, van, log=lambda *_: None):
                         vanilla_tex['bytes_per_pixel'] != 1 or
                         vanilla_tex['colors_per_palette'] <= 0):
                     raise ValueError('native destination is not indexed TEX')
-                if (source_tex['width'] * vanilla_tex['height'] !=
+                if (not special and
+                        source_tex['width'] * vanilla_tex['height'] !=
                         source_tex['height'] * vanilla_tex['width']):
                     raise ValueError(
                         'source aspect %dx%d differs from native slot %dx%d'
                         % (source_tex['width'], source_tex['height'],
                            vanilla_tex['width'], vanilla_tex['height']))
                 sw, sh = source_tex['width'], source_tex['height']
-                nw = max(1, int(round(vanilla_tex['width'] * scale)))
-                nh = max(1, int(round(vanilla_tex['height'] * scale)))
+                if special:
+                    nw, nh = _world_special_size(sw, sh, cap)
+                else:
+                    nw = max(1, int(round(vanilla_tex['width'] * scale)))
+                    nh = max(1, int(round(vanilla_tex['height'] * scale)))
                 image = Image.frombytes(
                     'RGBA', (sw, sh), source_tex['pixels'], 'raw', 'BGRA')
                 if (nw, nh) != (sw, sh):
@@ -1503,15 +1564,66 @@ def _convert_world_dds(mod_files, van, log=lambda *_: None):
                 colorkey = bool(struct.unpack_from(
                     '<I', vanilla_data, tex.O_COLORKEY)[0])
                 usable = 255 if colorkey else 256
-                indexed = image.convert('RGB').quantize(
+                alpha = image.getchannel('A').tobytes()
+                rgb = image.convert('RGB')
+                shadow_cut = 1
+                if special and special['mask'] == 'shadow_alpha':
+                    # Gaia's shadow RGB is almost black; opacity is the soft
+                    # falloff. Native shadow.tex expresses that falloff as
+                    # blended greys, so retain it rather than binarising it.
+                    #
+                    # Everything below the cutoff is forced to black so it
+                    # cannot pull the median-cut palette toward the faint
+                    # tail it is about to be keyed out of, and the surviving
+                    # range is stretched across the whole 115..41 native grey
+                    # ramp instead of only its top slice.
+                    shadow_cut = _shadow_alpha_cutoff(alpha, vanilla_tex)
+                    span = float(max(1, 255 - shadow_cut))
+                    rgb.putdata([
+                        (0, 0, 0) if a < shadow_cut else
+                        (max(41, min(115, int(round(
+                            115.0 - (a - shadow_cut) * 74.0 / span)))),) * 3
+                        for a in alpha
+                    ])
+                    log('  %s: shadow alpha cutoff %d (%d of %d px kept, '
+                        'native covers %.1f%%)'
+                        % (low, shadow_cut,
+                           sum(1 for a in alpha if a >= shadow_cut),
+                           len(alpha),
+                           100.0 * sum(1 for x in vanilla_tex['pixels'] if x)
+                           / max(1, vanilla_tex['width'] *
+                                 vanilla_tex['height'])))
+                elif special and special['mask'] == 'alpha_premultiply':
+                    source = rgb.tobytes()
+                    rgb.putdata([
+                        tuple(int(round(source[pos * 3 + channel] * a / 255.0))
+                              for channel in range(3))
+                        for pos, a in enumerate(alpha)
+                    ])
+                indexed = rgb.quantize(
                     colors=usable, method=Image.Quantize.MEDIANCUT,
                     dither=Image.Dither.NONE)
                 raw_indices = bytearray(indexed.tobytes())
                 if colorkey:
-                    alpha = image.getchannel('A').tobytes()
-                    raw_indices = bytearray(
-                        0 if a < 128 else i + 1
-                        for i, a in zip(raw_indices, alpha))
+                    source_rgb = image.convert('RGB').tobytes()
+                    mask_mode = special['mask'] if special else 'alpha'
+                    keyed = bytearray()
+                    for pos, (idx, a) in enumerate(zip(raw_indices, alpha)):
+                        # shadow_alpha keys at the coverage-matched cutoff;
+                        # alpha_premultiply keeps 1 because its renderer is
+                        # ADDITIVE -- a premultiplied near-black pixel adds
+                        # nothing, so a faint tail there is invisible rather
+                        # than a halo.
+                        threshold = (shadow_cut if mask_mode == 'shadow_alpha'
+                                     else 1 if mask_mode == 'alpha_premultiply'
+                                     else 128)
+                        transparent = a < threshold
+                        if mask_mode == 'sky_black':
+                            off = pos * 3
+                            transparent = (transparent or
+                                           max(source_rgb[off:off + 3]) <= 2)
+                        keyed.append(0 if transparent else idx + 1)
+                    raw_indices = keyed
 
                 pillow_pal = indexed.getpalette() or []
                 entries = [(0, 0, 0, 0)] if colorkey else []
@@ -1538,8 +1650,16 @@ def _convert_world_dds(mod_files, van, log=lambda *_: None):
                 checked = tex.parse(converted_tex)
                 if checked is None:
                     raise ValueError('converted payload failed TEX validation')
-                note = ('%dx%d -> %dx%d, uniform %sx native, %d/256 colours'
-                        % (sw, sh, nw, nh, scale, palette_used))
+                if special:
+                    note = ('%dx%d -> %dx%d, renderer-aware %.3gx/%.3gy '
+                            'native, %d/256 colours'
+                            % (sw, sh, nw, nh,
+                               nw / vanilla_tex['width'],
+                               nh / vanilla_tex['height'], palette_used))
+                else:
+                    note = ('%dx%d -> %dx%d, uniform %sx native, '
+                            '%d/256 colours'
+                            % (sw, sh, nw, nh, scale, palette_used))
                 tmp = cached + '.tmp'
                 with open(tmp, 'wb') as f:
                     f.write(converted_tex)
@@ -1551,24 +1671,37 @@ def _convert_world_dds(mod_files, van, log=lambda *_: None):
                     'keeping vanilla' % (low, exc))
                 continue
         out[low] = (cached, mod)
+        if special and special['object_uv']:
+            with open(cached, 'rb') as f:
+                cached_tex = tex.parse(f.read())
+            special_scales[low[:-4]] = [
+                float(cached_tex['width']) / float(vanilla_tex['width']),
+                float(cached_tex['height']) / float(vanilla_tex['height'])]
         converted += 1
         source_bytes += len(raw)
         output_bytes += os.path.getsize(cached)
 
     if converted:
         log('  world_us.lgp: %d Gaia DDS texture(s) converted to native '
-            'indexed TEX at uniform %sx scale (cap %s), fresh 256-colour '
-            'palettes '
+            'indexed TEX (terrain %sx, special textures aspect-preserved, '
+            'cap %s), fresh 256-colour palettes '
             '(%.1f MiB DDS -> %.1f MiB TEX)'
             % (converted, scale, cap or 'off', source_bytes / (1024 * 1024),
                output_bytes / (1024 * 1024)))
     if held_native:
-        log('  world_us.lgp: %d Gaia runtime sprite/effect texture(s) use '
-            'independent UV, blend, mesh, or palette state; kept native'
+        log('  world_us.lgp: %d multi-palette Gaia effect texture(s) cannot '
+            'be reconstructed from frame zero; kept native'
             % held_native)
     if failed:
         log('  ! world_us.lgp: %d Gaia DDS texture(s) rejected; their '
             'vanilla entries remain in use' % failed)
+    if special_scales:
+        os.environ[WORLD_GAIA_SPECIAL_ENV] = json.dumps(
+            special_scales, sort_keys=True, separators=(',', ':'))
+        log('  Gaia sprite UV factors: %s'
+            % os.environ[WORLD_GAIA_SPECIAL_ENV])
+    else:
+        os.environ.pop(WORLD_GAIA_SPECIAL_ENV, None)
     return out
 
 
@@ -2065,9 +2198,10 @@ FIELD_TEX_CAP_ENV = 'SEVENTH_NX_FIELD_TEX_CAP'
 # the smallest cap that is unambiguously generous against it -- a clean 2:1
 # halving of the largest thing anyone ships, twice vanilla's own maximum,
 # and it rewrites nothing vanilla contains (test_texcap.py proves that).
-# 768 is affordable too at 256 MB; the reason not to reach further is that
-# nothing above 256px has ever been rendered by this port's world texture
-# bind, not that the bytes are unavailable.
+# 768 is affordable too at 256 MB and is now hardware-testable through the
+# Gaia archive/UV pair. 512 remains the conservative default; the GUI's 768
+# choice deliberately spends more archive/texture memory for 3x terrain and
+# the 768x384 meteor while Gaia's cloud source itself tops out at 512x128.
 #
 # What the heap does still rule out is TRUECOLOR at full size: 212 MB of a
 # 256 MB pool, on top of field backgrounds, which FINDINGS-106 5.2 names as
@@ -2084,6 +2218,7 @@ WORLD_TEX_CAP_DEFAULT = 512
 # exefs/main UV correction. It is populated from the active plan; users do
 # not need to set it by hand.
 WORLD_GAIA_SCALE_ENV = 'SEVENTH_NX_WORLD_GAIA_SCALE'
+WORLD_GAIA_SPECIAL_ENV = 'SEVENTH_NX_WORLD_GAIA_SPECIAL_SCALES'
 
 
 def _world_gaia_scale(cap=None):
@@ -2618,8 +2753,103 @@ def _battle_enemy_report(mod_files, van, folder_of, log):
     return mod_files
 
 
+BATTLE_BG_SHARED_PAL_ENV = 'SEVENTH_NX_BATTLE_BG_SHARED_PALETTE'
+
+
+def _battle_bg_shared_palettes(mod_files, battle_bg_native_names, cap, log):
+    """{lowername: palette} so every tile of a stage quantises to the same one.
+
+    THE DEFECT. `tex.convert_for_battle` median-cuts each file on its own.
+    Two tiles of one battle background therefore get two unrelated 256-colour
+    ramps -- MEASURED on the shipped archive, adjacent tiles of stage 03
+    share between 0 and 12 of their 256 entries:
+
+        ojac vs ojad :  1/256      ojae vs ojaf :  0/256
+        ojaf vs ojag :  0/256      ojag vs ojah : 10/256
+
+    A sky gradient crossing that boundary lands on different colours either
+    side and steps at the seam. That is what the discontinuities in the sky
+    are, and they come from quantising the tiles SEPARATELY, not from
+    quantising at all. FFNx does not have the problem because it never
+    quantises -- it has an external texture loader and binds the mod's DDS
+    in truecolor. This port has no such loader, so the fix is to quantise
+    better rather than to stop.
+
+    `battle_bg_dds_map.json` already says which LGP entry each stage tile is
+    ("01_00": "ohac"), so the grouping is read from the same map the rest of
+    the background work uses rather than guessed from names.
+
+    Tiles whose stage is unknown, stages with a single tile, and every
+    non-background texture get no entry and keep the existing per-file
+    behaviour byte-identical -- an enemy skin has no neighbour to disagree
+    with.
+
+    Cost: one median cut and one lookup table per STAGE, not per tile.
+    """
+    if os.environ.get(BATTLE_BG_SHARED_PAL_ENV) == '0':
+        log('  battle backgrounds: shared stage palettes DISABLED '
+            f'({BATTLE_BG_SHARED_PAL_ENV}=0); tiles quantise independently '
+            'and the sky will step at every seam')
+        return {}
+    if not battle_bg_native_names:
+        return {}
+    try:
+        with open(os.path.join(HERE, 'battle_bg_dds_map.json')) as f:
+            tile_map = json.load(f)
+    except Exception as exc:                                   # noqa: BLE001
+        log(f'  ! battle bg palettes: cannot read battle_bg_dds_map.json '
+            f'({exc}); tiles keep their own palettes')
+        return {}
+    stage_of = {}
+    for key, entry in tile_map.items():
+        st = str(key).split('_')[0]
+        stage_of.setdefault(str(entry).lower(), st)
+    groups = {}
+    for low in mod_files:
+        if low not in battle_bg_native_names:
+            continue
+        st = stage_of.get(low) or stage_of.get(os.path.splitext(low)[0])
+        if st:
+            groups.setdefault(st, []).append(low)
+    out = {}
+    built = single = 0
+    for st, lows in sorted(groups.items()):
+        if len(lows) < 2:
+            single += 1
+            continue
+        sources = []
+        for low in sorted(lows):
+            try:
+                with open(mod_files[low][0], 'rb') as f:
+                    sources.append(f.read())
+            except OSError:
+                pass
+        try:
+            pal = tex.shared_palette(sources, max_colors=255)
+        except Exception as exc:                               # noqa: BLE001
+            log(f'  ! battle bg palettes: stage {st}: {exc}; '
+                'its tiles keep their own')
+            continue
+        if not pal:
+            continue
+        for low in lows:
+            out[low] = pal
+        built += 1
+    if built:
+        log(f'  battle backgrounds: {built} stage(s) now share ONE palette '
+            f'across their {len(out)} tile(s), and dither onto it. Adjacent '
+            'tiles were quantised independently before -- measured at 0-12 '
+            'shared entries out of 256 -- which is what made the sky step at '
+            f'every seam. Set {BATTLE_BG_SHARED_PAL_ENV}=0 to go back.')
+    if single:
+        log(f'  battle backgrounds: {single} stage(s) have one tile and are '
+            'unchanged (nothing to disagree with)')
+    return out
+
+
 def _convert_battle_textures(name, mod_files, van, log, folder_of=None,
-                             battle_bg_native_names=None):
+                             battle_bg_native_names=None,
+                             bg_palettes=None):
     """
     Replace truecolor TEX files headed for a battle archive with paletted
     conversions (see tex.py). Results are cached by source signature.
@@ -2639,6 +2869,7 @@ def _convert_battle_textures(name, mod_files, van, log, folder_of=None,
     os.makedirs(TEXCONV_CACHE, exist_ok=True)
     folder_of = folder_of or {}
     battle_bg_native_names = battle_bg_native_names or ()
+    bg_palettes = bg_palettes or {}
     bg_cap = None
     out = {}
     converted = 0
@@ -2687,7 +2918,16 @@ def _convert_battle_textures(name, mod_files, van, log, folder_of=None,
         #   v7  the reserved transparent entry carries the boundary colour
         #       instead of black, so filtering stops drawing a dark line
         #       along every atlas seam
-        cache_key = ('TEXCONV-V7-' + _sig(src) + f'-cap{cap}'
+        # The shared palette is part of what the pixels ARE, so it has
+        # to be part of the key. The V7 note above is this exact mistake
+        # made once already: a cap change that did not invalidate the cache
+        # and looked like a broken setting for a whole build.
+        shared_pal = bg_palettes.get(low)
+        pal_sig = ''
+        if shared_pal:
+            pal_sig = '-pal' + hashlib.sha1(
+                repr(shared_pal).encode()).hexdigest()[:12]
+        cache_key = ('TEXCONV-V7-' + _sig(src) + f'-cap{cap}' + pal_sig
                      + ('-' + _sig(van_path) if van_path else ''))
         cached = os.path.join(TEXCONV_CACHE,
                               f'{name}.{low}.{hashlib.sha1(cache_key.encode()).hexdigest()[:16]}')
@@ -2696,7 +2936,8 @@ def _convert_battle_textures(name, mod_files, van, log, folder_of=None,
             converted += 1
             continue
         try:
-            new, note = tex.convert_for_battle(data, van_data, cap=cap)
+            new, note = tex.convert_for_battle(data, van_data, cap=cap,
+                                               palette=shared_pal)
         except Exception as exc:
             log(f'  ! texconv {low}: {exc}; using original')
             out[low] = (src, mod)
@@ -2715,6 +2956,162 @@ def _convert_battle_textures(name, mod_files, van, log, folder_of=None,
     if bg_cap is not None and bg_cap != 256:
         log(f'  {name}: Avalanche Arisen battle background tiles capped at '
             f'{bg_cap}px (everything else stays at the proven 256px)')
+    return out
+
+
+def _normalise_tex_headers(name, mod_files, log):
+    """
+    Repair TEX header fields that contradict the file's own pixel data.
+
+    A TEX header describes the same pixel block from several angles, and
+    nothing in this tree ever checked that they agree. `tex.parse` enforces
+    the payload LENGTH against width * height * bytes_per_pixel, so a file
+    can never be the wrong size -- but a sibling field can still describe an
+    image that does not exist, and the port is free to believe whichever
+    field it reads.
+
+    Found by `audit_texheaders.py` against the shipped archives. Only three
+    files in the whole build are affected, all in char.lgp, all supplied by
+    a mod and passed through verbatim:
+
+        bpee.tex  brca.tex  ecda.tex
+        bits_per_pixel = 4   over an 8-bit indexed payload (bytes_per_pixel 1)
+        vanilla's own copies say 8
+
+    A loader that computes a row stride from bits_per_pixel reads these at
+    half width. Nothing else in any archive disagrees with itself: world_us,
+    magic and battle are clean, and battle's 117 oddities are Square's own --
+    present in vanilla, therefore not rules.
+
+    ONLY provably-contradictory fields are touched, and only to the value the
+    pixel data already implies. Anything a file gets right is left alone, and
+    a field that vanilla also gets "wrong" is not a defect -- Square shipped
+    it and the port reads it.
+    """
+    fixed = 0
+    out = {}
+    for low, (src, mod) in mod_files.items():
+        try:
+            with open(src, 'rb') as f:
+                data = f.read()
+        except OSError:
+            out[low] = (src, mod)
+            continue
+        t = tex.parse(data)
+        if t is None:
+            out[low] = (src, mod)
+            continue
+        bypp = t['bytes_per_pixel']
+        want = bypp * 8
+        have = struct.unpack_from('<I', data, tex.O_BITS_PER_PIXEL)[0]
+        if have == want:
+            out[low] = (src, mod)
+            continue
+        os.makedirs(TEXCAP_CACHE, exist_ok=True)
+        key = 'TEXHDR-V1-' + _sig(src)
+        cached = os.path.join(
+            TEXCAP_CACHE,
+            f'{name}.hdr.{low}.'
+            f'{hashlib.sha1(key.encode()).hexdigest()[:16]}')
+        if not os.path.exists(cached):
+            fixed_bytes = bytearray(data)
+            struct.pack_into('<I', fixed_bytes, tex.O_BITS_PER_PIXEL, want)
+            with open(cached, 'wb') as f:
+                f.write(bytes(fixed_bytes))
+        out[low] = (cached, mod)
+        fixed += 1
+        log(f'  texhdr {low}: bits_per_pixel {have} -> {want} '
+            f'(payload is {bypp} byte(s) per pixel)')
+    if fixed:
+        log(f'  {name}: {fixed} TEX header(s) repaired -- a field that '
+            'contradicted the file\'s own pixel data. audit_texheaders.py '
+            'finds these.')
+    return out
+
+
+def _cap_battle_textures(name, mod_files, log, max_dim):
+    """
+    A HARD size ceiling over EVERY texture headed for battle.lgp.
+
+    `_convert_battle_textures` carries a cap, but it is a parameter of the
+    converter and the converter has two early-outs that run before the cap is
+    ever consulted:
+
+        'main' in opt.lower()        -> player-character skins, EXEMPT
+        not tex.is_unpaletted(data)  -> already-paletted mod art, passes
+
+    Both exemptions are about FORMAT and both are correct about format.
+    Neither was meant to exempt a file from SIZE, but because the cap lived
+    inside the converter rather than beside it, that is what they did.
+    Measured on the shipped archive (`audit_texheaders.py`): 610 textures
+    over 256px, 32 of them ABOVE the configured 768 ceiling, including
+    player skins at 1024x1024 replacing vanilla slots of 64x64 and 128x64.
+    Vanilla battle.lgp has zero textures over 256px.
+
+    `char.lgp` and `world_us.lgp` never had this hole because they cap
+    through `_cap_field_textures`, which is a pass over every file rather
+    than an argument to a converter. This is that same pass for battle.
+
+    FORMAT IS PRESERVED EXACTLY. `tex.cap_dimensions` resamples in place:
+    paletted stays paletted with the same palette and entry count, truecolor
+    stays truecolor at the same bit depth, and only width/height/pitch move.
+    That is what makes it safe to apply to the player skins whose exemption
+    from the CONVERTER exists because the players-only build is proven
+    pixel-perfect as shipped -- nothing here requantises anything.
+
+    Runs AFTER the converter so it sees final pixels, and it is idempotent:
+    a file already within the ceiling is returned untouched.
+    """
+    import ff7nx_battlecap
+    if not max_dim:
+        return mod_files
+    os.makedirs(TEXCAP_CACHE, exist_ok=True)
+    out = {}
+    capped = 0
+    biggest_before = 0
+    for low, (src, mod) in mod_files.items():
+        try:
+            with open(src, 'rb') as f:
+                data = f.read()
+        except OSError:
+            out[low] = (src, mod)
+            continue
+        t = tex.parse(data)
+        if t is None:
+            out[low] = (src, mod)
+            continue
+        biggest_before = max(biggest_before, t['width'], t['height'])
+        # BATTLECAP-V1 -- bump when cap_dimensions' pixels change for an
+        # input it has already seen, exactly as TEXCONV-Vn does.
+        cache_key = f'BATTLECAP-V1-{max_dim}-' + _sig(src)
+        cached = os.path.join(
+            TEXCAP_CACHE,
+            f'{name}.battle.{low}.'
+            f'{hashlib.sha1(cache_key.encode()).hexdigest()[:16]}')
+        if os.path.exists(cached):
+            out[low] = (cached, mod)
+            capped += 1
+            continue
+        try:
+            new, note = tex.cap_dimensions(data, max_dim)
+        except Exception as exc:                               # noqa: BLE001
+            log(f'  ! battlecap {low}: {exc}; using original')
+            out[low] = (src, mod)
+            continue
+        if new is None:
+            out[low] = (src, mod)          # already within the ceiling
+            continue
+        with open(cached, 'wb') as f:
+            f.write(new)
+        out[low] = (cached, mod)
+        capped += 1
+    if capped:
+        log(f'  {name}: {capped} texture(s) brought under a HARD {max_dim}px '
+            f'ceiling (largest source was {biggest_before}px). This applies '
+            'to player skins and already-paletted mod art too -- both were '
+            'exempt from the converter, and therefore from its cap. Format '
+            'is preserved exactly; only the dimensions change. Set '
+            f'{ff7nx_battlecap.CEILING_ENV}=0 to disable.')
     return out
 
 
@@ -5523,9 +5920,20 @@ def _build_model_archive(name, archive_path, mod_files, romfs, pack_lgp,
                                                  log)
     if (name in ('battle.lgp', 'magic.lgp')
             and os.environ.get('SEVENTH_NX_NO_TEXCONV') != '1'):
+        _bg_pals = (_battle_bg_shared_palettes(
+            mod_files, battle_bg_native_names, _battle_bg_tex_cap(), log)
+            if name == 'battle.lgp' else {})
         mod_files = _convert_battle_textures(
             name, mod_files, van, log, folder_of,
-            battle_bg_native_names=battle_bg_native_names)
+            battle_bg_native_names=battle_bg_native_names,
+            bg_palettes=_bg_pals)
+    # The ceiling is a separate pass on purpose: the converter's format
+    # exemptions must not be size exemptions. See _cap_battle_textures.
+    if name == 'battle.lgp':
+        import ff7nx_battlecap
+        _ceil = ff7nx_battlecap.ceiling(_battle_bg_tex_cap())
+        if _ceil:
+            mod_files = _cap_battle_textures(name, mod_files, log, _ceil)
 
     # FFNx/Cosmos Gaia ships world replacements as loose DDS files.  The
     # Switch has no external-texture loader, so convert the narrowly-routed
@@ -5538,6 +5946,7 @@ def _build_model_archive(name, archive_path, mod_files, romfs, pack_lgp,
     # Opt-in only (see FIELD_TEX_CAP_ENV above) -- disabled by default, so
     # a build with nothing set behaves exactly as before this was added.
     if name in ('char.lgp', 'world_us.lgp'):
+        mod_files = _normalise_tex_headers(name, mod_files, log)
         mod_files = _drop_stray_model_parts(name, mod_files, van, log)
         _field_model_report(name, mod_files, van, log)
         # world_us.lgp has its own cap. Vanilla's largest world texture is
@@ -5698,9 +6107,20 @@ def _build_inplace_archive(name, archive_path, mod_files, romfs, log,
     if (name in ('battle.lgp', 'magic.lgp')
             and os.environ.get('SEVENTH_NX_NO_TEXCONV') != '1'):
         van = vanilla_unpack(name, archive_path, log)
+        _bg_pals = (_battle_bg_shared_palettes(
+            mod_files, battle_bg_native_names, _battle_bg_tex_cap(), log)
+            if name == 'battle.lgp' else {})
         mod_files = _convert_battle_textures(
             name, mod_files, van, log, folder_of,
-            battle_bg_native_names=battle_bg_native_names)
+            battle_bg_native_names=battle_bg_native_names,
+            bg_palettes=_bg_pals)
+    # The ceiling is a separate pass on purpose: the converter's format
+    # exemptions must not be size exemptions. See _cap_battle_textures.
+    if name == 'battle.lgp':
+        import ff7nx_battlecap
+        _ceil = ff7nx_battlecap.ceiling(_battle_bg_tex_cap())
+        if _ceil:
+            mod_files = _cap_battle_textures(name, mod_files, log, _ceil)
     archive = lgp.Archive(archive_path)
     payloads = {}
     new_names = []
@@ -7565,10 +7985,12 @@ def apply_plan(plan, archive_paths, sdout, log=lambda *_: None,
     # GUI process cannot inherit the previous build's patch.
     if plan.world_dds_native_names:
         os.environ[WORLD_GAIA_SCALE_ENV] = str(_world_gaia_scale())
+        os.environ.pop(WORLD_GAIA_SPECIAL_ENV, None)
         log('Gaia native world scale: %sx (archive and terrain UV correction)'
             % os.environ[WORLD_GAIA_SCALE_ENV])
     else:
         os.environ.pop(WORLD_GAIA_SCALE_ENV, None)
+        os.environ.pop(WORLD_GAIA_SPECIAL_ENV, None)
 
     model_targets = sorted(a for a in plan.archive_files if a != 'flevel.lgp')
     flevel_fields = plan.archive_files.get('flevel.lgp', {})
@@ -7596,9 +8018,30 @@ def apply_plan(plan, archive_paths, sdout, log=lambda *_: None,
             name, archive_paths[name], plan.archive_files[name],
             (sorted((plan.folder_of.get(name) or {}).items()),
              sorted(plan.battle_bg_native_names or ())))
-        hit, _ = _archive_cache_ok(name, dest_path, fp, log)
+        hit, payload = _archive_cache_ok(name, dest_path, fp, log)
         if hit:
             produced.append(dest_path)
+            # Restore the side effect the skipped build would have set.
+            #
+            # _convert_world_dds publishes the per-sprite UV factors through
+            # WORLD_GAIA_SPECIAL_ENV, and ff7nx_gaia turns those into the
+            # exefs/main correction that tells the renderer how much bigger
+            # each Gaia sprite is than its native slot. A cache hit skips the
+            # conversion, so without this the variable is simply absent: the
+            # module still gets the TERRAIN correction (its scale comes from
+            # settings, not from the conversion) while the archive still holds
+            # 512x128 clouds, a 768x384 meteor and a 256x256 shadow that are
+            # then sampled with native-size UVs.
+            #
+            # That is build 184: clouds tiled into hard panels, the meteor
+            # sampled entirely off-texture and invisible, the shadow reduced
+            # to a shapeless corner of itself. The archive was right and the
+            # module was wrong about it.
+            if name == 'world_us.lgp':
+                if payload:
+                    os.environ[WORLD_GAIA_SPECIAL_ENV] = payload
+                else:
+                    os.environ.pop(WORLD_GAIA_SPECIAL_ENV, None)
             continue
         log(f'building {name} ...')
         dest = _build_model_archive(name, archive_paths[name],
@@ -7608,7 +8051,10 @@ def apply_plan(plan, archive_paths, sdout, log=lambda *_: None,
                                     plan.battle_bg_native_names)
         if dest:
             produced.append(dest)
-            _archive_cache_store(name, dest, fp)
+            _archive_cache_store(
+                name, dest, fp,
+                os.environ.get(WORLD_GAIA_SPECIAL_ENV, '')
+                if name == 'world_us.lgp' else '')
 
     if do_flevel and not reuse_flevel:
         progress(step, total, 'flevel.lgp')
@@ -7931,8 +8377,97 @@ def apply_widescreen(sdout, dump, log=lambda *_: None, produced=()):
     return [dest] if not built else []
 
 
+def _verify_gaia_sprite_uv_agrees_with_archive(sdout, log=lambda *_: None):
+    """Refuse to patch the module against an archive it does not describe.
+
+    The UV correction and the archive are ONE change. The module says how much
+    bigger each Gaia sprite is than its native slot; the archive is what is
+    actually that size. Ship one without the other and the renderer samples a
+    fraction of each texture: build 184's clouds tiled into hard panels, its
+    meteor sampled entirely off-texture and vanished, its shadow collapsed to
+    a shapeless corner -- all because an archive cache hit skipped the
+    conversion and with it the sprite scales, while the terrain correction
+    (whose scale comes from settings) went out anyway.
+
+    So compare the two directly, every build. Any sprite the shipped
+    world_us.lgp has ENLARGED must have a matching declared factor.
+    """
+    dest = os.path.join(sdout, 'atmosphere', 'contents', TITLE_ID, ROMFS,
+                        ARCHIVES['world_us.lgp'])
+    if not os.path.isfile(dest):
+        return
+    declared = ff7nx_gaia.special_scales()
+    try:
+        shipped = _lgp_entry_sizes(dest, WORLD_GAIA_SPECIAL_TEXTURES)
+    except Exception as exc:                                  # noqa: BLE001
+        log('  ! Gaia sprite UV check skipped: %s' % exc)
+        return
+    missing = []
+    for low, (w, h) in sorted(shipped.items()):
+        stem = low[:-4]
+        nat = _WORLD_NATIVE_SPRITE_SIZE.get(low)
+        if nat is None:
+            continue
+        if (w, h) == nat:
+            continue                       # not enlarged, needs no correction
+        # Only the object_uv sprites carry pixel-space UVs that scale with the
+        # texture. The rest (radar, the two minimap layers, both snow sheets)
+        # are sampled through normalized 1/256 constants, so enlarging them
+        # needs no module change and publishing no factor for them is correct.
+        if not (WORLD_GAIA_SPECIAL_TEXTURES.get(low) or {}).get('object_uv'):
+            continue
+        if stem not in declared:
+            missing.append('%s is %dx%d in the archive (native %dx%d) but no '
+                           'UV factor was published' % (low, w, h, *nat))
+    if missing:
+        raise RuntimeError(
+            'Gaia sprite UV correction disagrees with the archive that '
+            'shipped:\n    ' + '\n    '.join(missing) +
+            '\n  The module and world_us.lgp are one change and must be '
+            'built together. Re-run with %s=1 to force the archive (and its '
+            'sprite scales) to be rebuilt.' % NO_ARCHIVE_CACHE_ENV)
+    if declared:
+        log('  Gaia sprite UV factors agree with the shipped archive (%s)'
+            % ', '.join('%s %gx/%gy' % (k, v[0], v[1])
+                        for k, v in sorted(declared.items())))
+
+
+# Native dimensions of every sprite the Gaia converter may enlarge, measured
+# from vanilla world_us.lgp. Used only to tell "enlarged" from "unchanged".
+_WORLD_NATIVE_SPRITE_SIZE = {
+    'wm_kumo.tex': (256, 64),
+    'meteo.tex': (256, 64),
+    'shadow.tex': (64, 64),
+    'map.tex': (128, 64),
+    'midlmap.tex': (64, 64),
+    'midlmap2.tex': (64, 64),
+    'radar.tex': (128, 128),
+    'snow4.tex': (256, 256),
+    'snow5.tex': (256, 256),
+}
+
+
+def _lgp_entry_sizes(path, wanted):
+    """{name: (w, h)} for the wanted TEX entries of an LGP."""
+    with open(path, 'rb') as f:
+        data = f.read()
+    count = struct.unpack('<I', data[12:16])[0]
+    out = {}
+    for i in range(count):
+        entry = 16 + i * 27
+        low = data[entry:entry + 20].split(b'\0')[0].decode('latin1').lower()
+        if low not in wanted:
+            continue
+        off = struct.unpack('<I', data[entry + 20:entry + 24])[0]
+        size = struct.unpack('<I', data[off + 20:off + 24])[0]
+        parsed = tex.parse(data[off + 24:off + 24 + size])
+        if parsed:
+            out[low] = (parsed['width'], parsed['height'])
+    return out
+
+
 def apply_gaia_world_uv(sdout, dump, log=lambda *_: None, produced=()):
-    """Pair Gaia's uniformly enlarged TEX files with their mesh UV scale.
+    """Pair Gaia TEX files with terrain and sprite UV corrections.
 
     This follows the same no-clobber composition rule as every other module
     pass: use the module produced earlier in THIS build, or a stock dump, and
@@ -7945,14 +8480,15 @@ def apply_gaia_world_uv(sdout, dump, log=lambda *_: None, produced=()):
             'Gaia world UV correction needs exefs/main from a full game '
             'dump. The build was stopped rather than emitting enlarged '
             'terrain TEX files with uncorrected native UVs.')
+    _verify_gaia_sprite_uv_agrees_with_archive(sdout, log)
     dest = os.path.join(sdout, 'atmosphere', 'contents', TITLE_ID, 'exefs',
                         'main')
     fresh = {os.path.normpath(os.path.abspath(p)) for p in produced}
     built = os.path.normpath(os.path.abspath(dest)) in fresh
     src = dest if built else dump.nso
     log('')
-    log('applying Cosmos Gaia native world UV correction (%sx) ...'
-        % ff7nx_gaia.scale())
+    log('applying Cosmos Gaia native world UV correction '
+        '(terrain %sx; renderer-aware sprites) ...' % ff7nx_gaia.scale())
     if not built and os.path.exists(dest):
         try:
             same = (os.path.getsize(dest) == os.path.getsize(dump.nso)
@@ -7977,6 +8513,9 @@ def apply_gaia_world_uv(sdout, dump, log=lambda *_: None, produced=()):
     os.replace(tmp, dest)
     log('  all three U and three V coordinates now cover the complete Gaia '
         'texture instead of stretching its upper-left crop')
+    if ff7nx_gaia.special_scales():
+        log('  Gaia cloud, meteor, map-marker, and shadow sprites use their '
+            'own capped X/Y texture factors')
     return [dest] if not built else []
 
 
@@ -8150,6 +8689,290 @@ def apply_heap(sdout, dump, log=lambda *_: None, produced=()):
         'to 2 MB -- so this is not competing with a fixed reservation. If '
         'it ever does not fit, map_region aborts at +0x10FB580 on boot '
         'rather than corrupting anything.')
+    return [dest] if not built else []
+
+
+def apply_gfxpool(sdout, dump, log=lambda *_: None, produced=()):
+    """
+    Raise the GRAPHICS pool the port hardcoded at 256 MB.
+
+    NOT the guest heap. `apply_heap` above sizes the Win32 `HeapAlloc` arena
+    FF7's own code allocates pixels out of; this sizes the block handed to
+    `nv::InitializeGraphics` at module +0x113BD7C, which is where the NVN/GL
+    driver puts everything the GPU has to read -- textures, render targets,
+    vertex and command memory. The two are independent, and every texture
+    ceiling this project raised lands on THIS one:
+
+      * `apply_field_frame`'s own log line has said so for a hundred builds
+        -- "field render targets: 28.12 MB (8 of them), +25.78 MB vs stock
+        ... that comes out of the same pool the field background PAGES
+        allocate from";
+      * a 768px truecolor page is 3.38 MB of surface against a vanilla
+        paletted page's 0.31 MB;
+      * plus the 768px world cap, the 512px char cap and the 768px battle
+        background cap.
+
+    None of that existed in the game the port reserved 256 MB for, and this
+    repository has never touched the number. `ff7nx_gfxpool` has the
+    disassembly, the PLT/`.rela.plt` symbol resolution that names the call,
+    and an honest account of what this does and does not claim: it is a
+    LEVER on the end-of-frame fault in the crash reports, not a diagnosis of
+    it. FINDINGS-302.
+
+    Runs immediately after `apply_heap`, for the same reason `apply_heap`
+    runs last: it edits `exefs/main`, so it must see what every earlier pass
+    wrote. It shares no site, no cave and no padding hole with anything --
+    two in-place immediates at +0x113BD70 and +0x113BD78, both arguments
+    that are dead until the instruction that sets them.
+
+    Off (= the port's 256 MB) is a legitimate setting and writes nothing.
+    The failure mode of asking for too much is loud and immediate: the
+    malloc returns NULL, `nv::InitializeGraphics(NULL, n)` aborts, and the
+    game does not boot. `patch_gfxpool_sdout.py --stock` reverts it in one
+    command with no rebuild.
+    """
+    import ff7nx_gfxpool
+    mb = ff7nx_gfxpool.pool_mb()
+    if mb == ff7nx_gfxpool.STOCK_MB:
+        return []
+    why = ff7nx_gfxpool.encodable(mb)
+    if why:
+        log(f'! graphics pool: {mb} MB cannot be written -- {why}')
+        return []
+    if dump is None or not dump.nso:
+        log('! graphics pool: needs exefs/main from a full game dump; '
+            'skipped')
+        return []
+    dest = os.path.join(sdout, 'atmosphere', 'contents', TITLE_ID, 'exefs',
+                        'main')
+    fresh = {os.path.normpath(os.path.abspath(p)) for p in produced}
+    built = os.path.normpath(os.path.abspath(dest)) in fresh
+    src = dest if built else dump.nso
+    log('')
+    log(f'raising the graphics pool {ff7nx_gfxpool.STOCK_MB} -> {mb} MB ...')
+    if not built and os.path.exists(dest):
+        try:
+            same = (os.path.getsize(dest) == os.path.getsize(dump.nso)
+                    and open(dest, 'rb').read() == open(dump.nso, 'rb').read())
+        except OSError:
+            same = False
+        if not same:
+            log(f'! graphics pool: {dest}')
+            log('  already holds a module this build did not produce -- most '
+                'likely a patched one from an earlier run. Basing on the '
+                "dump's stock copy would silently throw those patches away, "
+                'so nothing was written.')
+            log('  Turn the 60 FPS switch on so the passes run together, or '
+                'delete sdout/ and rebuild.')
+            return []
+    log(f'  base main   {src}'
+        + ('   (previous patch output)' if built else '   (from dump)'))
+    tmp = dest + '.gfxpool-tmp'
+    if not ff7nx_gfxpool.apply_to_nso(src, tmp, log, mb):
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        # Unlike apply_heap this one is harmless on failure: no archive was
+        # built to match it. The module simply keeps the port's 256 MB,
+        # which is the behaviour every build before this pass shipped.
+        if ff7nx_gfxpool.read_mb(src) != mb:
+            log('  the module keeps the port\'s 256 MB. Nothing else in the '
+                'build depends on this setting, so the SD tree is still '
+                'valid -- it is just the build every earlier one was.')
+        return []
+    os.replace(tmp, dest)
+    return [dest] if not built else []
+
+
+def apply_glerror(sdout, dump, log=lambda *_: None, produced=()):
+    """
+    Keep the port's OpenGL reporter and drain, but remove its fatal trap.
+
+    THE ONE THAT WAS ACTUALLY IT. Nine crash reports over six days, every
+    one byte-identical at every module offset, in fields and on the world
+    map, with any party leader, and unaffected by the guest heap (64 -> 256
+    MB) or the graphics pool (256 -> 384 MB). Confirmed fixed on hardware
+    2026-08-27; FINDINGS-303 has the derivation.
+
+    The frame chain in every report ended at `gfx_drv_flip +0x10DAB58`,
+    which is the call to the renderer's vtable slot `+0x40`. That method
+    TAIL-CALLS `+0x113C6A0`, and a tail call pushes no frame -- so the
+    reports were pointing at the flip while the fault was one function
+    further on, in a debug OpenGL error reporter left in a retail build.
+
+    Thirteen wrappers in `UtilityPlatform.cpp` share it, each shaped
+
+        bl  <some GL entry point>
+        bl  glGetError
+        cbz w0, <skip>          ; the gate
+        ... format and log, through a lazily-built std::map ...
+
+    The original diagnostic path logs an error, executes a deliberate UDF,
+    then calls `glGetError` again in a loop to drain the driver's error
+    state. Builds 187/188 incorrectly replaced the FIRST `glGetError` call
+    with `mov w0, wzr`. That avoided the UDF but also bypassed the logger and
+    drain, converting the crash into persistent cross-mode rendering
+    corruption.
+
+    `ff7nx_glerror` restores every legacy gate to its stock `bl glGetError`
+    and replaces only the deliberate UDF with NOP. Clean frames are byte-for-
+    byte equivalent until the never-taken error path. Error frames log and
+    fully drain, then converge at the same address as the stock no-error
+    branch instead of terminating the process.
+
+    Runs after `apply_gfxpool` on its output, by the same rule every module
+    pass follows: whoever edits `exefs/main` last has to see what everyone
+    else wrote. In-place words only, no cave, no padding hole, and
+    no archive built to match it -- so a failure here leaves a completely
+    valid SD tree.
+
+    `ff7nx_glerror.MODE` is a CODE CONSTANT, not a GUI setting, for the same
+    reason `ff7nx_heap.NO_HEAP_DUMP` is: there is no build anyone would want
+    in which a debug reporter is allowed to kill the game. `off` and `all`
+    exist for controlled A/B work (`SEVENTH_NX_GL_ERROR_MODE`), not as a
+    quality or memory setting.
+    """
+    import ff7nx_glerror
+    m = ff7nx_glerror.mode()
+    if m == 'off':
+        log('')
+        log('! OpenGL error reporter: LEFT LIVE '
+            f'({ff7nx_glerror.MODE_ENV}=off). That is the configuration '
+            'that crashed nine times in six days -- see FINDINGS-303.')
+        return []
+    if dump is None or not dump.nso:
+        log('! OpenGL error reporter: needs exefs/main from a full game '
+            'dump; skipped')
+        return []
+    dest = os.path.join(sdout, 'atmosphere', 'contents', TITLE_ID, 'exefs',
+                        'main')
+    fresh = {os.path.normpath(os.path.abspath(p)) for p in produced}
+    built = os.path.normpath(os.path.abspath(dest)) in fresh
+    src = dest if built else dump.nso
+    log('')
+    log('making the end-of-frame GL reporter non-fatal (check/log/drain kept) ...')
+    if not built and os.path.exists(dest):
+        try:
+            same = (os.path.getsize(dest) == os.path.getsize(dump.nso)
+                    and open(dest, 'rb').read() == open(dump.nso, 'rb').read())
+        except OSError:
+            same = False
+        if not same:
+            log(f'! OpenGL error reporter: {dest}')
+            log('  already holds a module this build did not produce -- most '
+                'likely a patched one from an earlier run. Basing on the '
+                "dump's stock copy would silently throw those patches away, "
+                'so nothing was written.')
+            log('  Turn the 60 FPS switch on so the passes run together, or '
+                'delete sdout/ and rebuild.')
+            return []
+    log(f'  base main   {src}'
+        + ('   (previous patch output)' if built else '   (from dump)'))
+    tmp = dest + '.glerror-tmp'
+    if not ff7nx_glerror.apply_to_nso(src, tmp, log, m):
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        st = ff7nx_glerror.read_state(src)
+        if not (st and st[0] == len(ff7nx_glerror.gates_for(m))):
+            log('! OpenGL error reporter: FAILED -- legacy gate suppression '
+                'was not safely migrated and the non-fatal drain behavior '
+                'was not installed. Fix the cause above before testing.')
+        return []
+    os.replace(tmp, dest)
+    return [dest] if not built else []
+
+
+def apply_texcache(sdout, dump, log=lambda *_: None, produced=()):
+    """
+    Stop the port's texture cache from hoarding surfaces nothing will draw.
+
+    THE LEAK. `gfx_free_texture` (+0x42D0) does not destroy a texture. It
+    parks it in a multimap keyed on the surface's (width, height) and nothing
+    else, capped at ten per key, and a later creation of the SAME pixel
+    dimensions adopts it (+0x4620, hit at +0x47AC). The tree root and size
+    (`table+0x2078`, `+0x2080`) are written in exactly three places in the
+    module -- the constructor, that insert, and that erase -- so the only way
+    a cached surface is ever released is for the game to create another
+    texture of identical dimensions. Leave an area whose sizes you never
+    revisit and its surfaces stay resident for the rest of the session.
+
+    Bounded, not infinite: ten per distinct (w, h). Fine for the game it was
+    written for. Counted off the archives (`ff7nx_texcache --census`):
+
+        battle   vanilla   8.3 MB  ->  BUILT  135.8 MB
+        char     vanilla   4.1 MB  ->  BUILT   16.4 MB
+        world    vanilla   4.1 MB  ->  BUILT   14.4 MB
+        TOTAL   vanilla  16.5 MB  ->  BUILT  166.5 MB   (pool: 256 MB)
+
+    This mod does not only make textures bigger, it spreads them over more
+    distinct sizes -- battle goes 17 keys -> 32 -- and the bound is PER KEY,
+    so both axes multiply.
+
+    That matches the reported symptom in a way nothing else has: the
+    framerate SAGS as you play rather than falling off a cliff, corruption
+    arrives only after enough places have been visited, walking back and
+    forth heals it (a matching create consumes a corpse), and the graphics
+    pool size barely moves it in either direction -- 128, 256 and 384 MB all
+    get filled by the same 166 MB, only the time changes.
+
+    The patch is one word: the `b.hi` at +0x4364 that skips caching once a
+    key holds ten becomes unconditional, so `free` always destroys. That
+    destroy path is not new code -- it is the branch the stock game already
+    takes every time a key fills, and it releases both surfaces, nulls both
+    pointers, frees the container and clears the slot (+0x43D4..+0x4430).
+    With nothing ever inserted the tree stays empty, so the creator's lookup
+    always misses and every texture is made fresh.
+
+    DEFAULT OFF. The mechanism is measured and the branch is well-trodden,
+    which makes this far better supported than the graphics pool ever was --
+    and the graphics pool was also believed on good grounds, shipped as a
+    default, and became the baseline three builds of evidence were collected
+    through (FINDINGS-304 §6). One switch, thrown deliberately, with a before
+    and an after.
+
+    Runs after `apply_glerror` on its output, by the rule every module pass
+    follows: whoever edits `exefs/main` last has to see what everyone else
+    wrote. One in-place word, no cave, no archive built to match it.
+    """
+    import ff7nx_texcache
+    m = ff7nx_texcache.mode()
+    if m != 'nocache':
+        return []
+    if dump is None or not dump.nso:
+        log('! texture cache: needs exefs/main from a full game dump; skipped')
+        return []
+    dest = os.path.join(sdout, 'atmosphere', 'contents', TITLE_ID, 'exefs',
+                        'main')
+    fresh = {os.path.normpath(os.path.abspath(p)) for p in produced}
+    built = os.path.normpath(os.path.abspath(dest)) in fresh
+    src = dest if built else dump.nso
+    log('')
+    log('disabling the texture cache (free() destroys instead of hoarding) ...')
+    if not built and os.path.exists(dest):
+        try:
+            same = (os.path.getsize(dest) == os.path.getsize(dump.nso)
+                    and open(dest, 'rb').read() == open(dump.nso, 'rb').read())
+        except OSError:
+            same = False
+        if not same:
+            log(f'! texture cache: {dest}')
+            log('  already holds a module this build did not produce -- most '
+                'likely a patched one from an earlier run. Basing on the '
+                "dump's stock copy would silently throw those patches away, "
+                'so nothing was written.')
+            log('  Turn the 60 FPS switch on so the passes run together, or '
+                'delete sdout/ and rebuild.')
+            return []
+    log(f'  base main   {src}'
+        + ('   (previous patch output)' if built else '   (from dump)'))
+    tmp = dest + '.texcache-tmp'
+    if not ff7nx_texcache.apply_to_nso(src, tmp, log, m):
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        if ff7nx_texcache.read_state(src) != 'nocache':
+            log('! texture cache: FAILED -- the cache is still live. Fix the '
+                'cause above before testing.')
+        return []
+    os.replace(tmp, dest)
     return [dest] if not built else []
 
 

@@ -757,6 +757,43 @@ FIELD_BUF_CHOICES = [
 FIELD_BUF_LABELS = dict(FIELD_BUF_CHOICES)
 FIELD_BUF_BY_LABEL = {v: k for k, v in FIELD_BUF_CHOICES}
 
+# The GRAPHICS pool -- nv::InitializeGraphics at module +0x113BD7C.
+#
+# Read the note above on the field render target: "out of the same pool the
+# field background PAGES allocate from". THIS is that pool, and until now
+# nothing in this build had a way to make it bigger. It is not the guest
+# heap; the heap holds FF7's own pixel buffers and is raised separately by
+# ff7nx_heap. This one is the GL driver's, and it holds the textures, the
+# render targets, the vertex buffers and the command memory.
+#
+# 256 MB is what the port shipped. What this build asks of it that the
+# stock game did not: +25.78 MB of permanent field render target at 3x,
+# 768px truecolor field pages at 3.38 MB apiece against vanilla's 0.31 MB,
+# a 768px world texture cap, a 512px char cap and a 768px battle background
+# cap.
+#
+# See FINDINGS-302 for what the crash reports do and do not establish.
+GFX_POOL_CHOICES = [
+    (128, '128 MB — −128  ⚗ diagnostic: may not boot'),
+    (160, '160 MB — −96   ⚗ diagnostic: may not boot'),
+    (192, '192 MB — −64   ⚗ diagnostic: THE used-extent A/B'),
+    (224, '224 MB — −32   ⚗ diagnostic'),
+    (256, '256 MB — stock. LEAVE IT HERE (raising it corrupts textures)'),
+    (320, '320 MB — +64   ⚠ causes texture corruption'),
+    (384, '384 MB — +128  ⚠ causes texture corruption'),
+    (448, '448 MB — +192  ⚠ causes texture corruption'),
+    (512, '512 MB — +256  ⚠ causes texture corruption'),
+]
+GFX_POOL_LABELS = dict(GFX_POOL_CHOICES)
+GFX_POOL_BY_LABEL = {v: k for k, v in GFX_POOL_CHOICES}
+# Spelled out here rather than imported at module scope so this file keeps
+# importing cleanly on a machine where the project modules are not on the
+# path yet; the two places that use it check it against ff7nx_gfxpool.
+_HEADLESS_GFX_ENV = 'SEVENTH_NX_GFX_POOL_MB'
+# Same reason as above: spelled out rather than imported at module scope, and
+# checked against ff7nx_texcache.MODE_ENV by test_texcache.py.
+_HEADLESS_TEXCACHE_ENV = 'SEVENTH_NX_TEX_CACHE'
+
 # The background scaler and the full-screen AA. Both are PIXEL shaders the
 # port already loads from romfs; these are drop-in replacements that used to
 # have to be copied onto the card by hand. See ff7nx_shaders.py.
@@ -1049,6 +1086,27 @@ def run_build(mods, enabled, settings_by_mod, log, progress,
     # Cosmos art coverage and 512px backgrounds; ff7nx_heap.HEAP_MB is the
     # setting, and it is a CODE CONSTANT, not an environment variable.
     produced += build.apply_heap(SDOUT_DIR, DUMP, log, produced)
+    # The GRAPHICS pool, immediately after it and on its output. A different
+    # pool entirely -- nv::InitializeGraphics at +0x113BD7C, where the GL
+    # driver keeps textures and render targets -- and the one every texture
+    # ceiling this project raised actually lands on. Two in-place immediates,
+    # no cave, no archive built to match it, so it is safe to sit last.
+    # FINDINGS-302; the setting is the Graphics memory dropdown.
+    produced += build.apply_gfxpool(SDOUT_DIR, DUMP, log, produced)
+    # THE END-OF-FRAME CRASH FIX. Last module pass, on everything above it.
+    # The port's OpenGL error reporter -- debug code left in a retail build --
+    # is what nine identical crash reports were actually dying in; the frame
+    # chain pointed at gfx_drv_flip because the reporter is reached by a TAIL
+    # call and inherits its return address. Thirteen in-place immediates, no
+    # cave, no archive. Not a GUI setting: it is a defect fix, like
+    # ff7nx_heap's NO_HEAP_DUMP. FINDINGS-303.
+    produced += build.apply_glerror(SDOUT_DIR, DUMP, log, produced)
+    # The texture-cache leak. free() parks surfaces in a (w,h)-keyed multimap
+    # that nothing but a same-size create ever empties -- 16.5 MB of dead
+    # weight in vanilla, 166.5 MB in this build, out of a 256 MB pool. One
+    # word, and DEFAULT OFF: the mechanism is measured but the graphics pool
+    # was believed on good grounds too. FINDINGS-306.
+    produced += build.apply_texcache(SDOUT_DIR, DUMP, log, produced)
     # The custom PIXEL shader sets (background scaler, FXAA). These touch no
     # module at all, so they can go anywhere -- but they must go BEFORE
     # prune_stale, because that is what deletes them again when the setting
@@ -1536,6 +1594,8 @@ def launch_ui():
     m30_var = tk.BooleanVar(value=bool(global_saved.get('movie_30fps', False)))
     a360_var = tk.BooleanVar(value=bool(global_saved.get('analog_360', False)))
     norun_var = tk.BooleanVar(value=bool(global_saved.get('no_autorun', False)))
+    texcache_var = tk.BooleanVar(
+        value=bool(global_saved.get('no_texture_cache', False)))
     # REMOVED: bgclr_var ('bg_clear', "Black 16:9 margins") and mclip_var
     # ('movie_clip', "Clip models to the movie"). Both retired -- FINDINGS-92
     # §6. A stale key left in settings.json by an older build is ignored: the
@@ -1611,6 +1671,24 @@ def launch_ui():
     def current_field_buffer():
         return FIELD_BUF_BY_LABEL.get(fbuf_var.get(),
                                       build.ff7nx_fieldbuf.DEFAULT_SCALE)
+
+    # The graphics pool. Same shape as the field buffer above: an unknown
+    # saved value falls back to the largest offered entry that is not
+    # greater than it, never silently to something bigger than what was
+    # saved -- a memory reservation must not grow behind your back.
+    import ff7nx_gfxpool as _gfxpool
+    gfx_saved = global_saved.get('gfx_pool_mb', _gfxpool.DEFAULT_MB)
+    try:
+        gfx_saved = int(gfx_saved)
+    except (TypeError, ValueError):
+        gfx_saved = _gfxpool.DEFAULT_MB
+    if gfx_saved not in GFX_POOL_LABELS:
+        gfx_saved = max((v for v in GFX_POOL_LABELS if v <= gfx_saved),
+                        default=_gfxpool.STOCK_MB)
+    gfx_var = tk.StringVar(value=GFX_POOL_LABELS[gfx_saved])
+
+    def current_gfx_pool():
+        return GFX_POOL_BY_LABEL.get(gfx_var.get(), _gfxpool.DEFAULT_MB)
 
     scaler_saved = global_saved.get('scaler', '')
     if scaler_saved not in SCALER_LABELS:
@@ -1737,6 +1815,48 @@ def launch_ui():
              'budget or come back to 1× if you see that.\n\n'
              'Only does anything with “16:9 widescreen” selected above. '
              'See HANDOFF-51.', True),
+            ('combo', 'Graphics memory', gfx_var,
+             [l for _, l in GFX_POOL_CHOICES],
+             'LEAVE THIS AT 256 MB. It is here because it was tried, and '
+             'because the result is worth being able to reproduce — not '
+             'because it is a setting anyone should change.\n\n'
+             'WHAT IT IS. The port asks the NVN/GL driver for one 256 MB '
+             'block at module +0x113BD7C and keeps textures, render targets, '
+             'vertex and command memory in it. It is NOT the guest heap — '
+             'that one is FF7\'s own pixel arena and this build already '
+             'raises it from 64 to 256 MB.\n\n'
+             'WHY IT LOOKED LIKE A GOOD IDEA. This build spends far more of '
+             'that pool than the game it was sized for: +25.78 MB of '
+             'permanent field render target at 3×, 768px truecolor field '
+             'pages at 3.38 MB apiece against a vanilla paletted page\'s '
+             '0.31 MB, plus 768px world and battle caps. On paper it is '
+             'overspent.\n\n'
+             'WHAT ACTUALLY HAPPENS. Raising it CORRUPTS TEXTURES. Builds '
+             '187, 188 and 189 shipped 384 MB and every one of them showed '
+             'permanent corruption of field models, world map and battle '
+             'textures — and 512 MB was worse, not better. Setting it back '
+             'to 256 stopped all of it, in Wutai, in lower Junon, in battle '
+             'and on the world map, with nothing else changed. Measured on '
+             'hardware, 2026-08-27.\n\n'
+             'THE SIZES BELOW 256 ARE A DIAGNOSTIC, NOT A SETTING. 384 MB '
+             'corrupted textures constantly; 256 MB still corrupts them, '
+             'rarely, after enough field and battle churn. That is a '
+             'dose-response — more pool, sooner — so the axis is probably '
+             'how far into the block the allocator has climbed, not how '
+             'much room is left. If that is right, 192 MB should make the '
+             'corruption STOP, because the high-water mark can never reach '
+             'whatever address stops being correct. If instead the pool is '
+             'simply running out, 192 MB will be far WORSE, fast. Those are '
+             'opposite outcomes from one playtest, which is why the rung is '
+             'here. Expect a game that will not boot at the low end.\n\n'
+             'So this is not a headroom knob. 256 MB is a number the port '
+             'and the driver agree about, and a bigger block does not mean '
+             'more room — whatever the driver does with it stops being '
+             'correct. The exact mechanism is not established and this text '
+             'is not going to pretend otherwise.\n\n'
+             'It also does not fix the end-of-frame crash. That was the GL '
+             'error reporter, and it is fixed separately and permanently. '
+             'See FINDINGS-303.', True),
         ]),
         ('Display extras', [
             ('check', 'Full-height 16:9 field', frame_var, None,
@@ -1860,6 +1980,36 @@ def launch_ui():
              'click fills HP, MP and the limit gauge, and one accidental '
              'press can spoil a playthrough. Left stick click (3× speed) '
              'is left alone.', True),
+            ('check', 'Disable texture cache (fixes the slow FPS sag)',
+             texcache_var, None,
+             'TRY THIS IF THE FRAMERATE DECAYS AS YOU PLAY AND TEXTURES '
+             'EVENTUALLY CORRUPT.\n\n'
+             'WHAT IT IS. Freeing a texture on this port does not destroy '
+             'it. It parks the surface in a table keyed on its WIDTH AND '
+             'HEIGHT ONLY, ten per size, and only a later texture of exactly '
+             'those dimensions ever takes it back out. Nothing else empties '
+             'it — not leaving the field, not ending the battle, not the '
+             'world map. Visit an area whose sizes you never revisit again '
+             'and its surfaces stay resident until you close the game.\n\n'
+             'WHY IT MATTERS HERE AND NOT IN THE STOCK GAME. The bound is '
+             'per size, and this mod pushes on both axes at once: bigger '
+             'textures AND more distinct sizes (battle alone goes from 17 to '
+             '32). Counted off the built archives, the worst case goes from '
+             '16.5 MB in vanilla to 166.5 MB here — out of a 256 MB graphics '
+             'pool that also has to hold everything actually on screen.\n\n'
+             'WHAT IT DOES. One word: the check that stops caching once a '
+             'size holds ten becomes unconditional, so freeing always '
+             'destroys. That is the same branch the stock game already takes '
+             'whenever a size fills up, so it is well-travelled code, not '
+             'new code.\n\n'
+             'THE COST. Texture creation can no longer recycle, so loading a '
+             'field or a battle does a little more allocation work. That is '
+             'the trade: a little load time against up to 166 MB of pool.\n\n'
+             'OFF by default — the graphics-memory setting above was also '
+             'believed on good grounds and shipped as a default, and three '
+             'builds of evidence were then collected through it. Turn this '
+             'on deliberately and compare against a build without it. '
+             'FINDINGS-306.', True),
         ]),
         ('Textures', [
             ('combo', 'Field backgrounds', fpre_var,
@@ -2397,11 +2547,13 @@ def launch_ui():
                                  'movie_30fps': bool(m30_var.get()),
                                  'analog_360': bool(a360_var.get()),
                                  'no_autorun': bool(norun_var.get()),
+                                 'no_texture_cache': bool(texcache_var.get()),
                                  'field_frame': bool(frame_var.get()),
                                  'no_cheats': bool(nocheat_var.get()),
                                  'limiter_fps': current_limiter_fps(),
                                  'widescreen': current_widescreen(),
                                  'field_buffer': current_field_buffer(),
+                                 'gfx_pool_mb': current_gfx_pool(),
                                  'scaler': current_scaler(),
                                  'fxaa': current_fxaa(),
                                  'video_shader': current_video_shader()}
@@ -2440,6 +2592,7 @@ def launch_ui():
     m30_var.trace_add('write', save_settings_now)
     a360_var.trace_add('write', save_settings_now)
     norun_var.trace_add('write', save_settings_now)
+    texcache_var.trace_add('write', save_settings_now)
     frame_var.trace_add('write', save_settings_now)
     nocheat_var.trace_add('write', save_settings_now)
     lim_var.trace_add('write', save_settings_now)
@@ -2448,6 +2601,7 @@ def launch_ui():
     # correct and not enough to be obvious -- every other control here
     # saves the moment it changes.
     fbuf_var.trace_add('write', save_settings_now)
+    gfx_var.trace_add('write', save_settings_now)
     scaler_var.trace_add('write', save_settings_now)
     fxaa_var.trace_add('write', save_settings_now)
     vshader_var.trace_add('write', save_settings_now)
@@ -3222,6 +3376,10 @@ def launch_ui():
         os.environ[build.MOVIE_30FPS_ENV] = '1' if m30_var.get() else '0'
         os.environ[build.ANALOG_360_ENV] = '1' if a360_var.get() else '0'
         os.environ[build.NO_AUTORUN_ENV] = '1' if norun_var.get() else '0'
+        # 'nocache'/'off' rather than '1'/'0' -- ff7nx_texcache.mode() takes
+        # both, but the words are what the build log and --show print.
+        os.environ[_HEADLESS_TEXCACHE_ENV] = ('nocache' if texcache_var.get()
+                                              else 'off')
         os.environ[build.NO_CHEATS_ENV] = '1' if nocheat_var.get() else '0'
         os.environ[build.LIMITER_FPS_ENV] = str(current_limiter_fps())
         os.environ[build.ff7nx_ws.WIDESCREEN_ENV] = current_widescreen()
@@ -3265,6 +3423,16 @@ def launch_ui():
         os.environ.pop(build.CREDITS_ENV, None)
         os.environ[build.ff7nx_fieldbuf.SCALE_ENV] = str(
             current_field_buffer())
+        # The graphics pool. Written unconditionally, including at stock,
+        # so that clearing the dropdown back to 256 actually clears the
+        # environment a previous run in this process left behind.
+        #
+        # The module-level constant, not the closed-over `_gfxpool` from
+        # launch_ui. Both resolve, but this one does not depend on `start`
+        # staying nested where it is, and it is the same name the headless
+        # path uses. test_gfxpool.py asserts it matches
+        # ff7nx_gfxpool.POOL_MB_ENV.
+        os.environ[_HEADLESS_GFX_ENV] = str(current_gfx_pool())
         os.environ[build.ff7nx_shaders.SCALER_ENV] = current_scaler()
         os.environ[build.ff7nx_shaders.FXAA_ENV] = current_fxaa()
         os.environ[build.ff7nx_shaders.VIDEO_ENV] = \
@@ -3477,6 +3645,12 @@ def main():
             if _ws is True or _ws is False or _ws in build.ff7nx_ws.LEGACY_MODES:
                 _ws = ''
             os.environ[build.ff7nx_ws.WIDESCREEN_ENV] = str(_ws)
+        if _HEADLESS_GFX_ENV not in os.environ:
+            _gp = saved.get('__global__', {}).get('gfx_pool_mb', None)
+            if _gp is None:
+                import ff7nx_gfxpool as _gfxpool_h
+                _gp = _gfxpool_h.DEFAULT_MB
+            os.environ[_HEADLESS_GFX_ENV] = str(_gp)
         if build.ff7nx_fieldbuf.SCALE_ENV not in os.environ:
             _fb = saved.get('__global__', {}).get(
                 'field_buffer', build.ff7nx_fieldbuf.DEFAULT_SCALE)
@@ -3501,6 +3675,9 @@ def main():
                 '1' if saved.get('__global__', {}).get('analog_360') else '0')
         os.environ[build.NO_AUTORUN_ENV] = (
                 '1' if saved.get('__global__', {}).get('no_autorun') else '0')
+        os.environ[_HEADLESS_TEXCACHE_ENV] = (
+                'nocache' if saved.get('__global__', {}).get('no_texture_cache')
+                else 'off')
         os.environ[build.NO_CHEATS_ENV] = (
                 '1' if saved.get('__global__', {}).get('no_cheats') else '0')
         os.environ[build.LIMITER_FPS_ENV] = str(
