@@ -965,6 +965,10 @@ def _add_imm(rd, rn, imm):
     return 0x11000000 | (imm << 10) | (rn << 5) | rd
 
 
+def _add_imm64(rd, rn, imm):
+    return 0x91000000 | (imm << 10) | (rn << 5) | rd
+
+
 def _subs_imm(rd, rn, imm):
     return 0x71000000 | (imm << 10) | (rn << 5) | rd
 
@@ -1171,27 +1175,29 @@ SMOOTH_SCRATCH_OFF  = 0x2008
 #   * decrement wait_frames every other WORLD FRAME;
 #   * still execute the movement body on every rendered frame.
 #
-# We mirror that exactly. world_mode_loop_sub_74DB8C increments one shared
-# frame counter once per world tick. The opcode hook reads that counter: one
-# phase enters the wait_frames-- block, the other skips ONLY that decrement
-# and joins at +0xF9BFE8. Both phases then execute movement. A waiting opcode
-# (w22 != 0) still takes the stock rewind/return path.
+# We mirror FFNx's *per-entity* cadence.  A single global world-frame parity
+# is not equivalent: in a busy world region an entity can be serviced only on
+# one global parity and consequently skip its decrement forever.  That is the
+# transition deadlock seen near Junon (town/battle/submarine audio advances,
+# while the visual world script never finishes).  The opcode cave therefore
+# keeps a tiny `(entity pointer, parity)` table and alternates independently
+# for each entity.  Both phases still execute movement every rendered frame.
 #
 #     +0xF9B46C  cbz  w22, #0xF9BFB4   ; w22 = is_wait_frames_zero
 #                                      ;   0 -> +0xF9BFB4, do the work
 #                                      ; !=0 -> fall through, rewind + return 1
 #
 # The fall-through already IS "repeat this opcode next frame without doing
-# anything", which is exactly what a skipped frame needs. So the cave sends
-# odd frames down the path the function already has.
+# anything", which is exactly what a skipped decrement needs.  The cave uses
+# that path for the false phase of each entity's own alternating state.
 WORLD_SCRIPT_TICK_HOOK   = 0x00F9B46C
 WORLD_SCRIPT_TICK_ORIG   = 0x34005A56    # cbz w22, #0xF9BFB4
 WORLD_SCRIPT_NORMAL_PATH = 0x00F9BFB4    # add w0, w8, #0x56 -> wait_frames--
 WORLD_SCRIPT_CONTINUE_PATH = 0x00F9BFE8  # skip decrement, continue movement
 WORLD_SCRIPT_REWIND_PATH = 0x00F9B470    # rewind script position, return 1
-WORLD_FRAME_TICK_HOOK    = 0x00F29100    # world_mode_loop_sub_74DB8C entry
-WORLD_FRAME_TICK_ORIG    = 0xA9BA6FFC    # stp x28,x27,[sp,#-0x60]!
-WORLD_FRAME_COUNTER_OFF  = 0x3000
+WORLD_ENTITY_PARITY_OFF = 0x3000
+WORLD_ENTITY_PARITY_SLOTS = 64
+WORLD_ENTITY_PARITY_BYTES = WORLD_ENTITY_PARITY_SLOTS * 8
 
 # The four FFNx pop_world_script_stack_divide_wrapper call sites, translated
 # to ARM64. All call the same translated pop function and can share one
@@ -1377,6 +1383,16 @@ def _cmp_imm(rn, imm):
     return 0x71000000 | ((imm & 0xFFF) << 10) | (rn << 5) | 31
 
 
+def _cmp_reg(rn, rm):
+    """cmp wRn, wRm  (subs wzr, wRn, wRm)."""
+    return 0x6B000000 | (rm << 16) | (rn << 5) | 31
+
+
+def _cbz_rel(rt, words):
+    """cbz wRt, <this instruction + `words` instructions>."""
+    return 0x34000000 | ((words & 0x7FFFF) << 5) | rt
+
+
 def _cset_eq(rd):
     """cset wRd, eq  (csinc wRd, wzr, wzr, ne)."""
     return 0x1A9F17E0 | rd
@@ -1387,43 +1403,45 @@ def _orr_reg(rd, rn, rm):
     return 0x2A000000 | (rm << 16) | (rn << 5) | rd
 
 
-def _world_frame_tick_words(addr, counter_addr):
-    """Increment a counter exactly once per world frame.
-
-    This hooks the world-mode loop entry, replays its displaced stack-frame
-    prologue, and touches only the standard x16/x17 intra-procedure scratch.
-    `addr(i)` is the real address of logical word i in the scattered cave.
-    """
-    page, off = counter_addr & ~0xFFF, counter_addr & 0xFFF
-    return [
-        WORLD_FRAME_TICK_ORIG,
-        _adrp(16, addr(1), page),
-        _ldr_w(17, 16, off),
-        _add_imm(17, 17, 1),
-        _str_w(17, 16, off),
-        _b(addr(5), WORLD_FRAME_TICK_HOOK + 4),
-    ]
-
-
-def _world_script_tick_words(addr, counter_addr):
+def _world_script_tick_words(addr, table_addr):
     """Halve only opcode 0x306's wait decrement, never its movement.
 
     w22 is the stock `is_wait_frames_zero` value. A set value still takes the
-    stock rewind/return path. Otherwise the world-frame parity selects either
-    the stock decrement block or +0xF9BFE8 immediately after it; both paths
-    then execute the stock movement body on this rendered frame.
+    stock rewind/return path.  w8 is the current guest world-entity pointer.
+    Its own table entry selects either the stock decrement block or +0xF9BFE8
+    immediately after it; both paths then execute the stock movement body.
+
+    The fixed table is deliberately bounded.  A full-table fallback performs
+    the stock decrement, which may speed an exceptional entity up but can
+    never deadlock a transition.  Guest entity structs come from a small,
+    reused pool, so 64 keys leaves ample headroom in normal play.
     """
-    page, off = counter_addr & ~0xFFF, counter_addr & 0xFFF
+    page, off = table_addr & ~0xFFF, table_addr & 0xFFF
     return [
         # 0: waiting opcodes do not enter either live movement path.
-        0x35000000
-        | ((((addr(6) - addr(0)) >> 2) & 0x7FFFF) << 5) | 22,
+        _cbnz_rel(22, (addr(21) - addr(0)) >> 2),
         _adrp(16, addr(1), page),
-        _ldr_w(17, 16, off),
-        _tbz(17, 0, addr(3), addr(5)),
-        _b(addr(4), WORLD_SCRIPT_CONTINUE_PATH),
-        _b(addr(5), WORLD_SCRIPT_NORMAL_PATH),
-        _b(addr(6), WORLD_SCRIPT_REWIND_PATH),
+        _add_imm64(16, 16, off),
+        _movz(17, WORLD_ENTITY_PARITY_SLOTS),
+        # scan: entry = { guest entity pointer, next parity }
+        _ldr_w(15, 16, 0),
+        _cmp_reg(15, 8),
+        _bcond(addr(6), addr(14), 0),             # b.eq found
+        _cbz_rel(15, (addr(12) - addr(7)) >> 2),  # empty -> insert
+        _add_imm64(16, 16, 8),
+        _subs_imm(17, 17, 1),
+        _bcond(addr(10), addr(4), 1),             # b.ne scan
+        _b(addr(11), WORLD_SCRIPT_NORMAL_PATH),   # full: safe progress
+        _str_w(8, 16, 0),                         # insert key
+        _str_w(31, 16, 4),                        # initial parity = false
+        _ldr_w(15, 16, 4),                        # found: old parity
+        _cmp_imm(15, 0),
+        _cset_eq(17),                             # new = !old
+        _str_w(17, 16, 4),
+        _cbz_rel(15, (addr(20) - addr(18)) >> 2),  # old false -> skip --
+        _b(addr(19), WORLD_SCRIPT_NORMAL_PATH),    # old true -> decrement
+        _b(addr(20), WORLD_SCRIPT_CONTINUE_PATH),
+        _b(addr(21), WORLD_SCRIPT_REWIND_PATH),
     ]
 
 
@@ -1565,7 +1583,7 @@ def build_walk_gate_caves(text, ro_base, segs, data, verify_only, log,
     base_ctr = data_end + bss
     counter = base_ctr + WALK_TICK_OFF
     flag_addr = base_ctr + WALK_PFLAG_OFF
-    world_counter = base_ctr + WORLD_FRAME_COUNTER_OFF
+    world_entity_parity = base_ctr + WORLD_ENTITY_PARITY_OFF
 
     # The smooth-scripted helpers go in reclaimed padding, NOT the tail gap:
     # the whole point of the design is that the five caves below keep the
@@ -1696,8 +1714,8 @@ def build_walk_gate_caves(text, ro_base, segs, data, verify_only, log,
     # the whole 60 FPS pass with "dispatcher cave overflows .rodata".
     #
     # No padding hole is longer than 3 words, so emit_laid_out scatters all
-    # three helpers (world-frame counter, opcode gate, shared signed divide
-    # wrapper) and resolves their branches against the real addresses. The
+    # two helpers (per-entity opcode gate and shared signed divide wrapper)
+    # and resolves their branches against the real addresses. The
     # pool is built from `text` as it stands now, so earlier caves cannot be
     # handed out twice.
     #
@@ -1705,7 +1723,6 @@ def build_walk_gate_caves(text, ro_base, segs, data, verify_only, log,
     # (doubled) world script speed, rather than dying. Losing one timing
     # correction is not worth losing the build.
     world_sites = [
-        (WORLD_FRAME_TICK_HOOK, WORLD_FRAME_TICK_ORIG, 'world frame tick'),
         (WORLD_SCRIPT_TICK_HOOK, WORLD_SCRIPT_TICK_ORIG,
          'world script move-for-N-frames'),
     ] + [(va, orig, label) for va, orig, label in WORLD_SCRIPT_SPEED_CALLS]
@@ -1730,23 +1747,17 @@ def build_walk_gate_caves(text, ro_base, segs, data, verify_only, log,
             wpool = ff7nx_cave.HolePool(
                 text, starts=set(_wm.arm_starts),
                 named=cave_space.named_targets(_wm.img[cave_space.RODATA:]))
-            frame_entry, frame_placed = ff7nx_cave.emit_laid_out(
-                wpool,
-                lambda entry_va, addr: _world_frame_tick_words(
-                    addr, world_counter))
             tick_entry, tick_placed = ff7nx_cave.emit_laid_out(
                 wpool,
                 lambda entry_va, addr: _world_script_tick_words(
-                    addr, world_counter))
+                    addr, world_entity_parity))
             speed_entry, speed_placed = ff7nx_cave.emit_laid_out(
                 wpool,
                 lambda entry_va, addr: _world_script_speed_words(addr))
 
             patches = {}
-            for placed in (frame_placed, tick_placed, speed_placed):
+            for placed in (tick_placed, speed_placed):
                 patches.update(placed)
-            patches[WORLD_FRAME_TICK_HOOK] = a64.b(
-                WORLD_FRAME_TICK_HOOK, frame_entry)
             patches[WORLD_SCRIPT_TICK_HOOK] = a64.b(
                 WORLD_SCRIPT_TICK_HOOK, tick_entry)
             for va, _orig, _label in WORLD_SCRIPT_SPEED_CALLS:
@@ -1754,7 +1765,7 @@ def build_walk_gate_caves(text, ro_base, segs, data, verify_only, log,
 
             # Nothing is written until every cave has placed successfully,
             # so a NoRoom failure cannot leave a half-installed timing pair.
-            cave_vas = set(frame_placed) | set(tick_placed) | set(speed_placed)
+            cave_vas = set(tick_placed) | set(speed_placed)
             for va in cave_vas:
                 if struct.unpack_from('<I', text, va)[0] != 0:
                     raise RuntimeError('wanted padding at +0x%X and it is '
@@ -1763,10 +1774,7 @@ def build_walk_gate_caves(text, ro_base, segs, data, verify_only, log,
                 struct.pack_into('<I', text, va, word)
                 _WALK_SMOOTH_WORDS[va] = word
             log('  ok  +0x%06X  -> cave 0x%06X (%d placed words)  '
-                'world frame tick' % (WORLD_FRAME_TICK_HOOK, frame_entry,
-                                      len(frame_placed)))
-            log('  ok  +0x%06X  -> cave 0x%06X (%d placed words)  '
-                'world script decrement-only gate'
+                'world script per-entity decrement-only gate'
                 % (WORLD_SCRIPT_TICK_HOOK, tick_entry, len(tick_placed)))
             log('  ok  4 world script speed calls -> wrapper 0x%06X '
                 '(%d placed words)' % (speed_entry, len(speed_placed)))
@@ -1775,10 +1783,13 @@ def build_walk_gate_caves(text, ro_base, segs, data, verify_only, log,
                 'applied' % exc)
 
     _BSS_GROW = max(_BSS_GROW, WALK_PFLAG_OFF + 4,
-                    WORLD_FRAME_COUNTER_OFF + 4)
+                    WORLD_ENTITY_PARITY_OFF + WORLD_ENTITY_PARITY_BYTES)
     log('      walk-tick counter at module +0x%X, player flag at +0x%X, '
-        'world-frame counter at +0x%X, bssSize grown by >= 0x%X'
-        % (counter, flag_addr, world_counter, WORLD_FRAME_COUNTER_OFF + 4))
+        'world entity-parity table at +0x%X (%d slots), '
+        'bssSize grown by >= 0x%X'
+        % (counter, flag_addr, world_entity_parity,
+           WORLD_ENTITY_PARITY_SLOTS,
+           WORLD_ENTITY_PARITY_OFF + WORLD_ENTITY_PARITY_BYTES))
 
 
 def opcode_scaler_cave(cave, site, mult, shift):

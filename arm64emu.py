@@ -443,6 +443,30 @@ class Cpu:
             self._setflags32(a, b, res, True)
             s(rd, res, True)
             return None
+        if (w & 0xFFE00C10) == 0x7A400000:                    # ccmp Wn,Wm,#f,c
+            cond = (w >> 12) & 0xF
+            nzcv = w & 0xF
+            if self.cond(cond):
+                a, b = self.get(rn, True), self.get(rm, True)
+                self._setflags32(a, b, (a - b) & M32, True)
+            else:
+                self.n = (nzcv >> 3) & 1
+                self.z = (nzcv >> 2) & 1
+                self.c = (nzcv >> 1) & 1
+                self.v = nzcv & 1
+            return None
+        if (w & 0xFFE00C10) == 0x7A400800:                    # ccmp Wn,#i,#f,c
+            cond = (w >> 12) & 0xF
+            nzcv = w & 0xF
+            if self.cond(cond):
+                a, b = self.get(rn, True), (w >> 16) & 0x1F
+                self._setflags32(a, b, (a - b) & M32, True)
+            else:
+                self.n = (nzcv >> 3) & 1
+                self.z = (nzcv >> 2) & 1
+                self.c = (nzcv >> 1) & 1
+                self.v = nzcv & 1
+            return None
         if (w & 0xFF200000) == 0x8B000000:                    # add Xd,Xn,Xm
             amt = (w >> 10) & 0x3F
             return self._wr64(rd, self._rd64(rn) + ((self.get(rm) << amt) & M64))

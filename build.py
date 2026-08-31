@@ -9271,6 +9271,7 @@ def apply_field_frame(sdout, dump, log=lambda *_: None, produced=()):
     if not built:
         shutil.copyfile(src, dest)
     rc = 0
+    battle_exe_created = False
     if want_frame:
         rc |= ff7nx_letterbox.apply(dest, log=log)
     if want_cull:
@@ -9310,11 +9311,13 @@ def apply_field_frame(sdout, dump, log=lambda *_: None, produced=()):
     if want_clamp:
         rc |= ff7nx_camclamp.apply(dest, log=log)
     # --- the battle overlays -------------------------------------------
-    # Independent of everything above: different functions, no shared words,
-    # no ordering constraint.  They are here rather than in a pass of their
-    # own because they patch the same exefs/main and share the 16:9 gate;
-    # splitting them out would duplicate the copy-and-refuse logic for no
-    # gain.
+    # Different functions from the field/movie framing above, but deliberately
+    # AFTER the 60 FPS pass.  The opening-reveal strip count is the one shared
+    # constant: 60 FPS changes 21 -> 84, then battlewide composes that into
+    # 120 (FFNx reaches the same result in the opposite order, 21 -> 30 ->
+    # 120).  Everything else here has no shared site.  They stay in this pass
+    # because they patch the same exefs/main and share the 16:9 gate; splitting
+    # them out would duplicate the copy-and-refuse logic for no gain.
     #
     # NEITHER touches the STORED battle rect, which is what lets them coexist
     # with ff7nx_letterbox's uncrop leg -- that leg matches the literal rect
@@ -9323,6 +9326,42 @@ def apply_field_frame(sdout, dump, log=lambda *_: None, produced=()):
     # --verify; FINDINGS-99 4 is the build that proved it matters.
     if want_battle:
         rc |= ff7nx_battlewide.apply_all(dest, log=log)
+        # Build 207 changed two constants in the lookalike half-resolution
+        # menu fade at x86 0x6D0022; hardware showed the same overlap and a
+        # world-map battle-entry regression.  Restore those x86 experiments
+        # here.  `ff7nx_battlewide.apply_all` now corrects the actually
+        # measured full-resolution producer at x86 0x6CF5C5 / ARM +0xD1A7C0
+        # with one arithmetic-immediate replacement and no branch or cave.
+        #
+        # A 60 FPS or HEXT build has already produced ff7_en and it appears in
+        # `fresh`.  A 30 FPS build with no HEXT legitimately has not; in that
+        # case create a fresh output from the dump now.  Never feed a stale
+        # sdout executable back into this migration cleanup.
+        battle_exe = os.path.join(sdout, 'atmosphere', 'contents', TITLE_ID,
+                                  ROMFS_FF7, EXE_REL)
+        battle_exe_fresh = (os.path.normpath(os.path.abspath(battle_exe))
+                            in fresh)
+        if not battle_exe_fresh:
+            base_exe = dump.exe if dump is not None else None
+            if not base_exe or not os.path.exists(base_exe):
+                log('  ! battle UI fade data: this build produced no ff7_en '
+                    'and the dump has no base executable')
+                rc |= 1
+            else:
+                os.makedirs(os.path.dirname(battle_exe), exist_ok=True)
+                shutil.copyfile(base_exe, battle_exe)
+                battle_exe_fresh = True
+                battle_exe_created = True
+                log(f'  base ff7_en {base_exe}   (from dump)')
+        if battle_exe_fresh and not os.path.exists(battle_exe):
+            log(f'  ! battle UI fade data: fresh executable is missing: '
+                f'{battle_exe}')
+            rc |= 1
+        elif battle_exe_fresh:
+            rc |= ff7nx_battlewide.apply_exe_ui_fade_bottom(
+                battle_exe, revert=True, log=log)
+            rc |= ff7nx_battlewide.apply_exe_ui_fade_x(
+                battle_exe, revert=True, log=log)
     else:
         log('  battle overlays: OFF -- summon and limit-break flashes and '
             'the battle fade cover only the middle 4:3. '
@@ -9342,8 +9381,12 @@ def apply_field_frame(sdout, dump, log=lambda *_: None, produced=()):
     # left of centre loses its RIGHT border, one wholly right of centre loses
     # its LEFT border, and an edge near 320 loses part of one.
     #
-    # A 21-word cave at +0x10D9F48 puts the shader's own transform on the
-    # rect -- x -> (3x)/4 + tW/8 -- and leaves FULL-SCREEN rects alone.
+    # A 21-logical-word cave at +0x10D9F48 puts the shader's own transform on
+    # window rects -- x -> (3x)/4 + tW/8.  It compares x edges only, so a
+    # full-width partial-height rect stays byte-for-byte untouched.  Vertical
+    # coverage belongs to the battle fade/flash consumers in
+    # `ff7nx_battlewide`; inferring mode and promoting height here froze
+    # world-map battle entry in builds 199/200.
     #
     # NOT "point the viewport at the full rect". That was the first version,
     # it was two words, it shipped, and it fixed the borders by DELETING the
@@ -9376,6 +9419,16 @@ def apply_field_frame(sdout, dump, log=lambda *_: None, produced=()):
         log('  credits fade quad: OFF -- the intro fade covers only the '
             'middle 4:3 and credit text smears in the side margins. '
             f'({CREDITS_ENV}={os.environ.get(CREDITS_ENV, "<unset>")!r})')
+    # Build 208's post-translation UI-bottom experiment is migration-only.
+    # Hardware proved that those two loads are not the visible lower fade
+    # strip, while merely branching at them regresses world-map battle entry.
+    # Always remove that exact, recognized experiment.  Keeping this cleanup
+    # late also guarantees a build-208 input finishes with the same proven
+    # swirl/uiclip cave layout as a stock input.  The real UI-bottom fix is a
+    # direct one-word change at +0xD1AB18 and therefore cannot perturb this
+    # allocation order.
+    rc |= ff7nx_battlewide.apply_ui_fade_bottom_safe(
+        dest, revert=True, log=log)
     if rc:
         log('! field frame: one or more passes refused -- the module is '
             'whatever the passes that DID run left. Check the lines above.')
@@ -9383,7 +9436,10 @@ def apply_field_frame(sdout, dump, log=lambda *_: None, produced=()):
     log('  PASS/FAIL on hardware: walk to the bottom of a field. No black '
         'band, characters on the ground, NPCs already there at the side '
         'edges rather than appearing.')
-    return [dest] if not built else []
+    outputs = [dest] if not built else []
+    if battle_exe_created:
+        outputs.append(battle_exe)
+    return outputs
 
 
 MOVIE_CLIP_ENV = ff7nx_movieclip.MOVIECLIP_ENV

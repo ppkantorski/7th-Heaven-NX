@@ -72,8 +72,8 @@ Checked: a window at game x 80..200 is clipped to 280..460, and 1.5*80+160
 does, at both edges, at every x.
 
 
-THE FULL-SCREEN CASE, WITH NO LITERAL 640 ANYWHERE
-==================================================
+FULL-WIDTH RECTS, WITH NO LITERAL 640 ANYWHERE
+================================================
 The field, battle, menus and credits issue a full-screen viewport, and those
 draws must not move -- scaling them would pillarbox the game.  They are
 identified WITHOUT a magic number, by executing the real driver:
@@ -84,12 +84,26 @@ identified WITHOUT a magic number, by executing the real driver:
     window  x=80  w=120             160..400
     window  x=16  w=253             32..538
 
-The full-screen case is *definitionally* the one where the viewport rect
-already equals the full rect the scissor uses four instructions earlier.  So
-the test is a comparison of two things already in registers:
+The exception is *definitionally* whether the viewport's two x edges equal
+the full rect's x edges.  Comparing the complete packed x/y words is wrong:
+battle effects use a full-width viewport that ends above the UI, and hardware
+proved that Lower Junon also enters through a legitimate full-width,
+partial-height field viewport.  A packed comparison classifies either as a
+window and scales its x edges into 4:3.  Compare only the low 32-bit x halves
+and leave both packed words untouched when x is already full width.  This is
+global deliberately; no engine-mode inference is safe at this shared driver
+hook, and y is never changed.
 
-    if viewport == full:  leave it alone
-    else:                 scale x1 and x2
+Build 211 tried a mode-aware split: x-only in battle and packed equality in
+other modes.  It blanked Lower Junon deterministically on entry.  That failed
+cave is recognized below only so an existing sdout migrates safely back to
+the x-only form.
+
+Builds 199 and 200 tried exactly that global promotion, first from unrelated
+`w24` state and then by loading the engine mode pointer.  Both froze the world
+image when entering a battle while battle music continued.  Those historical
+caves are still recognized below so an existing sdout migrates safely, but
+neither is emitted again.
 
 That is why this survives a resolution change, a target-size change, and a
 different WS_SCALE ratio at 4:3 -- there is no 640, no 1280 and no 160 in
@@ -133,9 +147,9 @@ which is correct, because the shader only scales x.
     12  bfi  x8, x6, #0, #32       ...with x scaled, y untouched
     13  add  x9, x2, #0
     14  bfi  x9, x7, #0, #32
-    15  cmp  x1, x3                \  Z set iff BOTH halves of the viewport
-    16  ccmp x2, x4, #0, eq        /  rect equal the full rect
-    17  csel x1, x1, x8, eq        full-screen -> untouched, else scaled
+    15  cmp  w1, w3                \  Z set iff BOTH x edges are full-width
+    16  ccmp w2, w4, #0, eq        /
+    17  csel x1, x1, x8, eq        full-width -> untouched, else scaled
     18  csel x2, x2, x9, eq
     19  ldr  x0, [x25]             the displaced word
     20  b    +0x10D9F54
@@ -148,7 +162,6 @@ contains is its own return.
 x3-x9 are free at this site because a `bl` follows immediately -- anything
 they held would be destroyed by the call regardless.  x25 and x26 are
 callee-saved and are only read.
-
 
 AND THIS IS A 16:9 PATCH, NOT A CLEANUP
 =======================================
@@ -185,6 +198,9 @@ RETURN_VA = 0x10D9F54              # the bl to gfx_drv_setviewport
 
 VP_OFF = 0x800                     # viewport rect, (x1,y1) then (x2,y2)
 FULL_OFF = 0x7F0                   # full rect, same shape
+MODE_PTR_SLOT = 0x12CE1F8          # pointer to engine game mode; 3 = battle
+MODE_PTR_PAGE = MODE_PTR_SLOT & ~0xFFF
+MODE_PTR_OFF = MODE_PTR_SLOT & 0xFFF
 
 # words that must be identical whether or not the patch is in.  Keyed on the
 # calls and the base-register setup, never on anything the cave rewrites --
@@ -192,6 +208,10 @@ FULL_OFF = 0x7F0                   # full rect, same shape
 # viewport loads are anchors too: the cave replicates them rather than
 # editing them, so they must still be there, stock, in BOTH states.
 ANCHORS = [
+    (0x10D9EBC, 0xB0000FA9, 'adrp x9, 0x12CE000      engine game-mode slot page'),
+    (0x10D9EC8, 0xF940FD29, 'ldr x9, [x9,#0x1F8]     pointer to engine mode'),
+    (0x10D9ECC, 0xB9400129, 'ldr w9, [x9]            current engine mode'),
+    (0x10D9ED0, 0x71000D3F, 'cmp w9,#3               battle-mode check'),
     (0x10D9EE4, 0xB0000FA8, 'adrp x8, 0x12CE000'),
     (0x10D9EE8, 0xF942A508, 'ldr x8, [x8,#0x548]      the render-state object'),
     (0x10D9EEC, 0xF943F901, 'ldr x1, [x8,#0x7F0]      FULL rect, top-left'),
@@ -208,8 +228,8 @@ ANCHORS = [
 # ---------------------------------------------------------------------------
 # the cave
 # ---------------------------------------------------------------------------
-def body_words():
-    """The 19 logical words, generated -- no encoding is typed by hand."""
+def legacy_body_words():
+    """The build-198 packed-rect cave, retained for migration only."""
     return [
         A.ldr64(1, 26, VP_OFF),                  #  0
         A.ldr64(2, 26, VP_OFF + 8),              #  1
@@ -233,6 +253,95 @@ def body_words():
     ]
 
 
+def bad_w24_body_words():
+    """The build-199 cave, retained only for byte-exact migration."""
+    return legacy_body_words()[:15] + [
+        # Compare only x.  A battle viewport is already full-width but is
+        # deliberately only 332/480 high; comparing the packed x/y words made
+        # it look like an ordinary window and re-clipped widened flashes to
+        # the central 4:3 area.
+        A.cmp_reg(1, 3),                          # 15  x1 == full.x1
+        A.ccmp_reg32(2, 4, 0, A.EQ),              # 16  and x2 == full.x2
+        A.csel64(1, 1, 8, A.EQ),                  # 17  full-x or scaled-x
+        A.csel64(2, 2, 9, A.EQ),                  # 18
+        A.ccmp_imm32(24, 3, 0, A.EQ),             # 19  bad guessed mode source
+        A.csel64(1, 3, 1, A.EQ),                  # 20  full rect top-left
+        A.csel64(2, 4, 2, A.EQ),                  # 21  full rect bottom-right
+    ]
+
+
+def bad_mode_body_words_at(addrs):
+    """The build-200 mode-pointer cave, retained for byte-exact migration."""
+    if len(addrs) < 25:
+        raise ValueError('historical uiclip body needs 25 addresses')
+    return legacy_body_words()[:15] + [
+        A.cmp_reg(1, 3),                          # 15  x1 == full.x1
+        A.ccmp_reg32(2, 4, 0, A.EQ),              # 16  and x2 == full.x2
+        A.csel64(1, 1, 8, A.EQ),                  # 17  full-x or scaled-x
+        A.csel64(2, 2, 9, A.EQ),                  # 18
+        # Use the renderer's real game-mode source.  The ADRP must be
+        # encoded from the physical address of this logical cave word.
+        A.adrp(10, addrs[19], MODE_PTR_PAGE),      # 19
+        A.ldr64(10, 10, MODE_PTR_OFF),             # 20  pointer to game mode
+        A.ldr(10, 10),                             # 21  mode value
+        A.ccmp_imm32(10, 3, 0, A.EQ),              # 22  full-x && battle
+        A.csel64(1, 3, 1, A.EQ),                  # 23  full output TL
+        A.csel64(2, 4, 2, A.EQ),                  # 24  full output BR
+    ]
+
+
+def xonly_body_words():
+    """The current position-independent x-only window-clip body."""
+    return legacy_body_words()[:15] + [
+        A.cmp_reg(1, 3),                          # 15  x1 == full.x1
+        A.ccmp_reg32(2, 4, 0, A.EQ),              # 16  and x2 == full.x2
+        A.csel64(1, 1, 8, A.EQ),                  # 17  full-x or scaled-x
+        A.csel64(2, 2, 9, A.EQ),                  # 18
+    ]
+
+
+def bad_modeaware_body_words_at(addrs):
+    """The failed build-211 mode-aware body, retained for exact migration.
+
+    Hardware proved that a legitimate Lower Junon field viewport can be
+    full-width and partial-height outside battle.  Applying packed equality
+    there blanked field entry deterministically, so this form must never be
+    emitted again.
+    """
+    if len(addrs) < 29:
+        raise ValueError('mode-aware uiclip body needs 29 addresses')
+    return legacy_body_words()[:15] + [
+        # Stable world/field/menu result: equality includes both packed y
+        # halves.  A full-x partial-height rect is therefore recentred.
+        A.cmp_reg64(1, 3),                        # 15
+        A.ccmp_reg64(2, 4, 0, A.EQ),              # 16
+        A.csel64(11, 1, 8, A.EQ),                 # 17  packed result TL
+        A.csel64(12, 2, 9, A.EQ),                 # 18  packed result BR
+        # Battle result: equality deliberately ignores y, preserving the
+        # full-width partial-height viewport used by flashes and overlays.
+        A.cmp_reg(1, 3),                          # 19
+        A.ccmp_reg32(2, 4, 0, A.EQ),              # 20
+        A.csel64(13, 1, 8, A.EQ),                 # 21  x-only result TL
+        A.csel64(14, 2, 9, A.EQ),                 # 22  x-only result BR
+        A.adrp(10, addrs[23], MODE_PTR_PAGE),      # 23
+        A.ldr64(10, 10, MODE_PTR_OFF),             # 24  mode pointer
+        A.ldr(10, 10),                             # 25  current mode
+        A.cmp_imm(10, 3),                          # 26  battle == 3
+        A.csel64(1, 13, 11, A.EQ),                # 27
+        A.csel64(2, 14, 12, A.EQ),                # 28
+    ]
+
+
+def body_words_at(_addrs):
+    """Current x-only body; full-width rects retain both original y bounds."""
+    return xonly_body_words()
+
+
+def body_words(base=0x200000):
+    """A contiguous instance used by the emulator and mutation tests."""
+    return body_words_at([base + 4 * i for i in range(19)])
+
+
 N_BODY = 19
 N_WORDS = N_BODY + 2               # + the displaced word + the return branch
 
@@ -246,7 +355,7 @@ EXPECT_ASM = [
     'add w7, w2, w2, lsl #1',  'lsr w7, w7, #2',   'add w7, w7, w5',
     'add x8, x1, #0',          'bfxil x8, x6, #0, #0x20',
     'add x9, x2, #0',          'bfxil x9, x7, #0, #0x20',
-    'cmp x1, x3',              'ccmp x2, x4, #0, eq',
+    'cmp w1, w3',              'ccmp w2, w4, #0, eq',
     'csel x1, x1, x8, eq',     'csel x2, x2, x9, eq',
     'ldr x0, [x25]',
 ]
@@ -352,15 +461,16 @@ def walk_physical(t):
     entry = _b_target(w32(t, HOOK), HOOK)
     if entry is None:
         return []
-    va, out, logical = entry, [], 0
-    while logical < N_WORDS and va not in out:
+    va, out = entry, []
+    while len(out) < 128 and va not in out:
         x = w32(t, va)
         out.append(va)
         b = _b_target(x, va)
+        if b == RETURN_VA:
+            return out
         if b is not None and b != RETURN_VA:
             va = b
             continue
-        logical += 1
         va += 4
     return out
 
@@ -372,7 +482,7 @@ def walk(t):
         return None
     va, out = entry, []
     seen = set()
-    while len(out) < N_WORDS and va not in seen:
+    while len(out) < 128 and va not in seen:
         seen.add(va)
         x = w32(t, va)
         b = _b_target(x, va)
@@ -380,8 +490,55 @@ def walk(t):
             va = b
             continue
         out.append((va, x))
+        if b == RETURN_VA:
+            return out
         va += 4
     return out
+
+
+def _matches_fixed_body(wk, body):
+    """True for a position-independent historical body and exact tail."""
+    if not wk or len(wk) != len(body) + 2:
+        return False
+    have = [x for _, x in wk]
+    return (have[:len(body)] == list(body) and
+            have[len(body)] == HOOK_STOCK and
+            _b_target(have[-1], wk[-1][0]) == RETURN_VA)
+
+
+def _matches_current_cave(wk):
+    """True for the current x-only body and exact tail."""
+    if not wk or len(wk) != N_WORDS:
+        return False
+    addrs = [va for va, _ in wk[:N_BODY]]
+    have = [x for _, x in wk]
+    return (have[:N_BODY] == body_words_at(addrs) and
+            have[N_BODY] == HOOK_STOCK and
+            _b_target(have[-1], wk[-1][0]) == RETURN_VA)
+
+
+def _matches_bad_modeaware_cave(wk):
+    """True for the failed build-211 position-dependent cave."""
+    old_n = 29
+    if not wk or len(wk) != old_n + 2:
+        return False
+    addrs = [va for va, _ in wk[:old_n]]
+    have = [x for _, x in wk]
+    return (have[:old_n] == bad_modeaware_body_words_at(addrs) and
+            have[old_n] == HOOK_STOCK and
+            _b_target(have[-1], wk[-1][0]) == RETURN_VA)
+
+
+def _matches_bad_mode_cave(wk):
+    """True for the build-200 position-dependent promotion cave."""
+    old_n = 25
+    if not wk or len(wk) != old_n + 2:
+        return False
+    addrs = [va for va, _ in wk[:old_n]]
+    have = [x for _, x in wk]
+    return (have[:old_n] == bad_mode_body_words_at(addrs) and
+            have[old_n] == HOOK_STOCK and
+            _b_target(have[-1], wk[-1][0]) == RETURN_VA)
 
 
 # ---------------------------------------------------------------------------
@@ -395,12 +552,17 @@ def build_patches(img, starts, log=print):
         log('  ! hook +%#09x is %08X, not `ldr x0,[x25]`' % (HOOK, displaced))
         return None
     pool = ff7nx_cave.HolePool(img, starts=starts)
-    words, entry = ff7nx_cave.emit_hooked(pool, HOOK, displaced, body_words(),
-                                          return_va=RETURN_VA)
+
+    def builder(_entry, addr):
+        body = body_words_at([addr(i) for i in range(N_BODY)])
+        return body + [HOOK_STOCK, A.b(addr(N_BODY + 1), RETURN_VA)]
+
+    entry, words = ff7nx_cave.emit_laid_out(pool, builder)
+    words[HOOK] = A.b(HOOK, entry)
     log('  2D viewport scale: %d words in padding, entry +%#x'
         % (N_WORDS, entry))
     log('    window rects  x -> (3x)/4 + tW/8   (the shader\'s own 0.75, recentred)')
-    log('    full-screen rects passed through untouched, by comparison not by constant')
+    log('    full-width clips retain both original y bounds (no mode inference)')
     return words
 
 
@@ -449,7 +611,8 @@ CASES = [
 OBJ = 0x40001000
 
 
-def _run_cave(words, vp, full=(0, 0, 1280, 720)):
+def _run_cave(words, vp, full=(0, 0, 1280, 720), game_mode=3,
+              base=0x200000):
     """Execute the cave's logical words and return the rect it produced."""
     import arm64emu
     mem = arm64emu.Mem()
@@ -457,11 +620,14 @@ def _run_cave(words, vp, full=(0, 0, 1280, 720)):
     mem.setu(OBJ + FULL_OFF + 8, (full[3] << 32) | full[2], 8)
     mem.setu(OBJ + VP_OFF, (vp[1] << 32) | vp[0], 8)
     mem.setu(OBJ + VP_OFF + 8, (vp[3] << 32) | vp[2], 8)
+    mode_addr = 0x40002000
+    mem.setu(MODE_PTR_SLOT, mode_addr, 8)
+    mem.setu(mode_addr, game_mode, 4)
     cpu = arm64emu.Cpu(mem)
     cpu.set(26, OBJ)
     cpu.set(25, OBJ + 0x1000)
     cpu.sp = 0x50000000
-    cpu.run(0, list(words), max_steps=400)
+    cpu.run(base, list(words), max_steps=400)
     a, b = cpu.get(1), cpu.get(2)
     return (a & 0xFFFFFFFF, (a >> 32) & 0xFFFFFFFF,
             b & 0xFFFFFFFF, (b >> 32) & 0xFFFFFFFF)
@@ -490,7 +656,7 @@ def verify(t=None, log=print, verbose=True, words=None):
            'expected-asm table is %d rows, cave is %d words'
            % (len(EXPECT_ASM), len(seq)))
         for i, (word, want) in enumerate(zip(seq, EXPECT_ASM)):
-            got = _disasm(word)
+            got = _disasm(word, 0x200000 + 4 * i)
             ok(got is not None and
                got.replace(' ', '') == want.replace(' ', ''),
                'word %d is "%s", expected "%s"' % (i, got, want))
@@ -502,10 +668,13 @@ def verify(t=None, log=print, verbose=True, words=None):
         ok((word & 0x7E000000) not in (0x34000000, 0x36000000),
            'body word %d is a cbz/tbz' % i)
 
-    # 3. position-independent -- the cave runs from padding, not from the site
+    # 3. position-independent: this shared driver hook must not infer mode.
+    pc_relative = []
     for i, word in enumerate(body):
-        ok((word & 0x1F000000) != 0x10000000,
-           'body word %d is adrp/adr and cannot be relocated' % i)
+        if (word & 0x1F000000) == 0x10000000:
+            pc_relative.append(i)
+    ok(pc_relative == [],
+       'PC-relative words are %s, expected none' % pc_relative)
 
     # 4. no constant that ties this to one resolution or one WS_SCALE
     for i, word in enumerate(body):
@@ -516,6 +685,17 @@ def verify(t=None, log=print, verbose=True, words=None):
     for name, vp, want in CASES:
         got = _run_cave(body, vp)
         ok(got == want, '%s: cave gives %s, wanted %s' % (name, got, want))
+
+    # Full-x partial-height clips are legitimate in battle and field paths.
+    # Hardware proved Lower Junon blanks if packed equality narrows this rect.
+    # Mode must therefore have no effect and y must remain byte-for-byte.
+    partial = (0, 0, 1280, 498)
+    got = _run_cave(body, partial, game_mode=2)
+    ok(got == partial,
+       'field mode narrowed a full-x partial-height clip: %s' % (got,))
+    got = _run_cave(body, partial, game_mode=3)
+    ok(got == partial,
+       'battle mode narrowed a full-x partial-height clip: %s' % (got,))
 
     # 6. y is never touched, at two resolutions
     for full in ((0, 0, 1280, 720), (0, 0, 1920, 1080)):
@@ -541,15 +721,17 @@ def verify(t=None, log=print, verbose=True, words=None):
                % (len(wk) if wk else None, N_WORDS))
             if wk and len(wk) == N_WORDS:
                 have = [x for _, x in wk]
-                ok(have[:N_BODY] == body_words(),
+                addrs = [va for va, _ in wk[:N_BODY]]
+                ok(have[:N_BODY] == body_words_at(addrs),
                    'the installed cave body differs from this module\'s')
                 ok(have[N_BODY] == HOOK_STOCK,
                    'the installed cave does not carry the displaced word')
                 ok(_b_target(have[N_BODY + 1], wk[N_BODY + 1][0]) == RETURN_VA,
                    'the installed cave does not return to +%#x' % RETURN_VA)
-                got = _run_cave(have[:N_BODY], (160, 0, 400, 720))
-                ok(got == (PX(80), 0, PX(200), 720),
-                   'the INSTALLED cave misbehaves: %s' % (got,))
+                # Behaviour is executed on the same body encoded contiguously
+                # above.  The installed body is byte-compared against a
+                # rebuild using every one of its real, scattered PCs, which
+                # separately proves the ADRP reaches the correct page.
 
     if verbose:
         log('  %d check(s), %d failure(s)' % (checks, len(fails)))
@@ -568,10 +750,12 @@ def _mutants(log=lambda *_: None):
         ('scale by 1/2 not 3/4', 6, A.lsr(6, 6, 1)),
         ('recentre by tW/4', 4, A.lsr(5, 4, 2)),
         ('scale y as well as x', 12, A.bfi64(8, 6, 0, 64)),
-        ('invert the full-screen test', 17, A.csel64(1, 8, 1, A.EQ)),
+        ('invert the full-x test', 17, A.csel64(1, 8, 1, A.EQ)),
         ('compare only half the rect', 16, A.ccmp_reg64(2, 4, 4, A.EQ)),
         ('scale x2 from x1', 8, A.add_reg_lsl(7, 1, 1, 1)),
         ('forget to copy y into x8', 11, A.add_imm64(8, 31, 0)),
+        ('compare packed y as well as x', 16,
+         A.ccmp_reg64(2, 4, 0, A.EQ)),
     ]
     for what, idx, word in muts:
         total += 1
@@ -633,9 +817,9 @@ def show(main, log=print):
         wk = walk(t) or []
         for i, (va, x) in enumerate(wk):
             log('      %2d  +%#09x  %08X  %s' % (i, va, x, _disasm(x, va) or ''))
-        log('    window rects are scaled; full-screen rects pass through:')
-        body = [x for _, x in wk][:N_BODY]
-        if len(body) == N_BODY:
+        log('    window x-clips scale; full-width clips retain their y bounds:')
+        body = body_words()
+        if _matches_current_cave(wk):
             for name, vp, want in CASES:
                 got = _run_cave(body, vp)
                 log('      %-38s %s -> %s  %s'
@@ -671,17 +855,44 @@ def apply(main, revert=False, log=print) -> int:
             return 1
     else:
         if installed(t):
-            log('  2D viewport scale: already installed')
-            return 0
-        fails = verify(t, log=log, verbose=False)
-        if fails:
-            for f in fails:
-                log('  ! 2D viewport scale: ' + f)
-            log('  refusing to write.')
-            return 1
-        words = build_patches(m.img, set(m.arm_starts), log)
-        if words is None:
-            return 1
+            wk = walk(t)
+            if _matches_current_cave(wk):
+                log('  2D viewport scale: already installed')
+                return 0
+            known_old = (_matches_fixed_body(wk, legacy_body_words()) or
+                         _matches_fixed_body(wk, bad_w24_body_words()) or
+                         _matches_bad_modeaware_cave(wk) or
+                         _matches_bad_mode_cave(wk))
+            if not known_old:
+                log('  ! installed 2D viewport cave is neither this version '
+                    'nor a known historical version; refusing to replace it')
+                return 1
+            # Reclaim the known old cave in a virtual image, allocate the new
+            # one from that exact state, then express the migration as one
+            # checked patch transaction.  This avoids an on-disk interval in
+            # which the clip fix is absent and preserves idempotence.
+            log('  2D viewport scale: migrating historical viewport cave')
+            old = revert_patches(t, log)
+            if old is None:
+                return 1
+            virtual = bytearray(m.img)
+            for va, word in old.items():
+                struct.pack_into('<I', virtual, va, word)
+            new = build_patches(virtual, set(m.arm_starts), log)
+            if new is None:
+                return 1
+            words = dict(old)
+            words.update(new)
+        else:
+            fails = verify(t, log=log, verbose=False)
+            if fails:
+                for f in fails:
+                    log('  ! 2D viewport scale: ' + f)
+                log('  refusing to write.')
+                return 1
+            words = build_patches(m.img, set(m.arm_starts), log)
+            if words is None:
+                return 1
     if not words:
         log('  2D viewport scale: nothing to do')
         return 0

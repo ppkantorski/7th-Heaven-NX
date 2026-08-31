@@ -237,6 +237,17 @@ def ccmp_reg64(rn, rm, nzcv, cond):
     return 0xFA400000 | (rm << 16) | (cond << 12) | (rn << 5) | nzcv
 
 
+def ccmp_reg32(rn, rm, nzcv, cond):
+    """ccmp Wn, Wm, #nzcv, cond"""
+    return 0x7A400000 | (rm << 16) | (cond << 12) | (rn << 5) | nzcv
+
+
+def ccmp_imm32(rn, imm5, nzcv, cond):
+    """ccmp Wn, #imm5, #nzcv, cond"""
+    return (0x7A400800 | ((imm5 & 31) << 16) | (cond << 12) |
+            (rn << 5) | nzcv)
+
+
 def csel64(rd, rn, rm, cond):
     """csel Xd, Xn, Xm, cond -- Xd = cond ? Xn : Xm"""
     return 0x9A800000 | (rm << 16) | (cond << 12) | (rn << 5) | rd

@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Execute and verify the 60 Hz world scripted-motion timing pair.
+"""Execute and verify the 60 Hz world scripted-motion timing patch.
 
     python3 test_world_script_tick.py [--main game_data_files/exefs/main]
 
-The renderer must see motion every frame while opcode 0x306 consumes its
-wait counter every other world frame. The four script speed setters share a
-signed divide-by-two wrapper, matching FFNx rather than quantising a byte with
-an unsigned shift.
+The renderer must see motion every invocation while opcode 0x306 consumes its
+wait counter every other invocation *for each entity*.  The four script speed
+setters share a signed divide-by-two wrapper, matching FFNx rather than
+quantising a byte with an unsigned shift.
 """
 import argparse
 import struct
@@ -37,8 +37,6 @@ def main(argv=None):
 
     print('stock fingerprints')
     checks = [
-        (F.WORLD_FRAME_TICK_HOOK, F.WORLD_FRAME_TICK_ORIG,
-         'world-loop entry'),
         (F.WORLD_SCRIPT_TICK_HOOK, F.WORLD_SCRIPT_TICK_ORIG,
          'opcode 0x306 branch'),
     ] + [(va, word, label) for va, word, label
@@ -55,51 +53,63 @@ def main(argv=None):
            '%s calls pop_world_script_stack' % label)
 
     data_end = (m.segs[2][1] + m.segs[2][2] + 0xFFF) & ~0xFFF
-    counter = data_end + m.bss + F.WORLD_FRAME_COUNTER_OFF
+    table = data_end + m.bss + F.WORLD_ENTITY_PARITY_OFF
     pool = ff7nx_cave.HolePool(
         bytearray(m.text), starts=set(m.arm_starts),
         named=cave_space.named_targets(m.img[cave_space.RODATA:]))
-    frame_entry, frame_code = ff7nx_cave.emit_laid_out(
-        pool, lambda _entry, addr: F._world_frame_tick_words(addr, counter))
     tick_entry, tick_code = ff7nx_cave.emit_laid_out(
-        pool, lambda _entry, addr: F._world_script_tick_words(addr, counter))
+        pool, lambda _entry, addr: F._world_script_tick_words(addr, table))
     speed_entry, speed_code = ff7nx_cave.emit_laid_out(
         pool, lambda _entry, addr: F._world_script_speed_words(addr))
 
     print('\nplacement')
-    all_code = {**frame_code, **tick_code, **speed_code}
+    all_code = {**tick_code, **speed_code}
     ok(all(struct.unpack_from('<I', m.img, va)[0] == 0 for va in all_code),
        'every helper word occupies verified zero padding')
-    ok(len(frame_code) >= 6 and len(tick_code) >= 7 and len(speed_code) >= 8,
-       'all three complete helpers fit in reclaimed padding')
-
-    print('\nworld-frame source')
-    mem = arm64emu.Mem()
-    cpu = arm64emu.Cpu(mem)
-    cpu.sp = 0x70010000
-    for n in range(1, 5):
-        out = cpu.run(frame_entry, [], code=frame_code, start_pc=frame_entry)
-        ok(out == F.WORLD_FRAME_TICK_HOOK + 4,
-           'frame %d returns after the displaced prologue' % n)
-        ok(mem.u(counter, 4) == n, 'frame counter is %d' % n)
+    ok(len(tick_code) >= 21 and len(speed_code) >= 8,
+       'both complete helpers fit in reclaimed padding')
+    ok(F.WORLD_ENTITY_PARITY_OFF + F.WORLD_ENTITY_PARITY_BYTES <= 0x4000,
+       'bounded entity table fits inside the reserved BSS growth')
 
     print('\nopcode 0x306 paths')
-    def tick(phase, waiting=0):
-        tm = arm64emu.Mem()
-        tm.setu(counter, phase, 4)
+    tm = arm64emu.Mem()
+
+    def tick(entity, waiting=0):
         tc = arm64emu.Cpu(tm)
+        tc.x[8] = entity
         tc.x[22] = waiting
         return tc.run(tick_entry, [], code=tick_code, start_pc=tick_entry)
 
-    ok(tick(0) == F.WORLD_SCRIPT_NORMAL_PATH,
-       'even world frame enters wait_frames--')
-    ok(tick(1) == F.WORLD_SCRIPT_CONTINUE_PATH,
-       'odd world frame skips only wait_frames-- and still reaches movement')
-    ok(tick(0, 1) == F.WORLD_SCRIPT_REWIND_PATH
-       and tick(1, 1) == F.WORLD_SCRIPT_REWIND_PATH,
-       'stock waiting state rewinds on both phases')
-    ok([tick(1) for _ in range(4)] == [F.WORLD_SCRIPT_CONTINUE_PATH] * 4,
-       'multiple actors share frame parity without toggling one another')
+    a, b = 0x40100000, 0x40200000
+    ok([tick(a) for _ in range(4)] == [
+        F.WORLD_SCRIPT_CONTINUE_PATH, F.WORLD_SCRIPT_NORMAL_PATH,
+        F.WORLD_SCRIPT_CONTINUE_PATH, F.WORLD_SCRIPT_NORMAL_PATH],
+       'one entity alternates skip/decrement independently')
+    ok([tick(b), tick(a), tick(b), tick(a)] == [
+        F.WORLD_SCRIPT_CONTINUE_PATH, F.WORLD_SCRIPT_CONTINUE_PATH,
+        F.WORLD_SCRIPT_NORMAL_PATH, F.WORLD_SCRIPT_NORMAL_PATH],
+       'interleaved entities cannot steal one another\'s cadence')
+    ok(tick(a, 1) == F.WORLD_SCRIPT_REWIND_PATH
+       and tick(b, 1) == F.WORLD_SCRIPT_REWIND_PATH,
+       'stock waiting state rewinds without changing either parity')
+
+    # This is the Junon failure mode of the retired global gate: an entity
+    # serviced only on global odd frames would skip forever.  The keyed gate
+    # must continue making progress regardless of that external schedule.
+    c = 0x40300000
+    scheduled_on_global_odd_only = [tick(c) for _global in (1, 3, 5, 7)]
+    ok(scheduled_on_global_odd_only.count(F.WORLD_SCRIPT_NORMAL_PATH) == 2,
+       'odd-only external scheduling still decrements every second service')
+
+    full_mem = arm64emu.Mem()
+    for i in range(F.WORLD_ENTITY_PARITY_SLOTS):
+        full_mem.setu(table + i * 8, 0x50000000 + i * 0x100, 4)
+    full_cpu = arm64emu.Cpu(full_mem)
+    full_cpu.x[8] = 0x60000000
+    full_cpu.x[22] = 0
+    ok(full_cpu.run(tick_entry, [], code=tick_code,
+                    start_pc=tick_entry) == F.WORLD_SCRIPT_NORMAL_PATH,
+       'a full table falls back to progress instead of deadlocking')
 
     print('\nsigned speed wrapper')
     ctx = 0x71000000
