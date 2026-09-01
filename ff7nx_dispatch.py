@@ -1366,9 +1366,11 @@ CAMERA_CASES = [
 #       them is the point of the exercise: 21 of the 25 cameras are summon,
 #       limit-break and enemy-attack cameras.
 #
-#   kotr_excluded_frames (13)  FixCounterExceptionEffectDecorator, which pauses
-#       and additionally rewinds the slot's frame counter on named frames. The
-#       pacing half is reproduced; the rewind is not. Knights of the Round only.
+#   kotr_excluded_frames (13) use FixCounterExceptionEffectDecorator.  These
+#       are handled by the dedicated counter-hold path below, not by the pause
+#       decorator: the knight function must execute on every rendered frame so
+#       its model animation keeps moving, while its logical effect counter is
+#       restored on the three repeated frames.
 EFFECT100_NO_THROTTLE = [
     # the five arithmetic arms -- these get FFNx's default NoEffectDecorator
     'display_battle_action_text_42782A',
@@ -1388,10 +1390,66 @@ EFFECT100_NO_THROTTLE = [
     'run_summon_animations_5C0E4B',
     'run_summon_animations_script_5C1B81',
     'goblin_punch_flash_573291',
-    'run_ifrit_movement_596702',
+    # Ifrit used to be excluded because FFNx replaces the whole function.  In
+    # this port the stock function is retained, so excluding it advances its
+    # 15-fps phase counter on all four 60-fps frames and makes the model vanish.
+    # Pause-throttling is the safe stock-code equivalent (correct duration;
+    # interpolation can be added independently later).
     'vincent_limit_fade_effect_sub_5D4240',
     'cloud_limit_2_2_sub_467256',
     'battle_escape_magic_loop_5D602A',
+]
+
+# FFNx does not pause these thirteen Knights of the Round script functions.
+# It calls them on every rendered frame, but restores effect100.field_2 on the
+# three repeated frames (and suppresses nested effect registration).  At one
+# counter value per affected knight it temporarily presents counter+1 during
+# the call; without that exception the knight's own model animation stalls.
+# A value of zero means that knight has no exceptional counter.
+KOTR_COUNTER_EXCEPTIONS = [
+    ('run_summon_kotr_knight_script_0',  0x47ABB0,  50),
+    ('run_summon_kotr_knight_script_1',  0x47C793,  50),
+    ('run_summon_kotr_knight_script_2',  0x47CBAE,   0),
+    ('run_summon_kotr_knight_script_3',  0x47D976,  52),
+    ('run_summon_kotr_knight_script_4',  0x47DD6A,  35),
+    ('run_summon_kotr_knight_script_5',  0x47E05E,  14),
+    ('run_summon_kotr_knight_script_6',  0x47E367,   0),
+    ('run_summon_kotr_knight_script_7',  0x47EB92,  26),
+    ('run_summon_kotr_knight_script_8',  0x47EFA0,  71),
+    ('run_summon_kotr_knight_script_9',  0x47FB7D,  51),
+    ('run_summon_kotr_knight_script_10', 0x47FFC2,  56),
+    ('run_summon_kotr_knight_script_11', 0x48034E,  56),
+    ('run_summon_kotr_knight_script_12', 0x480776, 112),
+]
+
+# FFNx's summon-specific ModelInterpolationEffectDecorator set.  The final
+# value is stored as marker bit 3: zero means the normal 1000-unit smoothness
+# threshold, eight means Alexander's 3000-unit threshold.  Chocobuckle and
+# Barret's limit use related decorators but are intentionally not included in
+# this summon-only path: their pause policy and actor selection differ.
+# Quarantined after the first hardware run (build 214).  KOTR's separate
+# counter-hold path was stable, but every tested entry through this actor-3
+# position path (Shiva, Alexander and Bahamut ZERO) aborted the game.  The
+# generic PauseEffectDecorator path already preserves the required 15 Hz
+# logical pacing while still executing the stock function on every rendered
+# frame; use that proven path until the Switch-native actor-state access can be
+# established independently.  Keeping this list empty is intentional: the
+# functions remain in EFFECT100_MODEL/candidates, so they are throttled rather
+# than excluded and can still be selected in a future, separately gated model
+# interpolation implementation.
+SUMMON_MODEL_INTERPOLATION = []
+
+QUARANTINED_SUMMON_MODEL_INTERPOLATION = [
+    ('run_fat_chocobo_movement_509692', 0x509692, 0),
+    ('run_bahamut_movement_49ADEC', 0x49ADEC, 0),
+    ('run_bahamut_neo_movement_48D7BC', 0x48D7BC, 0),
+    ('run_odin_gunge_movement_4A584D', 0x4A584D, 0),
+    ('run_odin_steel_movement_4A6CB8', 0x4A6CB8, 0),
+    ('run_phoenix_movement_518AFF', 0x518AFF, 0),
+    ('run_chocomog_movement_50B1A3', 0x50B1A3, 0),
+    ('run_bahamut_zero_movement_48BBFC', 0x48BBFC, 0),
+    ('run_shiva_movement_592538', 0x592538, 0),
+    ('run_alexander_movement_5078D8', 0x5078D8, 8),
 ]
 
 # The functions FFNx DOES throttle, by name. They are not needed to build the
@@ -1988,6 +2046,22 @@ def build_addfn_cave(cave, site, flag_addr, mask_bits, throttle=None):
                          'block was asked for -- nothing to emit')
     ctx, io = site['ctx_reg'], site['idx_off']
     w = []
+    # Knights of the Round calls add_fn from inside each repeated knight
+    # frame.  FFNx deliberately suppresses those nested registrations while
+    # its logical counter is held.  Branch to the stock function's common
+    # return path before either our registration bookkeeping or the displaced
+    # array store.  No other dispatcher supplies these keys, so its behaviour
+    # remains byte-for-byte unchanged.
+    if throttle is not None and throttle.get('kotr'):
+        dis = throttle['kotr_disable']
+        w += [A.adrp(17, cave + 4 * len(w), dis & ~0xFFF),
+              A.add_imm64(17, 17, dis & 0xFFF),
+              A.ldrb(16, 17, 0)]
+        enabled_i = len(w)
+        w.append(0)                                  # cbz -> normal registration
+        w.append(A.b(cave + 4 * len(w), throttle['kotr_add_skip']))
+        w[enabled_i] = A.cbz(16, cave + 4 * enabled_i,
+                             cave + 4 * len(w))
     if flag_addr is not None:
         w += [A.ldr(16, ctx, io),
               A.and_mask(16, 16, mask_bits),
@@ -2007,6 +2081,15 @@ def build_addfn_cave(cave, site, flag_addr, mask_bits, throttle=None):
         # is inside the cave (adr reach) and can never be executed.
         assert len(w) == table_at, (len(w), table_at)
         w += list(throttle['table']) + [0]
+        # Packed as exception:8 | guest_function:24.  Guest addresses in this
+        # binary are below 0x01000000, so the format is lossless; zero remains
+        # available as the sentinel and exception zero means "no exception".
+        w += [((exc & 0xFF) << 24) | (va & 0xFFFFFF)
+              for _name, va, exc in throttle.get('kotr', ())] + [0]
+        # Packed as marker-bits:8 | guest_function:24.  Bit 5 identifies the
+        # model decorator; bit 3 selects Alexander's 3000-unit threshold.
+        w += [((marker & 0xFF) << 24) | (va & 0xFFFFFF)
+              for _name, va, marker in throttle.get('model', ())] + [0]
     return w
 
 
@@ -2067,12 +2150,17 @@ def build_addfn_cave(cave, site, flag_addr, mask_bits, throttle=None):
 # pause trick never changes control flow: the call always happens, on every
 # frame, exactly as the stock dispatcher does it.
 #
-# NO INTERPOLATION
-# ----------------
-# The result is correct pacing with visibly steppier motion -- which is what the
-# game looked like natively at 15 FPS, so it is arguably right rather than a
-# compromise. Interpolation is per-slot C++ state (an unordered_map keyed on a
-# Cantor hash of the return address) and is not expressible as a cave.
+# INTERPOLATION SCOPE
+# -------------------
+# Generic effect100/effect60 entries retain correct 15 Hz pacing on the 60 Hz
+# render loop.  FFNx's ten summon movement functions are different: their
+# ModelInterpolationEffectDecorator advances once, then displays three
+# interpolated actor-3 positions.  The effect100 cave below now carries the
+# equivalent fixed per-slot state directly in BSS (including Alexander's 3000
+# unit teleport threshold and deferred final-frame retirement).  KOTR uses its
+# separate counter-hold decorator because its thirteen knight scripts animate
+# by a different contract.  This keeps interpolation narrowly matched to FFNx
+# instead of guessing that every visual effect owns the same kind of position.
 #
 # STATE
 # -----
@@ -2169,6 +2257,77 @@ def _addfn_throttle_words(cave, w, site, mask_bits, throttle, allow=False):
     w.append(A.movz(16, hit_val))
     done = pc()
     w[cbz_i] = A.cbz(0, cave + 4 * cbz_i, done)
+    # Keep the ordinary exclusion result while the optional KOTR table borrows
+    # w16 for its masked function comparison.
+    special = throttle.get('kotr', ())
+    model = throttle.get('model', ())
+    if special or model:
+        w.append(A.str_(16, A.SP, 8))
+    if special:
+        special_adr_i = len(w)
+        w.append(0)                                  # adr x17,KOTR_TABLE
+        special_loop_i = len(w)
+        w.append(A.ldr_post(0, 17, 4))
+        special_end_i = len(w)
+        w.append(0)                                  # cbz -> ordinary result
+        w.append(A.and_mask(16, 0, 24))
+        w.append(A.cmp_reg(16, fn))
+        w.append(A.bcond(pc(), cave + 4 * special_loop_i, A.NE))
+        # A match is the KOTR marker (bit 6), and its high byte is saved in the
+        # per-slot exception array.  This includes zero for the two knights
+        # without an exceptional frame, clearing stale state on slot reuse.
+        w.append(A.lsr(16, 0, 24))
+        w.append(A.ldr(0, ctx, io))
+        w.append(A.and_mask(0, 0, mask_bits))
+        exc = throttle['kotr_exc']
+        w.append(A.adrp(17, pc(), exc & ~0xFFF))
+        w.append(A.add_imm64(17, 17, exc & 0xFFF))
+        w.append(A.add_reg64(17, 17, 0))
+        w.append(A.strb(16, 17, 0))
+        w.append(A.movz(16, 0x40))
+        special_done_jump = len(w)
+        w.append(0)                                  # b -> final slot store
+        special_miss = pc()
+        w[special_end_i] = A.cbz(0, cave + 4 * special_end_i, special_miss)
+        # Do not clear a stale exception byte here.  It is unreachable unless
+        # this slot's counter marker has bit 6 set, and every KOTR registration
+        # overwrites the byte before setting that marker.  Omitting the dead
+        # cleanup saves seven words in the tightly bounded dispatcher cave.
+    else:
+        special_adr_i = special_done_jump = None
+
+    # FFNx gives these ten summon movement routines a model-position
+    # decorator rather than the generic pause decorator.  A table match seeds
+    # marker bit 5; the optional high-byte bit 3 is Alexander's larger
+    # teleport threshold.  Phase and retirement state are reset lazily on the
+    # first invocation, after registration has made the marker authoritative.
+    if model:
+        model_adr_i = len(w)
+        w.append(0)                                  # adr x17,MODEL_TABLE
+        model_loop_i = len(w)
+        w.append(A.ldr_post(0, 17, 4))
+        model_end_i = len(w)
+        w.append(0)                                  # cbz -> ordinary result
+        w.append(A.and_mask(16, 0, 24))
+        w.append(A.cmp_reg(16, fn))
+        w.append(A.bcond(pc(), cave + 4 * model_loop_i, A.NE))
+        w.append(A.lsr(16, 0, 24))
+        w.append(A.add_imm(16, 16, 0x20))
+        model_done_jump = len(w)
+        w.append(0)                                  # b -> final slot store
+        model_miss = pc()
+        w[model_end_i] = A.cbz(0, cave + 4 * model_end_i, model_miss)
+    else:
+        model_adr_i = model_done_jump = None
+
+    if special or model:
+        w.append(A.ldr(16, A.SP, 8))                 # ordinary exclusion result
+
+    final_store = pc()
+    if special_done_jump is not None:
+        w[special_done_jump] = A.b(cave + 4 * special_done_jump, final_store)
+    if model_done_jump is not None:
+        w[model_done_jump] = A.b(cave + 4 * model_done_jump, final_store)
     w.append(A.ldr(0, ctx, io))
     w.append(A.and_mask(0, 0, mask_bits))
     w.append(A.adrp(17, pc(), ctr & ~0xFFF))
@@ -2179,11 +2338,20 @@ def _addfn_throttle_words(cave, w, site, mask_bits, throttle, allow=False):
     w.append(A.add_imm64(A.SP, A.SP, 0x10))
     table_at = len(w) + 2                             # + displaced + branch back
     w[adr_i] = A.adr(17, cave + 4 * adr_i, cave + 4 * table_at)
+    if special_adr_i is not None:
+        special_at = table_at + len(throttle['table']) + 1
+        w[special_adr_i] = A.adr(17, cave + 4 * special_adr_i,
+                                  cave + 4 * special_at)
+    if model_adr_i is not None:
+        model_at = (table_at + len(throttle['table']) + 1
+                    + len(throttle.get('kotr', ())) + 1)
+        w[model_adr_i] = A.adr(17, cave + 4 * model_adr_i,
+                               cave + 4 * model_at)
     return w, table_at
 
 
 def build_throttle_pre_cave(cave, site, throttle, paused_guest, mask_bits,
-                            freq_bits=2):
+                            freq_bits=2, addr=None):
     """
     Emit the pre-call half of the pause-throttle, hooked on the guest-stack push
     that immediately precedes the dispatcher's indirect call.
@@ -2251,7 +2419,8 @@ def build_throttle_pre_cave(cave, site, throttle, paused_guest, mask_bits,
     w = []
 
     def pc(i=None):
-        return cave + 4 * (len(w) if i is None else i)
+        i = len(w) if i is None else i
+        return addr(i) if addr is not None else cave + 4 * i
 
     w.append(A.adrp(17, pc(), base & ~0xFFF))
     w.append(A.add_imm64(17, 17, base & 0xFFF))
@@ -2260,8 +2429,22 @@ def build_throttle_pre_cave(cave, site, throttle, paused_guest, mask_bits,
     w.append(A.and_mask(16, 16, mask_bits))
     w.append(A.add_reg64(17, 17, 16))
     w.append(A.ldrb(16, 17, 0))
+    # Use ordinary conditional branches for the three class tests below.
+    # The production padding allocator may scatter decorator blocks by well
+    # over TBZ/TBNZ's +/-32 KiB range, while B.cond remains valid to +/-1 MiB.
+    w.append(A.cmp_imm(16, 0x80))
     tb_i = len(w)
-    w.append(0)                                     # tbnz w16,#7,OUT -- patched
+    w.append(0)                                     # b.hs OUT -- excluded marker
+    kotr_i = None
+    if throttle.get('kotr'):
+        w.append(A.cmp_imm(16, 0x40))
+        kotr_i = len(w)
+        w.append(0)                                 # b.hs KOTR (excluded split first)
+    model_i = None
+    if throttle.get('model'):
+        w.append(A.cmp_imm(16, 0x20))
+        model_i = len(w)
+        w.append(0)                                 # b.ge MODEL (KOTR already split)
     w.append(A.add_imm(16, 16, 1))
     w.append(A.and_mask(16, 16, freq_bits))
     w.append(A.strb(16, 17, 0))
@@ -2285,15 +2468,224 @@ def build_throttle_pre_cave(cave, site, throttle, paused_guest, mask_bits,
     w.append(A.ldr64(0, A.SP, 0))
     w.append(A.ldr64(e, A.SP, 8))
     w.append(A.add_imm64(A.SP, A.SP, 0x10))
+    normal_out_i = None
+    if throttle.get('kotr') or throttle.get('model'):
+        normal_out_i = len(w)
+        w.append(0)                                 # b OUT -- don't fall into decorator paths
+
+    # FFNx's FixCounterExceptionEffectDecorator for the thirteen KOTR knights.
+    # The function is called every rendered frame (so model animation is not
+    # frozen), but field_2 is restored after repeat calls.  Nested add_fn calls
+    # are suppressed, field_0 is restored except on the final repeat, and the
+    # named exception counter is temporarily presented as counter+1.
+    kotr_end_i = None
+    if throttle.get('kotr'):
+        kotr = pc()
+        w[kotr_i] = A.bcond(pc(kotr_i), kotr, A.HS)
+        w.append(A.add_imm(16, 16, 1))
+        w.append(A.and_mask(16, 16, freq_bits))
+        w.append(A.add_imm(16, 16, 0x40))
+        w.append(A.strb(16, 17, 0))
+        w.append(A.cmp_imm(16, 0x41))               # phase 1 = real step
+        kotr_real_i = len(w)
+        w.append(0)                                 # b.eq OUT
+
+        w.append(A.sub_imm64(A.SP, A.SP, 0x10))
+        w.append(A.str64(0, A.SP, 0))
+        w.append(A.str64(e, A.SP, 8))
+
+        # did=3 on the final repeat (phase 0), otherwise did=2.  The post cave
+        # uses this to let a retirement at the final repeat persist exactly as
+        # FFNx does.
+        w.append(A.cmp_imm(16, 0x40))
+        w.append(A.movz(16, 2))
+        # did=2 when phase != 0x40; increment to 3 when phase == 0x40.
+        w.append(A.csinc(16, 16, 16, A.NE))
+        w.append(A.adrp(17, pc(), base & ~0xFFF))
+        w.append(A.add_imm64(17, 17, base & 0xFFF))
+        w.append(A.strb(16, 17, did - base))
+
+        # Translate &effect100_array_data[idx].
+        w.append(A.ldr(16, ctx, io))
+        w.append(A.and_mask(16, 16, mask_bits))
+        data = throttle['data_base']
+        w.append(A.movz(0, data & 0xFFFF))
+        w.append(A.movk_hi(0, (data >> 16) & 0xFFFF))
+        if throttle.get('stride') != 0x20:
+            raise SystemExit('KOTR counter hold requires effect100 stride 0x20')
+        w.append(A.add_reg_lsl(0, 0, 16, 5))
+        w.append(A.bl(pc(), TRANSLATE))
+
+        w.append(A.adrp(17, pc(), base & ~0xFFF))
+        w.append(A.add_imm64(17, 17, base & 0xFFF))
+        w.append(A.str64(0, 17, throttle['kotr_ptr'] - base))
+        w.append(A.ldrh(16, 0, 0))
+        w.append(A.strh(16, 17, throttle['kotr_active'] - base))
+        w.append(A.ldrh(16, 0, 2))
+        w.append(A.strh(16, 17, throttle['kotr_counter'] - base))
+
+        # Fetch this slot's exception and, only on an exact counter match,
+        # expose counter+1 during the call.  The post cave always restores it.
+        w.append(A.ldr(16, ctx, io))
+        w.append(A.and_mask(16, 16, mask_bits))
+        w.append(A.add_reg64(17, 17, 16))
+        w.append(A.ldrb(16, 17, throttle['kotr_exc'] - base))
+        no_exc_i = len(w)
+        w.append(0)                                 # cbz NO_EXCEPTION
+        w.append(A.ldrh(17, 0, 2))
+        w.append(A.cmp_reg(17, 16))
+        not_exc_i = len(w)
+        w.append(0)                                 # b.ne NO_EXCEPTION
+        w.append(A.add_imm(17, 17, 1))
+        w.append(A.strh(17, 0, 2))
+        no_exception = pc()
+        w[no_exc_i] = A.cbz(16, pc(no_exc_i), no_exception)
+        w[not_exc_i] = A.bcond(pc(not_exc_i), no_exception, A.NE)
+
+        w.append(A.adrp(17, pc(), base & ~0xFFF))
+        w.append(A.add_imm64(17, 17, base & 0xFFF))
+        w.append(A.movz(16, 1))
+        w.append(A.strb(16, 17, throttle['kotr_disable'] - base))
+        w.append(A.ldr64(0, A.SP, 0))
+        w.append(A.ldr64(e, A.SP, 8))
+        w.append(A.add_imm64(A.SP, A.SP, 0x10))
+        if throttle.get('model'):
+            kotr_end_i = len(w)
+            w.append(0)                             # b OUT -- don't enter MODEL
+
+    # FFNx ModelInterpolationEffectDecorator for all ten summon movement
+    # functions.  Marker bit 5 selects this path, bit 4 means the initial
+    # position was captured, and bit 3 chooses Alexander's larger teleport
+    # threshold.  The phase byte is kept separately so wrapping 3->0 cannot
+    # carry into those marker bits.
+    model_init_i = model_real_i = model_repeat_done_i = None
+    if throttle.get('model'):
+        model = pc()
+        w[model_i] = A.bcond(pc(model_i), model, A.GE)
+        # AND's helper takes a low-bit count, not a literal mask.  Keeping
+        # the low five bits distinguishes uninitialized 0x20/0x28 from
+        # initialized 0x30/0x38 without losing Alexander's bit 3.
+        w.append(A.and_mask(0, 16, 5))
+        w.append(A.cmp_imm(0, 0x10))
+        model_init_i = len(w)
+        w.append(0)                                 # b.lo MODEL_INIT
+
+        # Remember the current slot for the post-call half, then advance its
+        # independent 0..3 interpolation phase.
+        w.append(A.ldr(0, ctx, io))
+        w.append(A.and_mask(0, 0, mask_bits))
+        w.append(A.adrp(17, pc(), base & ~0xFFF))
+        w.append(A.add_imm64(17, 17, base & 0xFFF))
+        w.append(A.strb(0, 17, throttle['model_idx'] - base))
+        w.append(A.add_reg64(17, 17, 0))
+        w.append(A.ldrb(16, 17, throttle['model_phase'] - base))
+        w.append(A.add_imm(0, 16, 1))
+        w.append(A.and_mask(0, 0, freq_bits))
+        w.append(A.strb(0, 17, throttle['model_phase'] - base))
+
+        # did = 5,6,7 for phases 1,2,3 and 8 for phase 0.  Only phase 1
+        # advances the logical summon; the other three calls use the pause
+        # trick and are overwritten with an interpolated model position.
+        w.append(A.cmp_imm(16, 0))
+        w.append(A.add_imm(16, 16, 4))
+        w.append(A.movz(0, 8))
+        w.append(A.csel(16, 0, 16, A.EQ))
+        w.append(A.adrp(17, pc(), base & ~0xFFF))
+        w.append(A.add_imm64(17, 17, base & 0xFFF))
+        w.append(A.strb(16, 17, did - base))
+        w.append(A.cmp_imm(16, 5))
+        model_real_i = len(w)
+        w.append(0)                                 # b.eq MODEL_REAL
+
+        # Repeated model frame: execute the stock function paused.  This is
+        # the same safe call-preserving pause trick as the generic decorator,
+        # but did=6/7/8 tells post which interpolation step to display.
+        w.append(A.sub_imm64(A.SP, A.SP, 0x10))
+        w.append(A.str64(0, A.SP, 0))
+        w.append(A.str64(e, A.SP, 8))
+        w.append(A.movz(0, paused_guest & 0xFFFF))
+        w.append(A.movk_hi(0, (paused_guest >> 16) & 0xFFFF))
+        w.append(A.bl(pc(), TRANSLATE))
+        w.append(A.adrp(17, pc(), base & ~0xFFF))
+        w.append(A.add_imm64(17, 17, base & 0xFFF))
+        w.append(A.str64(0, 17, pptr - base))
+        w.append(A.ldrb(16, 0, 0))
+        w.append(A.strb(16, 17, saved - base))
+        w.append(A.movz(16, 1))
+        w.append(A.strb(16, 0, 0))
+        w.append(A.ldr64(0, A.SP, 0))
+        w.append(A.ldr64(e, A.SP, 8))
+        w.append(A.add_imm64(A.SP, A.SP, 0x10))
+        model_repeat_done_i = len(w)
+        w.append(0)                                 # b OUT
+
+        # First invocation: mark initialized, reset per-registration state,
+        # and call the stock function normally.  Post captures nextPosition.
+        model_init = pc()
+        w[model_init_i] = A.bcond(pc(model_init_i), model_init, A.LT)
+        w.append(A.add_imm(16, 16, 0x10))
+        w.append(A.strb(16, 17, 0))                  # ctr[idx] marker
+        w.append(A.ldr(0, ctx, io))
+        w.append(A.and_mask(0, 0, mask_bits))
+        w.append(A.adrp(17, pc(), base & ~0xFFF))
+        w.append(A.add_imm64(17, 17, base & 0xFFF))
+        w.append(A.strb(0, 17, throttle['model_idx'] - base))
+        w.append(A.add_reg64(17, 17, 0))
+        w.append(A.movz(16, 1))
+        w.append(A.strb(16, 17, throttle['model_phase'] - base))
+        w.append(A.strb(A.WZR, 17, throttle['model_final'] - base))
+        w.append(A.adrp(17, pc(), base & ~0xFFF))
+        w.append(A.add_imm64(17, 17, base & 0xFFF))
+        w.append(A.movz(16, 4))
+        w.append(A.strb(16, 17, did - base))
+        model_init_done_i = len(w)
+        w.append(0)                                 # b OUT
+
+        # Real logical step (phase 1): save effectActive so post can defer a
+        # retirement until interpolation step 4, exactly as FFNx does.
+        model_real = pc()
+        w[model_real_i] = A.bcond(pc(model_real_i), model_real, A.EQ)
+        w.append(A.sub_imm64(A.SP, A.SP, 0x10))
+        w.append(A.str64(0, A.SP, 0))
+        w.append(A.str64(e, A.SP, 8))
+        w.append(A.ldr(16, ctx, io))
+        w.append(A.and_mask(16, 16, mask_bits))
+        data = throttle['data_base']
+        w.append(A.movz(0, data & 0xFFFF))
+        w.append(A.movk_hi(0, (data >> 16) & 0xFFFF))
+        if throttle.get('stride') != 0x20:
+            raise SystemExit('model interpolation requires effect100 stride 0x20')
+        w.append(A.add_reg_lsl(0, 0, 16, 5))
+        w.append(A.bl(pc(), TRANSLATE))
+        w.append(A.adrp(17, pc(), base & ~0xFFF))
+        w.append(A.add_imm64(17, 17, base & 0xFFF))
+        w.append(A.str64(0, 17, throttle['model_ptr'] - base))
+        w.append(A.ldrh(16, 0, 0))
+        w.append(A.strh(16, 17, throttle['model_active'] - base))
+        w.append(A.ldr64(0, A.SP, 0))
+        w.append(A.ldr64(e, A.SP, 8))
+        w.append(A.add_imm64(A.SP, A.SP, 0x10))
+        model_real_done_i = len(w)
+        w.append(0)                                 # b OUT
     out = pc()
-    w[tb_i] = A.tbnz(16, 7, cave + 4 * tb_i, out)
-    w[eq_i] = A.bcond(cave + 4 * eq_i, out, A.EQ)
+    w[tb_i] = A.bcond(pc(tb_i), out, A.HS)
+    w[eq_i] = A.bcond(pc(eq_i), out, A.EQ)
+    if throttle.get('kotr'):
+        w[kotr_real_i] = A.bcond(pc(kotr_real_i), out, A.EQ)
+    if normal_out_i is not None:
+        w[normal_out_i] = A.b(pc(normal_out_i), out)
+    if kotr_end_i is not None:
+        w[kotr_end_i] = A.b(pc(kotr_end_i), out)
+    if throttle.get('model'):
+        w[model_repeat_done_i] = A.b(pc(model_repeat_done_i), out)
+        w[model_init_done_i] = A.b(pc(model_init_done_i), out)
+        w[model_real_done_i] = A.b(pc(model_real_done_i), out)
     w.append(site['displaced'])
     w.append(A.b(pc(), site['hook'] + 4))
     return w
 
 
-def build_throttle_post_cave(cave, site, throttle):
+def build_throttle_post_cave(cave, site, throttle, addr=None):
     """
     Emit the post-call half: undo the pause the pre cave applied.
 
@@ -2327,19 +2719,262 @@ def build_throttle_post_cave(cave, site, throttle):
     w = []
 
     def pc(i=None):
-        return cave + 4 * (len(w) if i is None else i)
+        i = len(w) if i is None else i
+        return addr(i) if addr is not None else cave + 4 * i
 
     w.append(A.adrp(17, pc(), base & ~0xFFF))
     w.append(A.add_imm64(17, 17, base & 0xFFF))
     w.append(A.ldrb(16, 17, did - base))
     cbz_i = len(w)
     w.append(0)                                     # cbz w16, OUT -- patched
+
+    model_i = None
+    if throttle.get('model'):
+        w.append(A.cmp_imm(16, 4))
+        model_i = len(w)
+        w.append(0)                                 # b.ge MODEL -- did 4..8
+
+    special_i = None
+    if throttle.get('kotr'):
+        w.append(A.cmp_imm(16, 2))
+        special_i = len(w)
+        w.append(0)                                 # b.ge KOTR -- did 2/3
+
+    # Generic pause decorator (did=1).
     w.append(A.strb(A.WZR, 17, did - base))
     w.append(A.ldrb(16, 17, saved - base))
     w.append(A.ldr64(17, 17, pptr - base))
     w.append(A.strb(16, 17, 0))
+    normal_out_i = None
+    if throttle.get('kotr') or throttle.get('model'):
+        normal_out_i = len(w)
+        w.append(0)                                 # b OUT
+
+    # Knights of the Round counter-hold decorator (did=2/3).
+    final_i = special_out_i = None
+    if throttle.get('kotr'):
+        special = pc()
+        w[special_i] = A.bcond(pc(special_i), special, A.GE)
+        # Preserve the did value's flags while stores/loads restore the held
+        # state.  did==3 is the last repeat, where field_0 retirement persists.
+        w.append(A.cmp_imm(16, 3))
+        w.append(A.strb(A.WZR, 17, did - base))
+        w.append(A.strb(A.WZR, 17, throttle['kotr_disable'] - base))
+        w.append(A.ldr64(0, 17, throttle['kotr_ptr'] - base))
+        w.append(A.ldrh(16, 17, throttle['kotr_counter'] - base))
+        w.append(A.strh(16, 0, 2))
+        final_i = len(w)
+        w.append(0)                                 # b.eq OUT (keep field_0)
+        w.append(A.ldrh(16, 17, throttle['kotr_active'] - base))
+        w.append(A.strh(16, 0, 0))
+        if throttle.get('model'):
+            special_out_i = len(w)
+            w.append(0)                             # b OUT -- don't enter MODEL
+
+    # Summon model-position interpolation (did=4..8).  Registers x0..x17 are
+    # caller-saved and dead at this post-call hook; the displaced instruction
+    # defines w0, so this path may use them freely after TRANSLATE returns.
+    model_init_out_i = model_final_out_i = None
+    teleport_branches = []
+    if throttle.get('model'):
+        model = pc()
+        w[model_i] = A.bcond(pc(model_i), model, A.GE)
+
+        # Repeated frames used the pause trick; restore the original byte
+        # before doing any interpolation work.  did=4/5 were real calls.
+        w.append(A.cmp_imm(16, 6))
+        no_restore_i = len(w)
+        w.append(0)                                 # b.lt MODEL_TRANSLATE
+        w.append(A.ldrb(0, 17, saved - base))
+        w.append(A.ldr64(1, 17, pptr - base))
+        w.append(A.strb(0, 1, 0))
+        model_translate = pc()
+        w[no_restore_i] = A.bcond(pc(no_restore_i), model_translate, A.LT)
+
+        # Translate actor 3's modelPosition.  FFNx recovers battle_model_state
+        # at 0xBE1178, sizeof=0x1AEC, modelPosition=0x166, hence 0xBE63A2.
+        pos = throttle['model_pos']
+        w.append(A.movz(0, pos & 0xFFFF))
+        w.append(A.movk_hi(0, (pos >> 16) & 0xFFFF))
+        w.append(A.bl(pc(), TRANSLATE))              # x0 = host modelPosition
+
+        # Recover did and idx after the call (TRANSLATE may clobber every
+        # caller-saved register), clear did, and form the two 6-byte vectors.
+        w.append(A.adrp(1, pc(), base & ~0xFFF))
+        w.append(A.add_imm64(1, 1, base & 0xFFF))
+        w.append(A.ldrb(2, 1, did - base))
+        w.append(A.strb(A.WZR, 1, did - base))
+        w.append(A.ldrb(3, 1, throttle['model_idx'] - base))
+        prev = throttle['model_prev']
+        nxt = throttle['model_next']
+        w.append(A.adrp(4, pc(), prev & ~0xFFF))
+        w.append(A.add_imm64(4, 4, prev & 0xFFF))
+        w.append(A.add_reg64_lsl(4, 4, 3, 1))
+        w.append(A.add_reg64_lsl(4, 4, 3, 2))
+        w.append(A.adrp(5, pc(), nxt & ~0xFFF))
+        w.append(A.add_imm64(5, 5, nxt & 0xFFF))
+        w.append(A.add_reg64_lsl(5, 5, 3, 1))
+        w.append(A.add_reg64_lsl(5, 5, 3, 2))
+
+        # Frame zero only captures nextPosition.
+        w.append(A.cmp_imm(2, 4))
+        model_init_i = len(w)
+        w.append(0)                                 # b.eq MODEL_INIT
+
+        # Step four displays nextPosition exactly and, if the real step
+        # retired the effect, performs that deferred retirement now.
+        w.append(A.cmp_imm(2, 8))
+        model_final_i = len(w)
+        w.append(0)                                 # b.eq MODEL_FINAL
+
+        # Step one shifts old next -> previous and captures the newly produced
+        # position as next. Steps two/three retain those endpoints.
+        w.append(A.cmp_imm(2, 5))
+        no_capture_i = len(w)
+        w.append(0)                                 # b.ne MODEL_THRESH
+        for off in (0, 2, 4):
+            w.append(A.ldrh(6, 5, off))
+            w.append(A.strh(6, 4, off))
+            w.append(A.ldrh(6, 0, off))
+            w.append(A.strh(6, 5, off))
+
+        # Select 1000 (all summons) or 3000 (Alexander), and compare squared
+        # distance without allowing a huge signed-short delta to overflow the
+        # 32-bit squares.  A component at/over the threshold is already a
+        # teleport; otherwise the sum is bounded to <27,000,000.
+        model_thresh = pc()
+        w[no_capture_i] = A.bcond(pc(no_capture_i), model_thresh, A.NE)
+        w.append(A.adrp(1, pc(), base & ~0xFFF))
+        w.append(A.add_imm64(1, 1, base & 0xFFF))
+        w.append(A.add_reg64(1, 1, 3))
+        w.append(A.ldrb(6, 1, 0))                   # ctr[idx] marker
+        large_thresh_i = len(w)
+        w.append(0)                                 # tbnz bit3,LARGE
+        w.append(A.movz(6, 1000))
+        w += A.movz_movk(7, 1000 * 1000)
+        thresh_ready_i = len(w)
+        w.append(0)                                 # b THRESH_READY
+        large_thresh = pc()
+        w[large_thresh_i] = A.tbnz(6, 3, pc(large_thresh_i), large_thresh)
+        w.append(A.movz(6, 3000))
+        w += A.movz_movk(7, 3000 * 3000)
+        thresh_ready = pc()
+        w[thresh_ready_i] = A.b(pc(thresh_ready_i), thresh_ready)
+        w.append(A.movz(8, 0))                      # squared-distance sum
+        for off in (0, 2, 4):
+            w.append(A.ldrsh(9, 5, off))
+            w.append(A.ldrsh(10, 4, off))
+            w.append(A.sub_reg(11, 9, 10))
+            w.append(A.cmp_reg(11, 6))
+            ge_i = len(w)
+            w.append(0)                             # b.ge TELEPORT
+            teleport_branches.append((ge_i, A.GE))
+            w.append(A.sub_reg(12, A.WZR, 6))
+            w.append(A.cmp_reg(11, 12))
+            le_i = len(w)
+            w.append(0)                             # b.le TELEPORT
+            teleport_branches.append((le_i, A.LE))
+            w.append(A.mul(11, 11, 11))
+            w.append(A.add_reg(8, 8, 11))
+        w.append(A.cmp_reg(8, 7))
+        dist_i = len(w)
+        w.append(0)                                 # b.ge TELEPORT
+        teleport_branches.append((dist_i, A.GE))
+
+        # Smooth path: previous + trunc((next-previous)*step / 4).  The +3
+        # bias for negative products gives C++ signed division toward zero.
+        w.append(A.sub_imm(12, 2, 4))               # interpolation step 1..3
+        for off in (0, 2, 4):
+            w.append(A.ldrsh(9, 4, off))
+            w.append(A.ldrsh(10, 5, off))
+            w.append(A.sub_reg(10, 10, 9))
+            w.append(A.mul(10, 10, 12))
+            w.append(A.lsr(11, 10, 31))
+            w.append(A.add_reg_lsl(10, 10, 11, 1))
+            w.append(A.add_reg(10, 10, 11))
+            w.append(A.asr(10, 10, 2))
+            w.append(A.add_reg(10, 9, 10))
+            w.append(A.strh(10, 0, off))
+        smooth_done_i = len(w)
+        w.append(0)                                 # b MODEL_AFTER_POSITION
+
+        teleport = pc()
+        for bi, cond in teleport_branches:
+            w[bi] = A.bcond(pc(bi), teleport, cond)
+        for off in (0, 2, 4):
+            w.append(A.ldrh(9, 4, off))
+            w.append(A.strh(9, 0, off))
+
+        # Only a real phase-one call can newly retire the effect. Restore it
+        # and remember to retire after step four, matching FFNx's finalFrame.
+        after_position = pc()
+        w[smooth_done_i] = A.b(pc(smooth_done_i), after_position)
+        w.append(A.cmp_imm(2, 5))
+        not_real_i = len(w)
+        w.append(0)                                 # b.ne OUT
+        w.append(A.adrp(1, pc(), base & ~0xFFF))
+        w.append(A.add_imm64(1, 1, base & 0xFFF))
+        w.append(A.ldr64(4, 1, throttle['model_ptr'] - base))
+        w.append(A.ldrh(5, 4, 0))
+        w.append(A.movz(6, 0xFFFF))
+        w.append(A.cmp_reg(5, 6))
+        not_retired_i = len(w)
+        w.append(0)                                 # b.ne OUT
+        w.append(A.ldrh(5, 1, throttle['model_active'] - base))
+        w.append(A.cmp_reg(5, 6))
+        already_dead_i = len(w)
+        w.append(0)                                 # b.eq OUT
+        w.append(A.strh(5, 4, 0))
+        w.append(A.add_reg64(1, 1, 3))
+        w.append(A.movz(5, 1))
+        w.append(A.strb(5, 1, throttle['model_final'] - base))
+        model_retire_out_i = len(w)
+        w.append(0)                                 # b OUT
+
+        model_init = pc()
+        w[model_init_i] = A.bcond(pc(model_init_i), model_init, A.EQ)
+        for off in (0, 2, 4):
+            w.append(A.ldrh(6, 0, off))
+            w.append(A.strh(6, 5, off))
+        model_init_out_i = len(w)
+        w.append(0)                                 # b OUT
+
+        model_final = pc()
+        w[model_final_i] = A.bcond(pc(model_final_i), model_final, A.EQ)
+        for off in (0, 2, 4):
+            w.append(A.ldrh(6, 5, off))
+            w.append(A.strh(6, 0, off))
+        w.append(A.adrp(1, pc(), base & ~0xFFF))
+        w.append(A.add_imm64(1, 1, base & 0xFFF))
+        w.append(A.add_reg64(1, 1, 3))
+        w.append(A.ldrb(6, 1, throttle['model_final'] - base))
+        no_final_i = len(w)
+        w.append(0)                                 # cbz OUT
+        w.append(A.strb(A.WZR, 1, throttle['model_final'] - base))
+        w.append(A.adrp(1, pc(), base & ~0xFFF))
+        w.append(A.add_imm64(1, 1, base & 0xFFF))
+        w.append(A.ldr64(4, 1, throttle['model_ptr'] - base))
+        w.append(A.movz(6, 0xFFFF))
+        w.append(A.strh(6, 4, 0))
+        model_final_out_i = len(w)
+        w.append(0)                                 # b OUT
+
     out = pc()
-    w[cbz_i] = A.cbz(16, cave + 4 * cbz_i, out)
+    w[cbz_i] = A.cbz(16, pc(cbz_i), out)
+    if normal_out_i is not None:
+        w[normal_out_i] = A.b(pc(normal_out_i), out)
+    if throttle.get('kotr'):
+        w[final_i] = A.bcond(pc(final_i), out, A.EQ)
+    if special_out_i is not None:
+        w[special_out_i] = A.b(pc(special_out_i), out)
+    if throttle.get('model'):
+        for bi in (not_real_i, not_retired_i, already_dead_i):
+            cond = A.NE if bi in (not_real_i, not_retired_i) else A.EQ
+            w[bi] = A.bcond(pc(bi), out, cond)
+        w[model_retire_out_i] = A.b(pc(model_retire_out_i), out)
+        w[model_init_out_i] = A.b(pc(model_init_out_i), out)
+        w[no_final_i] = A.cbz(6, pc(no_final_i), out)
+        w[model_final_out_i] = A.b(pc(model_final_out_i), out)
     w.append(site['displaced'])
     w.append(A.b(pc(), site['hook'] + 4))
     return w

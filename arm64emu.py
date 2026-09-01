@@ -164,6 +164,11 @@ class Cpu:
         thing under test, since every branch, adrp and label in it resolved
         against them.
         """
+        # Convenience for callers validating emitted padding caves: accepting
+        # the address->word map in `words` keeps the long-standing call shape
+        # while still executing every real bridge address.
+        if code is None and isinstance(words, dict):
+            code = words
         if code is not None:
             pc = base if start_pc is None else start_pc
             if pc not in code:

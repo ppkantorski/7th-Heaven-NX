@@ -164,6 +164,11 @@ def csel(rd, rn, rm, cond):
     return 0x1A800000 | (rm << 16) | (cond << 12) | (rn << 5) | rd
 
 
+def csinc(rd, rn, rm, cond):
+    """CSINC Wd, Wn, Wm, cond -- Wn if cond else Wm + 1."""
+    return 0x1A800400 | (rm << 16) | (cond << 12) | (rn << 5) | rd
+
+
 def orr_lsl(rd, rn, rm, sh):
     """ORR Wd, Wn, Wm, LSL #sh."""
     return 0x2A000000 | (sh << 10) | (rm << 16) | (rn << 5) | rd

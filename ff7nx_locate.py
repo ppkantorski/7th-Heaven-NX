@@ -20,7 +20,7 @@ bssSize, so nothing that already exists moves. Using the raw end of .data put
 scratch bytes 0x328 into live BSS on an earlier build and corrupted the game
 while every verification gate still passed -- hence the explicit assertion here.
 """
-import argparse, os, re, struct, sys
+import argparse, os, pprint, re, struct, sys
 
 import a64 as A
 import nxmap
@@ -65,6 +65,51 @@ RE_NAME_ADDR = re.compile(r'_((?:sub_)?)([0-9A-F]{6})$')
 #     ff7_externals.g_is_battle_paused =
 #         (byte*)get_absolute_value(ff7_externals.run_animation_script, 0xA);
 PAUSED_FROM = ('run_animation_script', 0xA)
+
+# These three field sites were established by separate x86/ARM data-flow
+# traces.  They are not children of the battle-dispatcher chain resolved by
+# locate_all(), but they live in the same generated module because the build
+# consumes one verified site catalogue.  Keeping their source here prevents a
+# dispatcher refresh from silently deleting field-wait/blink support.
+MANUAL_FIELD_WAIT_SITES = {
+    'field-wait': {
+        'what': 'field script opcode 0x24 (WAIT) frame counts -- scripted set pieces, alarms, timed NPC business',
+        'fn_x86': 0x610818, 'fn_arm': 0x951A80,
+        'opcode_table': 0x9055A0, 'opcode_index': 0x24,
+        'wait_frames': 0xCC0900, 'x86_store': 0x6108B9,
+        'hook': 0x951D00, 'displaced': 0x79000014, 'val_reg': 0x14,
+        'sig': [(-40, 0x2A1303E0), (-36, 0x790002A8),
+                (-32, 0xB90006BF), (-28, 0x941EA9AF),
+                (-24, 0x39400008), (-20, 0x390012A8),
+                (-16, 0xB94006A8), (-12, 0x794002B4),
+                (-8, 0x0B080700), (-4, 0x941EA9A9),
+                (0, 0x79000014)],
+    },
+}
+
+MANUAL_FIELD_BLINK_SITES = {
+    'test': {
+        'what': 'blink test: counter == 0 -> counter <= 0',
+        'fn_x86': 0x6392BB, 'fn_arm': 0x949B60,
+        'counter': 0xCC167A, 'hook': 0x094B5B8,
+        'displaced': 0x34000514, 'val_reg': 0x14,
+        'blink_arm': 0x0094B658,
+        'sig': [(-24, 0x11264260), (-20, 0x7100029F),
+                (-16, 0x1A9F17E8), (-12, 0xB9000AB4),
+                (-8, 0x39008EA8), (-4, 0x941EC37B),
+                (0, 0x34000514), (4, 0x3900001A)],
+    },
+    'hold': {
+        'what': 'blink reload: hold shut one more frame before reloading',
+        'fn_x86': 0x6392BB, 'fn_arm': 0x949B60,
+        'counter': 0xCC167A, 'hook': 0x094B704,
+        'displaced': 0x7900001B, 'val_reg': 0x1B,
+        'sig': [(-24, 0x0B081108), (-20, 0x794002BB),
+                (-16, 0x531D7108), (-12, 0x0B160100),
+                (-8, 0xB90006A8), (-4, 0x941EC328),
+                (0, 0x7900001B), (4, 0x2A1403E0)],
+    },
+}
 
 
 def exclusion_addresses(names, sym, main, tag):
@@ -163,6 +208,33 @@ def locate_all(exe_path, nso_path, verbose=True, throttle_one_call=True):
         spec['_throttle_size'] = size
         tcursor += size
         tgrow += size
+    # ff7nx_analog owns the next 0x20 bytes.  Reserve that established block,
+    # then place the KOTR FixCounterException state after it so regeneration
+    # cannot silently overlap the two independently enabled features.
+    tcursor += 0x20
+    tgrow += 0x20
+    kbase = tcursor
+    D.DISPATCHERS['effect100']['_throttle'].update(
+        kotr_exc=kbase, kotr_ptr=kbase + 0x80,
+        kotr_active=kbase + 0x88, kotr_counter=kbase + 0x8A,
+        kotr_disable=kbase + 0x8C)
+    tcursor += 0x90
+    tgrow += 0x90
+    # Ten summon model decorators: one byte phase/final per effect100 slot and
+    # two signed-short vector3 endpoints per slot.  The three scalar values
+    # hand state from the pre cave to the immediately following post cave.
+    mbase = tcursor
+    D.DISPATCHERS['effect100']['_throttle'].update(
+        model_idx=mbase,
+        model_ptr=mbase + 0x08,
+        model_active=mbase + 0x10,
+        model_phase=mbase + 0x12,
+        model_final=mbase + 0x76,
+        model_prev=mbase + 0xDA,
+        model_next=mbase + 0x332,
+        model_pos=0xBE63A2)
+    tcursor += 0x590
+    tgrow += 0x590
     out['throttle_base'] = flag0 + grow
     out['bss_grow_throttle'] = grow + tgrow
     out['paused_guest'] = sym['g_is_battle_paused']
@@ -227,6 +299,38 @@ def locate_all(exe_path, nso_path, verbose=True, throttle_one_call=True):
                                                     sym, main, tag)
                                 if tag == 'effect60' else [])
             ts['one_call_throttled'] = throttle_one_call
+            if tag == 'effect100':
+                missing = [(n, va) for n, va, _exc in
+                           D.KOTR_COUNTER_EXCEPTIONS
+                           if va not in main.x86_to_arm]
+                if missing:
+                    raise SystemExit('REFUSED KOTR counter functions are not '
+                                     'entries in the recompilation map: %r'
+                                     % missing)
+                ts['kotr'] = list(D.KOTR_COUNTER_EXCEPTIONS)
+                missing = [(n, va) for n, va, _marker in
+                           D.SUMMON_MODEL_INTERPOLATION
+                           if va not in main.x86_to_arm]
+                if missing:
+                    raise SystemExit('REFUSED summon model functions are not '
+                                     'entries in the recompilation map: %r'
+                                     % missing)
+                ts['model'] = list(D.SUMMON_MODEL_INTERPOLATION)
+                ts['data_base'] = data
+                ts['stride'] = spec['stride']
+                # The stock no-registration path joins immediately before the
+                # selected-slot return.  It is +0x6C from this exact hook in
+                # 1.0.3; verify its full translated signature before emitting.
+                ts['kotr_add_skip'] = ah['hook'] + 0x6C
+                want = (0xB9401688, 0x51001100, 0x9425E424,
+                        0x79400008, 0x17FFFFC2)
+                got = tuple(struct.unpack_from('<I', text,
+                                               ts['kotr_add_skip'] + 4 * i)[0]
+                            for i in range(len(want)))
+                if got != want:
+                    raise SystemExit('REFUSED KOTR add suppression target '
+                                     '+0x%X signature %r != %r'
+                                     % (ts['kotr_add_skip'], got, want))
             thr = ts
 
         out['dispatchers'][tag] = dict(
@@ -376,6 +480,14 @@ def emit(path, info, exe_path, nso_path):
                           'store_reg', 'ctr', 'pptr', 'saved', 'did',
                           'mask_bits', 'size'):
                     f.write('        %-16r: 0x%X,\n' % (k, t[k]))
+                for k in ('kotr_exc', 'kotr_ptr', 'kotr_active',
+                          'kotr_counter', 'kotr_disable', 'kotr_add_skip',
+                          'model_idx', 'model_ptr', 'model_active',
+                          'model_phase', 'model_final', 'model_prev',
+                          'model_next', 'model_pos',
+                          'data_base', 'stride'):
+                    if k in t:
+                        f.write('        %-16r: 0x%X,\n' % (k, t[k]))
                 f.write('        %-16r: %r,\n'
                         % ('one_call_throttled', t['one_call_throttled']))
                 for k in ('pre_sig', 'post_sig'):
@@ -393,6 +505,18 @@ def emit(path, info, exe_path, nso_path):
                     f.write('        %-16r: [\n' % key)
                     for name, va in t[key]:
                         f.write('            (%r, 0x%X),\n' % (name, va))
+                    f.write('        ],\n')
+                if t.get('kotr'):
+                    f.write('        %-16r: [\n' % 'kotr')
+                    for name, va, exc in t['kotr']:
+                        f.write('            (%r, 0x%X, %d),\n'
+                                % (name, va, exc))
+                    f.write('        ],\n')
+                if t.get('model'):
+                    f.write('        %-16r: [\n' % 'model')
+                    for name, va, marker in t['model']:
+                        f.write('            (%r, 0x%X, %d),\n'
+                                % (name, va, marker))
                     f.write('        ],\n')
                 f.write('    },\n')
             for key in ('disp_hook', 'add_hook'):
@@ -437,6 +561,13 @@ def emit(path, info, exe_path, nso_path):
                                         for o, w in s['sig'])))
             f.write('  },\n')
         f.write('}\n')
+        f.write('\n# Separately traced field timing sites; retained by the generator.\n')
+        f.write('FIELD_WAIT_SITES = %s\n'
+                % pprint.pformat(MANUAL_FIELD_WAIT_SITES, width=100,
+                                 sort_dicts=False))
+        f.write('\nFIELD_BLINK_SITES = %s\n'
+                % pprint.pformat(MANUAL_FIELD_BLINK_SITES, width=100,
+                                 sort_dicts=False))
     print('wrote %s' % path)
 
 

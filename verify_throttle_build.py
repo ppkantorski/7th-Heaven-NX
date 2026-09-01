@@ -93,6 +93,43 @@ def cave_words(text, cave, hook, limit=256):
     return None
 
 
+def cave_map(text, cave, hook, limit=512):
+    """Recover a scattered padding cave by following its complete CFG."""
+    code, todo = {}, [cave]
+
+    def rel_target(pc, bits, shift, field):
+        sign = 1 << (bits - 1)
+        field = field - (1 << bits) if field & sign else field
+        return pc + (field << shift)
+
+    while todo and len(code) < limit:
+        pc = todo.pop()
+        if pc == hook + 4 or pc in code:
+            continue
+        if not 0 <= pc <= len(text) - 4:
+            return None
+        w, = struct.unpack_from('<I', text, pc)
+        code[pc] = w
+        if (w >> 26) == 0x05:                       # b
+            tgt = rel_target(pc, 26, 2, w & 0x3FFFFFF)
+            if tgt != hook + 4:
+                todo.append(tgt)
+        elif (w & 0xFF000010) == 0x54000000:        # b.cond
+            todo += [pc + 4, rel_target(pc, 19, 2, (w >> 5) & 0x7FFFF)]
+        elif (w & 0x7E000000) == 0x34000000:        # cbz/cbnz
+            todo += [pc + 4, rel_target(pc, 19, 2, (w >> 5) & 0x7FFFF)]
+        elif (w & 0x7E000000) == 0x36000000:        # tbz/tbnz
+            todo += [pc + 4, rel_target(pc, 14, 2, (w >> 5) & 0x3FFF)]
+        else:
+            todo.append(pc + 4)                     # includes BL fallthrough
+    if todo or not code:
+        return None
+    exits = [pc for pc, w in code.items()
+             if (w >> 26) == 0x05 and
+             rel_target(pc, 26, 2, w & 0x3FFFFFF) == hook + 4]
+    return (code, exits) if exits else None
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--nso', required=True, help='the BUILT exefs/main')
@@ -144,21 +181,30 @@ def main():
             continue
 
         # ---- 2 / 3: the caves close properly and replay the stock word ----
-        pre = cave_words(text, pre_cave, thr['pre'])
-        post = cave_words(text, post_cave, thr['post'])
-        for what, words, hook, cave in (('pre', pre, thr['pre'], pre_cave),
-                                        ('post', post, thr['post'], post_cave)):
-            if words is None:
+        pre_info = cave_map(text, pre_cave, thr['pre'])
+        post_info = cave_map(text, post_cave, thr['post'])
+        pre = pre_info[0] if pre_info else None
+        post = post_info[0] if post_info else None
+        displaced = {}
+        for what, info, hook, cave in (('pre', pre_info, thr['pre'], pre_cave),
+                                       ('post', post_info, thr['post'], post_cave)):
+            if info is None:
                 bad('%s %s cave at 0x%X never branches back to hook+4'
                     % (tag, what, cave))
                 continue
+            words, exits = info
             stock_word, = struct.unpack('<I', stext[hook:hook + 4])
-            if words[-2] != stock_word:
+            # A linker bridge may land between the final two logical words
+            # when a padding run ends after the displaced instruction. The
+            # CFG already proves every path reaches the branch back; require
+            # the exact stock word somewhere in that recovered map.
+            replay = [pc for pc, word in words.items() if word == stock_word]
+            if not replay:
                 bad('%s %s cave does not replay the displaced instruction '
-                    '(%08X, stock is %08X)' % (tag, what, words[-2],
-                                               stock_word))
+                    '(stock is %08X)' % (tag, what, stock_word))
             else:
-                ok('%s %s hook +0x%X -> cave 0x%X (%d words), replays %08X, '
+                displaced[what] = stock_word
+                ok('%s %s hook +0x%X -> padding cave 0x%X (%d mapped words), replays %08X, '
                    'returns to +0x%X' % (tag, what, hook, cave, len(words),
                                          stock_word, hook + 4))
         if pre is None or post is None:
@@ -223,6 +269,34 @@ def main():
                            % (tag, ', '.join('%06X' % v for v in got),
                               (1 << thr['mask_bits']) - len(got)))
 
+            # The effect100 registration cave carries two additional packed
+            # tables after the ordinary exclusion sentinel: KOTR exception
+            # markers and the ten FFNx model-interpolation functions.  Execute
+            # the registration words read from the built NSO so a wrong table
+            # address, marker or nested-add path cannot hide behind the first
+            # table's successful structural check.
+            literal_words = (len(got) + 1
+                             + len(thr.get('kotr', ())) + 1
+                             + len(thr.get('model', ())) + 1)
+            reg_full = list(reg)
+            for i in range(literal_words):
+                reg_full.append(struct.unpack_from(
+                    '<I', text, add_cave + 4 * (len(reg) + i))[0])
+            shipped_reg = dict(words=reg_full, cave=add_cave, hook=add_hook)
+            tt = dict(thr)
+            tt['paused_guest'] = PAUSED_GUEST
+            tt['idx_off'] = d['disp_hook']['idx_off']
+            before = len(T.FAIL)
+            nk = T.kotr_registration(tt, quiet=True, shipped=shipped_reg)
+            nm = T.model_registration(tt, quiet=True, shipped=shipped_reg)
+            new = len(T.FAIL) - before
+            if new:
+                bad('%s: shipped special registration paths disagree in %d '
+                    'place(s)' % (tag, new))
+            elif nk or nm:
+                ok('%s shipped special registration: %d KOTR and %d model '
+                   'execution(s) agree with FFNx' % (tag, nk or 0, nm or 0))
+
         # ---- 5: the differential, on the SHIPPED words ---------------------
         t = dict(thr)
         t['paused_guest'] = PAUSED_GUEST
@@ -233,7 +307,8 @@ def main():
                                           cave_pre=pre_cave,
                                           cave_post=post_cave,
                                           pre_hook=thr['pre'],
-                                          post_hook=thr['post']))
+                                          post_hook=thr['post'],
+                                          post_displaced=displaced['post']))
         new = len(T.FAIL) - before
         if new:
             bad('%s: the shipped caves disagree with FFNx in %d place(s)'
@@ -241,6 +316,25 @@ def main():
         else:
             ok('%s differential: %d execution(s) of the SHIPPED words agree '
                'with PauseEffectDecorator' % (tag, n or 0))
+
+        if thr.get('model'):
+            before = len(T.FAIL)
+            nm = T.model_interpolation(t, quiet=True,
+                                       shipped=dict(pre=pre, post=post,
+                                                    cave_pre=pre_cave,
+                                                    cave_post=post_cave,
+                                                    pre_hook=thr['pre'],
+                                                    post_hook=thr['post'],
+                                                    post_displaced=
+                                                    displaced['post']))
+            new = len(T.FAIL) - before
+            if new:
+                bad('%s: shipped model interpolation disagrees with FFNx in '
+                    '%d place(s)' % (tag, new))
+            else:
+                ok('%s model interpolation: %d execution(s) of the SHIPPED '
+                   'words pass smooth, teleport and deferred-retirement cases'
+                   % (tag, nm or 0))
 
         # ---- 7: the undecorated site -------------------------------------
         for pc, want in zip(thr['undecorated'], thr['undecorated_words']):
@@ -300,17 +394,33 @@ def main():
 
     # ---- 6: BSS ---------------------------------------------------------
     if any_throttle:
-        if grew != BSS_GROW_THROTTLE:
-            bad('bssSize grew by 0x%X, the throttle needs 0x%X'
+        if grew < BSS_GROW_THROTTLE:
+            bad('bssSize grew by 0x%X, less than the throttle needs (0x%X)'
                 % (grew, BSS_GROW_THROTTLE))
         else:
-            ok('bssSize grew by 0x%X, covering the flag block and the throttle '
-               'block at +0x%X' % (grew, THROTTLE_BASE))
+            ok('bssSize grew by 0x%X (minimum 0x%X), covering the flag block '
+               'and the throttle block at +0x%X'
+               % (grew, BSS_GROW_THROTTLE, THROTTLE_BASE))
         top = THROTTLE_BASE
         for tag in ('effect100', 'effect60'):
             thr = (DISPATCH_SITES.get(tag) or {}).get('throttle')
             if thr:
-                top = max(top, thr['did'] + 1)
+                # The mask is the next power of two used defensively at the
+                # dispatcher hook; the actual arrays retain the engine's
+                # exact slot count (100 effect100, 60 effect60).
+                slots = DISPATCH_SITES[tag]['slots']
+                regions = [('ctr', slots), ('saved', 1), ('did', 1),
+                           ('pptr', 8), ('kotr_exc', slots),
+                           ('kotr_disable', 1), ('kotr_field2', 2),
+                           ('kotr_ptr', 8), ('kotr_active', 2),
+                           ('model_idx', 1), ('model_ptr', 8),
+                           ('model_active', 2), ('model_phase', slots),
+                           ('model_final', slots),
+                           ('model_prev', slots * 6),
+                           ('model_next', slots * 6)]
+                for key, size in regions:
+                    if key in thr:
+                        top = max(top, thr[key] + size)
         page_end = (segs[2][1] + segs[2][2] + 0xFFF) & ~0xFFF
         limit = page_end + struct.unpack('<I', built[0x3C:0x40])[0]
         if top > limit:

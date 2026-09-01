@@ -168,6 +168,17 @@ NSO_GATED = {
         ('g_script_wait_frames 14 -> 56 (3 of 4)',   0x007E1D40, 0x321F0BF3, 0x52800713),
         ('g_script_wait_frames 14 -> 56 (4 of 4)',   0x00833800, 0x321F0BE8, 0x52800708),
     ],
+    # FFNx's summon fixes are not one generic speed multiplier.  These are the
+    # independently verified ARM64 counterparts of its paired Shiva boundary,
+    # its camera pause guards, and the summon setup duration.  Keeping them in
+    # a summon-only group avoids disturbing normal attacks or battle entry.
+    'summon-runtime': [
+        ('summon setup duration 45 -> 180',          0x007DF46C, 0x528005A8, 0x52801688),
+        ('Shiva phase boundary 90 -> 92',            0x00700500, 0x51016909, 0x51017109),
+        ('Shiva phase boundary 89 -> 91',            0x00700534, 0x7101651F, 0x71016D1F),
+        ('Shiva camera: do not skip on held frames', 0x006EF7B8, 0x3501DA68, 0xD503201F),
+        ('Odin camera: do not skip on held frames',  0x002C7C48, 0x3501D828, 0xD503201F),
+    ],
     # FFNx: patch_divide_code<byte>(battle_fps_menu_multiplier, 4).
     # The resolver does NOT reproduce this one (FFNx points at a byte its
     # linear-disassembly scan does not see as an immediate operand), so it is
@@ -3109,21 +3120,27 @@ def _place_padding_caves(padded, text, raw, segs, nso_path, log=print):
             'stock module,\n       and patch_nso was not told where that is. '
             'Pass nso_path=.' % padded[0]['tag'])
 
-    # --- the lookup tables go in .rodata's own tail, already mapped R--,
-    # the same claim the shared-prologue descriptor table makes. .data's VA is
-    # a fixed header field independent of .rodata's declared size, so this
-    # cannot move or shrink anything else.
-    rodata_va, data_va = segs[1][1], segs[2][1]
-    tbl_va = rodata_va + len(raw[1])
-    tables = bytes(_AN.SNAP_TAB) + bytes(_AN.ATAN_TAB)
-    if data_va - tbl_va < len(tables):
-        raise SystemExit(
-            'ABORT  360 movement needs %d bytes in the .rodata tail gap '
-            '(0x%X..0x%X), only %d available.'
-            % (len(tables), tbl_va, data_va, data_va - tbl_va))
-    raw[1] = raw[1] + tables
-    snap_va = tbl_va
-    atan_va = tbl_va + len(_AN.SNAP_TAB)
+    # Only the 360-degree field cave needs lookup tables. Other users of the
+    # same verified padding allocator (notably the effect60 pause wrappers)
+    # are code-only and must not consume or duplicate the .rodata tail.
+    needs_analog_tables = any(c.get('build') is _AC.build_field_cave
+                              for c in padded)
+    snap_va = atan_va = None
+    if needs_analog_tables:
+        # The lookup tables go in .rodata's own tail, already mapped R--, the
+        # same claim the shared-prologue descriptor table makes. .data's VA is
+        # fixed independently of .rodata's declared size.
+        rodata_va, data_va = segs[1][1], segs[2][1]
+        tbl_va = rodata_va + len(raw[1])
+        tables = bytes(_AN.SNAP_TAB) + bytes(_AN.ATAN_TAB)
+        if data_va - tbl_va < len(tables):
+            raise SystemExit(
+                'ABORT  360 movement needs %d bytes in the .rodata tail gap '
+                '(0x%X..0x%X), only %d available.'
+                % (len(tables), tbl_va, data_va, data_va - tbl_va))
+        raw[1] = raw[1] + tables
+        snap_va = tbl_va
+        atan_va = tbl_va + len(_AN.SNAP_TAB)
 
     m = nxmap.Main(nso_path)
     starts = set(m.arm_starts)
@@ -3131,8 +3148,9 @@ def _place_padding_caves(padded, text, raw, segs, nso_path, log=print):
     pool = ff7nx_cave.HolePool(text, starts=starts, named=named)
     log('      padding pool: %d verified hole(s), %d usable word(s)'
         % (len(pool.free), sum(max(0, n - 1) for _, n in pool.free)))
-    log('      360 movement tables -> .rodata +0x%X (%d bytes)'
-        % (tbl_va - rodata_va, len(tables)))
+    if needs_analog_tables:
+        log('      360 movement tables -> .rodata +0x%X (%d bytes)'
+            % (tbl_va - rodata_va, len(tables)))
 
     for c in padded:
         hook = c['site']['hook']
@@ -3444,19 +3462,26 @@ def dispatch_caves(scale_tags, throttle_tags, batt_mult, extra_exclude=(),
                        store_reg=thr['store_reg'])
             post = dict(hook=thr['post'], displaced=thr['post_displaced'],
                         sig=thr['post_sig'])
+            # Registration and its literal tables remain contiguous in the
+            # tail cave. The pre/post wrappers contain instructions only, so
+            # they can safely use the verified, layout-aware inter-function
+            # padding allocator. This keeps the production preset inside the
+            # immutable .rodata bound even with the faithful KOTR path.
+            pre['place'] = 'padding'
+            post['place'] = 'padding'
             out.append(dict(
                 tag=tag, kind='throttle_pre', site=pre, throttle=thr,
                 label='%s pause-throttle pre-call (1 step in %d)'
                       % (tag, batt_mult),
-                build=lambda cave, pre=pre, thr=thr, d=d:
+                build=lambda cave, addr=None, pre=pre, thr=thr, d=d:
                     _disp.build_throttle_pre_cave(
                         cave, pre, thr, PAUSED_GUEST, thr['mask_bits'],
-                        freq_bits)))
+                        freq_bits, addr)))
             out.append(dict(
                 tag=tag, kind='throttle_post', site=post, throttle=thr,
                 label='%s pause-throttle post-call' % tag,
-                build=lambda cave, post=post, thr=thr:
-                    _disp.build_throttle_post_cave(cave, post, thr)))
+                build=lambda cave, addr=None, post=post, thr=thr:
+                    _disp.build_throttle_post_cave(cave, post, thr, addr)))
     return out
 
 
@@ -4544,12 +4569,20 @@ RECOMMENDED_ENABLE = (
     'effect100-throttle', 'aura-throttle', 'camera-wait',
     # battle constants
     'victory', 'victory-fade', 'damage-numbers', 'limit-aura', 'aura-eskill',
-    'aura-summon', 'boss-death', 'battle-text', 'tifa-slots',
+    'aura-summon', 'summon-runtime', 'boss-death', 'battle-text', 'tifa-slots',
     # field
     'field-wait', 'opcode-scale-safe', 'field-text',
     'field-blink', 'field-blink-hold',
 )
-RECOMMENDED_DISABLE_SYM = ('battle_sub_42A72D',)
+# FFNx labels this exact fully-resolved word "Character fade in/out" and
+# scales its 14-frame lifetime to 56.  It used to be quarantined because an
+# early hardware build associated it with white enemies.  That predates the
+# completed pause decorators and the later proof that the white-model failures
+# came from battle texture format/binding.  Leaving it disabled now makes the
+# party vanish abruptly at the end of a summon charge, which is the direct
+# symptom this word controls.  Re-enable the complete r-battle_misc patch; do
+# not add a summon-specific replacement for a shared engine fade primitive.
+RECOMMENDED_DISABLE_SYM = ()
 
 
 def recommended_argv(out, exe=None, nso=None, dump=None, battle_lgp=None,
