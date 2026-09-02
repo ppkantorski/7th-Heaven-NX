@@ -99,6 +99,31 @@ def normalize_part(d):
     return bytes(b), ', '.join(changes)
 
 
+def enable_vertex_colors(d):
+    """Expose an already-present vertex-colour array to the renderer.
+
+    Nino player parts contain a complete colour entry for every vertex but
+    commonly leave the header's ``vcolType`` at zero.  Normal drawing can get
+    its colour from a truecolor texture and mask that exporter error; the
+    summon fade cannot, because the stock fallback for a texture without a
+    mutable palette re-renders the part through its vertex colours.  With the
+    flag at zero the fallback has nothing to shade and the part pops off.
+
+    This player-safe repair changes ONLY the four-byte flag at header +0x08.
+    It deliberately does not transplant render state, alter normals, touch the
+    colour array, or promote its alpha from 128 to 255.  Red XIII's few parts
+    that already carry vcolType=1 fade correctly with those exact remaining
+    values, making them the hardware-observed control for this minimal edit.
+    """
+    if parse_header(d) is None:
+        return None, 'unparseable P file'
+    if struct.unpack_from('<I', d, 0x08)[0] == 1:
+        return None, 'vertex colours already enabled'
+    b = bytearray(d)
+    struct.pack_into('<I', b, 0x08, 1)
+    return bytes(b), 'vcolType=1 (existing vertex colours enabled)'
+
+
 def transplant_hundreds(mod_bytes, van_bytes):
     """
     Return mod_bytes with its hundreds block replaced by the vanilla

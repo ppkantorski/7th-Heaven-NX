@@ -2616,29 +2616,40 @@ def _apply_battle_experiments(mod_files, folder_of, log):
     return out
 
 
-def _transplant_render_state(mod_files, van, folder_of, log):
+def _transplant_render_state(mod_files, van, folder_of, log,
+                             enemy_hundreds=True):
     """
     Copy each vanilla battle part's "hundreds" render-state block into the
     replacing mod part (geometry untouched). The death dissolve re-renders
     parts using this state; exporter-default state in mod parts is the
-    prime remaining suspect for the missing dissolve. Skips player files
-    (Mains) to preserve the byte-identical regression build. Disable with
-    SEVENTH_NX_NO_VANILLA_HUNDREDS=1.
+    prime remaining suspect for the missing dissolve.
+
+    Player files (Mains) take a deliberately narrower path: keep their mod
+    render state and truecolor textures byte-for-byte, and only enable the
+    vertex-colour array already stored in each P part. The stock renderer uses
+    that array as the truecolor fallback during summon fades. This is what
+    distinguishes Red XIII's few correctly fading parts (vcolType=1) from the
+    many parts that pop (vcolType=0).
+
+    SEVENTH_NX_NO_VANILLA_HUNDREDS=1 disables only the enemy transplant; the
+    independent player metadata repair remains active.
     """
     os.makedirs(PFIX_CACHE, exist_ok=True)
     folder_of = folder_of or {}
     out = {}
-    done = skipped = 0
+    done = skipped = player_vcol = 0
     for low, (src, mod) in mod_files.items():
+        is_main = 'main' in str(folder_of.get(low, '')).lower()
         if (len(low) != 4 or not low.isalpha() or low[2:] < 'am'
-                or low[2:] == 'da'
-                or 'main' in str(folder_of.get(low, '')).lower()):
+                or low[2:] == 'da' or (not is_main and not enemy_hundreds)):
             out[low] = (src, mod)
             continue
         try:
             with open(src, 'rb') as f:
                 mod_bytes = f.read()
-            if low in van:
+            if is_main:
+                new, why = pfile.enable_vertex_colors(mod_bytes)
+            elif low in van:
                 with open(van[low], 'rb') as f:
                     van_bytes = f.read()
                 new, why = pfile.transplant_hundreds(mod_bytes, van_bytes)
@@ -2648,30 +2659,40 @@ def _transplant_render_state(mod_files, van, folder_of, log):
             # vertex alphas) -- the death-effect path re-renders parts via
             # vertex colors, and the mod's parts declare themselves
             # colorless. Applied whether or not the transplant ran.
-            fixed, fwhy = pfile.normalize_part(new if new else mod_bytes)
-            if fixed is not None:
-                new, why = fixed, (why + ' + ' if new else '') + fwhy
+            if not is_main:
+                fixed, fwhy = pfile.normalize_part(new if new else mod_bytes)
+                if fixed is not None:
+                    new, why = fixed, (why + ' + ' if new else '') + fwhy
         except OSError:
             new, why = None, 'io error'
         if new is None:
             if why not in ('already identical', 'unparseable P file',
-                           'already normal', 'no vanilla counterpart'):
+                           'already normal', 'no vanilla counterpart',
+                           'vertex colours already enabled'):
                 skipped += 1
             out[low] = (src, mod)
             continue
-        van_sig = _sig(van[low]) if low in van else 'novan'
+        van_sig = (_sig(van[low]) if low in van else 'novan')
+        policy = ('PFIX-PLAYER-VCOL-V1-' if is_main else 'PFIX-V7-')
         cached = os.path.join(
             PFIX_CACHE,
-            f'{low}.{hashlib.sha1(("PFIX-V7-" + _sig(src) + van_sig).encode()).hexdigest()[:16]}')
+            f'{low}.{hashlib.sha1((policy + _sig(src) + van_sig).encode()).hexdigest()[:16]}')
         if not os.path.exists(cached):
             with open(cached, 'wb') as f:
                 f.write(new)
         out[low] = (cached, mod)
-        done += 1
+        if is_main:
+            player_vcol += 1
+        else:
+            done += 1
     if done or skipped:
         log(f'  render-state: {done} part(s) given vanilla hundreds '
             f'(death-dissolve state), {skipped} skipped on group mismatch '
             '(set SEVENTH_NX_NO_VANILLA_HUNDREDS=1 to disable)')
+    if player_vcol:
+        log(f'  render-state: {player_vcol} player part(s) kept TRUECOLOR and '
+            'had their existing vertex-colour arrays enabled for summon fades '
+            '(no geometry, material, colour, alpha, or texture bytes changed)')
     return out
 
 
@@ -2855,10 +2876,11 @@ def _convert_battle_textures(name, mod_files, van, log, folder_of=None,
     conversions (see tex.py). Results are cached by source signature.
     Non-TEX files (geometry, skeletons, animations) pass through untouched.
 
-    Player-character files (source option under a "Mains" folder) are
-    EXEMPT: the players-only build is proven pixel-perfect on hardware as
-    shipped, and must stay byte-identical to the reference archive.
-    Players never use the death dissolve anyway.
+    Player-character files (source option under a "Mains" folder) remain
+    TRUECOLOR and are exempt here. Their summon fade uses the renderer's
+    vertex-colour fallback; `_transplant_render_state` enables the colour array
+    Nino stores but marks absent. Quantising the player textures was the wrong
+    layer to fix and loses colour information without repairing that metadata.
 
     battle_bg_native_names: lowername set from
     plan.battle_bg_native_names -- ONLY these get the user-configurable
@@ -5906,18 +5928,21 @@ def _build_model_archive(name, archive_path, mod_files, romfs, pack_lgp,
     van = vanilla_unpack(name, archive_path, log)
     filemap = dict(van)  # lowercase entry name -> disk path (unchanged bytes)
 
-    # The Switch battle module needs paletted textures (the enemy death
-    # dissolve and some magic effects are palette-driven; truecolor mod
-    # textures vanish instead of fading, or render white). Convert them.
+    # The Switch battle module needs paletted textures for enemies and magic
+    # (their dissolve/effects are palette-driven; truecolor replacements can
+    # vanish or render white). Player truecolor textures are the exception:
+    # their model parts are repaired above so the vertex-colour fade fallback
+    # works, and _convert_battle_textures deliberately leaves them truecolor.
     # Field/model textures are fine with truecolor.  The world module is not;
     # its Gaia path below has a separate destination-palette conversion.
     # Battle and magic use this battle-specific converter.
     if name == 'battle.lgp':
         mod_files = _apply_battle_experiments(mod_files, folder_of, log)
         mod_files = _battle_enemy_report(mod_files, van, folder_of, log)
-        if os.environ.get('SEVENTH_NX_NO_VANILLA_HUNDREDS') != '1':
-            mod_files = _transplant_render_state(mod_files, van, folder_of,
-                                                 log)
+        mod_files = _transplant_render_state(
+            mod_files, van, folder_of, log,
+            enemy_hundreds=(os.environ.get(
+                'SEVENTH_NX_NO_VANILLA_HUNDREDS') != '1'))
     if (name in ('battle.lgp', 'magic.lgp')
             and os.environ.get('SEVENTH_NX_NO_TEXCONV') != '1'):
         _bg_pals = (_battle_bg_shared_palettes(

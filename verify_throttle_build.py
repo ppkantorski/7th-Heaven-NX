@@ -93,9 +93,15 @@ def cave_words(text, cave, hook, limit=256):
     return None
 
 
-def cave_map(text, cave, hook, limit=512):
-    """Recover a scattered padding cave by following its complete CFG."""
+def cave_map(text, cave, hook, limit=512, other_exits=()):
+    """Recover a scattered padding cave by following its complete CFG.
+
+    `other_exits` covers deliberate cross-hook joins. The exact OneCall path
+    leaves the pre-cave at the post hook after repairing guest ESP; following
+    that hook as though it were part of the pre-cave would conflate two caves.
+    """
     code, todo = {}, [cave]
+    valid_exits = set(other_exits) | {hook + 4}
 
     def rel_target(pc, bits, shift, field):
         sign = 1 << (bits - 1)
@@ -104,7 +110,7 @@ def cave_map(text, cave, hook, limit=512):
 
     while todo and len(code) < limit:
         pc = todo.pop()
-        if pc == hook + 4 or pc in code:
+        if pc in valid_exits or pc in code:
             continue
         if not 0 <= pc <= len(text) - 4:
             return None
@@ -112,7 +118,7 @@ def cave_map(text, cave, hook, limit=512):
         code[pc] = w
         if (w >> 26) == 0x05:                       # b
             tgt = rel_target(pc, 26, 2, w & 0x3FFFFFF)
-            if tgt != hook + 4:
+            if tgt not in valid_exits:
                 todo.append(tgt)
         elif (w & 0xFF000010) == 0x54000000:        # b.cond
             todo += [pc + 4, rel_target(pc, 19, 2, (w >> 5) & 0x7FFFF)]
@@ -126,7 +132,7 @@ def cave_map(text, cave, hook, limit=512):
         return None
     exits = [pc for pc, w in code.items()
              if (w >> 26) == 0x05 and
-             rel_target(pc, 26, 2, w & 0x3FFFFFF) == hook + 4]
+             rel_target(pc, 26, 2, w & 0x3FFFFFF) in valid_exits]
     return (code, exits) if exits else None
 
 
@@ -181,7 +187,9 @@ def main():
             continue
 
         # ---- 2 / 3: the caves close properly and replay the stock word ----
-        pre_info = cave_map(text, pre_cave, thr['pre'])
+        pre_info = cave_map(text, pre_cave, thr['pre'],
+                            other_exits=((thr['post'],)
+                                         if thr.get('one_call') else ()))
         post_info = cave_map(text, post_cave, thr['post'])
         pre = pre_info[0] if pre_info else None
         post = post_info[0] if post_info else None
@@ -213,6 +221,7 @@ def main():
         # ---- 4: the exclusion table, out of the built file -----------------
         add_hook = d['add_hook']['hook']
         add_cave = follow(text, add_hook)
+        shipped_reg = None
         if add_cave is None:
             bad('%s: the registration hook +0x%X is not a branch'
                 % (tag, add_hook))
@@ -277,7 +286,8 @@ def main():
             # table's successful structural check.
             literal_words = (len(got) + 1
                              + len(thr.get('kotr', ())) + 1
-                             + len(thr.get('model', ())) + 1)
+                             + len(thr.get('model', ())) + 1
+                             + len(thr.get('one_call', ())) + 1)
             reg_full = list(reg)
             for i in range(literal_words):
                 reg_full.append(struct.unpack_from(
@@ -316,6 +326,24 @@ def main():
         else:
             ok('%s differential: %d execution(s) of the SHIPPED words agree '
                'with PauseEffectDecorator' % (tag, n or 0))
+
+        if thr.get('one_call'):
+            before = len(T.FAIL)
+            no = T.one_call_balanced(
+                t, a.freq, quiet=True,
+                shipped=dict(pre=pre, post=post,
+                             cave_pre=pre_cave, cave_post=post_cave,
+                             pre_hook=thr['pre'], post_hook=thr['post'],
+                             post_displaced=displaced['post']),
+                shipped_reg=shipped_reg)
+            new = len(T.FAIL) - before
+            if new:
+                bad('%s: shipped exact OneCall path disagrees in %d place(s)'
+                    % (tag, new))
+            else:
+                ok('%s exact OneCall: %d registration/stack-balance '
+                   'execution(s) of the SHIPPED words agree with FFNx'
+                   % (tag, no or 0))
 
         if thr.get('model'):
             before = len(T.FAIL)

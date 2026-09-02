@@ -316,6 +316,14 @@ def locate_all(exe_path, nso_path, verbose=True, throttle_one_call=True):
                                      'entries in the recompilation map: %r'
                                      % missing)
                 ts['model'] = list(D.SUMMON_MODEL_INTERPOLATION)
+                missing = [(n, va) for n, va in
+                           D.EFFECT100_BALANCED_ONE_CALL
+                           if va not in main.x86_to_arm]
+                if missing:
+                    raise SystemExit('REFUSED exact OneCall functions are not '
+                                     'entries in the recompilation map: %r'
+                                     % missing)
+                ts['one_call'] = list(D.EFFECT100_BALANCED_ONE_CALL)
                 ts['data_base'] = data
                 ts['stride'] = spec['stride']
                 # The stock no-registration path joins immediately before the
@@ -517,6 +525,11 @@ def emit(path, info, exe_path, nso_path):
                     for name, va, marker in t['model']:
                         f.write('            (%r, 0x%X, %d),\n'
                                 % (name, va, marker))
+                    f.write('        ],\n')
+                if t.get('one_call'):
+                    f.write('        %-16r: [\n' % 'one_call')
+                    for name, va in t['one_call']:
+                        f.write('            (%r, 0x%X),\n' % (name, va))
                     f.write('        ],\n')
                 f.write('    },\n')
             for key in ('disp_hook', 'add_hook'):

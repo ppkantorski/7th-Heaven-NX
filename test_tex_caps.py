@@ -138,11 +138,13 @@ def main():
     # promotion there is -- had never been tried: the UI could not ask for it.
     check('off is not 256', FB.OFF_PAGE_PX != FB.VANILLA_PAGE_PX, True)
     check('off is disabled', FB.enabled.__call__ and FB.words(0), {})
-    check('256 is enabled but writes no size words', FB.words(256), {})
+    check('256 writes only the scoped FX blend ladder',
+          set(FB.words(256)), set(FB.FX_BLEND_SITES))
     check('256 still gets the field buffer on a big build',
-          list(FB.words(256, max_raw=3_000_000)), [FB.SITE_FIELD_BUF])
-    check('256 needs no module on a normal build',
-          FB.patches_module(256), False)
+          set(FB.words(256, max_raw=3_000_000)),
+          set(FB.FX_BLEND_SITES) | {FB.SITE_FIELD_BUF})
+    check('256 needs the module for truecolor additive FX',
+          FB.patches_module(256), True)
     check('128 does need a module', FB.patches_module(128), True)
 
     # The ladder is derived from what the READ-BYTES immediate can encode in
@@ -186,7 +188,8 @@ def main():
                     0x9370CC: 0x320B03FB, 0xA026C8: 0x51440109,
                     0xA03C44: 0x321603F3, 0xA03C88: 0x321503E8})):
         check('%dpx words unchanged by the ladder rewrite' % px,
-              {k: v[1] for k, v in FB.words(px=px).items()}, want)
+              {k: v[1] for k, v in FB.words(px=px).items()
+               if k in want}, want)
 
     # 128 is the new one, so state what it must be rather than only that it
     # encodes. elem rounds UP to 1 (a 32,768 byte page inside a 65,536 byte

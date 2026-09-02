@@ -208,6 +208,9 @@ DISPATCH_SITES = {
             ('run_summon_kotr_knight_script_11', 0x48034E, 56),
             ('run_summon_kotr_knight_script_12', 0x480776, 112),
         ],
+        'one_call'      : [
+            ('run_bahamut_zero_main_loop_484A16', 0x484A16),
+        ],
     },
     'disp_hook' : {
         'add_pc'   : 0x7D2FEC,

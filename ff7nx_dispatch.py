@@ -1353,12 +1353,10 @@ CAMERA_CASES = [
 # NOT excluded, on purpose:
 #
 #   one_call_effect100_addresses (7)  FFNx gives these OneCallEffectDecorator,
-#       which SKIPS the call rather than pausing it. Skipping is the thing that
-#       leaks guest stack and crashed --cam-throttle, so it is not available
-#       here. Pausing gives the same 1-in-4 pacing if the function honours
-#       g_is_battle_paused, and leaves it exactly as it is today if it does not,
-#       so it can improve or do nothing but cannot regress. Listed separately
-#       below so a bisect can move them across in one flag.
+#       which SKIPS the call rather than pausing it. Most retain the conservative
+#       call-preserving pause path. Bahamut ZERO is the hardware-observed
+#       exception and uses the explicitly stack-balanced exact skip listed in
+#       EFFECT100_BALANCED_ONE_CALL below.
 #
 #   camera_effect100_addresses (25) and model_effect100_addresses (10)  FFNx
 #       gives these Camera/ModelInterpolationEffectDecorator, both of which are
@@ -1515,6 +1513,20 @@ EFFECT100_ONE_CALL = [
     'run_confu_main_loop_5600BE',
     'death_kill_sub_loop_5624A5',
     'death_kill_sub_loop_562C60',
+]
+
+# OneCallEffectDecorator truly skips the callback on repeated render frames;
+# it is not a PauseEffectDecorator. Bahamut ZERO's main loop is the observed
+# case where calling it with g_is_battle_paused set is visibly not equivalent:
+# it still changes presentation state and makes the summon flicker.
+#
+# The dedicated pre-cave path cancels the translated guest `ESP -= 4`, writes
+# the restored ESP, and then joins at the post-call hook. That is stack-balanced
+# unlike the old experiment which skipped only the BL and leaked four guest
+# bytes per held frame. Keep the allow-list narrow until another callback has a
+# hardware-observed need for true call skipping.
+EFFECT100_BALANCED_ONE_CALL = [
+    ('run_bahamut_zero_main_loop_484A16', 0x484A16),
 ]
 
 # execute_effect60_fn, same source file. The first seven are FFNx's arithmetic
@@ -2090,6 +2102,9 @@ def build_addfn_cave(cave, site, flag_addr, mask_bits, throttle=None):
         # model decorator; bit 3 selects Alexander's 3000-unit threshold.
         w += [((marker & 0xFF) << 24) | (va & 0xFFFFFF)
               for _name, va, marker in throttle.get('model', ())] + [0]
+        # Exact OneCall callbacks use a plain, sentinel-terminated address
+        # table. Marker 0x10 is supplied by the registration cave itself.
+        w += [va for _name, va in throttle.get('one_call', ())] + [0]
     return w
 
 
@@ -2147,8 +2162,9 @@ def build_addfn_cave(cave, site, flag_addr, mask_bits, throttle=None):
 #     bl  #0xa1a0               ; indirect call thunk
 #
 # Skipping only the `bl` leaks four bytes of guest stack per skipped frame. The
-# pause trick never changes control flow: the call always happens, on every
-# frame, exactly as the stock dispatcher does it.
+# generic pause trick therefore never changes control flow. The one deliberate
+# exception is EFFECT100_BALANCED_ONE_CALL: its pre-cave restores those four
+# bytes and writes the corrected ESP before branching over the thunk.
 #
 # INTERPOLATION SCOPE
 # -------------------
@@ -2167,6 +2183,9 @@ def build_addfn_cave(cave, site, flag_addr, mask_bits, throttle=None):
 # One byte per slot, in the BSS block appended after the first-frame flags:
 #
 #     0x80  this slot's function is on the exclusion list -- never throttle
+#     0x40  this slot uses KOTR's counter-hold decorator
+#     0x20  this slot uses model interpolation (currently quarantined/unused)
+#     0x10  this slot uses the exact, stack-balanced OneCall decorator
 #     0..3  the phase; a real step happens on phase 0
 #
 # The byte is seeded at REGISTRATION, in the add_fn cave, not on the first
@@ -2261,7 +2280,8 @@ def _addfn_throttle_words(cave, w, site, mask_bits, throttle, allow=False):
     # w16 for its masked function comparison.
     special = throttle.get('kotr', ())
     model = throttle.get('model', ())
-    if special or model:
+    one_call = throttle.get('one_call', ())
+    if special or model or one_call:
         w.append(A.str_(16, A.SP, 8))
     if special:
         special_adr_i = len(w)
@@ -2320,7 +2340,27 @@ def _addfn_throttle_words(cave, w, site, mask_bits, throttle, allow=False):
     else:
         model_adr_i = model_done_jump = None
 
-    if special or model:
+    # Exact OneCall callbacks are stored as plain guest addresses. Marker bit
+    # 4 selects the stack-balanced skip path; its low bits remain the phase.
+    if one_call:
+        one_call_adr_i = len(w)
+        w.append(0)                                  # adr x17,ONE_CALL_TABLE
+        one_call_loop_i = len(w)
+        w.append(A.ldr_post(0, 17, 4))
+        one_call_end_i = len(w)
+        w.append(0)                                  # cbz -> ordinary result
+        w.append(A.cmp_reg(0, fn))
+        w.append(A.bcond(pc(), cave + 4 * one_call_loop_i, A.NE))
+        w.append(A.movz(16, 0x10))
+        one_call_done_jump = len(w)
+        w.append(0)                                  # b -> final slot store
+        one_call_miss = pc()
+        w[one_call_end_i] = A.cbz(0, cave + 4 * one_call_end_i,
+                                   one_call_miss)
+    else:
+        one_call_adr_i = one_call_done_jump = None
+
+    if special or model or one_call:
         w.append(A.ldr(16, A.SP, 8))                 # ordinary exclusion result
 
     final_store = pc()
@@ -2328,6 +2368,8 @@ def _addfn_throttle_words(cave, w, site, mask_bits, throttle, allow=False):
         w[special_done_jump] = A.b(cave + 4 * special_done_jump, final_store)
     if model_done_jump is not None:
         w[model_done_jump] = A.b(cave + 4 * model_done_jump, final_store)
+    if one_call_done_jump is not None:
+        w[one_call_done_jump] = A.b(cave + 4 * one_call_done_jump, final_store)
     w.append(A.ldr(0, ctx, io))
     w.append(A.and_mask(0, 0, mask_bits))
     w.append(A.adrp(17, pc(), ctr & ~0xFFF))
@@ -2347,6 +2389,12 @@ def _addfn_throttle_words(cave, w, site, mask_bits, throttle, allow=False):
                     + len(throttle.get('kotr', ())) + 1)
         w[model_adr_i] = A.adr(17, cave + 4 * model_adr_i,
                                cave + 4 * model_at)
+    if one_call_adr_i is not None:
+        one_call_at = (table_at + len(throttle['table']) + 1
+                       + len(throttle.get('kotr', ())) + 1
+                       + len(throttle.get('model', ())) + 1)
+        w[one_call_adr_i] = A.adr(17, cave + 4 * one_call_adr_i,
+                                  cave + 4 * one_call_at)
     return w, table_at
 
 
@@ -2445,6 +2493,11 @@ def build_throttle_pre_cave(cave, site, throttle, paused_guest, mask_bits,
         w.append(A.cmp_imm(16, 0x20))
         model_i = len(w)
         w.append(0)                                 # b.ge MODEL (KOTR already split)
+    one_call_i = None
+    if throttle.get('one_call'):
+        w.append(A.cmp_imm(16, 0x10))
+        one_call_i = len(w)
+        w.append(0)                                 # b.hs ONE_CALL
     w.append(A.add_imm(16, 16, 1))
     w.append(A.and_mask(16, 16, freq_bits))
     w.append(A.strb(16, 17, 0))
@@ -2469,9 +2522,34 @@ def build_throttle_pre_cave(cave, site, throttle, paused_guest, mask_bits,
     w.append(A.ldr64(e, A.SP, 8))
     w.append(A.add_imm64(A.SP, A.SP, 0x10))
     normal_out_i = None
-    if throttle.get('kotr') or throttle.get('model'):
+    if (throttle.get('kotr') or throttle.get('model')
+            or throttle.get('one_call')):
         normal_out_i = len(w)
         w.append(0)                                 # b OUT -- don't fall into decorator paths
+
+    # FFNx OneCallEffectDecorator. On phase 0 the stock call runs normally.
+    # On the other phases, cancel the stock `sub wE,wE,#4`, store the restored
+    # guest ESP, and join at the post-call hook. Joining there executes that
+    # hook's displaced instruction but never pushes a guest return address or
+    # enters the indirect thunk.
+    one_call_real_i = None
+    if throttle.get('one_call'):
+        one_call = pc()
+        w[one_call_i] = A.bcond(pc(one_call_i), one_call, A.HS)
+        w.append(A.add_imm(16, 16, 1))
+        # w0 is still the guest callback address consumed by the indirect
+        # thunk on the real-call phase.  Keep all phase arithmetic in w16;
+        # clobbering w0 here turns 0x00484A16 into phase value 1 and sends the
+        # translator to an invalid guest address as soon as Bahamut ZERO runs.
+        w.append(A.and_mask(16, 16, freq_bits))
+        w.append(A.add_imm(16, 16, 0x10))
+        w.append(A.strb(16, 17, 0))
+        w.append(A.cmp_imm(16, 0x11))               # phase 1 = real call
+        one_call_real_i = len(w)
+        w.append(0)                                 # b.eq OUT
+        w.append(A.add_imm(e, e, 4))                # cancel guest ESP -= 4
+        w.append(site['displaced'])                 # publish restored guest ESP
+        w.append(A.b(pc(), throttle['post']))       # skip thunk, run post hook
 
     # FFNx's FixCounterExceptionEffectDecorator for the thirteen KOTR knights.
     # The function is called every rendered frame (so model animation is not
@@ -2672,6 +2750,8 @@ def build_throttle_pre_cave(cave, site, throttle, paused_guest, mask_bits,
     w[eq_i] = A.bcond(pc(eq_i), out, A.EQ)
     if throttle.get('kotr'):
         w[kotr_real_i] = A.bcond(pc(kotr_real_i), out, A.EQ)
+    if one_call_real_i is not None:
+        w[one_call_real_i] = A.bcond(pc(one_call_real_i), out, A.EQ)
     if normal_out_i is not None:
         w[normal_out_i] = A.b(pc(normal_out_i), out)
     if kotr_end_i is not None:
