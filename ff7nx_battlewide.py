@@ -5,10 +5,10 @@ ff7nx_battlewide.py -- widen the battle effects that size themselves to the
 
 THE SYMPTOM
 ===========
-Summon and limit-break screen effects -- typhoon, odin's gunge, Barret's
-Catastrophe, fat chocobo -- draw a full-screen quad that covers only the
-middle 4:3 of a 16:9 frame.  The picture behind them is wide; the flash is
-not.
+Summon and limit-break screen effects -- typhoon, odin's gunge, Neo Bahamut,
+Barret's Catastrophe, fat chocobo -- draw a full-screen quad that covers only
+the middle 4:3 of a 16:9 frame.  The picture behind them is wide; the effect
+is not.
 
 THE MECHANISM
 =============
@@ -56,9 +56,11 @@ So the rule now has two clauses, and the second is checked in `verify`:
 
 THE RULE THAT PICKS THE SITES -- EXTENT, NOT ORIGIN
 ===================================================
-This module patches only reads of `x` and `w`, in functions that read BOTH.
-That distinction is the whole design, and getting it wrong is what an earlier
-attempt (`ff7nx_overlay.py`, now refusing to apply) did:
+This module patches the origin and every extent actually consumed by an
+isolated full-frame effect (`x`, `w`, and its local `h` when present), in
+functions that read both origin and extent.  That distinction is the whole
+design, and getting it wrong is what an earlier attempt (`ff7nx_overlay.py`,
+now refusing to apply) did:
 
     a full-screen overlay needs a corner AND an extent, so it reads w
     a thing merely PLACED in the frame reads only the origin
@@ -181,6 +183,7 @@ def apply_all(main, revert=False, log=print) -> int:
     if revert:
         # Group 3 was an inferred inventory, not an FFNx-identified fade
         # path.  Revert it for compatibility with build 197/198 images.
+        rc |= apply_neo_bahamut_scale(main, revert=True, log=log)
         for g in sorted(GROUPS):
             rc |= apply(main, g, revert=True, log=log)
     else:
@@ -189,6 +192,7 @@ def apply_all(main, revert=False, log=print) -> int:
         rc |= apply(main, 3, revert=True, log=log)
         for g in ACTIVE_GROUPS:
             rc |= apply(main, g, revert=False, log=log)
+        rc |= apply_neo_bahamut_scale(main, revert=False, log=log)
     # The rect redirects and the strip geometry are one FFNx feature.  They
     # used to be separated here because the 21-strip constant is also touched
     # by the 60 FPS pass.  Hardware has now supplied the missing observation:
@@ -305,12 +309,58 @@ GROUPS = {
         ('barret_limit_3_1_sub_4700F7',  0x4700F7, ((0x1B, 'x', 2), (0x36, 'w', 2), (0x043, 'h', 2))),
         ('fat_chocobo_sub_5096F3',       0x5096F3, ((0x4A, 'x', 2), (0x5F, 'w', 2), (0x06A, 'h', 2))),
     ]),
+    4: ('Neo Bahamut full-frame background geometry', [
+        # FFNx has a dedicated Neo Bahamut block in widescreen.cpp.  Unlike
+        # FFNx, this port deliberately leaves the shared battle rect stock,
+        # so the four x+w pairs that the x86 builds locally must redirect
+        # BOTH source loads here.  FFNx gets the second load of each pair for
+        # free from its globally widened rect.  These offsets are therefore
+        # re-derived from ff7_en_switch, not copied past the point where the
+        # current FFNx PC executable and the Switch PC source diverge.
+        ('neo_bahamut_effect_sub_490F2A', 0x490F2A,
+         ((0x05D, 'w', 4), (0x06A, 'x', 4),
+          (0x095, 'h', 4),
+          (0x1A2, 'x', 2), (0x1AF, 'w', 2))),
+        ('run_bahamut_neo_main_48C2A1', 0x48C2A1,
+         ((0x140, 'x', 2), (0x15B, 'w', 2),
+          (0x168, 'h', 2),
+          (0x19B, 'x', 2),
+          (0x1D1, 'x', 4), (0x1D7, 'w', 4),
+          (0x20E, 'x', 2),
+          (0x243, 'x', 4), (0x249, 'w', 4),
+          (0x28A, 'x', 2),
+          (0x2C0, 'x', 4), (0x2C6, 'w', 4),
+          (0x2FC, 'x', 2),
+          (0x332, 'x', 4), (0x338, 'w', 4))),
+    ]),
 }
 
 # Only these groups are part of a normal build.  Group 3 remains described so
 # old test images can be reverted byte-exactly, but hardware disproved its
 # guessed "victory fade" attribution.  The actual path is MENU_FADE below.
-ACTIVE_GROUPS = (1, 2)
+ACTIVE_GROUPS = (1, 2, 4)
+
+# neo_bahamut_effect_sub_490F2A has two x86 `imul reg,reg,160`
+# instructions which FFNx changes to wide_viewport_width/4 (854/4 = 213).
+# The recompiler strength-reduced each multiply to x*5 followed by <<5.
+# Replacing those two words with `mov w9,#213` and `mul` is exact, needs no
+# code cave, and is safe because w9 is dead until a later load at both sites.
+NEO_BAHAMUT_SEGMENT = 213
+NEO_BAHAMUT_SCALE = {
+    0x00280238: (0x0B080908, 'Neo Bahamut first strip x5'),
+    0x00280248: (0x531B6908, 'Neo Bahamut first strip x32'),
+    0x002802C8: (0x0B080908, 'Neo Bahamut second strip x5'),
+    0x002802CC: (0x531B6916, 'Neo Bahamut second strip x32'),
+}
+NEO_BAHAMUT_SCALE_ANCHORS = {
+    0x00280234: 0xB9400008,  # ldr w8,[x0] -- first source
+    0x0028023C: 0x5295A997,  # materialise battle-rect base
+    0x00280244: 0x110042E0,  # add w0,w23,#0x10
+    0x0028024C: 0xB9000B28,  # store first scaled result
+    0x002802C0: 0xB9400008,  # ldr w8,[x0] -- second source
+    0x002802C4: 0x1100B280,  # add w0,w20,#0x2c
+    0x002802D0: 0xB9000736,  # store second scaled result
+}
 
 # battle_enter is never touched -- not its stored rect, not its viewport
 # reads, and (since the build-202 world-map freeze) not the two post-write
@@ -432,6 +482,8 @@ NOT_FROM_FFNX = {
     (0x4A4BE6, 0x05E): 'the rect height',
     (0x4700F7, 0x043): 'the rect height',
     (0x5096F3, 0x06A): 'the rect height',
+    (0x490F2A, 0x095): 'Neo Bahamut height inherited from FFNx stored rect',
+    (0x48C2A1, 0x168): 'Neo Bahamut height inherited from FFNx stored rect',
 }
 
 # FFNx's "Battle fading animation fix".  These are geometry despite the old
@@ -1085,6 +1137,84 @@ def _word(img, va):
 
 def _fmt_word(w):
     return struct.pack('<I', w).hex()
+
+
+def neo_bahamut_scale_plan(m, revert=False):
+    """Exact Switch translation of FFNx's two 160 -> 854/4 patches."""
+    import a64 as A
+
+    img = m.img
+    wide = {
+        0x00280238: A.movz(9, NEO_BAHAMUT_SEGMENT),
+        0x00280248: A.mul(8, 8, 9),
+        0x002802C8: A.movz(9, NEO_BAHAMUT_SEGMENT),
+        0x002802CC: A.mul(22, 8, 9),
+    }
+    ps, notes, problems = [], [], []
+    for va, expected in sorted(NEO_BAHAMUT_SCALE_ANCHORS.items()):
+        if _word(img, va) != expected:
+            problems.append('Neo Bahamut scale anchor +0x%X is %08X, expected %08X'
+                            % (va, _word(img, va), expected))
+    md = _md()
+    for va in (0x00280238, 0x002802C8):
+        # In stock code w9 must be dead before we claim it as scratch.  In an
+        # already-patched image the owned MUL intentionally reads that w9,
+        # which is proof of the installed pair rather than a liveness error.
+        if (_word(img, va) == NEO_BAHAMUT_SCALE[va][0]
+                and not reg_dead_before_write(img, va, md, 'w9', window=40)):
+            problems.append('Neo Bahamut scale +0x%X: scratch w9 is live'
+                            % va)
+    for va, (stock, name) in sorted(NEO_BAHAMUT_SCALE.items()):
+        cur = _word(img, va)
+        frm, to = (wide[va], stock) if revert else (stock, wide[va])
+        if cur == to:
+            continue
+        if cur != frm:
+            problems.append('%s +0x%X is %08X, expected %08X or %08X'
+                            % (name, va, cur, stock, wide[va]))
+            continue
+        ps.append({'name': name + (' restore x160' if revert else ' -> x213'),
+                   'va': hex(va), 'expect': _fmt_word(frm),
+                   'set': _fmt_word(to)})
+        notes.append('    %-40s @ +0x%07X' %
+                     (name + (' -> stock x160' if revert else ' -> wide x213'),
+                      va))
+    return ps, notes, problems
+
+
+def apply_neo_bahamut_scale(main, revert=False, log=print) -> int:
+    """Apply/revert the two Neo Bahamut segment-width multiplications."""
+    import nso_patcher
+
+    main = Path(main)
+    m = nxmap.Main(str(main))
+    patches, notes, problems = neo_bahamut_scale_plan(m, revert=revert)
+    if problems:
+        for p in problems:
+            log('  ! ' + p)
+        log('  refusing to write Neo Bahamut segment scaling.')
+        return 1
+    log('  Neo Bahamut full-frame segment scaling:')
+    for n in notes:
+        log(n)
+    if not patches:
+        log('    nothing to do -- already in the requested state')
+        return 0
+    nso = nso_patcher.read_nso(main)
+    for line in nso_patcher.apply_spec(
+            nso, {'name': 'ff7nx_battlewide_neo_bahamut',
+                  'patches': patches}):
+        log('    ' + line)
+    fd, tmp = tempfile.mkstemp(dir=str(main.parent), prefix='.neobahamut-')
+    os.close(fd)
+    try:
+        Path(tmp).write_bytes(nso_patcher.rebuild(nso))
+        shutil.move(tmp, str(main))
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+    log('  %d Neo Bahamut scale word(s) written' % len(patches))
+    return 0
 
 
 def _add_shift(rd, rn, rm, shift):
@@ -2375,7 +2505,7 @@ def verify(main=None, group=1, log=print) -> int:
                 '%s +0x%03X is a %d-byte access in the x86, table says %d'
                 % (name, off, xw, width))
         chk(len({f for f, _, _, _, _, _, _ in xf}) == len(GROUPS[group][1]),
-            'the function set matches FFNx exactly (%d)' % len(GROUPS[group][1]))
+            'the function set is complete (%d)' % len(GROUPS[group][1]))
 
     log('  the extent rule: every function here reads BOTH origin and extent:')
     for name, fn, offs in GROUPS[group][1]:
@@ -2405,6 +2535,14 @@ def verify(main=None, group=1, log=print) -> int:
             chk(n_tab >= 1,
                 '%s reads the rect %s and the table redirects it (%d entry)'
                 % (name, f, n_tab))
+        if group == 4:
+            for f in ('x', 'w'):
+                n_arm = sum(1 for x in acc
+                            if x.guest == FIELD[f] and x.is_load)
+                n_tab = sum(1 for _, y, _ in offs if y == f)
+                chk(n_tab == n_arm,
+                    '%s redirects all %d Switch rect-%s consumers'
+                    % (name, n_arm, f))
 
     log('  offsets not taken from FFNx are declared:')
     for name, fn, offs in GROUPS[group][1]:
@@ -2498,6 +2636,22 @@ def verify(main=None, group=1, log=print) -> int:
             'the wide width immediate really decodes to FFNx\'s 854')
         chk((ENGINE_FADE_ANCHORS[0x00A3F0D4] >> 10) & 0x1FFF == 0x1E0 or True,
             'the height beside it is 480 and is deliberately not rewritten')
+
+    if group == 4:
+        log('  Neo Bahamut segment scaling is the exact FFNx companion:')
+        ws = Path('repos/FFNx-master/src/ff7/widescreen.cpp')
+        src = ws.read_text() if ws.exists() else ''
+        for off in (0x58, 0x88):
+            chk(('neo_bahamut_effect_sub_490F2A + 0x%X, '
+                 'wide_viewport_width / 4' % off) in src,
+                'FFNx owns Neo Bahamut width/4 at x86 +0x%X' % off)
+        for va, expected in sorted(NEO_BAHAMUT_SCALE_ANCHORS.items()):
+            chk(_word(m.img, va) == expected,
+                'Neo Bahamut scale anchor +0x%X is stock' % va)
+        _np, _nn, nproblems = neo_bahamut_scale_plan(m, revert=False)
+        chk(not nproblems,
+            'Neo Bahamut scale plan recognizes this image (%s)'
+            % (nproblems[0] if nproblems else 'clean'))
 
     log('  the sites, re-derived from the image:')
     found, problems = sites(m, group, values, md)
@@ -2601,6 +2755,20 @@ def main(argv=None) -> int:
             m = nxmap.Main(a.main)
             ps, notes, problems = fade_animation_plan(m, revert=False)
             print('  battle fade / flash strip geometry:')
+            for n in notes:
+                print(n)
+            if not notes and not problems:
+                print('    already applied')
+            for p in problems:
+                print('    ! ' + p)
+                rc = 1
+    if 4 in groups:
+        if a.apply or a.revert:
+            rc |= apply_neo_bahamut_scale(a.main, revert=a.revert)
+        elif a.show:
+            m = nxmap.Main(a.main)
+            _ps, notes, problems = neo_bahamut_scale_plan(m, revert=False)
+            print('  Neo Bahamut full-frame segment scaling:')
             for n in notes:
                 print(n)
             if not notes and not problems:
