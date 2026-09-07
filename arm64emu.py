@@ -210,6 +210,18 @@ class Cpu:
         rn = (w >> 5) & 0x1F
         rm = (w >> 16) & 0x1F
 
+        if (w & 0xFFFFFFE0) == 0xD53B4200:                    # mrs Xt,nzcv
+            self.set(rd, (self.n << 31) | (self.z << 30) |
+                     (self.c << 29) | (self.v << 28))
+            return None
+        if (w & 0xFFFFFFE0) == 0xD51B4200:                    # msr nzcv,Xt
+            value = self.get(rd)
+            self.n = (value >> 31) & 1
+            self.z = (value >> 30) & 1
+            self.c = (value >> 29) & 1
+            self.v = (value >> 28) & 1
+            return None
+
         # In the DATA-PROCESSING register forms below, register 31 is the
         # ZERO register, not SP. `self.get` maps 31 to SP because every form
         # this interpreter previously decoded was an addressing one, where it
@@ -219,6 +231,9 @@ class Cpu:
         def gz(r, wide=True):
             return 0 if r == 31 else self.get(r, wide)
 
+        if w == 0xD503201F:                                  # nop
+            return None
+
         # ---- the handful of forms the 360-degree movement cave needs.
         # Each is decoded exactly, not approximated: an FP load moves a raw
         # 32-bit pattern, `fsub` is real IEEE single arithmetic done through
@@ -227,6 +242,37 @@ class Cpu:
         if (w & 0xFFC00000) == 0xBD400000:                    # ldr St,[Xn,#i]
             a = self._addr(rn, ((w >> 10) & 0xFFF) * 4)
             self.fp[rd] = self.mem.u(a, 4)
+            return None
+        if (w & 0xFFC00000) == 0xBD000000:                    # str St,[Xn,#i]
+            a = self._addr(rn, ((w >> 10) & 0xFFF) * 4)
+            self.mem.setu(a, self.fp[rd], 4)
+            return None
+        if (w & 0xFFFFFC00) == 0x1E230000:                    # ucvtf Sd,Wn
+            x = float(g(rn, True))
+            self.fp[rd] = struct.unpack('<I', struct.pack('<f', x))[0]
+            return None
+        if (w & 0xFFE0FC00) == 0x1E200800:                    # fmul Sd,Sn,Sm
+            x = struct.unpack('<f', struct.pack('<I', self.fp[rn]))[0]
+            y = struct.unpack('<f', struct.pack('<I', self.fp[rm]))[0]
+            self.fp[rd] = struct.unpack('<I', struct.pack('<f', x * y))[0]
+            return None
+        # ---- double precision -------------------------------------------
+        # The recompiler keeps the x87 stack in doubles, so the reciprocal
+        # caves work in D registers rather than S.
+        if (w & 0xFFFFFC00) == 0x1E630000:                    # ucvtf Dd,Wn
+            self.fp[rd] = struct.unpack(
+                '<Q', struct.pack('<d', float(g(rn, True))))[0]
+            return None
+        if (w & 0xFFE0FC00) == 0x1E600800:                    # fmul Dd,Dn,Dm
+            x = struct.unpack('<d', struct.pack('<Q', self.fp[rn]))[0]
+            y = struct.unpack('<d', struct.pack('<Q', self.fp[rm]))[0]
+            self.fp[rd] = struct.unpack('<Q', struct.pack('<d', x * y))[0]
+            return None
+        if (w & 0xFFE0FC00) == 0x1E601800:                    # fdiv Dd,Dn,Dm
+            x = struct.unpack('<d', struct.pack('<Q', self.fp[rn]))[0]
+            y = struct.unpack('<d', struct.pack('<Q', self.fp[rm]))[0]
+            self.fp[rd] = struct.unpack(
+                '<Q', struct.pack('<d', 0.0 if y == 0 else x / y))[0]
             return None
         if (w & 0xFFE0FC00) == 0x1E203800:                    # fsub Sd,Sn,Sm
             x = struct.unpack('<f', struct.pack('<I', self.fp[rn]))[0]
@@ -250,6 +296,10 @@ class Cpu:
             return s(rd, gz(rn) ^ gz(rm), True)
         if (w & 0xFFE0FC00) == 0x2A000000:                    # orr Wd,Wn,Wm
             return s(rd, gz(rn) | gz(rm), True)
+        if (w & 0xFFE0FC00) == 0xAA000000:                    # orr Xd,Xn,Xm
+            a = 0 if rn == 31 else g(rn)
+            b = 0 if rm == 31 else g(rm)
+            return self._wr64(rd, a | b)
         if (w & 0xFFE0FC00) == 0x4B000000:                    # sub Wd,Wn,Wm
             return s(rd, gz(rn) - gz(rm), True)
         # 0xFFC00000, not 0xFF800000: bit 22 is the `lsl #12` flag, and a
@@ -284,6 +334,26 @@ class Cpu:
             a = self._rd64(rn) + imm7 * 8
             self.mem.setu(a, g(rd), 8)
             self.mem.setu(a + 8, g((w >> 10) & 0x1F), 8)
+            return None
+        if (w & 0xFFC00000) == 0xAD000000:                    # stp Qa,Qb,[Xn,#i]
+            imm7 = (w >> 15) & 0x7F
+            if imm7 & 0x40:
+                imm7 -= 0x80
+            a = self._rd64(rn) + imm7 * 16
+            rt2 = (w >> 10) & 0x1F
+            # The interpreter models the low S lane of each vector register;
+            # preserve that lane at the architecturally correct Q addresses.
+            self.mem.setu(a, self.fp[rd], 4)
+            self.mem.setu(a + 16, self.fp[rt2], 4)
+            return None
+        if (w & 0xFFC00000) == 0xAD400000:                    # ldp Qa,Qb,[Xn,#i]
+            imm7 = (w >> 15) & 0x7F
+            if imm7 & 0x40:
+                imm7 -= 0x80
+            a = self._rd64(rn) + imm7 * 16
+            rt2 = (w >> 10) & 0x1F
+            self.fp[rd] = self.mem.u(a, 4)
+            self.fp[rt2] = self.mem.u(a + 16, 4)
             return None
         if (w & 0xFFC00000) == 0xA9400000:                    # ldp Xa,Xb,[Xn,#i]
             imm7 = (w >> 15) & 0x7F
@@ -479,6 +549,22 @@ class Cpu:
             return s(rd, g(rm, True), True)
         if (w & 0xFFE0FC00) == 0x1B007C00:                    # mul Wd,Wn,Wm
             return s(rd, (g(rn, True) * g(rm, True)) & M32, True)
+        if (w & 0xFFE0FC00) == 0xCB000000:                    # sub Xd,Xn,Xm
+            return s(rd, (gz(rn) - gz(rm)) & M64, False)
+        if (w & 0xFFE0FC00) == 0x1AC02400:                    # lsr Wd,Wn,Wm
+            return s(rd, (g(rn, True) >> (g(rm, True) & 31)) & M32, True)
+        if (w & 0x9F000000) == 0x10000000:                    # adr Xd,label
+            imm = (((w >> 5) & 0x7FFFF) << 2) | ((w >> 29) & 3)
+            if imm & (1 << 20):
+                imm -= 1 << 21
+            return s(rd, (pc + imm) & M64, False)
+        if (w & 0xFFE0FC00) == 0x1AC00800:                    # udiv Wd,Wn,Wm
+            # ARM defines division by zero as producing zero, not a trap.
+            # Modelling that exactly matters: a cave that divides by an
+            # unvalidated scale would silently write 0 on hardware and the
+            # emulator has to show the same thing rather than raise.
+            d = g(rm, True)
+            return s(rd, 0 if d == 0 else (g(rn, True) // d) & M32, True)
 
         # ---- shifted-register SUB and AND -------------------------------
         # The recompiler open-codes x86 flag computations with these, so any

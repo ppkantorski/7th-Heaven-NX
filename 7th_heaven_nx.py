@@ -136,6 +136,42 @@ BATTLE_BG_TEX_CAP_CHOICES = [
     (1024, 'Cap at 1024px \u2014 full size, as authored'),
 ]
 
+# Spell/summon texture cap -- see build.ff7nx_spelltex. Scoped to magic.lgp
+# textures rebuilt from an FFNx DDS set (SYW Unified Spell Textures, and
+# Enhanced Stock UI's battle cursor). Nothing else in magic.lgp moves.
+#
+# MEASURED, so the ladder means something: SYW authored every file at
+# EXACTLY 4x its vanilla slot (110 of 120 sampled), and vanilla magic.lgp
+# tops out at 256px, so this is really a uniform whole-number scale --
+# 512 = 2x, 768 = 3x, 1024 = 4x, same shape as the Gaia world cap.
+#
+# "Native" is the zero-risk end of the ladder and it is NOT the default,
+# because it is also the pointless end: the art is rebuilt at the vanilla
+# 128px/256px slot size, so the mod is applied correctly and you can barely
+# see it. 1,013 of magic.lgp's 1,109 textures are locked to 16 colours per
+# palette, so resolution is the only place the detail can go.
+#
+# The honest caveat: vanilla magic.lgp is the ONE archive this project has
+# never pushed past 256px, and ff7nx_battlecap records that every archive
+# that was pushed past it has been reported corrupting. This setting is how
+# that gets tested one step at a time, and the mod's own toggle is the
+# revert.
+SPELL_TEX_CAP_CHOICES = [
+    (512, '512px \u2014 2x (default)'),
+    (768, '768px \u2014 3x'),
+    (1024, '1024px \u2014 4x'),
+    (0, 'Vanilla size \u2014 no upscaling'),
+]
+
+# Retained only so older settings.json files load. V37 uses the single spell
+# cap above for every mapped TEX; the per-TEX runtime marker replaces this
+# split. Production conversion ignores the old value.
+SPELL_FX_CAP_CHOICES = [
+    (0, 'Vanilla size \u2014 known good (default)'),
+    (512, '512px \u2014 2x, EXPERIMENTAL'),
+    (768, '768px \u2014 3x, EXPERIMENTAL'),
+]
+
 # SUPERSEDED by FIELD_BG_PAGE_PX_CHOICES below. Kept only so an older
 # settings.json still loads. Everything it says about the FORMAT is
 # right; the conclusion -- "there is no dimension to resize" -- is not.
@@ -1118,6 +1154,24 @@ def run_build(mods, enabled, settings_by_mod, log, progress,
     # word, and DEFAULT OFF: the mechanism is measured but the graphics pool
     # was believed on good grounds too. FINDINGS-306.
     produced += build.apply_texcache(SDOUT_DIR, DUMP, log, produced)
+    # Resized SYW TEX payloads carry a per-file integer scale in two inert
+    # header words. All three u/v reciprocal pairs in _load_texture apply that
+    # scale when each graphics object is constructed, so every consumer keeps
+    # native logical texels while its GPU image is larger. Texture dimensions,
+    # .s tables and on-screen quad extents remain stock.
+    produced += build.apply_spelluv(
+        SDOUT_DIR, DUMP, log, produced,
+        needed=bool(plan.spell_dds
+                    and build.ff7nx_spelltex.uniform_scale() > 1))
+    # The framebuffer-texture capture rect. The floor-warp summons snapshot
+    # the frame and map it onto their mesh; the capture converts the rect to
+    # staging-surface columns with a hardcoded identity that assumes a 640
+    # unit wide frame, and 16:9 makes it 854 spanning -107..747. Applied only
+    # where xscale == 1 -- the page-scaled captures (the battle-entry swirl)
+    # are left byte-identical. One word plus a branch-free cave in padding.
+    # ON with 16:9 and OFF at 4:3 where the identity is already right -- the
+    # same gate as ff7nx_battlewide. FINDINGS-247.
+    produced += build.apply_fbcapture(SDOUT_DIR, DUMP, log, produced)
     # The custom PIXEL shader sets (background scaler, FXAA). These touch no
     # module at all, so they can go anywhere -- but they must go BEFORE
     # prune_stale, because that is what deletes them again when the setting
@@ -1180,6 +1234,18 @@ def launch_ui():
     initial_bg_cap_value = global_saved.get('battle_bg_tex_cap', 256)
     if initial_bg_cap_value not in bg_cap_label_by_value:
         initial_bg_cap_value = 256
+
+    fxcap_label_by_value = dict(SPELL_FX_CAP_CHOICES)
+    fxcap_value_by_label = {v: k for k, v in SPELL_FX_CAP_CHOICES}
+    initial_fxcap_value = global_saved.get('spell_fx_cap', 0)
+    if initial_fxcap_value not in fxcap_label_by_value:
+        initial_fxcap_value = 0
+
+    spell_cap_label_by_value = dict(SPELL_TEX_CAP_CHOICES)
+    spell_value_by_cap_label = {v: k for k, v in SPELL_TEX_CAP_CHOICES}
+    initial_spell_cap_value = global_saved.get('spell_tex_cap', 512)
+    if initial_spell_cap_value not in spell_cap_label_by_value:
+        initial_spell_cap_value = 512
 
     fbg_label_by_value = dict(FIELD_BG_PAGE_PX_CHOICES)
     fbg_value_by_label = {v: k for k, v in FIELD_BG_PAGE_PX_CHOICES}
@@ -1456,6 +1522,17 @@ def launch_ui():
 
     def current_battle_bg_tex_cap():
         return bg_value_by_cap_label.get(bg_cap_var.get(), 256)
+
+    spell_cap_var = tk.StringVar(
+        value=spell_cap_label_by_value[initial_spell_cap_value])
+
+    fxcap_var = tk.StringVar(value=fxcap_label_by_value[initial_fxcap_value])
+
+    def current_spell_fx_cap():
+        return fxcap_value_by_label.get(fxcap_var.get(), 0)
+
+    def current_spell_tex_cap():
+        return spell_value_by_cap_label.get(spell_cap_var.get(), 512)
 
     fbg_var = tk.StringVar(value=fbg_label_by_value[initial_fbg_value])
 
@@ -2285,6 +2362,18 @@ def launch_ui():
              [l for _, l in BATTLE_BG_TEX_CAP_CHOICES],
              'Scoped to Arisen\u2019s own tiles. Everything else in '
              'battle.lgp stays at the proven 256px.', False),
+            ('combo', 'Spell texture cap (SYW Unified Spells)',
+             spell_cap_var, [l for _, l in SPELL_TEX_CAP_CHOICES],
+             'Applies to every deterministically mapped SYW spell, summon, '
+             'attack and effect texture, including packed frame sheets. Each '
+             'resized TEX records its own physical-to-logical scale, and the '
+             'native loader corrects u_offset/v_offset once when it constructs '
+             'the graphics object. Atlas cells stay in their original logical '
+             'texel space without changing their on-screen size.\n\n'
+             'The cap is a maximum. A source with less real detail stops at '
+             'its available integer scale. Animation .s files remain '
+             'byte-identical.',
+             False),
         ]),
         ('Movies', [
             ('combo', 'Video quality', movie_var,
@@ -2481,6 +2570,8 @@ def launch_ui():
         persist['__global__'] = {'field_tex_cap': current_field_tex_cap(),
                                  'world_tex_cap': current_world_tex_cap(),
                                  'battle_bg_tex_cap': current_battle_bg_tex_cap(),
+                                 'spell_tex_cap': current_spell_tex_cap(),
+                                 'spell_fx_cap': current_spell_fx_cap(),
                                  'field_bg_page_px':
                                      current_field_bg_page_px(),
                                  'field_bg_budget_mb':
@@ -3307,6 +3398,8 @@ def launch_ui():
         cap_value = current_field_tex_cap()
         world_cap_value = current_world_tex_cap()
         bg_cap_value = current_battle_bg_tex_cap()
+        spell_cap_value = current_spell_tex_cap()
+        spell_fx_value = current_spell_fx_cap()
         fbg_px_value = current_field_bg_page_px()
         # DEPTH-1 PAGE SIZE -- NOW A DIALOG CONTROL. FINDINGS-223, 225.
         #
@@ -3485,6 +3578,15 @@ def launch_ui():
                       f'{bg_cap_value}px (only tiles from Avalanche '
                       'Arisen -- everything else in battle.lgp stays at '
                       'the proven 256px)')
+        os.environ[build.ff7nx_spelltex.CAP_ENV] = str(spell_cap_value)
+        os.environ[build.ff7nx_spelltex.FX_CAP_ENV] = '0'
+        if spell_cap_value:
+            log_write(f'spell texture cap: {spell_cap_value}px '
+                      f'({spell_cap_value // 256}x vanilla for a 256px slot; '
+                      'magic.lgp textures rebuilt from FFNx DDS only)')
+        else:
+            log_write('spell textures: native size (vanilla dimensions, '
+                      'magic.lgp size unchanged)')
         os.environ[build.ff7nx_fieldbg.PAGE_PX_ENV] = str(fbg_px_value)
         if fbg_px_value != build.ff7nx_fieldbg.OFF_PAGE_PX:
             kb = fbg_px_value * fbg_px_value * 2 // 1024
@@ -3575,6 +3677,12 @@ def main():
             bg_cap_value = saved.get('__global__', {}).get(
                 'battle_bg_tex_cap', 256)
             os.environ[build.BATTLE_BG_TEX_CAP_ENV] = str(bg_cap_value)
+        if build.ff7nx_spelltex.FX_CAP_ENV not in os.environ:
+            os.environ[build.ff7nx_spelltex.FX_CAP_ENV] = str(
+                saved.get('__global__', {}).get('spell_fx_cap', 0))
+        if build.ff7nx_spelltex.CAP_ENV not in os.environ:
+            os.environ[build.ff7nx_spelltex.CAP_ENV] = str(
+                saved.get('__global__', {}).get('spell_tex_cap', 512))
         if build.ff7nx_fieldbg.PAGE_PX_ENV not in os.environ:
             _g = saved.get('__global__', {})
             _px = _g.get('field_bg_page_px', build.ff7nx_fieldbg.OFF_PAGE_PX)

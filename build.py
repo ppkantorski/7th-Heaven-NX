@@ -62,6 +62,7 @@ import ff7nx_fxpalette
 import ff7nx_fxcoverage
 import ff7nx_fxart
 import ff7nx_fxbake
+import ff7nx_spelltex
 import ff7nx_fshipart
 import ff7nx_marginpal
 import ff7nx_palkey
@@ -286,6 +287,7 @@ WORLD_DDS_RE = _re.compile(
     r'^(?P<stem>.+)_(?P<frame>[0-9]{2})(?:_[0-9a-f]+)?\.dds$',
     _re.IGNORECASE)
 WORLD_DDS_CACHE = os.path.join(HERE, 'cache', '_world_dds')
+SPELL_DDS_CACHE = os.path.join(HERE, 'cache', '_spell_dds')
 WORLD_DDS_POLICY = 'world-dds-v1'
 
 
@@ -343,6 +345,12 @@ def _no_switch_loader(name):
     if _switch_world_dds(name):
         return False
     if BATTLE_STAGE_RE.search(base):
+        return False
+    # magic.lgp spell/summon art has a build-time native path too --
+    # `<stem>_<NN>.dds` is palette NN of `<stem>.tex`. See ff7nx_spelltex.
+    # Gated on the DIRECTORY, like every other exception here: a basename
+    # test would also pull in Cosmos Gaia's world/rock_00.dds.
+    if 'magic' in low.split('/')[:-1]:
         return False
     return 'battle' not in low.split('/')[:-1]
 
@@ -454,6 +462,27 @@ class Mod:
                     policy_ok = all(os.path.isfile(os.path.join(
                         self.cache, e.replace('\\', os.sep)))
                                     for e in world_entries)
+                # magic.lgp spell art got the same treatment -- older caches
+                # excluded it outright, so a mod extracted before that has a
+                # perfectly valid signature and none of the files.
+                #
+                # Checked by PRESENCE, not by a policy string. Bumping the
+                # string would delete and re-extract EVERY mod's cache
+                # (Cosmos Limit Break alone is 3.1 GB) to fix the two mods
+                # that ship magic DDS, and presence is the thing that
+                # actually matters.
+                if policy_ok:
+                    spell_entries = [e for e in self.entries()
+                                     if e.lower().endswith('.dds')
+                                     and 'magic' in e.replace('\\', '/')
+                                     .lower().split('/')[:-1]]
+                    if spell_entries and not all(
+                            os.path.isfile(os.path.join(
+                                self.cache, e.replace('\\', os.sep)))
+                            for e in spell_entries):
+                        policy_ok = False
+                        log('%s: cache predates spell-texture support, '
+                            're-extracting' % self.filename)
                 try:
                     self.skipped_images = int(lines[1]) if len(lines) > 1 else 0
                 except ValueError:
@@ -752,6 +781,11 @@ class Plan:
         self.world_dds_native_names = set()  # world_us.lgp TEX names whose
                                               # active FFNx frame-zero DDS is
                                               # converted at archive build time
+        self.spell_dds = []          # [(rel, full, mod)] FFNx magic.lgp DDS.
+                                     # Collected, not routed: magic.lgp has
+                                     # 652 duplicate entry names and picking
+                                     # the right one needs the archive's own
+                                     # conflict table. See ff7nx_spelltex.
         self.widescreen = None       # (config.toml, movie_config.toml, mod)
                                      # -- FFNx's per-field widescreen table,
                                      # baked into flevel.lgp section 8 by
@@ -1106,6 +1140,29 @@ def build_plan(mods, settings_by_mod, catalogs, log=lambda *_: None,
                         'route': (mod.filename, os.path.dirname(rel)),
                         'option': option,
                     })
+                    continue
+
+            # SYW Unified Spell Textures, and any other FFNx mod shipping
+            # magic.lgp art (Enhanced Stock UI's battle cursor `yubi` lands
+            # here too). `<stem>_<NN>.dds` is palette NN of `<stem>.tex`.
+            #
+            # These are only COLLECTED here. magic.lgp has 652 duplicate entry
+            # names resolved through its conflict table, so choosing WHICH
+            # `smoke.tex` a file replaces needs the open archive -- that
+            # happens in _build_inplace_archive via ff7nx_spelltex.route().
+            #
+            # Gated on the directory, never the basename. Cosmos Gaia's
+            # `world/rock_00.dds` and SYW MiniGames' `snowboard/smoke_00.dds`
+            # both have stems matching a real magic.lgp texture, and the
+            # `world` branch above must keep the first of those.
+            if ext == '.dds' and 'magic' in dirs_l:
+                parsed = ff7nx_spelltex._parse_dds_name(base)
+                if parsed and (parsed[0] + '.tex') in catalogs.get(
+                        'magic.lgp', ()):
+                    plan.spell_dds.append((rel, full, mod))
+                    # magic.lgp must be in archive_files or apply_plan never
+                    # looks at it -- these DDS may be its only contribution.
+                    plan.archive_files.setdefault('magic.lgp', {})
                     continue
 
             if ext in FFNX_EXT:
@@ -5895,7 +5952,8 @@ def _lookup_unreachable(path):
 
 
 def _build_model_archive(name, archive_path, mod_files, romfs, pack_lgp,
-                         log, folder_of=None, battle_bg_native_names=None):
+                         log, folder_of=None, battle_bg_native_names=None,
+                         spell_dds=None):
     """
     Rebuild a model LGP (char/battle/magic/world/menu) with PyFF7: reuse
     every untouched vanilla entry, overlay the mod's files unchanged, add any
@@ -5923,7 +5981,14 @@ def _build_model_archive(name, archive_path, mod_files, romfs, pack_lgp,
                      for _ in range(count)]
     if len(toc_names) != len(set(toc_names)):
         return _build_inplace_archive(name, archive_path, mod_files, romfs,
-                                      log, folder_of, battle_bg_native_names)
+                                      log, folder_of, battle_bg_native_names,
+                                      spell_dds)
+    if spell_dds:
+        # Only magic.lgp has duplicate names, and only magic.lgp is a spell
+        # destination. If that ever stops being true, say so loudly rather
+        # than silently dropping the conversion on the repack path.
+        log(f'  ! {name}: {len(spell_dds)} spell DDS ignored -- the converted '
+            'path only exists for the in-place (duplicate-name) rebuild')
 
     van = vanilla_unpack(name, archive_path, log)
     filemap = dict(van)  # lowercase entry name -> disk path (unchanged bytes)
@@ -6117,7 +6182,8 @@ def _tex_dims(data):
 
 
 def _build_inplace_archive(name, archive_path, mod_files, romfs, log,
-                           folder_of=None, battle_bg_native_names=None):
+                           folder_of=None, battle_bg_native_names=None,
+                           spell_dds=None):
     """
     Replace entry payloads inside the vanilla archive without repacking:
     every entry (including duplicate-named ones) and the lookup/conflict
@@ -6128,8 +6194,11 @@ def _build_inplace_archive(name, archive_path, mod_files, romfs, log,
     """
     log(f'  {name}: archive uses duplicate entry names (internal '
         'directories); rebuilding in-place to preserve all entries')
-    # texture preprocessing still applies (battle-module-safe paletted)
-    if (name in ('battle.lgp', 'magic.lgp')
+    # texture preprocessing still applies (battle-module-safe paletted).
+    # `mod_files` can now be empty -- a mod that contributes only spell DDS
+    # puts magic.lgp on the build list with nothing native in it -- and
+    # vanilla_unpack() writes the whole 51 MB archive to disk, so skip it.
+    if (mod_files and name in ('battle.lgp', 'magic.lgp')
             and os.environ.get('SEVENTH_NX_NO_TEXCONV') != '1'):
         van = vanilla_unpack(name, archive_path, log)
         _bg_pals = (_battle_bg_shared_palettes(
@@ -6166,10 +6235,58 @@ def _build_inplace_archive(name, archive_path, mod_files, romfs, log,
     if new_names:
         log(f'  ! {name}: {len(new_names)} new entries cannot be added '
             f'in-place, skipped (e.g. {new_names[0]})')
+
+    # FFNx spell art -> native multi-palette TEX, addressed by TOC INDEX.
+    #
+    # This is the one replacement path in the build that cannot go through
+    # `payloads`. `lgp.Archive.index` is {name: entry} and magic.lgp uses 652
+    # names more than once, so a name-keyed write reaches only the LAST
+    # duplicate and leaves the rest vanilla without saying so. Routing and
+    # writing by index is the whole reason ff7nx_spelltex exists; see its
+    # docstring for the ladder, which leaves an entry vanilla rather than
+    # guess between duplicates.
+    spell_payloads = {}
+    if spell_dds:
+        targets, report = ff7nx_spelltex.route(
+            archive, [(rel, full) for rel, full, _mod in spell_dds], log)
+        spell_payloads, spell_tables, sstats = ff7nx_spelltex.convert(
+            archive, targets, SPELL_DDS_CACHE, log)
+        # V37 never writes `.s`: their extents also set on-screen quad size.
+        # Ignore any future accidental output here as a final archive guard.
+        if spell_tables:
+            log('  ! spell textures: refused %d attempted frame-table '
+                'rewrite(s); .s payloads must remain byte-identical'
+                % len(spell_tables))
+        line = ff7nx_spelltex.summarise(report, sstats)
+        if line:
+            log('  ' + line)
+
+    # An explicit native replacement outranks a converted DDS: a mod that
+    # ships a real .tex for this name said something more specific than a
+    # mod that shipped an image for it.
+    shadowed = 0
+    for idx in sorted(spell_payloads):
+        entry_name = archive.entries[idx]['name'].lower()
+        if entry_name in payloads:
+            del spell_payloads[idx]
+            shadowed += 1
+    if shadowed:
+        log(f'  {name}: {shadowed} converted spell texture(s) skipped, a mod '
+            'ships a native replacement for the same entry')
+
+    for idx, data in spell_payloads.items():
+        if archive.entries[idx]['payload'] != data:
+            changed += 1
+
     if changed == 0:
         log(f'  {name}: mod changes nothing here, not writing an archive')
         return None
     archive.replace(payloads)
+    # AFTER replace(), so a name-keyed write can never land on top of one of
+    # these. Nothing else about the entry is touched -- name, check byte,
+    # conflict id and the verbatim `middle` blob all stay as read.
+    for idx, data in spell_payloads.items():
+        archive.entries[idx]['payload'] = data
     dest = os.path.join(romfs, ARCHIVES[name])
     archive.write(dest)
     chk = lgp.Archive(dest)
@@ -6177,9 +6294,10 @@ def _build_inplace_archive(name, archive_path, mod_files, romfs, log,
         os.remove(dest)
         log(f'  ! {name}: in-place rebuild failed verification; rejected')
         return None
-    log(f'  {len(payloads)} entries replaced in place ({changed} changed); '
-        f'wrote {name} ({os.path.getsize(dest):,} bytes, '
-        f'{len(chk.entries)} entries)')
+    log(f'  {len(payloads)} entries replaced in place'
+        + (f' + {len(spell_payloads)} by TOC index' if spell_payloads else '')
+        + f' ({changed} changed); wrote {name} '
+          f'({os.path.getsize(dest):,} bytes, {len(chk.entries)} entries)')
     return dest
 
 
@@ -8039,10 +8157,22 @@ def apply_plan(plan, archive_paths, sdout, log=lambda *_: None,
         progress(step, total, name)
         step += 1
         dest_path = os.path.join(romfs, ARCHIVES[name])
+        _spell = ([] if name != 'magic.lgp' else
+                  sorted(r for r, _f, _m in plan.spell_dds))
         fp = _archive_fingerprint(
             name, archive_paths[name], plan.archive_files[name],
             (sorted((plan.folder_of.get(name) or {}).items()),
-             sorted(plan.battle_bg_native_names or ())))
+             sorted(plan.battle_bg_native_names or ()),
+             # The spell set, its size setting, AND the converter version.
+             # The cap covers a settings change; the version covers a CODE
+             # change, which nothing else here would notice -- build 224's
+             # finished magic.lgp would otherwise be reused verbatim and the
+             # fix would appear to have done nothing.
+             _spell,
+             # V37 has one cap for every mapped TEX. Frame tables never move;
+             # each resized payload carries its own runtime scale marker.
+             (ff7nx_spelltex.cap(),
+              ff7nx_spelltex.CONVERSION_VERSION.decode()) if _spell else 0))
         hit, payload = _archive_cache_ok(name, dest_path, fp, log)
         if hit:
             produced.append(dest_path)
@@ -8073,7 +8203,9 @@ def apply_plan(plan, archive_paths, sdout, log=lambda *_: None,
                                     plan.archive_files[name], romfs,
                                     pack_lgp, log,
                                     plan.folder_of.get(name),
-                                    plan.battle_bg_native_names)
+                                    plan.battle_bg_native_names,
+                                    plan.spell_dds
+                                    if name == 'magic.lgp' else None)
         if dest:
             produced.append(dest)
             _archive_cache_store(
@@ -9018,6 +9150,119 @@ def apply_texcache(sdout, dump, log=lambda *_: None, produced=()):
         if ff7nx_texcache.read_state(nxmap.Main(str(src)).img) != m:
             log('! texture cache: FAILED -- the leak is still live. Fix the '
                 'cause above before testing.')
+        return []
+    os.replace(tmp, dest)
+    return [dest] if not built else []
+
+
+def apply_spelluv(sdout, dump, log=lambda *_: None, produced=(), needed=False):
+    """Install the per-TEX logical-texel bridge used by resized SYW art."""
+    if not needed:
+        return []
+    if dump is None or not dump.nso:
+        log('! spell logical UV: needs exefs/main from a full game dump; skipped')
+        return []
+    import ff7nx_spelluv
+    dest = os.path.join(sdout, 'atmosphere', 'contents', TITLE_ID, 'exefs',
+                        'main')
+    fresh = {os.path.normpath(os.path.abspath(p)) for p in produced}
+    built = os.path.normpath(os.path.abspath(dest)) in fresh
+    src = dest if built else dump.nso
+    log('')
+    log('spell textures -> per-TEX logical texel coordinates ...')
+    if not built and os.path.exists(dest):
+        try:
+            same = (os.path.getsize(dest) == os.path.getsize(dump.nso)
+                    and open(dest, 'rb').read() == open(dump.nso, 'rb').read())
+        except OSError:
+            same = False
+        if not same:
+            log('! spell logical UV: existing main was not produced by this '
+                'build; delete sdout/ and rebuild')
+            return []
+    log(f'  base main   {src}'
+        + ('   (previous patch output)' if built else '   (from dump)'))
+    tmp = dest + '.spelluv-tmp'
+    if not ff7nx_spelluv.apply_to_nso(src, tmp, log):
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        return []
+    os.replace(tmp, dest)
+    return [dest] if not built else []
+
+
+def apply_fbcapture(sdout, dump, log=lambda *_: None, produced=()):
+    """
+    Give the framebuffer-texture capture rect the 16:9 transform. See
+    ff7nx_fbcapture.py.
+
+    FINDINGS-247. The floor-warp summons do not texture themselves from
+    magic.lgp -- they snapshot the frame through FF7's framebuffer-texture
+    path and map the snapshot onto their mesh. That path converts the rect
+    the game asked for into coordinates on a 640x480 staging surface with a
+    hardcoded identity, i.e. assuming the frame is exactly 640 game units
+    wide. Under ws-3d it is 854, spanning game x -107..747, so every 1:1
+    capture is 1.334x too wide and 80 staging columns off, and the ones that
+    then run off the surface leave the destination texture's tail as
+    uninitialised heap -- the black and transparent regions welded to the
+    floor.
+
+    Applied ONLY where xscale == 1, i.e. where the rect is a 1:1 window on
+    the frame in game units. Captures with xscale > 1 are PSX page
+    arithmetic -- width and height rounded up to powers of two, a rect
+    deliberately larger than the frame, UVs authored against the result --
+    and the battle-entry swirl is one. Build 244 scaled those too and made
+    one half of the swirl discontinuous with the other; they now pass through
+    byte-identically. See FINDINGS-247 section 8.
+
+    One word in the module (the thunk's tail branch) plus an 11-word
+    branch-free cave in dead alignment padding, so the 60 FPS budget is
+    untouched. Byte-exactly reversible. Reachable only from guest
+    sub_673F5C, so no ordinary texture can be affected.
+
+    ON with 16:9 and OFF at 4:3, where the stock identity is already right --
+    the same gate and the same reasoning as ff7nx_battlewide.
+    SEVENTH_NX_FB_CAPTURE=0 forces it off for an A/B.
+
+    Runs LAST of the module passes, by the rule the others follow: whoever
+    edits `exefs/main` last has to see what everyone else wrote -- and here
+    that also means the cave allocator sees which padding holes texcache
+    already took.
+    """
+    import ff7nx_fbcapture
+    if not ff7nx_fbcapture.enabled():
+        log('')
+        log('  framebuffer capture: LEFT STOCK (4:3, or %s=0)'
+            % ff7nx_fbcapture.FBCAP_ENV)
+        return []
+    if dump is None or not dump.nso:
+        log('! fb capture: needs exefs/main from a full game dump; skipped')
+        return []
+    dest = os.path.join(sdout, 'atmosphere', 'contents', TITLE_ID, 'exefs',
+                        'main')
+    fresh = {os.path.normpath(os.path.abspath(p)) for p in produced}
+    built = os.path.normpath(os.path.abspath(dest)) in fresh
+    src = dest if built else dump.nso
+    log('')
+    log('framebuffer capture rect -> 16:9 (1:1 captures only) ...')
+    if not built and os.path.exists(dest):
+        try:
+            same = (os.path.getsize(dest) == os.path.getsize(dump.nso)
+                    and open(dest, 'rb').read() == open(dump.nso, 'rb').read())
+        except OSError:
+            same = False
+        if not same:
+            log(f'! fb capture: {dest}')
+            log('  already holds a module this build did not produce. Basing '
+                "on the dump's stock copy would throw those patches away, so "
+                'nothing was written. Delete sdout/ and rebuild.')
+            return []
+    log(f'  base main   {src}'
+        + ('   (previous patch output)' if built else '   (from dump)'))
+    tmp = dest + '.fbcapture-tmp'
+    if not ff7nx_fbcapture.apply_to_nso(src, tmp, log):
+        if os.path.exists(tmp):
+            os.remove(tmp)
         return []
     os.replace(tmp, dest)
     return [dest] if not built else []

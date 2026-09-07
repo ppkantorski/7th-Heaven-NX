@@ -70,6 +70,43 @@ HI = 0x8        # unsigned higher (C set and Z clear) -- used by the field-wait
                 # masked to 16 bits, so the unsigned test is the correct one.
 
 def mov_reg(rd, rm):  return 0x2A0003E0 | (rm << 16) | rd      # ORR Wd, WZR, Wm
+def mov_reg64(rd, rm): return 0xAA0003E0 | (rm << 16) | rd      # ORR Xd, XZR, Xm
+def eor_reg(rd, rn, rm): return 0x4A000000 | (rm << 16) | (rn << 5) | rd
+
+
+def mrs_nzcv(rt):
+    """MRS Xt, NZCV -- preserve native flags across an injected call."""
+    return 0xD53B4200 | rt
+
+
+def msr_nzcv(rt):
+    """MSR NZCV, Xt -- restore native flags after an injected call."""
+    return 0xD51B4200 | rt
+
+
+# Scalar-FP and SIMD save forms used by the spell logical-texel bridge.
+# Encodings are independently assembled with Apple clang and decoded with
+# llvm-objdump by tests/test_spelluv.py.
+def ldr_s(rt, rn, imm=0): return 0xBD400000 | ((imm >> 2) << 10) | (rn << 5) | rt
+def str_s(rt, rn, imm=0): return 0xBD000000 | ((imm >> 2) << 10) | (rn << 5) | rt
+def ucvtf_s(rd, rn):      return 0x1E230000 | (rn << 5) | rd
+def fmul_s(rd, rn, rm):   return 0x1E200800 | (rm << 16) | (rn << 5) | rd
+
+
+def stp_q_off(rt, rt2, rn, imm):
+    """STP Qt, Qt2, [Xn, #imm], unsigned/signed scaled offset form."""
+    if imm % 16 or not -1024 <= imm < 1024:
+        raise ValueError('stp q offset %d invalid' % imm)
+    return (0xAD000000 | (((imm // 16) & 0x7F) << 15) | (rt2 << 10)
+            | (rn << 5) | rt)
+
+
+def ldp_q_off(rt, rt2, rn, imm):
+    """LDP Qt, Qt2, [Xn, #imm], unsigned/signed scaled offset form."""
+    if imm % 16 or not -1024 <= imm < 1024:
+        raise ValueError('ldp q offset %d invalid' % imm)
+    return (0xAD400000 | (((imm // 16) & 0x7F) << 15) | (rt2 << 10)
+            | (rn << 5) | rt)
 
 
 # ------------------------------------------------------------------ added for
@@ -132,6 +169,25 @@ def ldr_post(rt, rn, imm):
     if not -256 <= imm < 256:
         raise ValueError('ldr post-index %d out of range' % imm)
     return 0xB8400400 | ((imm & 0x1FF) << 12) | (rn << 5) | rt
+
+
+def ucvtf_d(rd, rn):      return 0x1E630000 | (rn << 5) | rd   # UCVTF Dd, Wn
+def fmul_d(rd, rn, rm):   return 0x1E600800 | (rm << 16) | (rn << 5) | rd
+def fdiv_d(rd, rn, rm):   return 0x1E601800 | (rm << 16) | (rn << 5) | rd
+
+
+def sub_reg64(rd, rn, rm):  return 0xCB000000 | (rm << 16) | (rn << 5) | rd
+def lsr_reg(rd, rn, rm):    return 0x1AC02400 | (rm << 16) | (rn << 5) | rd
+
+
+def udiv(rd, rn, rm):
+    """UDIV Wd, Wn, Wm -- unsigned 32-bit divide, Wd = Wn / Wm.
+
+    Division by zero yields 0 rather than trapping, but every caller in this
+    project rejects a zero divisor first: a scale of 0 means the marker is
+    absent, and the value must then pass through untouched, not become 0.
+    """
+    return 0x1AC00800 | (rm << 16) | (rn << 5) | rd
 
 
 def mul(rd, rn, rm):

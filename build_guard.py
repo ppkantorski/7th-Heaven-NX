@@ -809,6 +809,11 @@ COUNTERS = (
     ('warning lines', None, 'any'),
 )
 
+# Increment only when extraction semantics change. Older baselines counted the
+# bounded spell-conversion example warnings; comparing that saved total to the
+# corrected extractor creates a one-build false alarm (build 250's 93 -> 87).
+COUNTER_EXTRACT_VERSION = 2
+
 
 def extract(text):
     """{counter name: int} for everything this log mentions."""
@@ -827,9 +832,22 @@ def extract(text):
     # where it stayed quiet -- it inflated the very metric it monitors, and
     # then flagged the inflation. Seen between builds 35 and 36: 93 -> 96,
     # exactly the three `!!` lines it had just written.
-    out['warning lines'] = len([
+    warning_lines = [
         ln for ln in re.findall(r'^\s*!.*$', text, re.M)
-        if not ln.lstrip().startswith('!!')])
+        if not ln.lstrip().startswith('!!')]
+    # A spell DDS that cannot be converted is intentionally left vanilla and
+    # is already counted in the spell summary's aggregate refusal fields.
+    # `convert()` prints at most five examples plus one "N more" line, so the
+    # raw number of example lines changes at the arbitrary display limit even
+    # when no unrelated pass moved. That produced the misleading 92 -> 93
+    # guard failure in build 249. Keep genuine integrity warnings (invalid
+    # canvas/marker, failed archive verification) in this global count; omit
+    # only the bounded, expected examples.
+    spell_example = re.compile(
+        r'^\s*!\s+(?:spell texture \S+:\s|\d+ more spell texture\(s\) '
+        r'left vanilla\s*$)')
+    out['warning lines'] = len([
+        ln for ln in warning_lines if not spell_example.match(ln)])
     return out
 
 
@@ -886,21 +904,36 @@ class CounterGuard:
         if not new:
             return
         old = None
+        old_version = None
         try:
             with open(self.path) as fh:
-                old = json.load(fh).get('counters')
+                saved = json.load(fh)
+                old = saved.get('counters')
+                old_version = saved.get('extract_version')
         except Exception:                                      # noqa: BLE001
             old = None
         try:
             with open(self.path, 'w') as fh:
-                json.dump({'label': self.label, 'counters': new}, fh, indent=1)
+                json.dump({'label': self.label,
+                           'extract_version': COUNTER_EXTRACT_VERSION,
+                           'counters': new}, fh, indent=1)
         except Exception:                                      # noqa: BLE001
             pass
         if not old:
             self._log('  counter guard: no previous build to compare against; '
                       'this build is now the baseline.')
             return
-        unexpected, expected = compare(old, new, self.expect)
+        compare_old, compare_new = old, new
+        if old_version != COUNTER_EXTRACT_VERSION:
+            # Only this counter changed definition. Preserve comparison of
+            # every build/pass counter while migrating the saved baseline.
+            compare_old = dict(old)
+            compare_new = dict(new)
+            compare_old.pop('warning lines', None)
+            compare_new.pop('warning lines', None)
+            self._log('  counter guard: warning-line extractor baseline '
+                      'migrated; all named pass counters still compared.')
+        unexpected, expected = compare(compare_old, compare_new, self.expect)
         if expected:
             self._log('  counter guard: expected movement -- '
                       + ', '.join(f'{n} {a} -> {b}' for n, a, b in expected))

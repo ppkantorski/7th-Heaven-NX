@@ -167,6 +167,19 @@ BLOCK_HDR = 0x34
 # -- so the number that has to fit is not the total but the largest single
 # contiguous request, and fragmentation across a play session eats the
 # difference. 256 MB leaves ~192 MB of headroom for a worst case near 20 MB.
+#: 256, chosen for field background pages (FINDINGS-106), and BACK at 256
+#: after a measurement.
+#:
+#: 512 was tried, on the theory that the port's graphics driver allocates
+#: decoded texture surfaces out of this heap -- twelve HeapAlloc/HeapFree
+#: call sites in the driver use this handle as a literal -- so the upscaled
+#: magic.lgp textures were competing with the field pages for one 256 MB
+#: pool. The theory predicted that MORE heap and SMALLER textures would both
+#: help. Shipped together on hardware they made Bahamut ZERO visibly WORSE,
+#: which the theory cannot produce. It is retracted, not weakened.
+#:
+#: Keep this at 256 until something other than a theory asks for more. The
+#: 64 -> 256 raise is separately proven (Men's Hall, FINDINGS-106) and stays.
 HEAP_MB = 256
 
 # Delete the call to FF7's heap dump on allocation failure. ONE WORD, and it

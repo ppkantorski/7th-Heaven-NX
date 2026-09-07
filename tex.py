@@ -27,6 +27,7 @@ HEADER_LEN = 0xEC
 
 # header field offsets (bytes)
 O_VERSION = 0x00
+O_USER_MARK = 0x04
 O_COLORKEY = 0x08
 O_MIN_BPC = 0x14
 O_MAX_BPC = 0x18
@@ -34,6 +35,7 @@ O_MIN_ABITS = 0x1C
 O_MAX_ABITS = 0x20
 O_MIN_BPP = 0x24
 O_MAX_BPP = 0x28
+O_USER_SCALE = 0x2C
 O_NUM_PALETTES = 0x30
 O_COLORS_PER_PAL = 0x34
 O_BIT_DEPTH = 0x38
@@ -46,6 +48,31 @@ O_PAL_SIZE = 0x58
 O_COLORS_PER_PAL2 = 0x5C
 O_BITS_PER_PIXEL = 0x64
 O_BYTES_PER_PIXEL = 0x68
+
+# Private metadata used only by the native spell-texture bridge. These two
+# words are zero in every valid TEX in the stock magic.lgp and are ignored by
+# the version-1 loader. Keeping the scale in the individual TEX is what makes
+# a mixed archive (1x, 2x, 3x) safe.
+SYW_SCALE_MARK = 0x31575953          # RETIRED. little-endian bytes: "SYW1"
+
+# ---- THE SCALE TRAVELS IN THE MARKER WORD ITSELF ------------------------
+#
+# FINDINGS-266. The scale used to live in a second header word at +0x2C.
+# On hardware that word never reached the runtime hook: a cave that read only
+# +0x04 fired every time, and the identical cave with one extra read of +0x2C
+# never fired once. Measured across four builds, in both directions.
+#
+# Why +0x2C is lost is still unexplained -- `load_tex_file` reads the whole
+# 0xEC-byte header in ONE `read_file` call and nothing in the recompiled x86
+# writes through the header pointer afterwards. Rather than keep guessing at
+# the mechanism, the scale now travels in the word that is proven to survive:
+#
+#     +0x04  =  0x5359 <sy> <sx>        e.g. 0x53590404 = 4x by 4x
+#
+# Vanilla headers hold 0 there, so unmarked data still reads as unmarked, and
+# the retired "SYW1" value no longer validates -- an old archive paired with a
+# new binary does nothing at all rather than something wrong.
+SYW_SCALE_MAGIC = 0x5359             # high half of the marker word
 
 
 def _u32(d, off):
@@ -79,6 +106,40 @@ def parse(data):
         'palette': data[HEADER_LEN:HEADER_LEN + palsize * 4],
         'pixels': data[HEADER_LEN + palsize * 4:],
     }
+
+
+def logical_scale(data):
+    """Return ``(scale_x, scale_y)`` for a marked TEX, else ``None``.
+
+    Malformed markers deliberately behave like unmarked stock data. The
+    runtime hook applies the same validation before changing UV reciprocals.
+    """
+    if parse(data) is None:
+        return None
+    word = _u32(data, O_USER_MARK)
+    if (word >> 16) != SYW_SCALE_MAGIC:
+        return None
+    sx, sy = word & 0xFF, (word >> 8) & 0xFF
+    if not (1 <= sx <= 16 and 1 <= sy <= 16):
+        return None
+    return sx, sy
+
+
+def mark_logical_scale(data, scale_x, scale_y=None):
+    """Return a TEX carrying its physical/logical whole-number scale."""
+    scale_y = scale_x if scale_y is None else scale_y
+    if parse(data) is None:
+        raise ValueError('cannot mark invalid TEX data')
+    if not (1 <= scale_x <= 16 and 1 <= scale_y <= 16):
+        raise ValueError('logical TEX scales must be in 1..16')
+    out = bytearray(data)
+    struct.pack_into('<I', out, O_USER_MARK,
+                     (SYW_SCALE_MAGIC << 16) | (int(scale_y) << 8)
+                     | int(scale_x))
+    # +0x2C is deliberately left alone now. It was the old carrier and it does
+    # not survive to the runtime hook; writing it would only invite someone to
+    # depend on it again.
+    return bytes(out)
 
 
 def is_unpaletted(data):

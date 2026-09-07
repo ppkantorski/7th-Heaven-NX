@@ -166,6 +166,18 @@
    "BA 1": 1
   }
  },
+ "[Tsunamods].SYW.Unified.MiniGames.Textures.V1.04.iro": {
+  "enabled": false,
+  "options": {
+   "SYWU": 1
+  }
+ },
+ "[Tsunamods].SYW.Unified.Spells.Textures.V1.03.iro": {
+  "enabled": true,
+  "options": {
+   "FF7SYWU": 1
+  }
+ },
  "Enhanced Stock UI-rel2.iro": {
   "enabled": false,
   "options": {
@@ -219,7 +231,9 @@
  "__global__": {
   "field_tex_cap": 512,
   "world_tex_cap": 768,
-  "battle_bg_tex_cap": 768,
+  "battle_bg_tex_cap": 1024,
+  "spell_tex_cap": 768,
+  "spell_fx_cap": 768,
   "field_bg_page_px": 768,
   "field_bg_budget_mb": 0.0,
   "field_bg_truecolor_pages": 3,
