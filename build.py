@@ -42,6 +42,7 @@ import ff7nx_moviecull
 import ff7nx_moviebars
 import ff7nx_camclamp
 import ff7nx_battlewide
+import ff7nx_effectwide
 import ff7nx_swirlscale
 import ff7nx_uiclip
 import ff7nx_credits
@@ -9596,6 +9597,17 @@ def apply_field_frame(sdout, dump, log=lambda *_: None, produced=()):
     # --verify; FINDINGS-99 4 is the build that proved it matters.
     if want_battle:
         rc |= ff7nx_battlewide.apply_all(dest, log=log)
+        # The effect-owned 4:3 geometry FFNx never patched: Ultima's wash
+        # (x86 0x57A20A / 0x57A38C) and KOTR's five-column BG_1 field
+        # (x86 0x481867 / 0x481A4E).  Separate module because neither is an
+        # FFNx port -- see
+        # ff7nx_effectwide's header for how each was identified.  It runs
+        # AFTER battlewide so both take their caves from one already-settled
+        # padding layout, and it touches no site battlewide touches.
+        if ff7nx_effectwide.enabled():
+            rc |= ff7nx_effectwide.apply_all(dest, log=log)
+        else:
+            rc |= ff7nx_effectwide.apply_all(dest, revert=True, log=log)
         # Build 207 changed two constants in the lookalike half-resolution
         # menu fade at x86 0x6D0022; hardware showed the same overlap and a
         # world-map battle-entry regression.  Restore those x86 experiments
