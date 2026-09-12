@@ -917,6 +917,15 @@ def discover_mods():
 
 def run_build(mods, enabled, settings_by_mod, log, progress,
               fps_60=False):
+    # BUILD 326. Publish the 60 FPS setting so the ARCHIVE CACHE can see it.
+    # It arrives here as a GUI checkbox / --60fps flag, which means
+    # `_archive_fingerprint` was blind to it -- and it is the one setting
+    # outside that function which changes an archive's bytes:
+    # `apply_fps_patches` rewrites the finished battle.lgp with every
+    # animation wait scaled x4. build.py folds this into battle.lgp's key
+    # only, so toggling it cannot invalidate the other four archives.
+    os.environ[build.FPS_ENV] = '1' if fps_60 else '0'
+
     # COUNTER GUARD (HANDOFF-121 3.6). Tee the log, and at the end name every
     # counter that moved outside the pass this build was meant to change. It
     # only ever writes extra lines -- no build is ever stopped by it -- and it

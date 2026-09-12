@@ -43,6 +43,7 @@ import ff7nx_moviebars
 import ff7nx_camclamp
 import ff7nx_battlewide
 import ff7nx_effectwide
+import ff7nx_terrainfx
 import ff7nx_swirlscale
 import ff7nx_uiclip
 import ff7nx_credits
@@ -7867,6 +7868,114 @@ NO_ARCHIVE_CACHE_ENV = 'SEVENTH_NX_NO_ARCHIVE_CACHE'
 # maximum field size before any module patch runs.
 REUSE_FLEVEL_ENV = 'SEVENTH_NX_REUSE_FLEVEL'
 
+# BUILD 324. `_archive_fingerprint` hashes every .py in this folder that is
+# not in MAIN_ONLY_MODULES -- **build.py included** -- so editing the build
+# script at all invalidates every archive and battle.lgp / magic.lgp rebuild
+# even when nothing that reaches them changed. That is correct by default:
+# build.py really can change an archive's bytes. But during a test cycle it is
+# pure cost, so these say "keep the one you already built", the same promise
+# SEVENTH_NX_REUSE_FLEVEL makes.
+REUSE_ARCHIVE_ENV = {
+    'battle.lgp': 'SEVENTH_NX_REUSE_BATTLE',
+    'magic.lgp': 'SEVENTH_NX_REUSE_MAGIC',
+    'world_us.lgp': 'SEVENTH_NX_REUSE_WORLD',
+    'char.lgp': 'SEVENTH_NX_REUSE_CHAR',
+}
+# One switch for all of them, flevel included.
+REUSE_ALL_ENV = 'SEVENTH_NX_REUSE_ARCHIVES'
+
+
+def _truthy(name):
+    return os.environ.get(name, '').strip().lower() in (
+        '1', 'true', 'yes', 'on')
+
+
+def _reuse_requested(name):
+    """Is a fast reuse asked for, for this archive?"""
+    if _truthy(REUSE_ALL_ENV):
+        return True
+    env = REUSE_ARCHIVE_ENV.get(name)
+    return bool(env) and _truthy(env)
+
+
+# Every name that only changes build SCHEDULING, never archive bytes. Putting
+# them in the fingerprint would make asking to skip battle.lgp invalidate
+# magic.lgp, which is the opposite of the point.
+SCHEDULING_ENV = frozenset([REUSE_FLEVEL_ENV, REUSE_ALL_ENV]
+                           + list(REUSE_ARCHIVE_ENV.values()))
+
+# BUILD 326. The 60 FPS setting. It is a GUI/CLI setting, not an environment
+# variable, so `_archive_fingerprint` could not see it -- and it is the one
+# setting outside this function that changes an archive's BYTES:
+# `apply_fps_patches` reopens the finished sdout battle.lgp and scales every
+# animation-script wait x4 in place. `run_build` publishes it here so the
+# fingerprint can see it, and it is deliberately kept OUT of the generic
+# environment sweep and folded into battle.lgp's `extra` instead -- toggling
+# 60 FPS must not invalidate flevel.lgp (1.4 GB) to no purpose.
+FPS_ENV = 'SEVENTH_NX_60FPS'
+
+
+def fps_60_requested():
+    return _truthy(FPS_ENV)
+
+
+# Archives this invocation KEPT rather than built, by name. Two later passes
+# need to know the difference:
+#
+#   * apply_fps_patches, because a kept battle.lgp already carries the x4
+#     waits from the build that made it. Scaling is not idempotent -- the
+#     patcher's own guard aborts the build on an already-scaled archive -- and
+#     falling back to the dump's copy would ship a vanilla battle.lgp with
+#     every mod's models thrown away. Not touching it is the correct answer,
+#     and the only one.
+#   * prune_stale, indirectly, through `produced`.
+#
+# Populated by whichever path kept the file, and cleared at the start of every
+# apply_plan so a second build in the same GUI process cannot inherit it.
+ALREADY_FPS_SCALED = set()
+
+# The fifth line of an archive's cache record: the (size, mtime_ns) the file
+# had after apply_fps_patches rewrote it. See _archive_on_disk_is_ours.
+FPS_SIG_TAG = 'fps='
+
+# Settings that patch `exefs/main` ONLY and cannot change an archive's bytes.
+# Including them in the archive fingerprint made every summon-tuning A/B
+# rebuild flevel for nothing, which is minutes per experiment. Each of these
+# reaches exactly one module, and every one of those modules writes into
+# `exefs/main` through nso_patcher -- none of them touch an .lgp, a .tex or a
+# field file. Adding a name here is only safe under that rule.
+MAIN_ONLY_ENV = frozenset((
+    'SEVENTH_NX_FX_DISC',        # ff7nx_fxdisc      the floor disc radius
+    'SEVENTH_NX_FX_SCALE',       # ff7nx_fxscale     ditto, by whole bits
+    'SEVENTH_NX_FX_RIM',         # ff7nx_fxrim       the rim UV cap
+    'SEVENTH_NX_FX_SNAP',        # ff7nx_fxsnap      the snapshot window
+    'SEVENTH_NX_FX_CAPSCALE',    # ff7nx_fxcapscale  Kujata's xscale/yscale
+    'SEVENTH_NX_FB_RESAMPLE',    # ff7nx_fbresample
+    'SEVENTH_NX_FB_PROBE',       # ff7nx_fbresample  the diagnostic modes
+    'SEVENTH_NX_FB_SPAN',        # ff7nx_fbresample  the source span
+    'SEVENTH_NX_FB_FIT',         # ff7nx_fbfit
+    'SEVENTH_NX_FB_WINDOW',      # ff7nx_fbwindow
+    'SEVENTH_NX_FB_PATH',        # ff7nx_fbpath
+    'SEVENTH_NX_FB_SIZE',        # ff7nx_fbsize
+    'SEVENTH_NX_FB_SURFACE',     # ff7nx_fbsurf     the capture resolution
+    'SEVENTH_NX_FB_FILTER',      # ff7nx_fbfilter   the capture blit filter
+    'SEVENTH_NX_SWIRL_SEAM',     # ff7nx_swirlseam  the entry swirl's UVs
+    'SEVENTH_NX_SWIRL_GPU',      # ff7nx_swirlgpu   its capture path
+    'SEVENTH_NX_GPU_CAP',        # ff7nx_gpucap     the GPU target's size
+    'SEVENTH_NX_SUMMON_REACH',   # ff7nx_summonreach
+))
+
+# The modules those settings reach, by the same rule: each writes into
+# `exefs/main` and nothing else, so editing one cannot change archive bytes.
+MAIN_ONLY_MODULES = frozenset((
+    'ff7nx_fxdisc.py', 'ff7nx_fxscale.py', 'ff7nx_fxrim.py', 'ff7nx_fxsnap.py',
+    'ff7nx_fxcapscale.py', 'ff7nx_fbresample.py', 'ff7nx_fbfit.py',
+    'ff7nx_fbwindow.py', 'ff7nx_fbpath.py', 'ff7nx_fbsize.py',
+    'ff7nx_fbsurf.py', 'ff7nx_fbfilter.py', 'ff7nx_swirlseam.py',
+    'ff7nx_swirlgpu.py', 'ff7nx_gpucap.py',
+    'ff7nx_summonreach.py',
+))
+
 
 def _stat_sig(path):
     """(size, mtime_ns) for a path, or None if it is not there."""
@@ -7944,13 +8053,76 @@ def _archive_fingerprint(name, archive_path, files, extra):
     for k in sorted(os.environ):
         # This flag changes build scheduling, not archive bytes.  Including it
         # would needlessly invalidate every other archive on a fast test run.
-        if k.startswith('SEVENTH_NX') and k != REUSE_FLEVEL_ENV:
+        # FPS_ENV is excluded here and folded into battle.lgp's `extra`
+        # instead: it is the only archive whose bytes it changes, and a
+        # 1.4 GB flevel rebuild on every 60 FPS toggle is pure waste.
+        if (k.startswith('SEVENTH_NX') and k not in SCHEDULING_ENV
+                and k != FPS_ENV and k not in MAIN_ONLY_ENV):
             h.update(('%s=%s\0' % (k, os.environ[k])).encode())
     for fn in sorted(os.listdir(HERE)):
-        if fn.endswith('.py'):
+        # Same rule as MAIN_ONLY_ENV: these modules only ever write into
+        # `exefs/main`, so editing one cannot change an archive's bytes and
+        # must not invalidate an archive cache. Everything else still does,
+        # build.py included.
+        if fn.endswith('.py') and fn not in MAIN_ONLY_MODULES:
             h.update(('%s|%r' % (fn, _stat_sig(os.path.join(HERE, fn)))).encode())
     h.update(repr(extra).encode())
     return h.hexdigest()
+
+
+def _archive_record(name):
+    """(fp, size, mtime, payload, fps_sig) from the cache record, or None.
+
+    Records written before build 326 have four lines and simply yield
+    `fps_sig = None`, so an old cache degrades to the old behaviour rather
+    than failing.
+    """
+    rec = os.path.join(ARCHIVE_FP_CACHE, name + '.fp')
+    try:
+        with open(rec) as f:
+            parts = f.read().split('\n')
+        fp, size, mtime, payload = parts[0], parts[1], parts[2], parts[3]
+    except (OSError, IndexError, ValueError):
+        return None
+    fps_sig = None
+    for line in parts[4:]:
+        if line.startswith(FPS_SIG_TAG):
+            try:
+                a, b = line[len(FPS_SIG_TAG):].split(',')
+                fps_sig = (int(a), int(b))
+            except ValueError:
+                fps_sig = None
+    return fp, size, mtime, payload, fps_sig
+
+
+def _archive_on_disk_is_ours(dest, size, mtime, fps_sig):
+    """'base', 'fps', or None -- which state we last left this archive in.
+
+    BUILD 326, and the reason `battle.lgp` rebuilt on every single build no
+    matter which switch was set.
+
+    battle.lgp is written TWICE per build. The archive builder writes it and
+    `_archive_cache_store` records that stat -- and then, about ten seconds
+    later, `apply_fps_patches` reopens the very same file and rewrites it in
+    place with the animation waits scaled x4. Its mtime is now ten seconds
+    past the recorded one, so the file on disk never matched its own record
+    again: the fingerprint cache could not hit it and neither could the fast
+    reuse switch. `magic.lgp`, `char.lgp`, `world_us.lgp` and `flevel.lgp`
+    matched to the nanosecond, because nothing touches them afterwards.
+
+    So the record carries the second signature too, and either one counts as
+    "this is the file we wrote". Which one matched matters: the 'fps' state
+    means the archive is ALREADY scaled, and the 60 FPS pass must leave it
+    alone.
+    """
+    sig = _stat_sig(dest)
+    if sig is None:
+        return None
+    if str(sig[0]) == size and str(sig[1]) == mtime:
+        return 'base'
+    if fps_sig is not None and sig == fps_sig:
+        return 'fps'
+    return None
 
 
 def _archive_cache_ok(name, dest, fp, log):
@@ -7967,22 +8139,42 @@ def _archive_cache_ok(name, dest, fp, log):
     """
     if os.environ.get(NO_ARCHIVE_CACHE_ENV, '').strip() == '1':
         return False, None
-    rec = os.path.join(ARCHIVE_FP_CACHE, name + '.fp')
-    try:
-        with open(rec) as f:
-            parts = f.read().split('\n')
-        stored, size, mtime, payload = parts[0], parts[1], parts[2], parts[3]
-    except (OSError, IndexError, ValueError):
+    rec = _archive_record(name)
+    if rec is None:
         return False, None
-    sig = _stat_sig(dest)
-    if sig is None or stored != fp:
+    stored, size, mtime, payload, fps_sig = rec
+    if stored != fp:
         return False, None
     # the output must also be exactly the file we left behind
-    if str(sig[0]) != size or str(sig[1]) != mtime:
+    state = _archive_on_disk_is_ours(dest, size, mtime, fps_sig)
+    if state is None:
         return False, None
+    if not _accept_fps_state(name, state, log):
+        return False, None
+    sig = _stat_sig(dest)
     log(f'  {name}: unchanged since the last build, kept '
         f'({sig[0]:,} bytes). {NO_ARCHIVE_CACHE_ENV}=1 forces a rebuild.')
     return True, payload
+
+
+def _accept_fps_state(name, state, log):
+    """Is it safe to keep an archive we last left in `state`?
+
+    The only unsafe case is keeping a 60 FPS-scaled archive for a 30 FPS
+    build: its animation waits are four times too long and nothing downstream
+    would notice. FPS_ENV is in battle.lgp's fingerprint precisely so the
+    fingerprint path can never reach here in that state -- but the fast reuse
+    switch skips the fingerprint by design, so the check has to live where
+    both paths pass through.
+    """
+    if state != 'fps':
+        return True
+    if not fps_60_requested():
+        log('  %s: the archive on disk is the 60 FPS-scaled one and this is '
+            'not a 60 FPS build; rebuilding it' % name)
+        return False
+    ALREADY_FPS_SCALED.add(name)
+    return True
 
 
 def _archive_cache_store(name, dest, fp, payload=''):
@@ -7995,6 +8187,29 @@ def _archive_cache_store(name, dest, fp, payload=''):
             f.write('%s\n%d\n%d\n%s\n' % (fp, sig[0], sig[1], payload))
     except OSError:
         pass
+
+
+def _archive_fps_restat(name, dest, log=lambda *_: None):
+    """Record the archive's signature AFTER the 60 FPS pass rewrote it.
+
+    Keeps the existing fingerprint and payload -- the inputs did not change,
+    only the file's mtime did -- and appends the second signature so the next
+    build can recognise its own output. Without this, battle.lgp's record is
+    stale the instant it is written and the archive rebuilds forever.
+    """
+    rec = _archive_record(name)
+    sig = _stat_sig(dest)
+    if rec is None or sig is None:
+        return
+    fp, size, mtime, payload, _old = rec
+    try:
+        with open(os.path.join(ARCHIVE_FP_CACHE, name + '.fp'), 'w') as f:
+            f.write('%s\n%s\n%s\n%s\n%s%d,%d\n'
+                    % (fp, size, mtime, payload, FPS_SIG_TAG, sig[0], sig[1]))
+    except OSError:
+        return
+    log('      (recorded this archive\'s post-60-FPS signature, so the next '
+        'build can reuse it instead of rebuilding it)')
 
 
 def _reuse_existing_flevel(sdout, log=lambda *_: None):
@@ -8039,6 +8254,43 @@ def _reuse_existing_flevel(sdout, log=lambda *_: None):
         'matching exefs/main buffer patches'
         % (format(sig[0], ','), format(FIELD_BG_MAX_RAW, ',')))
     return dest
+
+
+def _reuse_existing_archive(name, dest, log):
+    """(True, payload) if `dest` can be kept without rebuilding it.
+
+    Deliberately NOT a fingerprint check -- the whole point is to skip that.
+    It verifies the weaker but still sufficient thing: the file on disk is
+    byte-for-byte the one this build cache last wrote, so its recorded side
+    effects (`payload`) describe it truthfully.
+
+    On anything unverifiable this returns False and the caller builds
+    normally. A fast option that silently shipped an archive nobody could
+    vouch for would be worse than a slow build.
+    """
+    sig = _stat_sig(dest)
+    if sig is None:
+        log('  %s: reuse asked for but there is no existing archive; '
+            'building it' % name)
+        return False, None
+    rec = _archive_record(name)
+    if rec is None:
+        log('  %s: reuse asked for but its build metadata is missing; '
+            'building it' % name)
+        return False, None
+    _fp, size, mtime, payload, fps_sig = rec
+    state = _archive_on_disk_is_ours(dest, size, mtime, fps_sig)
+    if state is None:
+        log('  %s: reuse refused -- the archive on disk is not the file the '
+            'build cache wrote; building it' % name)
+        return False, None
+    if not _accept_fps_state(name, state, log):
+        return False, None
+    log('  %s: FAST REUSE -- kept the existing archive (%s bytes) without '
+        'rebuilding%s' % (name, format(sig[0], ','),
+                          ' (already 60 FPS-scaled)' if state == 'fps'
+                          else ''))
+    return True, payload
 
 
 SDOUT_MANIFEST = os.path.join(HERE, 'cache', '_sdout_manifest')
@@ -8121,6 +8373,9 @@ def apply_plan(plan, archive_paths, sdout, log=lambda *_: None,
     """Write the finished SD tree. Returns a list of produced files."""
     romfs = os.path.join(sdout, 'atmosphere', 'contents', TITLE_ID, ROMFS)
     produced = []
+    # A second build in the same GUI process must not inherit the first one's
+    # answer about which archives were already 60 FPS-scaled.
+    ALREADY_FPS_SCALED.clear()
 
     # Keep the archive and renderer halves of Gaia inseparable.  The archive
     # converter emits every world tile at this one scale; the later module
@@ -8139,8 +8394,7 @@ def apply_plan(plan, archive_paths, sdout, log=lambda *_: None,
     model_targets = sorted(a for a in plan.archive_files if a != 'flevel.lgp')
     flevel_fields = plan.archive_files.get('flevel.lgp', {})
     do_flevel = bool(plan.chunks) or bool(flevel_fields)
-    reuse_flevel = os.environ.get(REUSE_FLEVEL_ENV, '').strip().lower() in (
-        '1', 'true', 'yes', 'on')
+    reuse_flevel = _truthy(REUSE_FLEVEL_ENV) or _truthy(REUSE_ALL_ENV)
     if reuse_flevel:
         # Add it to `produced` even though this invocation did not write it.
         # prune_stale() only knows that list; omitting the reused archive here
@@ -8158,6 +8412,21 @@ def apply_plan(plan, archive_paths, sdout, log=lambda *_: None,
         progress(step, total, name)
         step += 1
         dest_path = os.path.join(romfs, ARCHIVES[name])
+        if _reuse_requested(name):
+            ok, payload = _reuse_existing_archive(name, dest_path, log)
+            if ok:
+                # Same bookkeeping as a cache hit, for the same reasons:
+                # prune_stale() only knows `produced`, and world_us.lgp's
+                # per-sprite UV factors are a side effect of the build that
+                # exefs/main still needs. Skipping the work must not skip
+                # either of those.
+                produced.append(dest_path)
+                if name == 'world_us.lgp':
+                    if payload:
+                        os.environ[WORLD_GAIA_SPECIAL_ENV] = payload
+                    else:
+                        os.environ.pop(WORLD_GAIA_SPECIAL_ENV, None)
+                continue
         _spell = ([] if name != 'magic.lgp' else
                   sorted(r for r, _f, _m in plan.spell_dds))
         fp = _archive_fingerprint(
@@ -8173,7 +8442,13 @@ def apply_plan(plan, archive_paths, sdout, log=lambda *_: None,
              # V37 has one cap for every mapped TEX. Frame tables never move;
              # each resized payload carries its own runtime scale marker.
              (ff7nx_spelltex.cap(),
-              ff7nx_spelltex.CONVERSION_VERSION.decode()) if _spell else 0))
+              ff7nx_spelltex.CONVERSION_VERSION.decode()) if _spell else 0,
+             # BUILD 326. apply_fps_patches rewrites the finished battle.lgp
+             # with every animation wait scaled x4, so the 60 FPS setting
+             # really does change this ONE archive's bytes and has to be in
+             # its key. It is excluded from the generic environment sweep so
+             # it cannot invalidate the other four.
+             fps_60_requested() if name == 'battle.lgp' else 0))
         hit, payload = _archive_cache_ok(name, dest_path, fp, log)
         if hit:
             produced.append(dest_path)
@@ -8302,9 +8577,6 @@ def apply_plan(plan, archive_paths, sdout, log=lambda *_: None,
     return produced
 
 
-FPS_ENV = 'SEVENTH_NX_60FPS'
-
-
 def apply_fps_patches(sdout, dump, log=lambda *_: None, produced=()):
     """
     Run the 60 FPS patch set into an ALREADY BUILT sdout tree.
@@ -8360,10 +8632,22 @@ def apply_fps_patches(sdout, dump, log=lambda *_: None, produced=()):
         return []
     built_battle = os.path.join(sdout, 'atmosphere', 'contents', TITLE_ID,
                                 ROMFS, ARCHIVES['battle.lgp'])
-    battle = built_battle if from_this_build(built_battle) else None
-    if battle is None:
-        cand = os.path.join(dump.workingdir, ARCHIVES['battle.lgp'])
-        battle = cand if os.path.exists(cand) else None
+    if 'battle.lgp' in ALREADY_FPS_SCALED:
+        # BUILD 326. This build KEPT the archive a previous 60 FPS build
+        # wrote, so its waits are already x4. There is no third option here:
+        # scaling it again is not idempotent (the patcher's own guard aborts
+        # on it), and falling back to the dump's copy would overwrite the
+        # mods' battle.lgp with a vanilla-derived one. Leaving it alone is
+        # the correct answer, and it is already the file we want to ship.
+        battle = None
+        battle_note = ('(kept -- the reused archive is already scaled)')
+    else:
+        battle = built_battle if from_this_build(built_battle) else None
+        if battle is None:
+            cand = os.path.join(dump.workingdir, ARCHIVES['battle.lgp'])
+            battle = cand if os.path.exists(cand) else None
+        battle_note = ('   (built)' if battle == built_battle else
+                       '   (from dump)' if battle else '')
 
     log('')
     log('applying 60 FPS patches ...')
@@ -8371,8 +8655,7 @@ def apply_fps_patches(sdout, dump, log=lambda *_: None, produced=()):
         + ('   (HEXT output)' if base_exe == built_exe else '   (from dump)'))
     log(f'  base main   {dump.nso}')
     log(f'  battle.lgp  {battle or "(none -- animation waits not scaled)"}'
-        + ('   (built)' if battle == built_battle else
-           '   (from dump)' if battle else ''))
+        + battle_note)
 
     # The identity check must see the STOCK exe. `base_exe` is the one this
     # build produced, and if any mod shipped HEXT patches into .text -- a UI
@@ -8454,6 +8737,13 @@ def apply_fps_patches(sdout, dump, log=lambda *_: None, produced=()):
                  built_exe):
         if os.path.exists(path) and path not in new_files:
             new_files.append(path)
+    # BUILD 326. This pass has just rewritten battle.lgp in place, ten seconds
+    # after `_archive_cache_store` recorded what it looked like before. Record
+    # the new signature against the same fingerprint, or the archive can never
+    # match its own cache entry again and rebuilds on every single build --
+    # cache hit or fast-reuse switch, it made no difference.
+    if battle == built_battle:
+        _archive_fps_restat('battle.lgp', built_battle, log)
     return sorted(new_files)
 
 
@@ -9203,10 +9493,19 @@ def apply_fbcapture(sdout, dump, log=lambda *_: None, produced=()):
     the game asked for into coordinates on a 640x480 staging surface with a
     hardcoded identity, i.e. assuming the frame is exactly 640 game units
     wide. Under ws-3d it is 854, spanning game x -107..747, so every 1:1
-    capture is 1.334x too wide and 80 staging columns off, and the ones that
-    then run off the surface leave the destination texture's tail as
-    uninitialised heap -- the black and transparent regions welded to the
-    floor.
+    capture is 1.334x too wide and 80 staging columns off. The capture patch
+    moves the ORIGIN into that surface and clamps it so the copy stays inside.
+
+    It does NOT scale the width, and FINDINGS-308 is why: `fb_tex.w` is the
+    capture texture's real pixel width (+0x10D6E50..+0x10D6E80 takes the
+    texture's dimensions out of fb_tex whenever the header carries
+    FB_TEX_VERSION, exactly as FFNx's src/gl/texture.cpp:68 does), the CPU
+    readback branch these captures take copies 1:1 with no rescale, and the
+    effects' UVs are authored against the width they asked for. Builds
+    245-266 scaled it from 256 to 191, so every texel past u = 191 came back
+    black -- Kujata's one-sided staircase of black tiles, which fifteen
+    geometry, depth and clipping experiments could never have touched.
+    Build 262's inclusive-right endpoint variant (479 -> 480) is gone too.
 
     Applied ONLY where xscale == 1, i.e. where the rect is a 1:1 window on
     the frame in game units. Captures with xscale > 1 are PSX page
@@ -9216,7 +9515,7 @@ def apply_fbcapture(sdout, dump, log=lambda *_: None, produced=()):
     one half of the swirl discontinuous with the other; they now pass through
     byte-identically. See FINDINGS-247 section 8.
 
-    One word in the module (the thunk's tail branch) plus an 11-word
+    One word in the module (the thunk's tail branch) plus a 14-word
     branch-free cave in dead alignment padding, so the 60 FPS budget is
     untouched. Byte-exactly reversible. Reachable only from guest
     sub_673F5C, so no ordinary texture can be affected.
@@ -9266,6 +9565,120 @@ def apply_fbcapture(sdout, dump, log=lambda *_: None, produced=()):
             os.remove(tmp)
         return []
     os.replace(tmp, dest)
+    # The other half of the same correction. The capture cave puts the rect's
+    # ORIGIN in staging coordinates and leaves the width alone; this makes the
+    # readback loop resample, so the destination keeps its authored width
+    # while the source covers the right number of GAME units. One staging
+    # pixel is 854/640 = 1.334 game units under ws-3d, and a 1:1 copy cannot
+    # satisfy both -- FINDINGS-308 8. Must run after the capture cave: it
+    # takes its padding from whatever is left.
+    import ff7nx_fbresample
+    if ff7nx_fbresample.enabled():
+        ff7nx_fbresample.apply_all(dest, log=log)
+    else:
+        ff7nx_fbresample.apply_all(dest, revert=True, log=log)
+
+    # BUILD 285. The port has TWO capture implementations, selected per capture
+    # by field_0 at tex+0x24: a CPU 1:1 CROP of the 640x480 staging surface
+    # (what Kujata gets) and a GPU render-to-texture that scales the whole
+    # surface into the texture at any size. FINDINGS-284. This routes Kujata's
+    # capture -- and only Kujata's -- to the second one. Must run AFTER
+    # fbresample: it rewrites the selector one word above the loop fbresample
+    # anchors, and fbresample tolerates either state (see its `verify`).
+    # BUILD 288. The copy writes min(surface, origin+size) - origin pixels into
+    # the top-left of a fb_tex.w x fb_tex.h texture, and the mesh samples the
+    # WHOLE texture -- so a rect that runs past the surface leaves the rest
+    # unwritten. That is the black, and the black squares before it. Vanilla
+    # keeps texture size == blit size (FFNx createBlitTexture/blitTexture);
+    # this restores that invariant. A capture that already fits is written back
+    # unchanged, so the other twenty-four are byte-for-byte the same.
+    import ff7nx_fbfit
+    ff7nx_fbfit.apply_all(dest, revert=not ff7nx_fbfit.enabled(), log=log)
+
+    # BUILD 292. The UV space addresses 0..255 because tex_format.width is 256,
+    # but the copy only writes min(surface, origin+size) - origin columns. A
+    # rect that hangs off the surface therefore leaves texels on the RIGHT EDGE
+    # unwritten -- the black squares. ff7nx_fbcapture already clamps the origin
+    # for this, but against a hard-coded 640; the copy asks the surface for its
+    # real width at runtime. This clamps against that runtime value instead, so
+    # the window slides back on rather than being truncated. A rect that
+    # already fits is untouched. See FINDINGS-289 and PLAN-292.
+    import ff7nx_fbwindow
+    ff7nx_fbwindow.apply_all(dest, revert=not ff7nx_fbwindow.enabled(), log=log)
+
+    # BUILD 309. The capture surface is created from a LITERAL 640x480
+    # descriptor (+0x10D5970) and the whole display frame is blitted into it by
+    # one full-target quad, so 640x480 is the resolution ceiling for every
+    # capture in the game -- nothing downstream of that blit can put detail
+    # back. The rect that addresses the surface is computed in those same
+    # virtual units by a multiply-and-divide that is currently an identity, so
+    # scaling the surface and the rect together is five single-word patches.
+    # tex_format.width stays at the authored 256, which is the only field read
+    # as a UV scale, so the geometry does not move. See FINDINGS-308/PLAN-309.
+    # ff7nx_fbresample's gate follows this via ff7nx_fbsurf.scale(), which is
+    # read from the environment rather than from the image, so the order these
+    # two run in does not matter -- but they can never disagree.
+    import ff7nx_fbsurf
+    ff7nx_fbsurf.apply_all(dest, revert=not ff7nx_fbsurf.enabled(), log=log)
+
+    # BUILD 312. The scene target is cleared to (0,0,0,0) and has hard edges,
+    # so every pixel in it is either drawn (C, 255) or untouched (0,0,0,0).
+    # The blit that fills the capture surface (+0x10DACB0) sets a LINEAR
+    # sampler (+0x10DAD98/+0x10DAD9C), so at every silhouette it AVERAGES the
+    # two and manufactures texels that exist nowhere in the scene: dark,
+    # partly covered, and outside both categories the capture path knows how
+    # to handle. That is the black-square fringe, and it is why the artifact
+    # moved and shrank when build 310 resized the surface -- it is the
+    # filter's footprint. POINT sampling removes the invention rather than
+    # guessing downstream which dark texels were invented.
+    import ff7nx_fbfilter
+    ff7nx_fbfilter.apply_all(dest, revert=not ff7nx_fbfilter.enabled(),
+                             log=log)
+
+    # BUILD 314. The battle-entry swirl draws a 10 x 8 grid of POLY_FT4 quads
+    # over two half-frame captures, and builds their UVs with the PSX inclusive
+    # convention -- `u1 = i*32 + 32 - 1`, and `- 2` in the column where the two
+    # textures meet. This renderer maps u -> u / tex_format.width instead, so
+    # each quad stops one UV unit short of its block and the next one starts at
+    # the full multiple: a slice of picture falls down the crack at every quad
+    # boundary. Eight of those land on scenery; the ninth is the middle of the
+    # screen, which is where a character stands. Closing it is seven `sub #imm`
+    # immediates, each traced to the u1/u3 field it feeds -- `v` must keep its
+    # subtraction or the bottom row wraps. See FINDINGS-313.
+    import ff7nx_swirlseam
+    ff7nx_swirlseam.apply_all(dest, revert=not ff7nx_swirlseam.enabled(),
+                              log=log)
+
+    # BUILD 318. The capture loader picks a CPU readback or a GPU
+    # render-to-texture on `field_0` (+0x10D70AC), and the swirl's creator
+    # already submits each half BOTH ways -- field_0 = 1 at +0x123E4/+0x128A4
+    # and field_0 = 0 at +0x12640/+0x12B00. The CPU copy is byte-wise and its
+    # rects scale with the surface, so it is what makes battle entry slow at
+    # SEVENTH_NX_FB_SURFACE=4 (2.4M pixels per capture, twice). Sending those
+    # two submissions down the GPU path removes the readback from the swirl at
+    # any scale. Kujata keeps field_0 = 1 and stays on the CPU path, which is
+    # where punch, the resample and the window clamp live.
+    import ff7nx_swirlgpu
+    ff7nx_swirlgpu.apply_all(dest, revert=not ff7nx_swirlgpu.enabled(),
+                             log=log)
+
+    # BUILD 320. The loader's field_0 split IS the "in battle" / "entering
+    # battle" line: every battle effect object sets field_0 = 1 and takes the
+    # CPU readback, the entry swirl takes Path B. Path B sizes its render
+    # target from the SCALED rect, so at SEVENTH_NX_FB_SURFACE=4 battle entry
+    # allocates 39 MB in one frame. Its source region comes from the rect and
+    # the surface (+0x10D7478), NOT from the target, so the target can be the
+    # effect's authored size -- the same number its UVs divide by -- and the
+    # picture is unchanged at the resolution it was written for. In-battle
+    # effects keep the full surface scale. See FINDINGS-316/319.
+    import ff7nx_gpucap
+    ff7nx_gpucap.apply_all(dest, revert=not ff7nx_gpucap.enabled(), log=log)
+
+    import ff7nx_fbpath
+    if ff7nx_fbpath.enabled():
+        ff7nx_fbpath.apply_all(dest, log=log)
+    else:
+        ff7nx_fbpath.apply_all(dest, revert=True, log=log)
     return [dest] if not built else []
 
 
@@ -9608,6 +10021,121 @@ def apply_field_frame(sdout, dump, log=lambda *_: None, produced=()):
             rc |= ff7nx_effectwide.apply_all(dest, log=log)
         else:
             rc |= ff7nx_effectwide.apply_all(dest, revert=True, log=log)
+        # DIAGNOSTIC. The battle scene script hides three battleground
+        # layers at once while a floor-warp effect runs (x86 0x43B034,
+        # `or al, 7`, ARM +0x109E3C), and update_3d_battleground skips a
+        # separate model at [0xBE1128]+0x4070 on bit 1. If the effect only
+        # reaches the layer the party stands on, the others are hidden with
+        # nothing drawn in their place -- and nothing drawn is black. One
+        # word, four masks, SEVENTH_NX_BG_LAYERS; 7 is stock.
+        import ff7nx_bglayers
+        if ff7nx_bglayers.enabled():
+            rc |= ff7nx_bglayers.apply_all(dest, log=log)
+        else:
+            rc |= ff7nx_bglayers.apply_all(dest, revert=True, log=log)
+        # DIAGNOSTIC. Kujata's animated field photocopies a FIXED screen
+        # window -- x86 0x500858 takes (word[0x9AAD4C], word[0x9AAD50],
+        # 0x100, 0x100), the top-left 256x256 game units, and nothing about
+        # the summon, the camera or the terrain enters into it. After builds
+        # 267/268 that copy is complete and correctly registered, so any
+        # black in it is black that was already on the screen -- and the one
+        # thing that is black on a world-map grass stage and not on the beach
+        # is the void past the edge of the battleground model, which only
+        # ws-3d is wide enough to show. Move the window and find out.
+        # SEVENTH_NX_FX_SNAP_X / _Y; 'stock' on both turns it off.
+        import ff7nx_fxsnap
+        if ff7nx_fxsnap.enabled():
+            rc |= ff7nx_fxsnap.apply_all(dest, log=log)
+        else:
+            rc |= ff7nx_fxsnap.apply_all(dest, revert=True, log=log)
+        # DIAGNOSTIC. Build 271 moved the capture window and the black band
+        # did not move, so the black is not captured content. Measured from
+        # the screenshots, the band IS the mesh's outermost ring: 3 UV texels
+        # wide, 64 px at that depth, breaking into single-texel cells higher
+        # up. That ring is the only part of the disc whose UVs reach 255 --
+        # the last texel of a 256-wide capture (r0 = 124, r1 = 0x7F at ARM
+        # +0x4722B0). Pull the cap in and see whether the band goes with it.
+        # SEVENTH_NX_FX_RIM; 127 is stock, 124..126 inset.
+        import ff7nx_fxrim
+        if ff7nx_fxrim.enabled():
+            rc |= ff7nx_fxrim.apply_all(dest, log=log)
+        else:
+            rc |= ff7nx_fxrim.apply_all(dest, revert=True, log=log)
+        # The build-273 texel probe measured the disc showing 89 texels across
+        # 1180 px where 786 are needed -- 13 screen pixels per texel. The mesh
+        # ties one texel to 96 world units (R = 384*j, r = 4*j), so the disc's
+        # 254-texel span comes out 2.63 SCREEN WIDTHS across, and the texture
+        # filling it is a capture, which can never hold more than one screen.
+        # Halve the disc and both words move together: the ring multiplier and
+        # the j = 32 outer constant, which is 127 * world-units-per-texel.
+        # SEVENTH_NX_FX_SCALE; 7 is stock, 6 halves, 5 quarters.
+        # The capture's texel COUNT, which is what actually buys density: the
+        # UVs are normalised by tex_format.width, so fb_tex.w/h can grow
+        # without changing what a UV byte means. FFNx builds this capture at
+        # internal resolution for exactly this reason; this port ties the two
+        # together and caps it at 256. Two shifts in make_framebuffer_tex.
+        # SEVENTH_NX_FB_SIZE; 1 is stock, 2 doubles, 4 quadruples. The
+        # resample cave's gate and step move with it.
+        import ff7nx_fbsize
+        if ff7nx_fbsize.enabled():
+            rc |= ff7nx_fbsize.apply_all(dest, log=log)
+        else:
+            rc |= ff7nx_fbsize.apply_all(dest, revert=True, log=log)
+        # And the same job done to ONE effect instead of all twenty-five, via
+        # Kujata's own xscale/yscale. This is what makes the resample cave's
+        # `fb_tex.w == tex_format.width << k` gate a real discriminator rather
+        # than a tautology -- see ff7nx_fxcapscale's header for the scan that
+        # proved every capture in the game is xscale = 1.
+        import ff7nx_fxcapscale
+        if ff7nx_fxcapscale.enabled():
+            rc |= ff7nx_fxcapscale.apply_all(dest, log=log)
+        else:
+            rc |= ff7nx_fxcapscale.apply_all(dest, revert=True, log=log)
+        import ff7nx_fxscale
+        if ff7nx_fxscale.enabled():
+            rc |= ff7nx_fxscale.apply_all(dest, log=log)
+        else:
+            rc |= ff7nx_fxscale.apply_all(dest, revert=True, log=log)
+        # BUILD 294. The same two words as ff7nx_fxscale, but as a MULTIPLY
+        # rather than a shift, so the disc can be scaled by any percentage
+        # instead of by whole bits. FFNx corrects a widescreen mismatch on a
+        # framebuffer-snapshot battle effect by scaling the drawn GEOMETRY by
+        # 854/640 (animations.cpp:1071), not by resampling the capture -- and
+        # geometry scales about its own centre, so nothing slides. Must run
+        # after fxscale: they share +0x473248 and +0x473178, and fxscale is
+        # stock unless SEVENTH_NX_FX_SCALE says otherwise.
+        import ff7nx_fxdisc
+        if ff7nx_fxdisc.enabled():
+            rc |= ff7nx_fxdisc.apply_all(dest, log=log)
+        else:
+            rc |= ff7nx_fxdisc.apply_all(dest, revert=True, log=log)
+        # The floor-warp summons build their own ground surfaces and
+        # hard-code how much world one captured screen unit is worth (Kujata
+        # 96, KOTR 288/3). ws-3d shows 854 game units of world where 4:3
+        # showed 640, and the extra world at the sides is past where those
+        # surfaces stop -- so the bare battlefield shows through there, black
+        # under Kujata's darkening and unshaded under KOTR's. Grow the reach
+        # by the same 4/3. Paired with ff7nx_fbcapture's re-centring and with
+        # ff7nx_fbresample being OFF; see ff7nx_summonreach's header.
+        import ff7nx_summonreach
+        if ff7nx_summonreach.enabled():
+            rc |= ff7nx_summonreach.apply_all(dest, log=log)
+        else:
+            rc |= ff7nx_summonreach.apply_all(dest, revert=True, log=log)
+        # Kujata submits its animated field as pre-transformed screen-space
+        # primitives (x86 0x4FC048 and 0x4FBBAC), so the wide shader's 0.75
+        # leaves it 25% short of the frame while the battlefield around it
+        # reaches the edges. X * 4/3 after projection cancels that, the same
+        # correction battlewide makes for the full-screen summon quads.
+        # Build 266 shipped it and was reported "no change" -- but that report
+        # was about the black tiles, which build 266 still had. Build 267
+        # removed the tiles (FINDINGS-308) without this and the short coverage
+        # became visible on its own. The two builds isolate the two halves;
+        # both are needed and neither substitutes for the other.
+        if ff7nx_terrainfx.enabled():
+            rc |= ff7nx_terrainfx.apply_all(dest, log=log)
+        else:
+            rc |= ff7nx_terrainfx.apply_all(dest, revert=True, log=log)
         # Build 207 changed two constants in the lookalike half-resolution
         # menu fade at x86 0x6D0022; hardware showed the same overlap and a
         # world-map battle-entry regression.  Restore those x86 experiments

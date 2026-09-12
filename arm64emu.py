@@ -71,6 +71,11 @@ class Mem:
         self.write(addr, (val & ((1 << (8 * n)) - 1)).to_bytes(n, 'little'))
 
 
+def s64(v):
+    v &= 0xFFFFFFFFFFFFFFFF
+    return v - (1 << 64) if v & (1 << 63) else v
+
+
 def s32(v):
     v &= M32
     return v - (1 << 32) if v & 0x80000000 else v
@@ -256,6 +261,42 @@ class Cpu:
             y = struct.unpack('<f', struct.pack('<I', self.fp[rm]))[0]
             self.fp[rd] = struct.unpack('<I', struct.pack('<f', x * y))[0]
             return None
+        if (w & 0xFFE0FC00) == 0x1E202800:                    # fadd Sd,Sn,Sm
+            x = struct.unpack('<f', struct.pack('<I', self.fp[rn]))[0]
+            y = struct.unpack('<f', struct.pack('<I', self.fp[rm]))[0]
+            self.fp[rd] = struct.unpack('<I', struct.pack('<f', x + y))[0]
+            return None
+        if (w & 0xFFE0FC00) == 0x1E203800:                    # fsub Sd,Sn,Sm
+            x = struct.unpack('<f', struct.pack('<I', self.fp[rn]))[0]
+            y = struct.unpack('<f', struct.pack('<I', self.fp[rm]))[0]
+            self.fp[rd] = struct.unpack('<I', struct.pack('<f', x - y))[0]
+            return None
+        if (w & 0xFFE0FC00) == 0x1E201800:                    # fdiv Sd,Sn,Sm
+            x = struct.unpack('<f', struct.pack('<I', self.fp[rn]))[0]
+            y = struct.unpack('<f', struct.pack('<I', self.fp[rm]))[0]
+            self.fp[rd] = struct.unpack(
+                '<I', struct.pack('<f', 0.0 if y == 0 else x / y))[0]
+            return None
+        if (w & 0xFFE0FC00) == 0x1E202000:                    # fcmp Sn,Sm
+            x = struct.unpack('<f', struct.pack('<I', self.fp[rn]))[0]
+            y = struct.unpack('<f', struct.pack('<I', self.fp[rm]))[0]
+            if x != x or y != y:       # unordered: N=0,Z=0,C=1,V=1
+                self.n, self.z, self.c, self.v = 0, 0, 1, 1
+            else:
+                self.n = int(x < y)
+                self.z = int(x == y)
+                self.c = int(x >= y)
+                self.v = 0
+            return None
+        if (w & 0xFFE00C00) == 0x1E200C00:                    # fcsel Sd,Sn,Sm,c
+            cond = (w >> 12) & 0xF
+            self.fp[rd] = self.fp[rn] if self.cond(cond) else self.fp[rm]
+            return None
+        if (w & 0xFFFFFC00) == 0x1E260000:                    # fmov Wd,Sn
+            return s(rd, self.fp[rn], True)
+        if (w & 0xFFFFFC00) == 0x1E270000:                    # fmov Sd,Wn
+            self.fp[rd] = g(rn, True)
+            return None
         # ---- double precision -------------------------------------------
         # The recompiler keeps the x87 stack in doubles, so the reciprocal
         # caves work in D registers rather than S.
@@ -273,11 +314,6 @@ class Cpu:
             y = struct.unpack('<d', struct.pack('<Q', self.fp[rm]))[0]
             self.fp[rd] = struct.unpack(
                 '<Q', struct.pack('<d', 0.0 if y == 0 else x / y))[0]
-            return None
-        if (w & 0xFFE0FC00) == 0x1E203800:                    # fsub Sd,Sn,Sm
-            x = struct.unpack('<f', struct.pack('<I', self.fp[rn]))[0]
-            y = struct.unpack('<f', struct.pack('<I', self.fp[rm]))[0]
-            self.fp[rd] = struct.unpack('<I', struct.pack('<f', x - y))[0]
             return None
         if (w & 0xFFFF0000) == 0x1E180000:                    # fcvtzs Wd,Sn,#f
             fbits = 64 - ((w >> 10) & 0x3F)
@@ -429,6 +465,38 @@ class Cpu:
         if (w & 0xFFC00000) == 0x79C00000:                    # ldrsh -> Wt
             a = self._addr(rn, ((w >> 10) & 0xFFF) * 2)
             return s(rd, s16(self.mem.u(a, 2)), True)
+        if (w & 0xFFE00C00) == 0x38400400:                    # ldrb Wt,[Xn],#imm
+            imm9 = (w >> 12) & 0x1FF
+            step = imm9 - 512 if imm9 & 0x100 else imm9
+            a = self._addr(rn, 0)
+            v = self.mem.u(a, 1)
+            self.set(rn, (self.get(rn) + step) & M64)
+            return s(rd, v, True)
+        if (w & 0xFFE00C00) == 0x38000400:                    # strb Wt,[Xn],#imm
+            imm9 = (w >> 12) & 0x1FF
+            step = imm9 - 512 if imm9 & 0x100 else imm9
+            a = self._addr(rn, 0)
+            self.mem.setu(a, gz(rd, True), 1)
+            self.set(rn, (self.get(rn) + step) & M64)
+            return None
+        if (w & 0xFFE00C00) == 0x38400000:                    # ldurb
+            imm9 = (w >> 12) & 0x1FF
+            a = self._addr(rn, imm9 - 512 if imm9 & 0x100 else imm9)
+            return s(rd, self.mem.u(a, 1), True)
+        if (w & 0xFFE00C00) == 0x38000000:                    # sturb
+            imm9 = (w >> 12) & 0x1FF
+            a = self._addr(rn, imm9 - 512 if imm9 & 0x100 else imm9)
+            self.mem.setu(a, gz(rd, True), 1)
+            return None
+        if (w & 0xFFE00C00) == 0xB8400000:                    # ldur Wt
+            imm9 = (w >> 12) & 0x1FF
+            a = self._addr(rn, imm9 - 512 if imm9 & 0x100 else imm9)
+            return s(rd, self.mem.u(a, 4), True)
+        if (w & 0xFFE00C00) == 0xB8000000:                    # stur Wt
+            imm9 = (w >> 12) & 0x1FF
+            a = self._addr(rn, imm9 - 512 if imm9 & 0x100 else imm9)
+            self.mem.setu(a, gz(rd, True) & 0xFFFFFFFF, 4)
+            return None
         if (w & 0xFFC00000) == 0x39400000:                    # ldrb
             a = self._addr(rn, (w >> 10) & 0xFFF)
             return s(rd, self.mem.u(a, 1), True)
@@ -549,8 +617,53 @@ class Cpu:
             return s(rd, g(rm, True), True)
         if (w & 0xFFE0FC00) == 0x1B007C00:                    # mul Wd,Wn,Wm
             return s(rd, (g(rn, True) * g(rm, True)) & M32, True)
+        if (w & 0xFFE08000) == 0x9B200000:                    # smaddl Xd,Wn,Wm,Xa
+            # SMULL when Xa = XZR. The operands are SIGNED 32-bit; the
+            # accumulator and the result are 64-bit. ff7nx_fbresample's
+            # projective remap folds the row term with this, and its column
+            # coefficient is negative, so the sign extension is load-bearing.
+            ra = (w >> 10) & 31
+            return s(rd, (s32(g(rn, True)) * s32(g(rm, True))
+                          + s64(gz(ra, False))) & M64, False)
+        if (w & 0xFFE08000) == 0x9B000000:                    # madd Xd,Xn,Xm,Xa
+            ra = (w >> 10) & 31
+            # NOTE gz(r, wide=True) forwards to get(r, w=True), and that `w`
+            # means W REGISTER -- i.e. 32-bit. The default is the NARROW half.
+            # Every 64-bit read here passes False explicitly.
+            return s(rd, (gz(rn, False) * gz(rm, False)
+                          + gz(ra, False)) & M64, False)
+        if (w & 0xFFFFFC00) == 0x93407C00:                    # sxtw Xd, Wn
+            v = gz(rn, True) & M32
+            return s(rd, (v - (1 << 32)) & M64 if v & 0x80000000 else v, False)
+        if (w & 0xFFE08000) == 0x1B000000:                    # madd Wd,Wn,Wm,Wa
+            ra = (w >> 10) & 31
+            return s(rd, (gz(rn, True) * gz(rm, True)
+                          + gz(ra, True)) & M32, True)
+        if (w & 0xFFE08000) == 0x1B008000:                    # msub Wd,Wn,Wm,Wa
+            ra = (w >> 10) & 31
+            return s(rd, (gz(ra, True) - gz(rn, True) * gz(rm, True)) & M32,
+                     True)
+        if (w & 0xFFE0FC00) == 0x9AC00C00:                    # sdiv Xd,Xn,Xm
+            # ARM: division by zero yields zero, and INT64_MIN / -1 saturates
+            # to INT64_MIN. Truncation is toward ZERO, not floor -- the sign
+            # of the column numerator changes across the texel grid, so the
+            # two differ and it matters.
+            d = s64(gz(rm, False))
+            if d == 0:
+                return s(rd, 0, False)
+            n = s64(gz(rn, False))
+            q = abs(n) // abs(d)
+            if (n < 0) != (d < 0):
+                q = -q
+            return s(rd, q & M64, False)
+        if (w & 0xFFE0FC00) == 0x8B20C000:                    # add Xd,Xn,Wm,SXTW
+            return s(rd, (gz(rn, False) + s32(g(rm, True))) & M64, False)
+        if (w & 0xFFE08000) == 0x9BA00000:                    # umaddl Xd,Wn,Wm,Xa
+            ra = (w >> 10) & 31                               # UMULL when Xa=XZR
+            return s(rd, (g(rn, True) * g(rm, True) + gz(ra, False)) & M64,
+                     False)
         if (w & 0xFFE0FC00) == 0xCB000000:                    # sub Xd,Xn,Xm
-            return s(rd, (gz(rn) - gz(rm)) & M64, False)
+            return s(rd, (gz(rn, False) - gz(rm, False)) & M64, False)
         if (w & 0xFFE0FC00) == 0x1AC02400:                    # lsr Wd,Wn,Wm
             return s(rd, (g(rn, True) >> (g(rm, True) & 31)) & M32, True)
         if (w & 0x9F000000) == 0x10000000:                    # adr Xd,label
@@ -558,6 +671,16 @@ class Cpu:
             if imm & (1 << 20):
                 imm -= 1 << 21
             return s(rd, (pc + imm) & M64, False)
+        if (w & 0xFFFFFC00) == 0x5AC00800:                    # rev Wd,Wn
+            v = g(rn, True)
+            return s(rd, ((v & 0xFF) << 24) | ((v & 0xFF00) << 8)
+                     | ((v >> 8) & 0xFF00) | ((v >> 24) & 0xFF), True)
+        if (w & 0xFFE08000) == 0x13800000:                    # extr Wd,Wn,Wm,#lsb
+            lsb = (w >> 10) & 0x3F
+            hi = g(rn, True)                                  # the HIGH half
+            lo = g(rm, True)                                  # the LOW half
+            v = ((hi << 32) | lo) >> lsb if lsb else lo
+            return s(rd, v & M32, True)
         if (w & 0xFFE0FC00) == 0x1AC00800:                    # udiv Wd,Wn,Wm
             # ARM defines division by zero as producing zero, not a trap.
             # Modelling that exactly matters: a cave that divides by an
@@ -647,6 +770,18 @@ class Cpu:
                 return s(rd, (v >> immr) & ((1 << width) - 1), True)
             return s(rd, ((v & ((1 << (imms + 1)) - 1)) << (32 - immr)) & M32,
                      True)
+        if (w & 0xFFC00000) == 0xD3400000:                    # UBFM, 64-bit
+            # Same general form, X registers. `lsr Xd, Xn, #sh` is UBFM with
+            # imms = 63, which is how a 32x32 -> 64 reciprocal multiply takes
+            # its high half (ff7nx_fbcapture's cave).
+            immr = (w >> 16) & 0x3F
+            imms = (w >> 10) & 0x3F
+            v = gz(rn, False)
+            if imms >= immr:
+                width = imms - immr + 1
+                return s(rd, (v >> immr) & ((1 << width) - 1), False)
+            return s(rd, ((v & ((1 << (imms + 1)) - 1)) << (64 - immr)) & M64,
+                     False)
         if (w & 0xFFC00000) == 0x13000000:                    # SBFM, 32-bit
             # The general form, not only the `asr` alias (imms == 31). The
             # recompiler also emits `sxth`/`sxtb` here -- sbfm Wd,Wn,#0,#15
@@ -811,10 +946,16 @@ class Cpu:
             typ = (w >> 22) & 3
             if typ != 0:
                 raise Unsupported('subs64 shift type %d at 0x%X' % (typ, pc))
-            a, b = self.get(rn), (self.get(rm) << amt) & M64
+            # Register 31 is XZR here, NOT SP -- `cmp Xn, xzr` is
+            # `subs xzr, Xn, xzr`, and reading SP for either operand (or
+            # WRITING SP for the discarded destination) silently changes the
+            # answer. This mis-modelled every 64-bit clamp built on `cmp Xn,
+            # xzr` / `csel Xd, xzr, Xn, cond` until build 280 caught it.
+            a, b = gz(rn, False), (gz(rm, False) << amt) & M64
             res = (a - b) & M64
             self._setflags64(a, b, res, True)
-            s(rd, res)
+            if rd != 31:
+                s(rd, res)
             return None
         if (w & 0xFFE00C10) == 0xFA400000:                    # ccmp Xn,Xm,#f,c
             # If the condition holds, do the compare; otherwise ADOPT the
@@ -833,8 +974,9 @@ class Cpu:
                 self.v = nzcv & 1
             return None
         if (w & 0xFFE00C00) == 0x9A800000:                    # csel Xd,Xn,Xm,c
-            cond = (w >> 12) & 0xF
-            return s(rd, self.get(rn) if self.cond(cond) else self.get(rm))
+            cond = (w >> 12) & 0xF          # r31 is XZR in CSEL, not SP
+            return s(rd, gz(rn, False) if self.cond(cond)
+                     else gz(rm, False))
         if (w & 0xFFC00000) == 0xB3400000:                    # BFM, 64-bit
             # BFI and BFXIL are the same encoding; which one you get is
             # decided by imms vs immr, NOT by the mnemonic capstone prints.

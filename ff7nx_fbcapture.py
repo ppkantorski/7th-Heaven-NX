@@ -62,15 +62,88 @@ the widescreen transform.
 
 THE CORRECTION, AND WHO GETS IT
 ===============================
-    x' = (x + 107) * 640 / 854          w' = w * 640 / 854
+Move the origin, and ONLY the origin:
 
-which is FFNx's `getInternalCoordX(x + abs(wide_viewport_x))` (the form it
-uses for scissor rects, `src/renderer.cpp:1689`) with framebufferWidth = 640
-because that is what the staging surface is. Horizontal only: `ws-3d` widens
-and does nothing vertical, so y and h are never touched.
+    x' = clamp(floor((x + 107) * 640 / 854), 0, 640 - w)
+    w' = w                                   <-- deliberately unchanged
+
+Build 269 added a re-centring term here, `- floor(107 * w / 854)`, to pair
+with `ff7nx_summonreach`. That pairing is hardware-disproven and both halves
+are reverted; `centre_reciprocal()` and `map_rect()` keep the derivation in
+case the reach idea is ever revived.
+
+This is FFNx's `getInternalCoordX(x + abs(wide_viewport_x))` with
+framebufferWidth = 640 because that is what the staging surface is.
+Horizontal only: `ws-3d` widens and does nothing vertical, so y and h are
+never touched. Build 262's inclusive-endpoint variant changed the normal
+capture from 479 to 480 columns and left Kujata's black edge identical on
+hardware, so that one-pixel hypothesis has been removed.
 
 **It is applied only when `xscale == 1`, and that gate is the whole point of
 this file being written twice.**
+
+WHY `w` MUST NOT BE SCALED -- FINDINGS-308, THE BLACK TILE CHAIN
+================================================================
+Builds 245-266 also scaled `w`. That is what put the black squares along one
+side of Kujata's animated field, and it is why fifteen geometry, depth,
+clipping, UV-table and pass-suppression experiments after it all changed
+nothing: the black was never in the geometry, it was inside the texture.
+
+`fb_tex.w` is not only the width of the region that gets COPIED. It is the
+capture texture's ACTUAL PIXEL WIDTH:
+
+    FFNx  src/gl/texture.cpp:68   w = version == FB_TEX_VERSION
+                                      ? fb_tex.w : tex_format.width;
+    FFNx  src/common.cpp:1974     the same choice, for the conversion
+    port  +0x10D70B8              w*h*4 bytes are allocated for the image
+    port  +0x10D7264 / +0x10D72F4 the GPU target and its viewport are (w, h)
+
+and the CPU branch this port takes for these captures (`field_0 == 1`, set
+by `0x682D80` for every battle effect object) copies `min(surface_w, x+w) - x`
+columns 1:1 into that `w`-wide buffer. **There is no rescale anywhere on the
+path**, so shrinking `w` shrinks the texture.
+
+Kujata's animated field (x86 `0x50057F`, grid built by `0x500A5E`, snapshot
+taken by `0x500858`/`0x500935`) asks for a 256x256 1:1 capture and then maps
+it onto a 33-ring x 16-segment ground disc with UVs that are hard-coded in
+the executable:
+
+    ring j has world radius 384*j   (ring 32 = 12192), y = 0
+    u = 128 + (4*j) * sin(theta)    v = 128 + (4*j) * cos(theta)
+    the outer ring's UV radius is clamped to 127, so u runs 1..255
+
+With `w' = 256 * 640/854 = 191` the texture is 191x256 and every texel with
+u > 191 is off the right-hand edge of it. Sampling there returns black, the
+primitive is an OPAQUE POLY_FT4 (code 0x2C, tpage 0x12C), and a whole cell
+goes black at a time -- so the artifact is:
+
+    * per-quad, in the shape of the ring/segment grid          (a staircase)
+    * on ONE side only, because u < 0 never happens (u >= 1)   (screen right)
+    * horizontal only, because `h` was never scaled            (no top/bottom)
+    * bounded by u = 191, i.e. the straight WORLD-SPACE line x = 63*96 = 6048
+      -- the user's "the summon animations only warp a straight rectangle"
+    * invisible wherever that line is off-screen or occluded, which is why
+      flat, enclosed stages (beach, stone) look clean and an open, uneven
+      world-map field does not.
+
+It also explains "the animated layer looks lower resolution when it kicks
+in": 191 columns where the effect expects 256.
+
+Leaving `w` alone costs a 4:3-era framing detail and nothing else: the
+snapshot then covers 854/640 = 1.334x as many game units as the effect
+intended, i.e. the stamped ground picture is 25% smaller. On a rippling
+ground snapshot that is not perceptible; a quarter of the disc turning black
+is.
+
+Every 1:1 capture in the executable is at most 256 wide. Seventeen functions
+create a capture slot (`0x42992E`), and the twelve rect writers above them --
+`0x44BDE6 0x450276 0x45C263 0x48E3F6 0x494773 0x4A9C32 0x4D902F 0x500858
+0x503576 0x59C50F` and their siblings -- store a width of 64, 128, 192 or 256
+and a height of 128 or 256, the low value at 320x240 and the high one when
+`[0x9ACB5C] == 2`. 192 rounds to the same 256 through `0x690240`/`0x690270`.
+So with x' at most 80 the widest of them ends at staging column 336 of 640
+and the destination is filled to its last pixel. The clamp is belt-and-braces
+for a caller outside that measured list.
 
 Build 244 applied the correction in `make_framebuffer_tex`, to every caller.
 It fixed the summons and broke the battle-entry swirl, and the reason is a
@@ -79,8 +152,9 @@ real distinction between two kinds of caller, not a special case:
     xscale == 1   the capture rect IS the texture, 1:1, in game units. 27
                   functions build a rect this way; the floor-warp summons are
                   among them (Titan's, at guest 0x8C9698, is 192x256 scale 1).
-                  For these `w` is a length in game units and scaling it is
-                  the correction.
+                  For these `w` is a length in game units AND the texture's
+                  pixel width at the same time, which is why only `x` may
+                  move -- see FINDINGS-308 above.
 
     xscale >  1   PSX page arithmetic. The width and height fields are first
                   ROUNDED UP TO POWERS OF TWO (`0x690240` tests, `0x690270`
@@ -106,24 +180,29 @@ cave in padding, the same shape `ff7nx_uiclip` uses:
 
     +0x10F23B4  b #0x10DBB50   ->   b <cave>
 
-    cave:  cmp   w5, w1                 xscale == 1 ?
-           movz  w9, #<magic lo>        \  640/854
+    cave:  movz  w9, #<magic lo>        \  640/854
            movk  w9, #<magic hi>, 16    /
-           add   w8, w3, #107           x + 107
+           add   w8, w3, #107
            umull x8, w8, w9
-           lsr   x8, x8, #32
-           csel  w3, w8, w3, eq         x' only for 1:1 captures
-           umull x8, w5, w9
-           lsr   x8, x8, #32
-           csel  w5, w8, w5, eq         w' likewise
+           lsr   x8, x8, #32            w8 = (x + 107) * 640/854
+           movz  w9, #640
+           sub   w9, w9, w5             w9 = 640 - w   (signed)
+           cmp   w8, w9
+           csel  w8, w9, w8, gt         w8 = min(w8, 640 - w)
+           cmp   w8, wzr
+           csel  w8, wzr, w8, lt        w8 = max(w8, 0)
+           cmp   w5, w1                 xscale == 1 ?
+           csel  w3, w8, w3, eq         the origin, only for 1:1 captures
            b     #0x10DBB50
 
-Eleven words of dead alignment padding, no cave-budget cost (ff7nx_cave), and
-byte-exactly reversible. `w8` and `w9` are dead at the hook -- w8 was copied
-to w0 at +0x10F23AC and w9 consumed by the `cset` at +0x10F23A8 -- and the
-body writes no flags between the `cmp` and the two `csel`s. All three are
-asserted from the disassembly by `tests/test_fbcapture.py`, not from this
-paragraph.
+Fourteen logical words including the tail branch, in dead alignment padding,
+no cave-budget cost (ff7nx_cave), and byte-exactly reversible. `w8` and `w9`
+are dead at the hook -- w8 was copied to w0 at +0x10F23AC and w9 consumed by
+the `cset` at +0x10F23A8. Each `csel` reads the `cmp` immediately before it
+and nothing else in the body writes the flags. `w5` is now READ and never
+written, so a page-scaled capture leaves the cave bit-identical in both
+fields. All of that is asserted from the disassembly by
+`tests/test_fbcapture.py`, not from this paragraph.
 
 The magic is not a constant in this file. `reciprocal()` derives it from
 `ff7nx_ws.WIDE_VIEWPORT_WIDTH` / `WIDE_VIEWPORT_X` and **proves it
@@ -134,16 +213,8 @@ raising rather than returning an approximation.
 stock identity is already correct -- the same gate and the same reasoning as
 `ff7nx_battlewide`. `SEVENTH_NX_FB_CAPTURE=0` forces it off for an A/B.
 
-WHAT WOULD FALSIFY IT
-=====================
-If the floor still tears with this on, the capture rect is not the source of
-the missing region and this file is wrong -- a cheap, decisive answer that
-clears the whole framebuffer-capture path in one build.
-
-The independent check costs nothing extra: **the defect must also disappear
-with `widescreen` set to off**, with or without this patch. Every line above
-says the cause is the 16:9 transform. If it survives 4:3, the analysis is
-wrong at the root.
+This changes no summon geometry, UVs, culling, or blend state. Page-scaled
+captures such as the battle-entry swirl remain byte-identical at the hook.
 """
 from __future__ import annotations
 
@@ -173,10 +244,12 @@ STAGING_SITE = 0x10D5970          # mov x8, #0x280 ; movk x8, #0x1e0, lsl #32
 HOOK = 0x10F23B4
 RETURN_VA = 0x10DBB50
 HOOK_STOCK = 0x17FFA5E7           # b #0x10dbb50
-N_BODY = 10                       # logical words before the tail branch
+N_BODY = 13                       # logical words before the tail branch
 N_WORDS = N_BODY + 1
 
 COND_EQ = 0
+COND_LT = 11
+COND_GT = 12
 
 
 # --------------------------------------------------------------------------
@@ -213,15 +286,43 @@ def reciprocal(num: int = STAGING_W, den: int = None, limit: int = 65536):
 
 
 def map_x(x: int) -> int:
-    """The staging column a game-space x lands on, as the cave computes it."""
+    """The staging column a game-space x lands on, before the clamp."""
     magic, shift = reciprocal()
     off = geometry()[1]
     return (((x + off) & 0xFFFFFFFF) * magic) >> shift
 
 
-def map_w(w: int) -> int:
-    magic, shift = reciprocal()
-    return ((w & 0xFFFFFFFF) * magic) >> shift
+def centre_reciprocal():
+    """
+    (magic, shift) for floor(n * |wide_viewport_x| / wide_span) -- the half
+    of the extra width a 1:1 capture gains when it is NOT resampled.
+
+    A 1:1 capture covers `w` staging pixels, and one staging pixel is
+    854/640 game units, so it now spans 1.334*w game units instead of w.
+    Anchoring it on the same CENTRE as vanilla means starting it
+    (1.334 - 1) * w / 2 = 107*w/640 game units earlier, which in staging
+    columns is 107*w/854.
+    """
+    span, off = geometry()
+    return reciprocal(num=off, den=span)
+
+
+def map_rect(x: int, w: int) -> tuple:
+    """
+    The corrected (x, w) for a 1:1 capture, exactly as the cave computes it.
+
+    `w` is returned unchanged ON PURPOSE -- it is the capture texture's real
+    pixel width, see the header. Only the origin moves, and it is clamped so
+    the copy can never run off the staging surface or leave the tail of a
+    row uninitialised.
+    """
+    gx = map_x(x)
+    lim = STAGING_W - (w & 0xFFFFFFFF)
+    if gx > lim:
+        gx = lim
+    if gx < 0:
+        gx = 0
+    return gx, w & 0xFFFFFFFF
 
 
 # --------------------------------------------------------------------------
@@ -254,16 +355,19 @@ def body_words() -> list:
     magic, shift = reciprocal()
     off = geometry()[1]
     return [
-        A.cmp_reg(5, 1),                    # cmp   w5, w1     xscale == 1 ?
         A.movz(9, magic & 0xFFFF),          # movz  w9, #lo
         A.movk_hi(9, magic >> 16),          # movk  w9, #hi, lsl #16
         A.add_imm(8, 3, off),               # add   w8, w3, #107
         umull(8, 8, 9),                     # umull x8, w8, w9
-        lsr64(8, 8, shift),                 # lsr   x8, x8, #shift
+        lsr64(8, 8, shift),                 # lsr   x8, x8, #shift  -> x'
+        A.movz(9, STAGING_W),               # movz  w9, #640
+        A.sub_reg(9, 9, 5),                 # sub   w9, w9, w5      640 - w
+        A.cmp_reg(8, 9),                    # cmp   w8, w9
+        A.csel(8, 9, 8, COND_GT),           # csel  w8, w9, w8, gt  min
+        A.cmp_reg(8, A.WZR),                # cmp   w8, wzr
+        A.csel(8, A.WZR, 8, COND_LT),       # csel  w8, wzr, w8, lt max 0
+        A.cmp_reg(5, 1),                    # cmp   w5, w1     xscale == 1 ?
         A.csel(3, 8, 3, COND_EQ),           # csel  w3, w8, w3, eq
-        umull(8, 5, 9),                     # umull x8, w5, w9
-        lsr64(8, 8, shift),                 # lsr   x8, x8, #shift
-        A.csel(5, 8, 5, COND_EQ),           # csel  w5, w8, w5, eq
     ]
 
 
@@ -320,10 +424,50 @@ SURFACE = {
     0x10D7074:        0x7101911F,   # cmp  w8, #0x64
 }
 
+# FINDINGS-308's load-bearing fact, read out of THIS module rather than out
+# of FFNx: the uploader picks the texture's dimensions from `fb_tex` when the
+# header carries FB_TEX_VERSION, and from `tex_format` otherwise. It is
+# FFNx's src/gl/texture.cpp:68-69 compiled, and it is why `w` is the capture
+# texture's real pixel width and must never be scaled.
+#
+#     ldr  w8, [x20]            version
+#     add  x10, x20, #0x3c      &tex_format.width
+#     add  x9,  x20, #0x1c      &fb_tex.w
+#     cmp  w8, #0x64            FB_TEX_VERSION ?
+#     csel x8, x9, x10, eq      <-- the choice
+#     ldr  w23, [x8]            the width the texture is created with
+#     ...  #0x20 / #0x40        and the matching height field
+FB_TEX_SIZE_CHOICE = {
+    0x10D6E50: 0xB9400288,   # ldr  w8, [x20]
+    0x10D6E54: 0x9100F28A,   # add  x10, x20, #0x3c
+    0x10D6E58: 0x91007289,   # add  x9, x20, #0x1c
+    0x10D6E68: 0x7101911F,   # cmp  w8, #0x64
+    0x10D6E6C: 0x9A8A0128,   # csel x8, x9, x10, eq
+    0x10D6E70: 0x321B03E9,   # mov  w9, #0x20
+    0x10D6E74: 0xB9400117,   # ldr  w23, [x8]
+    0x10D6E78: 0x321A03E8,   # mov  w8, #0x40
+    0x10D6E7C: 0x9A880128,   # csel x8, x9, x8, eq
+    0x10D6E80: 0xB8686A98,   # ldr  w24, [x20, x8]
+}
+
+# The CPU readback branch these captures take (`field_0 == 1`, written
+# unconditionally by guest 0x682D80). It allocates fb_tex.w * fb_tex.h * 4
+# and copies 1:1 -- there is no rescale anywhere on the path, so a narrower
+# `w` is a narrower TEXTURE, not a resampled one.
+CPU_BRANCH = {
+    0x10D70AC: 0xB9402688,   # ldr  w8, [x20, #0x24]     field_0
+    0x10D70B0: 0x7100051F,   # cmp  w8, #1
+    0x10D70B8: 0x2943A688,   # ldp  w8, w9, [x20, #0x1c] fb_tex.w, .h
+    0x10D70BC: 0x1B097D08,   # mul  w8, w8, w9
+    0x10D70C0: 0x531E7502,   # lsl  w2, w8, #2           w * h * 4
+}
+
 ANCHORS = {}
 ANCHORS.update(THUNK)
 ANCHORS.update(IDENTITY)
 ANCHORS.update(SURFACE)
+ANCHORS.update(FB_TEX_SIZE_CHOICE)
+ANCHORS.update(CPU_BRANCH)
 
 
 # --------------------------------------------------------------------------
@@ -460,10 +604,12 @@ def verify(img) -> list:
 def describe() -> str:
     magic, shift = reciprocal()
     span, off = geometry()
-    return ("1:1 captures only: x' = (x + %d) * %d / %d, w' = w * %d / %d "
-            "(magic 0x%08X >> %d); page-scaled captures (xscale > 1, the "
-            "battle swirl) left stock"
-            % (off, STAGING_W, span, STAGING_W, span, magic, shift))
+    return ("1:1 captures only: the capture ORIGIN mapped through "
+            "(x + %d) * %d / %d (magic 0x%08X >> %d) and clamped into "
+            "0..%d-w; the WIDTH is left stock because it is the capture "
+            "texture's real pixel width (FINDINGS-308); page-scaled captures "
+            "(xscale > 1, the battle swirl) untouched"
+            % (off, STAGING_W, span, magic, shift, STAGING_W))
 
 
 # --------------------------------------------------------------------------
@@ -580,6 +726,37 @@ def apply_to_nso(src, dest, log=lambda *_: None, revert: bool = False) -> bool:
 # --------------------------------------------------------------------------
 # the cave, EXECUTED rather than read
 # --------------------------------------------------------------------------
+def _s32(v: int) -> int:
+    v &= 0xFFFFFFFF
+    return v - (1 << 32) if v & 0x80000000 else v
+
+
+def _subs_flags(a: int, b: int) -> tuple:
+    """(N, Z, C, V) for a 32-bit `SUBS Wd, Wa, Wb`, AArch64 semantics."""
+    a &= 0xFFFFFFFF
+    b &= 0xFFFFFFFF
+    res = (a - b) & 0xFFFFFFFF
+    n = (res >> 31) & 1
+    z = 1 if res == 0 else 0
+    c = 1 if a >= b else 0                       # unsigned: no borrow
+    v = 1 if (_s32(a) - _s32(b)) != _s32(res) else 0
+    return n, z, c, v
+
+
+def _cond_holds(nzcv: tuple, cond: int) -> bool:
+    """The AArch64 condition table, written out rather than assumed."""
+    n, z, c, v = nzcv
+    base = {0: z == 1,
+            2: c == 1,
+            4: n == 1,
+            6: v == 1,
+            8: c == 1 and z == 0,
+            10: n == v,
+            12: z == 0 and n == v,
+            14: True}[cond & ~1]
+    return (not base) if (cond & 1) and cond != 15 else base
+
+
 def run_cave(words, x: int, w: int, width: int) -> tuple:
     """
     Interpret the body against (w3 = x, w5 = w, w1 = width) and return the
@@ -588,13 +765,13 @@ def run_cave(words, x: int, w: int, width: int) -> tuple:
     condition fails here instead of on hardware.
     """
     r = {1: width & 0xFFFFFFFF, 3: x & 0xFFFFFFFF, 5: w & 0xFFFFFFFF,
-         8: 0, 9: 0}
+         8: 0, 9: 0, 31: 0}
     x64 = {8: 0, 9: 0}
-    eq = None
+    nzcv = None
     for word in words:
         if (word & 0xFFE0FC1F) == (0x6B000000 | 31):            # cmp Wn, Wm
             rm, rn = (word >> 16) & 31, (word >> 5) & 31
-            eq = (r[rn] == r[rm])
+            nzcv = _subs_flags(r[rn], r[rm])
         elif (word & 0xFFE00000) == 0x52800000:                 # movz Wd
             r[word & 31] = (word >> 5) & 0xFFFF
         elif (word & 0xFFE00000) == 0x72A00000:                 # movk Wd, hi
@@ -603,6 +780,15 @@ def run_cave(words, x: int, w: int, width: int) -> tuple:
         elif (word & 0xFFC00000) == 0x11000000:                 # add Wd,Wn,#i
             rd, rn = word & 31, (word >> 5) & 31
             r[rd] = (r[rn] + ((word >> 10) & 0xFFF)) & 0xFFFFFFFF
+        elif (word & 0xFFE00000) == 0x0B000000:                 # add Wd,Wn,Wm
+            rd, rn, rm = word & 31, (word >> 5) & 31, (word >> 16) & 31
+            r[rd] = (r[rn] + r[rm]) & 0xFFFFFFFF
+        elif (word & 0xFFC00000) == 0x51000000:                 # sub Wd,Wn,#i
+            rd, rn = word & 31, (word >> 5) & 31
+            r[rd] = (r[rn] - ((word >> 10) & 0xFFF)) & 0xFFFFFFFF
+        elif (word & 0xFFE00000) == 0x4B000000:                 # sub Wd,Wn,Wm
+            rd, rn, rm = word & 31, (word >> 5) & 31, (word >> 16) & 31
+            r[rd] = (r[rn] - r[rm]) & 0xFFFFFFFF
         elif (word & 0xFFE0FC00) == 0x9BA07C00:                 # umull Xd,Wn,Wm
             rd, rn, rm = word & 31, (word >> 5) & 31, (word >> 16) & 31
             x64[rd] = r[rn] * r[rm]
@@ -614,9 +800,9 @@ def run_cave(words, x: int, w: int, width: int) -> tuple:
         elif (word & 0xFFE00C00) == 0x1A800000:                 # csel Wd,Wn,Wm
             rd, rn, rm = word & 31, (word >> 5) & 31, (word >> 16) & 31
             cond = (word >> 12) & 15
-            if cond != COND_EQ:
-                raise ValueError('unexpected csel condition %d' % cond)
-            r[rd] = r[rn] if eq else r[rm]
+            if nzcv is None:
+                raise ValueError('csel before any flag-setting instruction')
+            r[rd] = r[rn] if _cond_holds(nzcv, cond) else r[rm]
         else:
             raise ValueError('the interpreter does not know %08X' % word)
     return r[3], r[5]
@@ -637,21 +823,23 @@ def selftest(log=print) -> bool:
     log('  reciprocal: 0x%08X >> %d' % (magic, shift))
 
     for n in range(0, 4096):
-        if map_w(n) != (n * STAGING_W) // span:
+        if map_x(n - off) != (n * STAGING_W) // span:
             ok = False
-            log('  FAIL map_w(%d) = %d, expected %d'
-                % (n, map_w(n), (n * STAGING_W) // span))
+            log('  FAIL map_x(%d) = %d, expected %d'
+                % (n - off, map_x(n - off), (n * STAGING_W) // span))
             break
     else:
-        log('  map_w exact against (n*%d)//%d for n in 0..4095'
+        log('  map_x exact against (n*%d)//%d for n in 0..4095'
             % (STAGING_W, span))
 
     # The cave, executed. `width` is what decides the gate.
     cases = [
         # (x, w, width, want_x, want_w, what)
-        (0, 640, 640, 80, 479, 'a 1:1 4:3 effect'),
-        (-off, span, span, 0, 640, 'a battlewide-widened 1:1 effect'),
-        (200, 256, 256, 230, 191, "Titan's 256 sub-rect"),
+        (0, 640, 640, 0, 640, 'a 1:1 640 effect (clamped, fills the surface)'),
+        (-off, span, span, 0, span, 'a battlewide-widened 1:1 effect'),
+        (0, 256, 256, 80, 256, "Kujata's animated field"),
+        (0, 512, 512, 80, 512, 'a 512 rect'),
+        (200, 256, 256, map_rect(200, 256)[0], 256, 'a real origin'),
         (0, 512, 256, 0, 512, 'the swirl tile A (xscale 2)'),
         (320, 512, 256, 320, 512, 'the swirl tile B (xscale 2)'),
     ]
@@ -673,14 +861,19 @@ def selftest(log=print) -> bool:
                 % (x, w, width))
     log('  every xscale>1 capture passes through unchanged')
 
-    # no 1:1 rect may leave the staging surface
-    for x, w in ((0, 640), (-off, span), (0, 320), (160, 320)):
-        gx, gw = run_cave(body, x, w, w)
-        if not 0 <= gx <= gx + gw <= STAGING_W:
-            ok = False
-            log('  FAIL (%d,%d) -> (%d,%d) leaves the %dpx surface'
-                % (x, w, gx, gw, STAGING_W))
-    log('  no 1:1 rect leaves the %dx%d staging surface'
+    # No 1:1 rect that CAN fit may leave the staging surface. Every capture
+    # rect in the executable is 128, 192, 222, 256 or 512 wide, so the whole
+    # class fits and the destination is always filled to its last pixel --
+    # which is the property the black tiles needed and did not have.
+    for w in (128, 192, 222, 256, 512, 640):
+        for x in (-off, 0, 160, 320, 480, 640, 747):
+            gx, gw = run_cave(body, x, w, w)
+            if not 0 <= gx <= gx + gw <= STAGING_W:
+                ok = False
+                log('  FAIL (%d,%d) -> (%d,%d) leaves the %dpx surface'
+                    % (x, w, gx, gw, STAGING_W))
+    log('  every 1:1 rect the executable builds stays inside the %dx%d '
+        'staging surface and keeps its authored width'
         % (STAGING_W, STAGING_H))
 
     if len(body) != N_BODY:

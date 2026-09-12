@@ -91,6 +91,18 @@ def ldr_s(rt, rn, imm=0): return 0xBD400000 | ((imm >> 2) << 10) | (rn << 5) | r
 def str_s(rt, rn, imm=0): return 0xBD000000 | ((imm >> 2) << 10) | (rn << 5) | rt
 def ucvtf_s(rd, rn):      return 0x1E230000 | (rn << 5) | rd
 def fmul_s(rd, rn, rm):   return 0x1E200800 | (rm << 16) | (rn << 5) | rd
+def fadd_s(rd, rn, rm):   return 0x1E202800 | (rm << 16) | (rn << 5) | rd
+def fsub_s(rd, rn, rm):   return 0x1E203800 | (rm << 16) | (rn << 5) | rd
+def fdiv_s(rd, rn, rm):   return 0x1E201800 | (rm << 16) | (rn << 5) | rd
+def fcmp_s(rn, rm):        return 0x1E202000 | (rm << 16) | (rn << 5)
+def fcsel_s(rd, rn, rm, cond):
+    return 0x1E200C00 | (rm << 16) | (cond << 12) | (rn << 5) | rd
+def fmov_w_from_s(rd, rn): return 0x1E260000 | (rn << 5) | rd
+def fmov_s_from_w(rd, rn): return 0x1E270000 | (rn << 5) | rd
+# Condition code used by FCSEL after FCMP.  Keep it beside the scalar-FP
+# encoders so callers do not accidentally use the integer CSEL condition table
+# with a floating comparison.
+GT = 0xC
 
 
 def stp_q_off(rt, rt2, rn, imm):
