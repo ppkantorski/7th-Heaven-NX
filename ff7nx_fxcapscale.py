@@ -76,6 +76,25 @@ import ff7nx_cave                                              # noqa: E402
 import nxmap                                                   # noqa: E402
 
 CAPSCALE_ENV = 'SEVENTH_NX_FX_CAPSCALE'
+# BUILD 337. The two axes, separately.
+#
+# One k for both was what made capscale=2 unusable. The renderer maps a UV
+# coordinate to a texel as `u / tex_format.width * fb_tex.w`, so doubling
+# fb_tex.w makes the SAME u read twice as far across the staging surface: the
+# picture halves and anchors at u = 0. That is exactly what the operator saw
+# -- "a small little rectangle, moved right and towards the screen" -- and it
+# happened on BOTH axes at once because both sites got the same k.
+#
+# Horizontally that is correctable: SEVENTH_NX_FB_SPAN scales the 640/854
+# source step, and span=50 puts the span back to 320..1087 against the
+# stock 320..1086 -- one column. Vertically there is no such dial, because
+# the row walk belongs to the outer loop the cave does not hook.
+#
+# So the y scale stays 1 and only x doubles. That is also the axis the texel
+# budget is actually short of: u is the starved direction (0.31-0.59 texels
+# per screen pixel), and doubling it alone recovers 1.68-1.71x of the 2x,
+# with no vertical overrun of the 1920-row surface at all.
+CAPSCALE_Y_ENV = 'SEVENTH_NX_FX_CAPSCALE_Y'
 
 X_SITE = 0x473C98                  # str w19, [x0]   -> struc91 + 0x10C xscale
 Y_SITE = 0x473CB8                  # str w19, [x0]   -> struc91 + 0x110 yscale
@@ -128,8 +147,25 @@ def scale() -> int:
     return n if n in LEGAL else DEFAULT_SCALE
 
 
+def scale_y() -> int:
+    """The Y scale. Defaults to the X scale, so every build before 337
+    behaves exactly as it did; set it to 1 to grow the capture WIDE only."""
+    v = os.environ.get(CAPSCALE_Y_ENV)
+    if v is None:
+        return scale()
+    try:
+        n = int(v, 0)
+    except ValueError:
+        return scale()
+    return n if n in LEGAL else scale()
+
+
+def scales() -> tuple:
+    return (scale(), scale_y())
+
+
 def enabled() -> bool:
-    return scale() != 1
+    return scales() != (1, 1)
 
 
 def _word(img, va):
@@ -165,11 +201,12 @@ def _walk(img, site):
 
 
 def installed_scale(img):
-    """The k both sites carry, or None."""
-    found = set()
+    """(kx, ky) the two sites carry, or None. BUILD 337: they no longer have
+    to agree -- a wide-only capture is the supported shape."""
+    found = []
     for site in (X_SITE, Y_SITE):
         if _word(img, site) == STORE_STOCK:
-            found.add(1)
+            found.append(1)
             continue
         addrs, _ = _walk(img, site)
         if len(addrs) != N_WORDS:
@@ -183,8 +220,8 @@ def installed_scale(img):
                 hit = k
         if hit is None:
             return None
-        found.add(hit)
-    return found.pop() if len(found) == 1 else None
+        found.append(hit)
+    return tuple(found)
 
 
 def verify(img) -> list:
@@ -203,7 +240,8 @@ def read_state(img) -> str:
     k = installed_scale(img)
     if k is None:
         return 'unknown'
-    return 'capture scale %dx%s' % (k, ' (stock)' if k == 1 else '')
+    return 'capture scale x%d y%d%s' % (k[0], k[1],
+                                        ' (stock)' if k == (1, 1) else '')
 
 
 def plan(m, revert=False):
@@ -212,11 +250,11 @@ def plan(m, revert=False):
     problems = verify(img)
     if problems:
         return [], [], problems
-    want = 1 if revert else scale()
+    want = (1, 1) if revert else scales()
     have = installed_scale(img)
     if have == want:
         return [], [], []
-    if have != 1 and want != 1:
+    if have != (1, 1) and want != (1, 1):
         # Two live caves cannot be rewritten in place: the hook words would be
         # expected in two states at once. apply_all reverts first and comes
         # back here on a clean image.
@@ -235,28 +273,31 @@ def plan(m, revert=False):
         patches.append({'name': 'restore xscale/yscale store', 'va': hex(site),
                         'expect': struct.pack('<I', _word(img, site)).hex(),
                         'set': struct.pack('<I', STORE_STOCK).hex()})
-    if want == 1:
+    if want == (1, 1):
         return patches, ['    capture scale back to stock (1x)'], []
 
     pool = ff7nx_cave.HolePool(
         img, starts=set(m.arm_starts),
         named=cave_space.named_targets(img[cave_space.RODATA:]))
-    for site, what in ((X_SITE, 'xscale'), (Y_SITE, 'yscale')):
+    for site, what, k in ((X_SITE, 'xscale', want[0]),
+                          (Y_SITE, 'yscale', want[1])):
+        if k == 1:
+            continue                 # the stock store already writes 1
         try:
             runs = pool.take(N_WORDS, span=0x80000)
             slots = ff7nx_cave.slots(runs, N_WORDS)
-            words = body_words(want, site + 4, lambda i: slots[i])
+            words = body_words(k, site + 4, lambda i: slots[i])
             placed = ff7nx_cave.link(runs, words)
         except ff7nx_cave.NoRoom as exc:
             return [], [], ['capture scale cave: %s' % exc]
         placed[site] = A.b(site, slots[0])
         for va, wd in sorted(placed.items()):
-            patches.append({'name': 'capture %s x%d' % (what, want),
+            patches.append({'name': 'capture %s x%d' % (what, k),
                             'va': hex(va),
                             'expect': struct.pack('<I', _word(img, va)).hex(),
                             'set': struct.pack('<I', wd).hex()})
         notes.append('    Kujata capture %s = %d (cave entry +0x%X)'
-                     % (what, want, slots[0]))
+                     % (what, k, slots[0]))
     return patches, notes, []
 
 
@@ -282,8 +323,8 @@ def apply_all(main, revert=False, log=print):
     m = nxmap.Main(str(main))
     patches, notes, problems = plan(m, revert=revert)
     if problems == ['RESIZE']:
-        log('  Kujata capture scale: %s -> %sx, reverting first'
-            % (read_state(m.img), scale()))
+        log('  Kujata capture scale: %s -> x%d y%d, reverting first'
+            % (read_state(m.img), *scales()))
         if apply_all(main, revert=True, log=log) != 0:
             return 1
         m = nxmap.Main(str(main))
@@ -293,8 +334,10 @@ def apply_all(main, revert=False, log=print):
             log('  ! ' + p)
         log('  refusing to change the Kujata capture scale.')
         return 1
-    log('  Kujata capture xscale/yscale (%s=%d, stock is 1; NO other capture '
-        'in the game is touched):' % (CAPSCALE_ENV, 1 if revert else scale()))
+    log('  Kujata capture xscale/yscale (%s=%d %s=%d, stock is 1; NO other '
+        'capture in the game is touched):'
+        % (CAPSCALE_ENV, 1 if revert else scale(),
+           CAPSCALE_Y_ENV, 1 if revert else scale_y()))
     for n in notes:
         log(n)
     if not patches:

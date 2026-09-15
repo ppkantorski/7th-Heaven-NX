@@ -156,7 +156,7 @@ def main():
             if kind == 'add':
                 want = D.build_addfn_cave(cave, site, d['flag'], d['mask_bits'])
             else:
-                want = D.build_cave(cave, site, d['flag'], d['mask_bits'],
+                want = D.build_cave(cave, None, site, d['flag'], d['mask_bits'],
                                     d['data_base'], d['stride'], d['fields'],
                                     cases, sym, T.K)
             got = list(struct.unpack('<%dI' % len(want),

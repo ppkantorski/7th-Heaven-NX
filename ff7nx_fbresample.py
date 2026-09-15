@@ -123,6 +123,7 @@ FB_Y_OFF = 0x18                    # fb_tex.y
 KUJATA_TEX = 0x100                 # tex_format.width/height of Kujata's capture
 
 COND_NE, COND_LT = 1, 11
+COND_GE = 10                       # used by the punch write in proj_body too
 
 # The whole CPU readback loop, asserted so a game update cannot silently move
 # the registers this cave borrows.
@@ -195,9 +196,18 @@ def _reciprocal():
     """
     import ff7nx_fbcapture as FB
     s = span()
-    if s == DEFAULT_SPAN:
+    # BUILD 356. The destination is the AUTHORED width whatever the surface
+    # is, so the columns one destination texel steps over grow with the
+    # surface k. ff7nx_fbauthored owns that number, and returns 640 at k = 1,
+    # so the stock constants are reproduced bit for bit.
+    try:
+        import ff7nx_fbauthored
+        base = ff7nx_fbauthored.column_numerator(FB.STAGING_W)
+    except Exception:                                          # noqa: BLE001
+        base = FB.STAGING_W
+    num = base * s // DEFAULT_SPAN
+    if num == FB.STAGING_W:
         return FB.reciprocal()
-    num = FB.STAGING_W * s // DEFAULT_SPAN
     return FB.reciprocal(num=num)
 
 
@@ -212,6 +222,11 @@ def umull(rd, rn, rm):
 def lsr64(rd, rn, shift):
     """LSR Xd, Xn, #shift."""
     return 0xD3400000 | (1 << 22) | (shift << 16) | (63 << 10) | (rn << 5) | rd
+
+
+def sxtw64(rd, rn):
+    """SXTW Xd, Wn -- SBFM Xd, Xn, #0, #31."""
+    return 0x93407C00 | (rn << 5) | rd
 
 
 def _unscaled(base, rt, rn, imm9):
@@ -303,6 +318,12 @@ PROBE_ENV = 'SEVENTH_NX_FB_PROBE'
 # background is missing -- takes the colour of the texel to its left instead
 # of punching black through the field. Everything else about the copy is
 # unchanged, and a capture with no holes produces the identical texture.
+# BUILD 367. WITHDRAWN: build 366 made `proj` the default and it was worse on
+# hardware. The remap's SHAPE is still the only one that can register (a
+# window leaves 169 px rms and wants a negative width), but its surface layout
+# is not established, and a default is not the place to keep testing that.
+# `punch` is the shipping body again -- build 307's, unchanged since.
+# `SEVENTH_NX_FB_PROBE=proj` still reaches the remap for testing.
 DEFAULT_PROBE = 'punch'
 
 
@@ -342,6 +363,16 @@ def mode() -> str:
         return 'proj'
     if v in ('projtexel', 'pt', '5'):
         return 'projtexel'
+    if v in ('projsrc', 'ps', '13'):
+        return 'projsrc'
+    if v in ('projmap', 'pm', '16'):
+        return 'projmap'
+    if v in ('projpitch', 'pp', '17'):
+        return 'projpitch'
+    if v in ('projbar', 'pb', '18'):
+        return 'projbar'
+    if v in ('projcopy', 'pc', '14'):
+        return 'projcopy'
     if v in ('report', 'r', '6'):
         return 'report'
     if v in ('stretch', 's', '7'):
@@ -354,6 +385,8 @@ def mode() -> str:
         return 'fillhole'
     if v in ('punch', 'pun', '11'):
         return 'punch'
+    if v in ('check', 'checker', 'c', '15'):
+        return 'check'
     if v in ('unpremul', 'unpre', 'u', '12'):
         return 'unpremul'
     return 'texel'
@@ -417,7 +450,7 @@ def surf_shift():
     """
     try:
         import ff7nx_fbsurf
-        return {1: 0, 2: 1, 4: 2}[ff7nx_fbsurf.scale()]
+        return {1: 0, 2: 1, 4: 2, 8: 3}[ff7nx_fbsurf.scale()]
     except Exception:                                          # noqa: BLE001
         return 0
 
@@ -496,6 +529,18 @@ def size_shift():
         return 0
 
 
+def size_shift_y():
+    """log2 of Kujata's yscale. BUILD 337: the capture no longer has to be
+    square. Growing it WIDE ONLY is the supported shape -- u is the starved
+    axis, and the vertical row walk has no span dial to undo the doubling
+    with, so y stays 1 while x grows."""
+    try:
+        import ff7nx_fxcapscale
+        return {1: 0, 2: 1, 4: 2}[ff7nx_fxcapscale.scale_y()]
+    except Exception:                                          # noqa: BLE001
+        return 0
+
+
 # --------------------------------------------------------------------------
 # 'proj' -- the PROJECTIVE remap. The only shape that can align a plane.
 # --------------------------------------------------------------------------
@@ -505,23 +550,103 @@ def size_shift():
 # express a homography at any constants, which is why tuning them only ever
 # moved the rectangle somewhere else.
 #
-# These nine coefficients are SOLVED, not fitted by eye, from the build-279
-# texel probe: 360226 probe pixels, grouped into 7158 distinct texels by
-# centroid (one texel covers many screen pixels near the camera, so the
-# centroid is its position and every pixel is just its footprint), then a
-# normalised DLT with outlier trimming. Residual 2.06 staging pixels median
-# over the inliers -- about half a texel at mid-screen.
-#
 #     col = (A00*i + A01*j + A02) / (A20*i + A21*j + A22)
 #     row = (A10*i + A11*j + A12) / (same denominator)
 #
-# at scale 2**18, which is the largest that keeps every coefficient inside
-# int32 while leaving the denominator's precision at 4e-6.
-PROJ_SCALE = 18
-PROJ_COEF = (-5076189, 4546630, 1267468383,      # col numerator
-                39616,  143742,  484422010,      # row numerator
-                 2663,    7515,     262144)      # denominator
+# BUILD 327. The nine coefficients are no longer a hard-coded tuple. They are
+# DERIVED, at build time, from one measured thing -- the screen <-> UV
+# homography of Kujata's disc -- composed with the three scales that this
+# build happens to be using. That change is the whole reason the build-280
+# attempt failed on hardware and this one can be trusted: the old tuple was a
+# k = 1, dial-100, 640x480 answer that kept being shipped after all three had
+# moved, and it addressed a 640-wide surface with a column coefficient of
+# 4834, i.e. off the end of the surface it was clamped to.
+#
+# WHAT WAS MEASURED (the `texel` probe, build 325, at k = 4, dial 94)
+# -------------------------------------------------------------------
+# The probe paints every texel with its own UV coordinate (B = u, G = v,
+# R = 0x40), so one screenshot is a dense read-out of "the texel drawn at
+# this screen pixel is (u, v)". Fitted by normalised DLT over the frame:
+#
+#     389677 probe pixels -> 349284 inliers, median residual 0.90 UV units
+#     (0.9 game units, about 1.35 screen px), no ripple structure left in
+#     the residual map -- a single homography describes the whole disc
+#
+# The one number that had to be recovered before any of it meant anything:
+# the field is drawn through a constant colour modulation, measured from the
+# probe's own R = 0x40 marker as 54.3651/64 = 0.84945, and confirmed by the
+# rim (u = 255 comes back as 217). The build-279 fit was read out of the
+# WRONG CHANNEL -- this module's own docstring said "R = column" while its
+# code stored the column in B -- which is the most likely reason a correct
+# piece of arithmetic came out wrong on the TV in build 281.
+#
+# WHY IT IS STORED IN NORMALISED SCREEN COORDINATES
+# -------------------------------------------------
+# `FIT_HUV` maps (x / frame_w, y / frame_h) -> (u, v). Normalised, so it does
+# not care what the Switch is rendering at; the surface scale, the capture
+# scale and the disc dial are then applied here, arithmetically, instead of
+# being baked in. Change `SEVENTH_NX_FB_SURFACE` or `SEVENTH_NX_FX_DISC` and
+# the coefficients follow -- which is exactly what the old tuple could not do.
+#
+# WHAT IT CANNOT DO
+# -----------------
+# The correct mapping IS the battle camera's ground-plane homography, and the
+# camera is per-battle-location data rather than a constant in the executable.
+# So this is measured for ONE camera. `tools/fit_proj.py` re-fits it from a
+# fresh probe screenshot in one command, and `SEVENTH_NX_FX_PROJ` takes nine
+# integers directly, so neither needs me.
+FIT_HUV = (1342.942886, -1996.873329, -1162.038969,      # -> u
+           -460.5917001, 1948.840443, -1452.684385,     # -> v
+           0.1640381782, -23.54451286, 1.0)          # denominator
+
+# BUILD 366. WHERE THE FRAME SITS INSIDE THE CAPTURE SURFACE.
+#
+# This is the number every previous remap got wrong, and it is not derived --
+# it is measured, off the operator's own green/red probe (the `srcblack` mode,
+# build 305). That probe paints a texel red when its source pixel is black.
+# Its two boundaries are lines of CONSTANT u:
+#
+#     right edge   u = 90.6, 87.7, 88.5, 89.8, 90.7, 89.1, 88.7, 88.5  -> 89.2
+#     left  edge   u = 187.7, 188.5, 188.0, 190.2, 185.8, 181.3        -> 187.0
+#
+# A content boundary that is a line of constant u is a boundary in the SOURCE,
+# because u is what selects the source column. Through the shipping resample
+# (column = fb_tex.x + 0.749*i, fb_tex.x = 80k, i = k*u) those two land on
+# surface columns 587.0 and 880.3 -- and read as the frame's own left and
+# right edge they give the layout below. Two independent checks on it:
+#
+#   * the whole-surface scan the operator ran (build 342's coefficients) put
+#     the content's right edge at column 876 -- against 880 here, 0.5 %.
+#   * fed back through the SHIPPING map, the two boundaries land on frame x
+#     1.9 and 1300.5, i.e. the frame's own edges to 1.5 %.
+#
+# The vertical is the weaker half: the scan's strip ended near row 1170 and
+# nothing contradicts it, but no second measurement confirms it. Both axes are
+# overridable without a rebuild of anything but `main`.
+BAND_ENV = ('SEVENTH_NX_FB_BAND_X0', 'SEVENTH_NX_FB_BAND_X1',
+            'SEVENTH_NX_FB_BAND_Y0', 'SEVENTH_NX_FB_BAND_Y1')
+BAND = (587.0, 880.3, 0.0, 1170.0)     # surface col/row of frame (0,0)-(1280,720)
+
+
+def band():
+    """The surface rectangle the frame is written into, at the STOCK surface
+    scale of 4. Scaled with ff7nx_fbsurf, because the blit follows the
+    surface: every column figure here is proportional to it."""
+    out = []
+    for env, default in zip(BAND_ENV, BAND):
+        v = os.environ.get(env)
+        try:
+            out.append(float(v) if v is not None else default)
+        except ValueError:
+            out.append(default)
+    if not (out[1] > out[0] and out[3] > out[2]):
+        out = list(BAND)
+    f = (1 << surf_shift()) / 4.0          # the band follows fbsurf's k
+    return (out[0] * f, out[1] * f, out[2] * f, out[3] * f)
+FIT_DISC_PCT = 94.0                # the dial the probe build was running
+FIT_UV_CENTRE = 128.0              # the disc scales about its own UV centre
 PROJ_ENV = 'SEVENTH_NX_FX_PROJ'
+PROJ_LIMIT = 2 ** 31 - 1           # the coefficients are int32, by smaddl
 
 
 def gate_shift():
@@ -532,22 +657,177 @@ def gate_shift():
     `tex_format.width << (both)`, so a gate that carries only one of them
     stops matching the moment the other moves -- which is what silently
     disengaged the texel and proj bodies at k > 1.
+
+    BUILD 357. `ff7nx_fbauthored` can take the surface's half back OUT of
+    fb_tex.w -- that is the whole point of it -- and when it does, a gate that
+    still carries `surf_shift()` matches nothing at all, which silently
+    disengages every body again. So ask the module that owns the answer
+    rather than assuming it. At k = 1 both terms are 0 either way.
     """
-    return size_shift() + surf_shift()
+    return size_shift() + _fbtex_surf_shift()
+
+
+def _fbtex_surf_shift() -> int:
+    """How much of the surface scale actually reaches `fb_tex.w`.
+
+    `surf_shift()` while ff7nx_fbauthored is inert, 0 once it is cancelling
+    the scale in the rect arithmetic. One question, one owner, so the gate
+    and the rect can never disagree about what fb_tex.w is.
+    """
+    try:
+        import ff7nx_fbauthored
+        if ff7nx_fbauthored.cancels_surface_scale():
+            return 0
+    except Exception:                                          # noqa: BLE001
+        pass
+    return surf_shift()
+
+
+def gate_word():
+    """The ONE word that asks "is this Kujata's capture?".
+
+    BUILD 339, and it is the battle-swirl regression 287 predicted.
+
+    The test has always been a RATIO -- `fb_tex.w == tex_format.width << k` --
+    which identifies a 1:1 capture rather than a particular one. That is fine
+    while k is the surface scale alone, because the swirl's ratio is 8 and the
+    gate's is 4. Raise the CAPTURE scale and the gate's ratio becomes 8 too:
+
+        capscale 1   gate ratio 4    Kujata 4 ENGAGES   swirl 8 stock
+        capscale 2   gate ratio 8    Kujata 8 ENGAGES   swirl 8 ENGAGES  <-- !
+
+    and the swirl gets resampled by a body built for a different texture,
+    which is the mirrored character on both halves of the screen.
+
+    So when the capture is scaled the test becomes ABSOLUTE: fb_tex.w must be
+    Kujata's own 256 << gate_shift(), which the swirl's 1280 is not. `cmp`
+    takes a 12-bit immediate, so this is still exactly one word and no body
+    changes length.
+
+    At capscale 1 it returns the ratio word unchanged, so the shipping build
+    is byte for byte what it was.
+    """
+    if size_shift() == 0:
+        return cmp_reg_lsl(15, 16, gate_shift())
+    want = KUJATA_TEX << gate_shift()
+    assert 0 <= want < 4096, want
+    return A.cmp_imm(15, want)
+
+
+def gate_shift_h():
+    """The same, for fb_tex.h. Equal to gate_shift() unless the capture has
+    been grown wide-only, in which case asserting the texture is SQUARE would
+    reject Kujata's own capture -- the trap that hid the probe in build 325,
+    in a new place."""
+    return size_shift_y() + _fbtex_surf_shift()
+
+
+def _disc_pct():
+    """The dial this build is running, for the report line."""
+    try:
+        import ff7nx_fxdisc
+        return ff7nx_fxdisc.percent()
+    except Exception:                                          # noqa: BLE001
+        return FIT_DISC_PCT
+
+
+def disc_factor():
+    """How much ff7nx_fxdisc has shrunk the disc, relative to the FIT build.
+
+    The dial scales the world radius of every ring about ring 0, so a UV
+    point that sat over world w at the fit's dial sits over `w * f` at this
+    one -- which moves the whole screen <-> UV relation by a known factor and
+    nothing else. Folding it in here is what stops the coefficients going
+    stale the moment the dial moves, which is how the build-280 tuple died.
+    """
+    try:
+        import ff7nx_fxdisc
+        return (ff7nx_fxdisc.k_for(ff7nx_fxdisc.percent())
+                / float(ff7nx_fxdisc.k_for(FIT_DISC_PCT)))
+    except Exception:                                          # noqa: BLE001
+        return 1.0
+
+
+def _mat3(a):
+    return [[a[0], a[1], a[2]], [a[3], a[4], a[5]], [a[6], a[7], a[8]]]
+
+
+def _mul3(a, b):
+    return [[sum(a[r][t] * b[t][c] for t in range(3)) for c in range(3)]
+            for r in range(3)]
+
+
+def _inv3(m):
+    (a, b, c), (d, e, f), (g, h, i) = m
+    det = (a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g))
+    if det == 0:
+        raise ZeroDivisionError('FIT_HUV is singular')
+    adj = [[e * i - f * h, c * h - b * i, b * f - c * e],
+           [f * g - d * i, a * i - c * g, c * d - a * f],
+           [d * h - e * g, b * g - a * h, a * e - b * d]]
+    return [[adj[r][c] / det for c in range(3)] for r in range(3)]
+
+
+def proj_matrix():
+    """physical texel (i, j) -> capture surface pixel (col, row), as floats.
+
+    Three composed steps, each one of them a thing this build knows:
+
+        (i, j)     -> (u, v)        the texel grid is `1 << gate_shift()`
+                                    physical texels per UV unit, and the
+                                    sample belongs at the texel's CENTRE
+        (u, v)     -> (u, v) at the fit's dial        disc_factor()
+        (u, v)     -> normalised screen               inverse(FIT_HUV)
+        normalised -> surface pixel                   surface()
+    """
+    n = float(1 << gate_shift())
+    f = disc_factor()
+    o = FIT_UV_CENTRE * (1.0 - f)
+    # (i, j) -> uv at the fit's dial:  f*(i + 0.5)/n + 128*(1 - f)
+    T = [[f / n, 0.0, o + 0.5 * f / n],
+         [0.0, f / n, o + 0.5 * f / n],
+         [0.0, 0.0, 1.0]]
+    # normalised screen -> surface, through the MEASURED band rather than the
+    # full-surface stretch builds 327-330 assumed
+    x0, x1, y0, y1 = band()
+    S = [[x1 - x0, 0.0, x0], [0.0, y1 - y0, y0], [0.0, 0.0, 1.0]]
+    M = _mul3(_mul3(S, _inv3(_mat3(FIT_HUV))), T)
+    k = M[2][2]
+    return [[v / k for v in row] for row in M]
+
+
+def proj_quantize(M):
+    """The nine int32s, at the largest scale that cannot overflow one.
+
+    The scale is chosen from the coefficients themselves rather than being a
+    fixed 2**18: the column offset is the big one (it is measured in surface
+    pixels, so it grows with `SEVENTH_NX_FB_SURFACE`) and at k = 4 a fixed
+    2**18 would put it within 4 % of int32's ceiling.
+    """
+    flat = [M[0][0], M[0][1], M[0][2], M[1][0], M[1][1], M[1][2],
+            M[2][0], M[2][1], M[2][2]]
+    big = max(abs(v) for v in flat)
+    scale = int((PROJ_LIMIT / 1.02) / big) if big else 1
+    out = tuple(int(round(v * scale)) for v in flat)
+    assert all(-PROJ_LIMIT <= x <= PROJ_LIMIT for x in out), out
+    return out
 
 
 def proj_coef():
-    """Env override, nine comma-separated integers, for tuning without me."""
+    """The nine coefficients this build will patch in.
+
+    `SEVENTH_NX_FX_PROJ` overrides them with nine comma-separated integers,
+    for tuning without a re-fit.
+    """
     v = os.environ.get(PROJ_ENV)
-    if not v:
-        return PROJ_COEF
-    try:
-        out = tuple(int(x, 0) for x in v.replace(' ', '').split(','))
-    except ValueError:
-        return PROJ_COEF
-    if len(out) != 9 or not all(-2**31 <= x < 2**31 for x in out):
-        return PROJ_COEF
-    return out
+    if v:
+        try:
+            out = tuple(int(x, 0) for x in v.replace(' ', '').split(','))
+        except ValueError:
+            out = ()
+        if len(out) == 9 and all(-2**31 <= x < 2**31 for x in out):
+            return out
+    return proj_quantize(proj_matrix())
 
 
 # encoders a64 does not carry; every one is round-tripped through capstone in
@@ -599,6 +879,7 @@ def proj_body(addr, how='proj'):
         x19 surface pitch   x20 tex_header   x26 surface base
     """
     k = gate_shift()
+    kh = gate_shift_h()
     c = proj_coef()
     A00, A01, A02, A10, A11, A12, A20, A21, A22 = c
     w = []
@@ -617,7 +898,7 @@ def proj_body(addr, how='proj'):
     gate.append(here())
     w.append(0)
     w.append(A.ldr(22, 20, FB_H_OFF))
-    w.append(cmp_reg_lsl(22, 16, k))
+    w.append(cmp_reg_lsl(22, 16, kh))          # BUILD 337: its OWN shift
     gate.append(here())
     w.append(0)
     w.append(A.ldr(17, 20, FB_X_OFF))
@@ -634,9 +915,16 @@ def proj_body(addr, how='proj'):
     w.append(A.stp64_off(5, 6, A.SP, 0x20))
     w.append(A.str64(7, A.SP, 0x30))
     # ---- once per row: fold the j terms ----------------------------------
+    # BUILD 327. The `sxtw` is new and it closes a latent trap: the seed is
+    # loaded by movz/movk, which ZERO-extends, and it then becomes SMADDL's
+    # 64-bit accumulator. A negative offset -- which a re-fit on another
+    # camera can perfectly well produce -- would have entered the division as
+    # a large positive. One word per accumulator, unconditional, so the body
+    # has one shape whatever the coefficients are.
     for coef_j, coef_c, acc in ((A01, A02, 1), (A11, A12, 2), (A21, A22, 3)):
         w += _const32(17, coef_j)
         w += _const32(acc, coef_c)
+        w.append(sxtw64(acc, acc))
         w.append(smaddl(acc, 17, 8, acc))          # acc = coef_j*row + coef_c
     for inc, reg in ((A00, 4), (A10, 5), (A20, 6)):
         w += _const32(reg, inc)
@@ -644,12 +932,27 @@ def proj_body(addr, how='proj'):
     lbl['loop'] = here()
     w.append(sdiv64(14, 1, 3))                     # col = numc / den
     w.append(sdiv64(16, 2, 3))                     # row = numr / den
-    for reg, hi in ((14, SURF_W - 1), (16, SURF_H - 1)):
+    # BUILD 327. The clamp is the REAL surface, not the stock 640x480. With
+    # ff7nx_fbsurf at k the surface is 640k x 480k, and a mapping that spans
+    # the frame produces columns up to 2560 -- every one of which this body
+    # used to clamp to 639, i.e. it sampled a quarter of the width and
+    # smeared the rest. That is one of the two reasons build 280's remap came
+    # out wrong, and it could not have been seen at the k = 1 it was fitted at.
+    for reg, hi in ((14, _surf_w() - 1), (16, _surf_h() - 1)):
         w.append(A.cmp_reg64(reg, A.XZR))
         w.append(A.csel64(reg, A.XZR, reg, COND_LT))
         w.append(A.movz(17, hi))
         w.append(A.cmp_reg64(reg, 17))
         w.append(A.csel64(reg, 17, reg, COND_GT))
+    if how in ('projsrc', 'projmap'):
+        # x14 is about to become an address; x7 is the body's spare register
+        # and it is saved and restored with the rest, so the column survives
+        # for the read-out. (x16 already does: madd64 reads it.)
+        #
+        # BUILD 342: 'projmap' needs it for the same reason, and leaving it
+        # out is exactly the class of bug that hid the texel probe in 325 --
+        # the body runs, reports zeroes, and looks like a measurement.
+        w.append(A.add_imm64(7, 14, 0))            # mov x7, x14
     w.append(madd64(14, 16, 19, 14))               # pitch*row + col
     w.append(A.add_reg64_lsl(14, 26, 14, 2))       # surface base + that*4
     w.append(A.add_imm64(14, 14, 3))               # the loop's "+3" convention
@@ -662,7 +965,138 @@ def proj_body(addr, how='proj'):
         w.append(sturb(15, 13, -1))
         w.append(A.movz(15, 0xFF))
         w.append(sturb(15, 13, 0))
-    else:
+    elif how == 'projsrc':
+        # BUILD 327, and it is the answer to "how do we know the remap is
+        # wired to the right picture" without shipping the picture. Every
+        # texel reports the SOURCE it sampled, in 16-surface-pixel units so
+        # that both axes fit a byte at any k:
+        #
+        #     B = col >> 4     G = row >> 4     R = 0x40     A = 0xFF
+        #
+        # If the chain is right, the field comes back carrying the screen's
+        # own coordinates -- at k = 4, B = x/8 and G = y/6 -- so one
+        # screenshot is a direct, theory-free check, and any error in it is
+        # measurable rather than a matter of opinion.
+        w.append(lsr64(15, 7, 4))
+        w.append(sturb(15, 13, -3))
+        w.append(lsr64(15, 16, 4))
+        w.append(sturb(15, 13, -2))
+        w.append(A.movz(15, 0x40))
+        w.append(sturb(15, 13, -1))
+        w.append(A.movz(15, 0xFF))
+        w.append(sturb(15, 13, 0))
+    elif how == 'projbar':
+        # BUILD 351. The stride again, encoded as a POSITION.
+        #
+        # `projpitch` wrote the number as a colour level and the answer came
+        # back contaminated: the field is drawn through a blend, so every
+        # intensity is pulled toward the floor underneath. The marker 0x40
+        # should read 54.4 at every k and read 54 then 55 -- small, but the
+        # digits it produced (576 at k=4, 724 at k=1) are not trustworthy to
+        # the unit, and they moved the WRONG WAY, which is the part that
+        # matters and the part a blend cannot fake.
+        #
+        # A blend cannot move an EDGE. So: every texel left of x19 is white,
+        # every texel right of it is dark. One hard vertical boundary, whose
+        # screen position converts through FIT_HUV -- validated to 1.2 UV
+        # units -- straight back into a texel index:
+        #
+        #     x19 = u(boundary) << gate_shift()
+        #
+        # and the answer is exact however the blend darkens either side.
+        #
+        # At k = 4 the texel grid is 1024 wide, so a stride of 576 or 724
+        # lands inside it and the edge is visible. At k = 2 (512 texels) and
+        # k = 1 (256) an unscaled stride runs off the end and the whole field
+        # comes back white -- which is itself the answer to "does it follow
+        # k", with no measurement needed at all.
+        BAR_SHIFT = bar_shift()
+        w.append(A.movz(15, 0xFFFF))
+        w.append(A.movk_hi(15, 0xFFFF))        # white, opaque
+        w.append(A.movz(17, 0x0040))
+        w.append(A.movk_hi(17, 0xFF00))        # dark blue, opaque
+        # BUILD 352. The comparison is against the counter SHIFTED LEFT by
+        # BAR_SHIFT, so the edge lands at texel  x19 >> BAR_SHIFT  and a
+        # stride larger than the texel grid can still be resolved.
+        #
+        # Build 351 compared the raw counter and came back solid white at
+        # k=4 AND k=2. The counter reaches 1019 at k=4, so that is not a
+        # failed measurement -- it is x19 > 1019, which contradicts the 576
+        # `projpitch` reported and means that reading lost its high byte in
+        # the blend. At shift 2 this resolves any stride up to 4096.
+        w.append(cmp_reg_lsl(19, 12, BAR_SHIFT))   # x19  vs  i << shift
+        w.append(A.csel(15, 15, 17, COND_GT))      # x19 > i<<shift -> white
+        w.append(stur32(15, 13, -3))
+    elif how == 'projpitch':
+        # BUILD 347. The last unverified assumption in the whole chain.
+        #
+        # Everything I have computed about "surface columns" rests on the
+        # surface being 2560 wide at k = 4, because that is what the
+        # descriptor at +0x10D5970 was patched to. But the body does not use
+        # that number -- it uses the loop's own pitch register x19, and the
+        # two have never been checked against each other. If they disagree,
+        # every column figure in findings 343 and 345 is wrong by that ratio,
+        # and the "150-column strip" is an artefact of my arithmetic rather
+        # than a property of the capture.
+        #
+        #     B = (pitch / 4)       & 0xFF     the surface width, low byte
+        #     G = (pitch / 4) >> 8  & 0xFF     ... and its high byte
+        #     R = 0x40                          the probe marker
+        #
+        # Flat colour over the whole field: width = G*256 + B. 2560 reads as
+        # G = 10, B = 0. Anything else and the surface is not the shape this
+        # thread has assumed for twenty builds.
+        w.append(lsr64(15, 19, 2))
+        w.append(sturb(15, 13, -3))
+        w.append(lsr64(15, 19, 10))
+        w.append(sturb(15, 13, -2))
+        w.append(A.movz(15, 0x40))
+        w.append(sturb(15, 13, -1))
+        w.append(A.movz(15, 0xFF))
+        w.append(sturb(15, 13, 0))
+    elif how == 'projmap':
+        # BUILD 342. THE instrument. Every previous attempt to locate the
+        # frame inside the staging surface measured the wrong thing.
+        #
+        # Builds 327 and 329 both read a parallelogram patch off the screen
+        # and called it "where the surface holds content". But the patch
+        # appeared at the SAME screen position under two builds whose
+        # texel->surface maps differ by a factor of 8.6 -- and a content
+        # region cannot be map-independent. What is map-independent is the
+        # DISC'S OWN DRAW EXTENT. Both measurements were of the disc, not of
+        # the capture, and every capture box in this thread was derived from
+        # them.
+        #
+        # This reports both halves at once, per texel, so the two can never
+        # be confused again:
+        #
+        #     B = col >> 4        the surface COLUMN this texel read
+        #     G = row >> 4        the surface ROW it read
+        #     R = 0xFF if that surface pixel HELD CONTENT, else 0x40
+        #     A = 0xFF
+        #
+        # One screenshot then gives, for every screen pixel, the surface
+        # coordinate AND whether there was a picture there. Scatter the
+        # content flag against (col, row) and the frame's real footprint in
+        # the staging surface falls out directly -- no model, no fit, and
+        # nothing that depends on the coefficients being right.
+        w.append(lsr64(15, 7, 4))
+        w.append(sturb(15, 13, -3))            # B = surface column / 16
+        w.append(lsr64(15, 16, 4))
+        w.append(sturb(15, 13, -2))            # G = surface row / 16
+        w.append(ldurb(17, 14, -1))            # and what was AT that pixel
+        w.append(ldurb(15, 14, -2))
+        w.append(A.orr_lsl(17, 17, 15, 8))
+        w.append(ldurb(15, 14, -3))
+        w.append(A.orr_lsl(17, 17, 15, 16))
+        w.append(A.cmp_imm(17, 8))             # content, or the void?
+        w.append(A.movz(15, 0xFF))
+        w.append(A.movz(17, 0x40))
+        w.append(A.csel(15, 15, 17, COND_GE))
+        w.append(sturb(15, 13, -1))            # R = the content flag
+        w.append(A.movz(15, 0xFF))
+        w.append(sturb(15, 13, 0))
+    elif how == 'projcopy':
         w.append(ldurb(15, 14, -1))
         w.append(sturb(15, 13, -3))
         w.append(ldurb(15, 14, -2))
@@ -671,6 +1105,23 @@ def proj_body(addr, how='proj'):
         w.append(sturb(15, 13, -1))
         w.append(ldurb(15, 14, 0))
         w.append(sturb(15, 13, 0))
+    else:
+        # 'proj' -- the SHIPPING write, word for word the one `punch` uses
+        # (build 307), so the only difference between this build and the one
+        # on the TV is which source pixel each texel reads. A texel whose
+        # source carries no picture is not drawn; everything else is copied
+        # byte for byte, source alpha included. Branch-free, because `_walk`
+        # reads an unconditional `b` inside a cave as a run-to-run link.
+        w.append(ldurb(15, 14, -1))                # src[2] -> dest byte 0
+        w.append(ldurb(17, 14, -2))                # src[1] -> dest byte 1
+        w.append(A.orr_lsl(15, 15, 17, 8))
+        w.append(ldurb(17, 14, -3))                # src[0] -> dest byte 2
+        w.append(A.orr_lsl(15, 15, 17, 16))
+        w.append(A.cmp_imm(15, 8))                 # content, or the void?
+        w.append(ldurb(17, 14, 0))                 # the source's own alpha
+        w.append(A.orr_lsl(17, 15, 17, 24))
+        w.append(A.csel(15, 17, A.WZR, COND_GE))   # ... or nothing at all
+        w.append(stur32(15, 13, -3))
     w.append(add_sxtw(1, 1, 4))                    # numc += A00
     w.append(add_sxtw(2, 2, 5))                    # numr += A10
     w.append(add_sxtw(3, 3, 6))                    # den  += A20
@@ -707,6 +1158,16 @@ def proj_body(addr, how='proj'):
 
 
 PROJ_WORDS = len(proj_body(lambda i: i * 4))
+PROJ_MODES = ('proj', 'projcopy', 'projtexel', 'projsrc', 'projmap',
+              'projpitch', 'projbar')
+
+
+def proj_words(how='proj'):
+    """The projective bodies do not all have the same length: the shipping
+    write is ten words where the read-outs are eight, and `projsrc` keeps one
+    more register. Every length is derived from the body itself, so a word
+    added to one mode cannot desynchronise the walk of another."""
+    return len(proj_body(lambda i: i * 4, how))
 
 
 def frame_body(addr, how='frame'):
@@ -723,6 +1184,7 @@ def frame_body(addr, how='frame'):
     """
     p = map_params()
     k = gate_shift()
+    kh = gate_shift_h()
     S = FRAME_STOCK_ENTRY
     w = [None] * FRAME_WORDS
     # ---- FIVE conditions, not one ---------------------------------------
@@ -741,7 +1203,9 @@ def frame_body(addr, how='frame'):
     w[4] = A.cmp_imm(16, KUJATA_TEX)           # tex_format.width == 256
     w[5] = A.bcond(addr(5), addr(S), COND_NE)
     w[6] = A.ldr(22, 20, FB_H_OFF)             # fb_tex.h
-    w[7] = cmp_reg_lsl(22, 16, k)              # ... == tex_w << k too (square)
+    w[7] = cmp_reg_lsl(22, 16, kh)             # ... == tex_w << kh (BUILD 337:
+                                               # its own shift, so a WIDE
+                                               # capture is not rejected)
     w[8] = A.bcond(addr(8), addr(S), COND_NE)
     # BUILD 325. These two used to be `fb_tex.x == 0` and `fb_tex.y == 0`.
     # ff7nx_fbcapture MOVES Kujata's origin for widescreen -- map_x(0) = 80
@@ -824,8 +1288,6 @@ HOLE_WORDS = 27
 HOLE_LOOP_TOP = 6
 HOLE_KEEP = 18
 HOLE_STOCK = 25
-COND_GE = 10
-
 
 def hole_body(addr):
     """'fillhole' -- never let the void reach the texture.
@@ -869,7 +1331,9 @@ def hole_body(addr):
     w = [None] * HOLE_WORDS
     w[0] = A.ldr(15, 20, FB_W_OFF)
     w[1] = A.ldr(16, 20, TEX_W_OFF)
-    w[2] = cmp_reg_lsl(15, 16, surf_shift())
+    w[2] = gate_word()                         # BUILD 339: absolute when the
+    #                                          capture is scaled, or the
+    #                                          swirl shares our ratio
     w[3] = A.bcond(addr(3), addr(HOLE_STOCK), COND_NE)
     w[4] = A.movz(16, magic & 0xFFFF)
     w[5] = A.movk_hi(16, magic >> 16)
@@ -969,7 +1433,9 @@ def unpremul_body(addr):
     w = [None] * UNPREMUL_WORDS
     w[0] = A.ldr(15, 20, FB_W_OFF)
     w[1] = A.ldr(16, 20, TEX_W_OFF)
-    w[2] = cmp_reg_lsl(15, 16, surf_shift())
+    w[2] = gate_word()                         # BUILD 339: absolute when the
+    #                                          capture is scaled, or the
+    #                                          swirl shares our ratio
     w[3] = A.bcond(addr(3), addr(UNPREMUL_STOCK), COND_NE)
     # --- one destination pixel -------------------------------------------
     # The reciprocal is rebuilt per texel rather than hoisted, which buys w16
@@ -1004,6 +1470,129 @@ def unpremul_body(addr):
     w[35] = A.b(addr(35), AFTER_LOOP)
     w[36] = HOOK_STOCK
     w[37] = A.b(addr(37), STOCK_LOOP)
+    assert all(x is not None for x in w)
+    return w
+
+
+BAR_SHIFT_ENV = 'SEVENTH_NX_FB_BAR'
+DEFAULT_BAR_SHIFT = 2          # resolves a stride up to 256<<gate_shift<<2
+
+
+def bar_shift():
+    """How far the projbar counter is shifted before the comparison. The
+    edge lands at texel `x19 >> bar_shift`, so a larger shift trades
+    precision for reach. 0 is build 351's behaviour."""
+    v = os.environ.get(BAR_SHIFT_ENV)
+    if v is None:
+        return DEFAULT_BAR_SHIFT
+    try:
+        n = int(v, 0)
+    except ValueError:
+        return DEFAULT_BAR_SHIFT
+    return n if 0 <= n <= 4 else DEFAULT_BAR_SHIFT
+
+
+CHECK_ENV = 'SEVENTH_NX_FB_CHECK'
+DEFAULT_CHECK_BIT = 5           # 2**5 = 32 texels a square
+
+
+def check_bit():
+    """Which bit of (column ^ row) turns a texel off, i.e. log2 of the
+    checker square in texels. 4 is fine detail, 6 is coarse."""
+    v = os.environ.get(CHECK_ENV)
+    if v is None:
+        return DEFAULT_CHECK_BIT
+    try:
+        n = int(v, 0)
+    except ValueError:
+        return DEFAULT_CHECK_BIT
+    return n if 2 <= n <= 8 else DEFAULT_CHECK_BIT
+
+
+CHECK_WORDS = 30
+CHECK_LOOP_TOP = 6
+CHECK_STOCK = 28
+
+
+def check_body(addr):
+    """'check' -- the shipping `punch`, with half the texels deliberately
+    NOT DRAWN, in a checkerboard.
+
+    BUILD 333. The instrument, not a fix. Every complaint about this field
+    since build 322 has been a global one -- "stretched", "slightly
+    magnified", "less texture pixels in a single square" -- and a global
+    scale error is the hardest kind of error for an eye to judge, because
+    there is nothing beside it to judge it against. Comparing two whole
+    screenshots taken seconds apart does not work either: the battle camera
+    sways between them, which is a real 10-20 px change, and it swamps the
+    thing being measured.
+
+    So put the reference INSIDE the picture. A punched texel is not drawn and
+    the real floor shows through it -- that is build 307's whole finding --
+    so punching a checkerboard lays the captured field and the floor it is
+    covering side by side, in the same frame, everywhere at once, with a
+    shared edge every 32 texels.
+
+    Then the judgement is local and binary instead of global and vague:
+
+        the grass runs straight through every square edge   -> the scale is
+                                                               right there
+        the texture JUMPS at the edge                       -> it is wrong,
+                                                               and the jump
+                                                               IS the error,
+                                                               in pixels
+
+    and because the error accumulates with distance, the pattern of the jumps
+    says which way to turn the dial: jumps that grow toward the rim are a
+    scale error, jumps that are the same size everywhere are an offset.
+
+    Four words on top of `punch`, after its own csel and before its store, so
+    the content path is byte-for-byte the shipping one:
+
+        eor  w17, w12, w8     column ^ row
+        ubfx w17, w17, #b, #1 the checker bit
+        cmp  w17, #0
+        csel w15, wzr, w15    set -> punch the texel, whatever it held
+
+    `SEVENTH_NX_FB_CHECK` sets b (2..8). Branch-free, for the `_walk` rule.
+    """
+    magic, shift = _reciprocal()
+    b = check_bit()
+    w = [None] * CHECK_WORDS
+    w[0] = A.ldr(15, 20, FB_W_OFF)
+    w[1] = A.ldr(16, 20, TEX_W_OFF)
+    w[2] = gate_word()                         # BUILD 339: absolute when the
+    #                                          capture is scaled, or the
+    #                                          swirl shares our ratio
+    w[3] = A.bcond(addr(3), addr(CHECK_STOCK), COND_NE)
+    w[4] = A.movz(16, magic & 0xFFFF)
+    w[5] = A.movk_hi(16, magic >> 16)
+    # --- identical to punch_body, word for word ---------------------------
+    w[6] = umull(14, 12, 16)
+    w[7] = lsr64(14, 14, shift)
+    w[8] = A.add_reg64_lsl(14, 11, 14, 2)
+    w[9] = ldurb(15, 14, -1)
+    w[10] = ldurb(17, 14, -2)
+    w[11] = A.orr_lsl(15, 15, 17, 8)
+    w[12] = ldurb(17, 14, -3)
+    w[13] = A.orr_lsl(15, 15, 17, 16)
+    w[14] = A.cmp_imm(15, 8)
+    w[15] = ldurb(17, 14, 0)
+    w[16] = A.orr_lsl(17, 15, 17, 24)
+    w[17] = A.csel(15, 17, A.WZR, COND_GE)
+    # --- and the checker, which is the only difference --------------------
+    w[18] = A.eor_reg(17, 12, 8)               # column ^ row
+    w[19] = ubfx32(17, 17, b, 1)               # the square we are in
+    w[20] = A.cmp_imm(17, 0)
+    w[21] = A.csel(15, A.WZR, 15, COND_NE)     # odd square -> not drawn
+    w[22] = stur32(15, 13, -3)
+    w[23] = A.add_imm64(12, 12, 1)
+    w[24] = A.add_imm64(13, 13, 4)
+    w[25] = A.cmp_reg64(12, 10)
+    w[26] = A.bcond(addr(26), addr(CHECK_LOOP_TOP), COND_LT)
+    w[27] = A.b(addr(27), AFTER_LOOP)
+    w[28] = HOOK_STOCK
+    w[29] = A.b(addr(29), STOCK_LOOP)
     assert all(x is not None for x in w)
     return w
 
@@ -1064,7 +1653,9 @@ def punch_body(addr):
     w[1] = A.ldr(16, 20, TEX_W_OFF)
     # BUILD 309: `<< surf_shift()` follows ff7nx_fbsurf. At the stock surface
     # the shift is 0 and this is the identical word to `cmp w15, w16`.
-    w[2] = cmp_reg_lsl(15, 16, surf_shift())
+    w[2] = gate_word()                         # BUILD 339: absolute when the
+    #                                          capture is scaled, or the
+    #                                          swirl shares our ratio
     w[3] = A.bcond(addr(3), addr(PUNCH_STOCK), COND_NE)
     w[4] = A.movz(16, magic & 0xFFFF)
     w[5] = A.movk_hi(16, magic >> 16)
@@ -1130,7 +1721,9 @@ def black_body(addr):
     w = [None] * BLACK_WORDS
     w[0] = A.ldr(15, 20, FB_W_OFF)
     w[1] = A.ldr(16, 20, TEX_W_OFF)
-    w[2] = cmp_reg_lsl(15, 16, surf_shift())
+    w[2] = gate_word()                         # BUILD 339: absolute when the
+    #                                          capture is scaled, or the
+    #                                          swirl shares our ratio
     w[3] = A.bcond(addr(3), addr(BLACK_STOCK), COND_NE)
     w[4] = A.movz(16, magic & 0xFFFF)
     w[5] = A.movk_hi(16, magic >> 16)
@@ -1176,11 +1769,13 @@ def body_words(addr, probe=None, how=None):
         return hole_body(addr)
     if how == 'punch':
         return punch_body(addr)
+    if how == 'check':
+        return check_body(addr)
     if how == 'unpremul':
         return unpremul_body(addr)
     if how == 'srcblack':
         return black_body(addr)
-    if how in ('proj', 'projtexel'):
+    if how in PROJ_MODES:
         return proj_body(addr, how)
     if how in ('frame', 'texel', 'alpha'):
         return frame_body(addr, how)
@@ -1199,7 +1794,7 @@ def body_words(addr, probe=None, how=None):
     # not-equal branch below can never be taken and the stock path is never
     # reached -- the word count, the walk and the revert stay identical.
     w[2] = (A.cmp_reg(15, 15) if how == 'report'
-            else cmp_reg_lsl(15, 16, surf_shift()))
+            else gate_word())
     w[3] = A.bcond(addr(3), addr(STOCK_ENTRY), COND_NE)
     if how == 'stretch':
         # BUILD 301 -- FILL THE SHEET, WHATEVER THE SOURCE HOLDS.
@@ -1461,8 +2056,9 @@ def walk_physical(img, n=None):
 
 
 MODES = ('copy', 'texel', 'alpha', 'frame', 'proj', 'projtexel',
+         'projsrc', 'projcopy',
          'report', 'stretch', 'opaque', 'srcblack', 'fillhole', 'punch',
-         'unpremul')
+         'unpremul', 'check', 'projmap', 'projpitch', 'projbar')
 
 
 def n_words(how):
@@ -1472,14 +2068,16 @@ def n_words(how):
         return UNPREMUL_WORDS
     if how == 'punch':
         return PUNCH_WORDS
+    if how == 'check':
+        return CHECK_WORDS
     if how == 'fillhole':
         return HOLE_WORDS
     if how == 'srcblack':
         return BLACK_WORDS
     if how in ('copy', 'report', 'stretch', 'opaque'):
         return N_WORDS
-    if how in ('proj', 'projtexel'):
-        return PROJ_WORDS
+    if how in PROJ_MODES:
+        return proj_words(how)
     return FRAME_WORDS
 
 
@@ -1612,16 +2210,25 @@ def plan(m, revert=False):
              'x + floor(i * 640 / 854) (magic 0x%08X >> %d)' % (magic, shift),
              '    page-scaled captures execute the stock loop unchanged',
              '    resample cave entry +0x%X' % slots[0]]
-    if mode() in ('proj', 'projtexel'):
+    if mode() in PROJ_MODES:
         c = proj_coef()
-        notes.insert(0, '    PROJECTIVE remap, solved from the build-279 texel '
-                        'probe (residual 2.06 staging px):')
+        notes.insert(0, '    PROJECTIVE remap, derived from the build-325 '
+                        'texel probe (349284 px, median 0.90 UV units) at '
+                        'surface %dx%d, disc %.2f%%:'
+                     % (surface() + (_disc_pct(),)))
         notes.insert(1, '      col = (%d*i %+d*j %+d) / (%d*i %+d*j %+d)'
                      % (c[0], c[1], c[2], c[6], c[7], c[8]))
         notes.insert(2, '      row = (%d*i %+d*j %+d) / (same denominator)'
                      % (c[3], c[4], c[5]))
         if mode() == 'projtexel':
             notes.insert(3, '      (texel read-out, not the picture)')
+        elif mode() == 'projsrc':
+            notes.insert(3, '      PROBE(projsrc): every texel reports the '
+                            'source it sampled -- B = col>>4, G = row>>4, '
+                            'R = 0x40 -- not the picture')
+        elif mode() == 'projcopy':
+            notes.insert(3, '      (plain copy write, not the shipping '
+                            'punch write)')
     elif mode() == 'texel':
         notes.insert(0, '    PROBE(texel): the texture is filled with its own '
                         'texel coordinates (B = u, G = v, R = 0x40), not the '

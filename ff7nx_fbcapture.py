@@ -238,16 +238,25 @@ FBCAP_ENV = 'SEVENTH_NX_FB_CAPTURE'
 # The staging surface the capture reads, asserted against the module.
 STAGING_W = 640
 STAGING_H = 480
+KUJATA_TEX_W = 256                # the authored width of Kujata's capture
 STAGING_SITE = 0x10D5970          # mov x8, #0x280 ; movk x8, #0x1e0, lsl #32
 
 # The hook: the thunk's tail branch into make_framebuffer_tex.
 HOOK = 0x10F23B4
 RETURN_VA = 0x10DBB50
 HOOK_STOCK = 0x17FFA5E7           # b #0x10dbb50
-N_BODY = 13                       # logical words before the tail branch
+def n_body() -> int:
+    """Logical words before the tail branch. BUILD 338: two more when the
+    capture is scaled, because the origin correction then needs a second
+    condition -- see body_words()."""
+    return 13 if _capture_scale() == 1 else 15
+
+
+N_BODY = 13                       # the stock length, for the stock build
 N_WORDS = N_BODY + 1
 
 COND_EQ = 0
+COND_NE = 1
 COND_LT = 11
 COND_GT = 12
 
@@ -366,9 +375,56 @@ def body_words() -> list:
         A.csel(8, 9, 8, COND_GT),           # csel  w8, w9, w8, gt  min
         A.cmp_reg(8, A.WZR),                # cmp   w8, wzr
         A.csel(8, A.WZR, 8, COND_LT),       # csel  w8, wzr, w8, lt max 0
-        A.cmp_reg(5, 1),                    # cmp   w5, w1     xscale == 1 ?
-        A.csel(3, 8, 3, COND_EQ),           # csel  w3, w8, w3, eq
-    ]
+    ] + _origin_gate()
+
+
+def _capture_scale() -> int:
+    try:
+        import ff7nx_fxcapscale
+        return ff7nx_fxcapscale.scale()
+    except Exception:                                          # noqa: BLE001
+        return 1
+
+
+def _origin_gate() -> list:
+    """Decide whether the centring correction is APPLIED.
+
+    BUILD 338, and it is the whole of "the field is FAR off to the left".
+
+    Stock, the correction lands only on a 1:1 capture:
+
+        cmp  w5, w1        w5 = width * xscale, w1 = width
+        csel w3, w8, w3, eq
+
+    so the moment `ff7nx_fxcapscale` makes Kujata's xscale 2, w5 != w1, the
+    correction is SKIPPED and fb_tex.x falls from 80 to 0 -- 320 staging
+    columns at surface k = 4, which is 107 UV units, about 1050 screen
+    pixels of leftward shift. Executed:
+
+        Kujata 1:1        (w 256, tex 256)  ->  x = 80
+        Kujata capscale 2 (w 512, tex 256)  ->  x = 0     <- the bug
+        the swirl         (w 320, tex 160)  ->  x = 0
+
+    The condition was written that way for a reason that no longer exists:
+    the frame gate used to require `fb_tex.x == 0`, and build 325 retired
+    that condition because `map_x(0)` is 80 and the gate could never match
+    the real capture. So a scaled Kujata capture may now keep its origin.
+
+    The correction is therefore applied when the capture is 1:1 **or** it is
+    the authored 256-wide one, which is Kujata's and which no 1:1 caller
+    loses by. `ccmp` takes a 5-bit immediate, so 256 goes through w9 -- dead
+    since the clamp above.
+
+    At scale 1 this returns the stock two words UNCHANGED, so the shipping
+    build is byte-for-byte what it was.
+    """
+    if _capture_scale() == 1:
+        return [A.cmp_reg(5, 1),                 # w5 == w1 -- a 1:1 capture
+                A.csel(3, 8, 3, COND_EQ)]
+    return [A.cmp_reg(5, 1),                     # 1:1 ...
+            A.movz(9, KUJATA_TEX_W),
+            A.ccmp_reg32(1, 9, 4, COND_NE),      # ... or the authored 256
+            A.csel(3, 8, 3, COND_EQ)]
 
 
 # --------------------------------------------------------------------------
@@ -569,12 +625,12 @@ def installed(img) -> bool:
     if cave_state(img) != 'patched':
         return False
     wk = walk(img)
-    if len(wk) != N_WORDS:
+    if len(wk) != n_body() + 1:
         return False
     body = body_words()
-    if [w for _, w in wk[:N_BODY]] != body:
+    if [w for _, w in wk[:n_body()]] != body:
         return False
-    tail_va, tail = wk[N_BODY]
+    tail_va, tail = wk[n_body()]
     return tail == A.b(tail_va, RETURN_VA)
 
 
@@ -624,12 +680,12 @@ def build_patches(img, starts=None, log=lambda *_: None):
     pool = ff7nx_cave.HolePool(bytearray(img), starts=starts)
 
     def builder(_entry, addr):
-        return body_words() + [A.b(addr(N_BODY), RETURN_VA)]
+        return body_words() + [A.b(addr(n_body()), RETURN_VA)]
 
     entry, words = ff7nx_cave.emit_laid_out(pool, builder)
     words[HOOK] = A.b(HOOK, entry)
     log('  fb capture cave: %d words in verified padding, entry +0x%X'
-        % (N_WORDS, entry))
+        % (n_body() + 1, entry))
     return words
 
 
@@ -876,9 +932,9 @@ def selftest(log=print) -> bool:
         'staging surface and keeps its authored width'
         % (STAGING_W, STAGING_H))
 
-    if len(body) != N_BODY:
+    if len(body) != n_body():
         ok = False
-        log('  FAIL the body is %d words, not %d' % (len(body), N_BODY))
+        log('  FAIL the body is %d words, not %d' % (len(body), n_body()))
     log('  selftest: %s' % ('PASS' if ok else 'FAIL'))
     return ok
 

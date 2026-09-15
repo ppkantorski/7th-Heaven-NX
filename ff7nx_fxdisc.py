@@ -1,44 +1,23 @@
 #!/usr/bin/env python3
 r"""
-ff7nx_fxdisc.py -- scale Kujata's floor disc by a FINE percentage, about its
-own centre.
+ff7nx_fxdisc.py -- optional diagnostic scale for Kujata's floor disc.
 
-WHY THE CAPTURE SIDE WAS THE WRONG SIDE -- FFNx SAYS SO
-=======================================================
-`repos/FFNx-master/src/ff7/battle/animations.cpp:1071`, the reference engine's
-fix for a battle effect whose framebuffer-snapshot art does not match a
-widescreen frame:
+WHY THIS IS NOT PART OF THE DEFAULT FIX
+=======================================
+Kujata's stock mesh is a world-space disc. Its snapshot is deliberately
+projected onto that disc and then viewed through the summon camera, so the
+picture is not expected to remain at the same screen coordinate as the live
+battlefield. Upstream FFNx has no Kujata-specific geometry correction either.
 
-```c
-// Temporary fix for Pollensalta cold breath bg widescreen fix
-// (The correct solution should be to edit the file
-//  `magic/ff7/data/battle/special/hubuki/kemu.s` to edit the texture page)
-if (widescreen_enabled && texture_ctx == pollensalta_cold_breath_bg_texture_ctx)
-{
-    float widescreen_multiplier =
-        ((float)wide_viewport_width / (float)wide_viewport_height) / (4 / 3.f);
-    quad_width  *= widescreen_multiplier;
-    quad_height *= widescreen_multiplier;
-}
-```
+The earlier 94% default came from treating a repeated grass motif as the same
+captured texel and from an ungated 244/256 probe reading. The executable trace
+now disproves that premise: Kujata captures game x = 0..256, while the marked
+motif in the supplied 1280-wide screenshot is near x = 727 (about game x =
+378), outside the snapshot. It can only be another instance of the tiled field
+texture. The 244-wide reading therefore cannot justify changing the mesh.
 
-Three things in eight lines, and all three are the opposite of what this
-project has been doing:
-
-1. **The capture is not touched.** Vanilla never resamples a framebuffer
-   snapshot. The correction is applied to the GEOMETRY the snapshot is drawn
-   on.
-2. **The multiplier is uniform in both axes**, not horizontal-only. And it is
-   exactly `(854/480) / (4/3)` = `854/640` = 1.3344 -- the same ratio this
-   project has been applying to the source columns.
-3. FFNx's own comment says the *correct* fix is to edit the effect's authored
-   geometry. Scaling the drawn quad is the shortcut.
-
-Scaling geometry also scales about the geometry's OWN centre, so it cannot
-slide the image sideways. Correcting on the capture side cannot do that: the
-resample is anchored on the rect's origin, so changing the span pivots about
-the left edge and the picture slides across the screen -- which is exactly what
-`SEVENTH_NX_FB_SPAN=110` did.
+The correct default is the original geometry, 100%. This module remains useful
+as an opt-in diagnostic, but an unset environment variable must write no patch.
 
 THE TWO WORDS THIS TOUCHES
 ==========================
@@ -97,48 +76,13 @@ OUTER_STOCK = 0x5285F417
 
 R_REG, J3_REG = 26, 8              # w26 = R (dead in), w8 = 3j
 STOCK_K = 128                      # the shift the stock `lsl #7` applies to 3j
-# BUILD 299. NOT a tuning knob any more -- a measured ratio.
-#
-# The report probe (builds 296/297) came back a flat grey 122 over the whole
-# field, twice, reading two different header fields. The capture sheet is
-# **244** texels wide. The mesh's UV bytes are authored 0..255:
-#
-#     u = 0x80 + (r * rsin >> 12),  r <= 127   ->   u reaches 255
-#
-# So the disc is sized for a 256-texel sheet and is being handed a 244-texel
-# one. It is too big by 256/244, and the correction is 244/256 = 0.953.
-#
-# Patrick compared 94 and 95 on hardware and called 94 the closer of the two.
-# This module truncates, so the reachable ratios near there are
-#
-#     94  ->  k 120, radius 360*j, ratio 0.9375  (= 240/256)   <- chosen
-#     95  ->  k 121, radius 363*j, ratio 0.9453
-#     96  ->  k 122, radius 366*j, ratio 0.9531  (= 244/256)
-#
-# 0.9375 and 0.9531 are 1.6% apart, which is inside what an eye can call on a
-# blurry rim, so the hardware verdict decides between them.
-#
-# This is a default so that a plain build is right without anyone having to
-# know the number. It is still a SYMPTOM: the real defect is that the sheet is
-# 244 while the UVs address 256, and the same mismatch is what makes the rim
-# sample past the sheet's high-u edge -- the black silhouette on the curved
-# side and nowhere else. Making those two agree removes both, and this default
-# goes back to 100 when it does.
-# BUILD 302: BACK TO 94, because build 301's fill never engaged.
-#
-# 301 raised the copy loop's bound to fb_tex.w so the sheet would be written in
-# full, guarded by "the source must hold at least 3/4 of the sheet" -- the
-# resample's furthest read is 0.749*(dest_w-1). On hardware the field came back
-# unchanged except for this default, which means the guard REFUSED the raise:
-# the source holds less than three quarters of the sheet.
-#
-# That is the guard working, not failing. It also says the surface does not
-# physically contain the region the effect asks for, so no arrangement of the
-# copy can fill the sheet with the right content -- the surface has to grow.
-#
-# Until it does, 94 is the setting that looks closest, and leaving the default
-# at 100 would only make the build worse than the one before it.
-DEFAULT_PERCENT = 94.0
+
+# BUILD 362. Stock is the only evidence-backed default. The old 94% value was
+# an eyeballed compensation built on a false texel correspondence: the marked
+# source motif lies outside Kujata's actual 0..256 game-unit capture window.
+# Keep the fine dial for controlled experiments, but do not alter the authored
+# radius unless the operator explicitly requests it.
+DEFAULT_PERCENT = 100.0
 
 # BUILD 321 -- A FRACTIONAL DIAL.
 #

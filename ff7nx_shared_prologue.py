@@ -294,7 +294,7 @@ def build_shared_prologue(shared_va):
 
 
 def build_dispatch_stub(cave, site, mask_bits, entry_va, shared_va,
-                        skip_va=None):
+                        skip_va=None, addr=None):
     """
     Per-site. `site` is the disp_hook sub-dict (ctx_reg, idx_off), same shape
     build_cave already takes. Returns (words, cbz_index); the caller patches
@@ -321,7 +321,8 @@ def build_dispatch_stub(cave, site, mask_bits, entry_va, shared_va,
     w = []
 
     def pc(i=None):
-        return cave + 4 * (len(w) if i is None else i)
+        j = len(w) if i is None else i
+        return addr(j) if addr is not None else cave + 4 * j
 
     w.append(A.ldr(16, ctx, io))
     w.append(A.and_mask(16, 16, mask_bits))
@@ -343,7 +344,7 @@ def build_dispatch_stub(cave, site, mask_bits, entry_va, shared_va,
     return w, cbz_i
 
 
-def build_cave_shared(cave, site, mask_bits, entry_va, shared_va,
+def build_cave_shared(cave, addr, site, mask_bits, entry_va, shared_va,
                       data_base, stride, fields, cases, sym, k):
     """
     Emits the SAME cave BEHAVIOR as ff7nx_dispatch.build_cave -- the real,
@@ -371,15 +372,19 @@ def build_cave_shared(cave, site, mask_bits, entry_va, shared_va,
     F = site['fn_reg']
     w = []
 
+    def pc(i=None):
+        j = len(w) if i is None else i
+        return addr(j) if addr is not None else cave + 4 * j
+
     stub_len = stub_word_count()
-    skip_va = cave + 4 * stub_len
+    # The word the PROCEED path falls through to. Under a scattered layout
+    # that is NOT cave + 4*stub_len -- the stub's last word and the first
+    # dispatch word can be in different holes.
+    skip_va = pc(stub_len)
     stub, cbz_i = build_dispatch_stub(cave, site, mask_bits, entry_va,
-                                      shared_va, skip_va=skip_va)
+                                      shared_va, skip_va=skip_va, addr=addr)
     w += stub
     assert len(w) == stub_len
-
-    def pc(i=None):
-        return cave + 4 * (len(w) if i is None else i)
 
     # ---- dispatch --------------------------------------------------------
     groups, shared = D._plan_dispatch(fields, cases, sym)
@@ -411,7 +416,7 @@ def build_cave_shared(cave, site, mask_bits, entry_va, shared_va,
                 w.append(0)                         # b.ne next -- patched
         body = len(w)
         for i in eq_jumps:
-            w[i] = A.bcond(cave + 4 * i, cave + 4 * body, A.EQ)
+            w[i] = A.bcond(pc(i), pc(body), A.EQ)
 
         if guard == 'n_frames>1':
             off, _width, _s = fields['n_frames']
@@ -438,16 +443,16 @@ def build_cave_shared(cave, site, mask_bits, entry_va, shared_va,
         w += D._ops(fields, [shared], k)
 
     out = pc()
-    w[cbz_i] = A.cbz(16, cave + 4 * cbz_i, out)
+    w[cbz_i] = A.cbz(16, pc(cbz_i), out)
     for i in out_jumps:
-        w[i] = A.b(cave + 4 * i, out)
+        w[i] = A.b(pc(i), out)
     for i in guard_jumps:
-        w[i] = A.bcond(cave + 4 * i, out, A.LE)
+        w[i] = A.bcond(pc(i), out, A.LE)
     for i in shared_jumps:
-        w[i] = A.b(cave + 4 * i, cave + 4 * shared_at)
+        w[i] = A.b(pc(i), pc(shared_at))
     for i, gi in next_patches:
-        nxt = cave + 4 * group_start[gi] if gi < len(ordered) else out
-        w[i] = A.bcond(cave + 4 * i, nxt, A.NE)
+        nxt = pc(group_start[gi]) if gi < len(ordered) else out
+        w[i] = A.bcond(pc(i), nxt, A.NE)
 
     w.append(site['displaced'])
     w.append(A.b(pc(), site['hook'] + 4))

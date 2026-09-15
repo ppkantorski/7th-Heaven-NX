@@ -2707,6 +2707,146 @@ NSO_GATED['aura-summon'] = [
 
 
 # --------------------------------------------------------------------------
+# `phoenix-camera` -- FFNx's "phoenix camera animation glitch", ported
+#
+# This is NOT a frame-rate patch. FFNx applies it unconditionally, in
+# ff7_opengl.cpp, under a header that reads `animation glitch fixes`, above the
+# chocobo/midi/snowboard crash fixes:
+#
+#     // phoenix camera animation glitch
+#     memset_code(ff7_externals.run_phoenix_main_loop_516297 + 0x3A5, 0x90, 49);
+#     memset_code(ff7_externals.run_phoenix_main_loop_516297 + 0x3F7, 0x90, 49);
+#
+# It is a stock-game bug, present at 30 FPS, and the 60 FPS work makes it worse
+# rather than causing it -- see "why it got louder" below. It was never in this
+# tree: `run_phoenix_main_loop_516297` appears nowhere in ff7nx_resolve.py,
+# because the resolver only scrapes `patch_*_code` specs and `memset_code` is
+# not one of them.
+#
+# WHAT THE 49 BYTES ARE
+# ---------------------
+# The chain FFNx uses to find the function reproduces exactly against
+# ff7_1.02/ff7_en:
+#
+#     run_summon_animations_5C0E4B +0x2AB   call -> 0x515101
+#     run_summon_phoenix_main_515101 +0x1A  call -> 0x515127
+#     run_summon_phoenix_sub_515127 +0xB2   dword -> 0x516297
+#
+# 0x516297 is a per-frame state machine on a frame counter in [ebp-4]. One of
+# its cases -- frames 0x14..0x22 of the phase, fifteen logic ticks -- ends like
+# this:
+#
+#     +0x398  push 0x89A948            a static vector3 offset
+#     +0x39D  call 0x662ECC            transform it by the current matrix
+#     +0x3A5  mov  ecx, [0xB5A6D4]     <-- 49 bytes, NOP'd by FFNx
+#     ...     g_battle_camera_focal_point = ecx->[8], ecx->[0xC], ecx->[0x10]
+#     +0x3EA  push 0x89A950            the other static offset
+#     +0x3EF  call 0x662ECC
+#     +0x3F7  mov  eax, [0xB5A6D4]     <-- 49 bytes, NOP'd by FFNx
+#     ...     g_battle_camera_position = eax->[8], eax->[0xC], eax->[0x10]
+#     +0x428  jmp  0x516AB9
+#
+# So for fifteen consecutive logic ticks the Phoenix main loop reaches past the
+# registered camera routine and jams its own value straight into
+# g_battle_camera_position (0xBF2158) and g_battle_camera_focal_point
+# (0xBFB1A0). FFNx keeps both `call 0x662ECC`s -- they have other side effects
+# -- and deletes only the two write-backs, leaving the jmp intact.
+#
+# WHY IT GOT LOUDER AT 60 FPS
+# ---------------------------
+# Those two globals are precisely the pair `camera-hold` captures and replays.
+# Held for three frames, a one-tick bogus camera becomes a four-frame bogus
+# camera, which is why the operator sees "it flickers between a black screen
+# and the image multiple times, then the rest looks fine after": fifteen logic
+# ticks of a camera aimed at nothing, alternating with the real summon camera,
+# then the state machine moves on and the rest of the summon is clean.
+#
+# THE ARM64 TRANSLATION
+# ---------------------
+# x86 0x516297 maps to +0x4CD6D0..+0x4CF350. The recompiler materialises both
+# globals as literals in the prologue -- `mov w20,#0x2158; movk w20,#0xBF` and
+# `mov w23,#0xB718; movk w23,#0xBF` -- and reaches the three components as
+# w20+0/2/4 and w23-0x578/-0x576/-0x574. That is what identifies the two blocks
+# beyond doubt, and it is the same pair of addresses ff7nx_dispatch.py's camera
+# hold uses, derived independently there from set_battle_camera_sub_5C22BD.
+#
+# The focal-point block is 33 words at +0xE9C and +0xEA4..+0xF20; the
+# camera-position block is 31 words at +0xFA4 and +0xFAC..+0x1020. Both were
+# checked for incoming branches -- the whole of .text was scanned for a B or BL
+# landing inside either range, and there are none -- so NOPping them is a
+# straight deletion with no reachable entry left dangling.
+#
+# The one place the port is not a literal NOP: the recompiler tail-merged the
+# THIRD camera-position store with an identical store from another x86 block,
+# so `strh w21,[x0]; b <tail>` is shared code at +0xAE4 that the camera block
+# reaches by `b #0x4CE1B4`. NOPping up to that branch and leaving it would run
+# the shared store with an uncontrolled w0 -- a wild 2-byte write. Instead the
+# branch is retargeted to +0x4CEFE0, which is the translation of x86 0x516AB9
+# (verified instruction for instruction: `mov edx,[ebp-8]; mov ax,[edx+2];
+# add ax,1; mov [ecx+2],ax`). That is the same destination the shared tail
+# branches to, and it is exactly what FFNx's surviving `jmp 0x516AB9` does.
+#
+# Dead register defs inside both blocks (w24, w21, and w19 -- the block
+# clobbers the 0xB5A6D4 literal on its way out) are not read before being
+# redefined on either exit path, which is checked in tests/test_phoenixcam.py.
+PHOENIX_FOCAL_WORDS = (
+    (0x004CE56C, 0x2A1303E0), (0x004CE574, 0x9430B78B),
+    (0x004CE578, 0xB9400008), (0x004CE57C, 0x11002100),
+    (0x004CE580, 0xB90006C8), (0x004CE584, 0x9430B787),
+    (0x004CE588, 0x79400018), (0x004CE58C, 0x5115E2E0),
+    (0x004CE590, 0x790012D8), (0x004CE594, 0x9430B783),
+    (0x004CE598, 0x79000018), (0x004CE59C, 0x2A1303E0),
+    (0x004CE5A0, 0x9430B780), (0x004CE5A4, 0xB9400008),
+    (0x004CE5A8, 0x11003100), (0x004CE5AC, 0xB90002C8),
+    (0x004CE5B0, 0x9430B77C), (0x004CE5B4, 0x79400018),
+    (0x004CE5B8, 0x5115DAE0), (0x004CE5BC, 0x79000AD8),
+    (0x004CE5C0, 0x9430B778), (0x004CE5C4, 0x79000018),
+    (0x004CE5C8, 0x2A1303E0), (0x004CE5CC, 0x9430B775),
+    (0x004CE5D0, 0xB9400008), (0x004CE5D4, 0x11004100),
+    (0x004CE5D8, 0xB9000AC8), (0x004CE5DC, 0x9430B771),
+    (0x004CE5E0, 0x79400018), (0x004CE5E4, 0x5115D2E0),
+    (0x004CE5E8, 0x790002D8), (0x004CE5EC, 0x9430B76D),
+    (0x004CE5F0, 0x79000018),
+)
+
+PHOENIX_CAMPOS_WORDS = (
+    (0x004CE674, 0x2A1303E0), (0x004CE67C, 0x9430B749),
+    (0x004CE680, 0xB9400008), (0x004CE684, 0x11002100),
+    (0x004CE688, 0xB90002C8), (0x004CE68C, 0x9430B745),
+    (0x004CE690, 0x79400015), (0x004CE694, 0x2A1403E0),
+    (0x004CE698, 0x79000AD5), (0x004CE69C, 0x9430B741),
+    (0x004CE6A0, 0x79000015), (0x004CE6A4, 0x2A1303E0),
+    (0x004CE6A8, 0x9430B73E), (0x004CE6AC, 0xB9400008),
+    (0x004CE6B0, 0x11003100), (0x004CE6B4, 0xB9000AC8),
+    (0x004CE6B8, 0x9430B73A), (0x004CE6BC, 0x79400015),
+    (0x004CE6C0, 0x11000A80), (0x004CE6C4, 0x790002D5),
+    (0x004CE6C8, 0x9430B736), (0x004CE6CC, 0x79000015),
+    (0x004CE6D0, 0x2A1303E0), (0x004CE6D4, 0x9430B733),
+    (0x004CE6D8, 0xB9400008), (0x004CE6DC, 0x11004100),
+    (0x004CE6E0, 0xB90006C8), (0x004CE6E4, 0x9430B72F),
+    (0x004CE6E8, 0x79400013), (0x004CE6EC, 0x790012D3),
+    (0x004CE6F0, 0x11001280),
+)
+
+# +0x1024  b #0x4CE1B4 (the shared third-store tail)  ->  b #0x4CEFE0 (the
+# translation of `jmp 0x516AB9`, which is where that tail was going anyway).
+PHOENIX_TAIL_BRANCH = (0x004CE6F4, 0x17FFFEB0, 0x1400023B)
+
+_PHX_NOP = 0xD503201F
+NSO_GATED['phoenix-camera'] = (
+    [('run_phoenix_main_loop_516297+0x3A5 stray focal-point write '
+      '(%d of %d)' % (i + 1, len(PHOENIX_FOCAL_WORDS)), va, stock, _PHX_NOP)
+     for i, (va, stock) in enumerate(PHOENIX_FOCAL_WORDS)]
+    + [('run_phoenix_main_loop_516297+0x3F7 stray camera-position write '
+        '(%d of %d)' % (i + 1, len(PHOENIX_CAMPOS_WORDS)), va, stock, _PHX_NOP)
+       for i, (va, stock) in enumerate(PHOENIX_CAMPOS_WORDS)]
+    + [('run_phoenix_main_loop_516297+0x428 jmp 0x516AB9 direct '
+        '(the third store lives in a tail shared with another block)',
+        ) + PHOENIX_TAIL_BRANCH]
+)
+
+
+# --------------------------------------------------------------------------
 # `damage-numbers` -- how long a damage number stays on screen, and its bounce
 #
 # FFNx does three things to display_battle_damage_5BB410:
@@ -3189,6 +3329,14 @@ def _place_padding_caves(padded, text, raw, segs, nso_path, log=print):
             % (hook, entry, len(placed), len(pool.used), span, c['label']))
         pool.used = []
 
+    # The number the next person needs. The tail gap is a hard 2,464 bytes and
+    # the build reports what is left of it; this is the OTHER budget, and it is
+    # the one new work should be spending. A cave built with the
+    # emit_laid_out contract costs the tail nothing.
+    left = sum(max(0, n - 1) for _, n in pool.free)
+    log('      padding pool: %d usable word(s) still free (%d bytes) -- new '
+        'caves belong here, not in the tail gap' % (left, 4 * left))
+
 
 
 SMOOTH_SCRIPTED_ENV = 'SEVENTH_NX_SMOOTH_SCRIPTED'
@@ -3425,6 +3573,8 @@ def dispatch_caves(scale_tags, throttle_tags, batt_mult, extra_exclude=(),
                         % (tag, n, va))
             else:
                 thr['table'] = throttle_table(tag, thr, extra_exclude, log)
+            _inject_model_interpolation(tag, thr, log)
+            _inject_camera_hold(tag, thr, log)
 
         flag = d['flag'] if want_scale else None
         out.append(dict(
@@ -3448,12 +3598,19 @@ def dispatch_caves(scale_tags, throttle_tags, batt_mult, extra_exclude=(),
                                  'is no first-frame scaler to build' % tag)
             out.append(dict(
                 tag=tag, kind='dispatcher', site=d['disp_hook'],
+                # BUILD 383: chained through inter-function padding, not the
+                # tail gap. `place` lives on the CAVE dict, never on
+                # `d['disp_hook']` -- that is the sites-file dict, shared
+                # between builds in a long-lived GUI process, and writing a
+                # placement decision into it would leak into the next build.
+                place='padding',
                 label='%s first-frame scaler (%d case(s), x%d)'
                       % (tag, len(cases), batt_mult),
-                build=lambda cave, d=d, cases=cases, sym=sym: _disp.build_cave(
-                    cave, d['disp_hook'], d['flag'], d['mask_bits'],
-                    d['data_base'], d['stride'], d['fields'], cases, sym,
-                    shift)))
+                build=lambda cave, addr=None, d=d, cases=cases, sym=sym:
+                    _disp.build_cave(
+                        cave, addr, d['disp_hook'], d['flag'], d['mask_bits'],
+                        d['data_base'], d['stride'], d['fields'], cases, sym,
+                        shift)))
 
         if want_thr:
             pre = dict(hook=thr['pre'], displaced=thr['pre_displaced'],
@@ -3735,6 +3892,318 @@ def field_blink_caves(enabled, log=print):
             label='eye blink %s -- %s' % (tag, s['what']),
             build=lambda cave, s=s, f=build[tag]: f(cave, s)))
     return out
+
+
+MODELINTERP_ENV = 'SEVENTH_NX_FX_MODELINTERP'
+CAMERAHOLD_ENV = 'SEVENTH_NX_FX_CAMERAHOLD'
+
+# BUILD 381: both are ON by default.
+#
+# They shipped behind these variables because build 214 aborted the game with
+# the model path armed and nobody knew why. BUILD 378 found why -- `and w0,
+# w16, #0x1F` destroyed the live guest function pointer -- and the operator has
+# since run both on hardware across the summon roster:
+#
+#   "choco / mog looks great now. i dont see any issues"
+#   "ramuh is fixed, hades and a lot of other summons look great"
+#   "i tested a number of other summons, they all look much better"
+#
+# That is the bar every other group in RECOMMENDED_ENABLE cleared, so they join
+# it. Unset now means ON; the off switches are explicit:
+#
+#   SEVENTH_NX_FX_MODELINTERP=0     model interpolation off
+#   SEVENTH_NX_FX_CAMERAHOLD=0      camera hold off
+#   SEVENTH_NX_FX_CAMERAHOLD=all    all 22 camera routines instead of 9
+#
+# Cost is unchanged and already measured: with both on, the dispatcher cave
+# ends 48 bytes before .rodata on the 40-group set. Making them default does
+# not consume a byte more than the builds already tested -- it only stops the
+# default build from being one nobody runs.
+_OFF_WORDS = ('0', 'off', 'no', 'false', 'stock', 'none')
+
+
+def _fx_switch(env: str) -> str:
+    """'off', 'on' or 'all' for a default-ON summon switch."""
+    v = os.environ.get(env)
+    if v is None:
+        return 'on'
+    v = v.strip().lower()
+    if v == '':
+        return 'on'
+    if v in _OFF_WORDS:
+        return 'off'
+    if v == 'all':
+        return 'all'
+    if v == 'hold':
+        return 'hold'
+    if v == 'summons':
+        return 'summons'
+    return 'on'
+
+
+def camerahold_enabled() -> bool:
+    return _fx_switch(CAMERAHOLD_ENV) != 'off'
+
+
+def camerainterp_enabled() -> bool:
+    """True for the full decorator, False for build 380's plain hold.
+
+    `SEVENTH_NX_FX_CAMERAHOLD=hold` is the one spelling that arms the camera
+    arm but asks for the old behaviour. Everything else that is not 'off'
+    interpolates.
+    """
+    return _fx_switch(CAMERAHOLD_ENV) not in ('off', 'hold')
+
+
+def _inject_camera_hold(tag, thr, log=print):
+    """Arm the summon camera HOLD -- the other half of FFNx's decorator.
+
+    Every summon camera routine begins `if (g_is_battle_paused) return`, so on
+    the three throttled frames in four it aims nothing, and the DEFAULT battle
+    camera -- which runs every frame -- is what the viewer sees. The two
+    alternating at 15 Hz is the strobe.
+
+    FFNx's `CameraInterpolationEffectDecorator` writes
+    `g_battle_camera_position` and `g_battle_camera_focal_point` after EVERY
+    call. BUILD 384 is the whole decorator, not just its load-bearing half:
+
+        phase 1   advance -- previous = next, next = what the routine just
+                  computed, display 1/4 of the way between them
+        phase 2   display 2/4                     (paused)
+        phase 3   display 3/4                     (paused)
+        phase 0   display `next` exactly          (paused)
+
+    so the camera trails the logic by one 15 Hz tick and moves in four even
+    steps instead of one jump. A cut larger than the routine's teleport
+    threshold snaps to `previous` instead of sliding through it, which is what
+    keeps a hard camera change hard.
+
+    `SEVENTH_NX_FX_CAMERAHOLD=hold` selects build 380's plain hold instead --
+    same capture, re-applied unchanged on the other three frames. That is the
+    version with hardware history, and it is the fallback if interpolation
+    ever looks wrong.
+
+    The two globals are read out of ff7_en at
+    `set_battle_camera_sub_5C22BD + 0x17` and `+ 0x5E`, exactly where FFNx
+    derives them, and both appear as literals in the Ramuh camera's own ARM
+    prologue at +0x714844 and +0x714854 -- the routine that aims the camera
+    loads precisely those addresses.
+
+    The scratch sits immediately after the model arrays, inside the throttle
+    block the build already reserves: two host pointers, the `next` and
+    `previous` endpoints, and one byte saying whether `previous` has ever been
+    written. 48 bytes of the 160 the block has spare.
+    """
+    if tag != 'effect100' or not camerahold_enabled():
+        return
+    import ff7nx_dispatch as _D
+    need = ('model_next', 'ctr')
+    missing = [k for k in need if k not in thr]
+    if missing:
+        raise SystemExit('ABORT  %s=1 but the sites file has no %s'
+                         % (CAMERAHOLD_ENV, ', '.join(missing)))
+    cam = (thr['model_next'] + 0x64 * 6 + 7) & ~7      # 8-byte aligned
+    end = thr['ctr'] + BSS_GROW_THROTTLE
+    if cam + 64 > end:
+        raise SystemExit('ABORT  the camera decorator needs 64 bytes at +0x%X '
+                         'but the throttle block ends at +0x%X' % (cam, end))
+    table = set(thr.get('table') or ())
+    # BUILD 387: the default is now every routine FFNx decorates, minus the
+    # two that already get the same treatment from their own code.
+    #
+    # It used to be a hand-kept "working" list -- routines the operator had
+    # reported as fine were left alone on the principle of not touching what
+    # works. That principle was sound when the risk was a strobe regression,
+    # and it has now been falsified twice in a row by the same mechanism:
+    # Bahamut ZERO was on the list and was stepping, and once it was fixed,
+    # regular Bahamut turned out to be stepping too. "Working" had been judged
+    # against the strobe, which is a different defect from the 15 Hz step, and
+    # a list built from strobe reports cannot predict which cameras step.
+    #
+    # FFNx decorates 25. Two of them -- Shiva and Odin gunge -- are excluded
+    # below because they already re-apply the camera from their own code. The
+    # remaining 23 are the default, which is the same answer FFNx gives and
+    # stops this being discovered one summon at a time.
+    #
+    # `SEVENTH_NX_FX_CAMERAHOLD=summons` narrows it to the 16 summon cameras,
+    # dropping the two level-4 limit breaks and the five enemy-attack cameras,
+    # for bisecting a regression.
+    #
+    # SHIVA AND ODIN GUNGE MUST BE EXCLUDED, not merely omitted. `summon-runtime`
+    # already NOPs a pause test inside their camera routine, so that routine
+    # re-applies the camera on every rendered frame out of its own state.
+    # Holding would overwrite what the routine just computed, on the two summons
+    # the operator reports as working.
+    #
+    # BUILD 381 correction, from disassembling what those NOPs actually hit.
+    # An earlier revision of this comment said `summon-runtime` "releases their
+    # pause guard" so the whole routine advances every frame. It does not, and
+    # the difference matters for anyone extending this:
+    #
+    #   run_shiva_camera_58E60D      +0xC2D   jne <tail>    <- NOP'd, 6 bytes
+    #   run_odin_gunge_camera_4A0F52 +0xC0C   jne <tail>    <- NOP'd, 6 bytes
+    #
+    # Those are NOT the entry guard at +0x3C..+0x43. They are a SECOND
+    # `g_is_battle_paused` test, ~0xC00 bytes into the body, sitting directly in
+    # front of the block that recomputes and writes g_battle_camera_position and
+    # g_battle_camera_focal_point. Releasing it lets the camera be re-applied on
+    # paused frames while the script section above it stays paused. The script
+    # does not run four times too fast, which is why Shiva was never the summon
+    # that froze.
+    #
+    # FFNx's third static summon patch is the same fix in a different shape:
+    #
+    #   patch_code_dword(run_ramuh_camera_597206 + 0x44, 0x000B9585)
+    #
+    # retargets the ENTRY guard's paused branch from 0x597DDF (`jmp <tail>`) to
+    # 0x597DE4 -- the head of Ramuh's own camera-apply block, which writes
+    # 0xBF2158 at +0xC2A..+0xC4C. Not "release the guard": jump past the script
+    # and into the camera write. BUILD 375 read it as a release, NOP'd the whole
+    # guard for seven routines, and the camera ran out four times early and
+    # froze ("camera is freezing at weird angles"). The `=stock` default in
+    # ff7nx_summonhold.py is still the right one for THAT edit.
+    #
+    # So all three of FFNx's static patches, and this hold, are one idea:
+    # re-apply the summon camera on the frames the throttle pauses. Shiva and
+    # Odin gunge get it natively; the nine below get it from outside.
+    #
+    # The rest are omitted for cave space. With all 25 in, the registration
+    # cave overflows .rodata and the build aborts; the operator's own group set
+    # is 32 bytes over at 20. Everything the operator has reported working
+    # (bahamut, bahamut neo, bahamut zero, kotr, ifrit, kujata) is left alone on
+    # principle as well -- do not touch what works -- and the two limit-break
+    # cameras are not summons and have never been reported.
+    #
+    # `=all` puts every one back and will ABORT rather than overflow, which is
+    # how the trimming was discovered rather than guessed.
+    HOLD_EXCLUDE = ('shiva_camera', 'odin_gunge_camera')
+    NOT_SUMMONS = ('barret_limit', 'aerith_limit', 'enemy_atk_camera')
+
+    def _hit(name, keys):
+        # the symbols are run_<what>_<addr>; match on <what>
+        return any(k in name for k in keys)
+    names = [n for n in _D.EFFECT100_CAMERA if not _hit(n, HOLD_EXCLUDE)]
+    if _fx_switch(CAMERAHOLD_ENV) == 'summons':
+        names = [n for n in names if not _hit(n, NOT_SUMMONS)]
+    # FFNx's per-routine teleport thresholds, transcribed from
+    # `camera_thresholds_by_address` in animations.cpp. Everything it does not
+    # name gets the 1500 default. BUILD 385 carries these EXACTLY -- the
+    # registration cave resolves one into BSS rather than squeezing a class
+    # into the marker byte, so 4000 is 4000 and not "the nearer of 1500 and
+    # 5000". See CAM_THRESH_UNIT in ff7nx_dispatch.py.
+    FFNX_THRESHOLD = {
+        'ramuh_camera': 5000,
+        'typhoon_camera': 5000,
+        'kotr_camera': 5000,
+        'kujata_camera': 5000,
+        'bahamut_zero_camera': 4000,
+        'barret_limit_4_1_camera': 4000,
+    }
+
+    def _threshold(name):
+        for key, val in FFNX_THRESHOLD.items():
+            if key in name:
+                return val
+        return _D.CAM_THRESH_DEFAULT
+
+    entries = []
+    for n in names:
+        thr_units, rem = divmod(_threshold(n), _D.CAM_THRESH_UNIT)
+        if rem or not 0 < thr_units < 256:
+            raise SystemExit('ABORT  %s wants a %d-unit camera threshold, '
+                             'which does not fit the table encoding'
+                             % (n, _threshold(n)))
+        entries.append((n, int(n.rsplit('_', 1)[-1], 16), thr_units))
+    excluded = [n for n, va, _c in entries if va in table]
+    if excluded:
+        raise SystemExit('ABORT  these camera routines are on the throttle '
+                         'exclusion list, so the decorator could never run '
+                         'for them: %r' % excluded)
+    thr['camera'] = entries
+    thr['cam_interp'] = camerainterp_enabled()
+    thr['cam_pos_guest'] = CAM_POS_GUEST
+    thr['cam_foc_guest'] = CAM_FOC_GUEST
+    thr['cam_pos_ptr'] = cam
+    thr['cam_foc_ptr'] = cam + 8
+    thr['cam_next'] = cam + 16
+    thr['cam_prev'] = cam + 28
+    thr['cam_init'] = cam + 40
+    # FFNx's `finalFrame`: a camera routine that retires during its advancing
+    # call must not take the slot away before the three interpolated frames
+    # have played, or the camera hands back to the battle camera a quarter of
+    # the way through its last move. These three hold the slot's field_0
+    # pointer, its value before the call, and "retire at the next endpoint".
+    thr['cam_slot_ptr'] = cam + 48
+    thr['cam_active'] = cam + 56
+    thr['cam_final'] = cam + 58
+    # This routine's teleport threshold, resolved once at registration. Global
+    # for the same reason prev/next are: one summon camera at a time.
+    thr['cam_thr'] = cam + 60
+    log('       throttle: %s camera %s armed for %d routines (default ON; '
+        '%s=0 reverts, =hold for build 380 behaviour, =summons for the 16 '
+        'summon cameras only), scratch at +0x%X'
+        % (tag, 'INTERPOLATION' if thr['cam_interp'] else 'HOLD',
+           len(entries), CAMERAHOLD_ENV, cam))
+
+
+# g_battle_camera_position / g_battle_camera_focal_point.  FFNx derives both
+# from set_battle_camera_sub_5C22BD (+0x17 and +0x5E); read straight out of
+# ff7_en, and cross-checked against the literals the Ramuh camera itself
+# loads at +0x714844 and +0x714854.
+CAM_POS_GUEST = 0xBF2158
+CAM_FOC_GUEST = 0xBFB1A0
+
+
+def modelinterp_enabled() -> bool:
+    return _fx_switch(MODELINTERP_ENV) != 'off'
+
+
+def _inject_model_interpolation(tag, thr, log=print):
+    """Re-arm the summon model-position decorator, build 214's quarantined work.
+
+    `ff7nx_dispatch.SUMMON_MODEL_INTERPOLATION` is deliberately empty, so the
+    generated sites file carries the BSS offsets the decorator needs but not
+    the function list, and `build_throttle_post_cave`'s `throttle.get('model')`
+    path is never emitted. Everything else about it is intact and tested:
+    `tests/test_throttle.py` executes the model arms under arm64emu -- 5,979
+    cave executions, 11 of 11 mutations caught -- and the BSS it wants
+    (model_next + 0x64 slots * 6 = +0x3FECAE2) fits inside the block the build
+    already reserves (+0x3FECB88).
+
+    It is still OFF by default because build 214 aborted the game with it on.
+    That predates the address work in FINDINGS-374 and roughly 160 builds of
+    other changes, and nothing found since explains the abort -- so this is an
+    experiment with a known failure mode, not a fix I am confident in.
+
+    WHY IT IS THE RIGHT EXPERIMENT. The decorator is what writes
+    `g_battle_model_state[3].modelPosition` on the frames where the throttle
+    pauses the routine. Without it the routine returns early (every summon
+    model function begins `if (g_is_battle_paused) return`), nothing positions
+    the model, and it is left wherever the previous writer put it -- which is
+    exactly "its position flickers back and forth between 2 positions".
+    """
+    if tag != 'effect100' or not modelinterp_enabled():
+        return
+    import ff7nx_dispatch as _D
+    want = list(_D.QUARANTINED_SUMMON_MODEL_INTERPOLATION)
+    need = ('model_idx', 'model_ptr', 'model_active', 'model_phase',
+            'model_final', 'model_prev', 'model_next', 'model_pos')
+    missing = [k for k in need if k not in thr]
+    if missing:
+        raise SystemExit('ABORT  %s=1 but the sites file has no %s -- '
+                         'regenerate ff7nx_dispatch_sites.py'
+                         % (MODELINTERP_ENV, ', '.join(missing)))
+    table = set(thr.get('table') or ())
+    excluded = [n for n, va, _m in want if va in table]
+    if excluded:
+        raise SystemExit('ABORT  these model functions are on the throttle '
+                         'exclusion list, so the decorator could never run '
+                         'for them: %r' % excluded)
+    thr['model'] = want
+    log('       throttle: %s model interpolation ARMED for %d summon '
+        'movement functions (default ON)' % (tag, len(want)))
+    log('       (build 214 aborted with this on -- BUILD 378 found the cause, '
+        'one register; %s=0 reverts it)' % MODELINTERP_ENV)
 
 
 def throttle_table(tag, thr, extra_exclude, log=print):
@@ -4266,11 +4735,11 @@ def patch_nso(data, patches, verify_only=False, log=print, extra=(),
                 # list (same dict objects), so replacing c['build'] here
                 # makes it verify the mechanism that actually shipped,
                 # instead of the old inline one.
-                c['build'] = (lambda cave, d=d, sym=sym, cases=cases,
-                              ev=entry_va[c['tag']], sv=shared_va,
-                              site=c['site'], shift=shift:
+                c['build'] = (lambda cave, addr=None, d=d, sym=sym,
+                              cases=cases, ev=entry_va[c['tag']],
+                              sv=shared_va, site=c['site'], shift=shift:
                               _sharedp.build_cave_shared(
-                                  cave, site, d['mask_bits'], ev, sv,
+                                  cave, addr, site, d['mask_bits'], ev, sv,
                                   d['data_base'], d['stride'], d['fields'],
                                   cases, sym, shift))
 
@@ -4282,11 +4751,27 @@ def patch_nso(data, patches, verify_only=False, log=print, extra=(),
 
         # Caves that go in reclaimed alignment padding are placed separately,
         # after the tail gap is finished -- see _place_padding_caves.
-        padded = [c for c in remaining if c['site'].get('place') == 'padding']
-        remaining = [c for c in remaining
-                     if c['site'].get('place') != 'padding']
+        #
+        # The flag is read from the CAVE dict first and the site dict second.
+        # Throttle wrappers build a fresh site dict per cave and mark that;
+        # the dispatcher scalers share `d['disp_hook']` with the sites file
+        # and mark themselves instead, so a placement decision can never be
+        # written back into module-level state.
+        def _is_padded(c):
+            return (c.get('place') or c['site'].get('place')) == 'padding'
 
-        for c in (dispatcher_entries if use_shared else []) + remaining:
+        # BUILD 383: the dispatcher scalers are candidates for padding too, so
+        # they have to go through this split rather than round it. When the
+        # shared prologue is in use they were pulled out of `remaining` above
+        # and re-added to the tail loop by hand, which silently exempted them.
+        # Split the FULL candidate list instead, in the same order the tail
+        # loop used, so a build that leaves them unmarked is byte-identical to
+        # the old one.
+        tail_order = (dispatcher_entries if use_shared else []) + remaining
+        padded = [c for c in tail_order if _is_padded(c)]
+        tail_order = [c for c in tail_order if not _is_padded(c)]
+
+        for c in tail_order:
             cave = len(text)
             words = c['build'](cave)
             text.extend(struct.pack('<%dI' % len(words), *words))
@@ -4569,7 +5054,8 @@ RECOMMENDED_ENABLE = (
     'effect100-throttle', 'aura-throttle', 'camera-wait',
     # battle constants
     'victory', 'victory-fade', 'damage-numbers', 'limit-aura', 'aura-eskill',
-    'aura-summon', 'summon-runtime', 'boss-death', 'battle-text', 'tifa-slots',
+    'aura-summon', 'summon-runtime', 'phoenix-camera', 'boss-death',
+    'battle-text', 'tifa-slots',
     # field
     'field-wait', 'opcode-scale-safe', 'field-text',
     'field-blink', 'field-blink-hold',

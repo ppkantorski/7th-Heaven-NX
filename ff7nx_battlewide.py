@@ -1234,6 +1234,10 @@ def _branch_target(va, word):
 
 def _walk_stride_cave(img, hook, limit=24):
     """Addresses in one installed x48 cave, including its return branch."""
+    # The pool hands out runs as small as three words, so a body of n words
+    # can need up to ~n/2 link branches on top; 4n is a generous ceiling that
+    # still terminates.
+    limit = limit if limit is not None else max(80, 4 * n)
     pc = _branch_target(hook, _word(img, hook))
     if pc is None:
         return None, 'hook +0x%X is not a branch' % hook
@@ -2781,3 +2785,1498 @@ def main(argv=None) -> int:
 
 if __name__ == '__main__':
     sys.exit(main())
+
+
+# ==========================================================================
+# BAHAMUT ZERO'S STAR FIELD  (BUILD 386)
+# ==========================================================================
+#
+# Reported: "some of the star fields appear to be popping out of existence as
+# the camera moves."
+#
+# This is HANDOFF-254 §3, finished. FFNx, inside `ff7_widescreen_hook_init`:
+#
+#     // Makes bahamut small stars background to 512x512 quad size and a
+#     // different positioning of the 6 image patches
+#     patch_code_short(bahamut_zero_draw_bg_effect_sub_4859AA + 0x20F, -512);
+#     patch_code_short(bahamut_zero_draw_bg_effect_sub_4859AA + 0x23F, 1024);
+#     patch_code_short(bahamut_zero_draw_bg_effect_sub_4859AA + 0x26F,  512);
+#     patch_code_short(bahamut_zero_draw_bg_effect_sub_4859AA + 0x29E,  512);
+#     patch_code_short(bahamut_zero_draw_bg_effect_sub_4859AA + 0x2CE,  512);
+#     patch_code_short(bahamut_zero_bg_star_graphics_data_7F6748 + 0x8,  512);
+#     patch_code_short(bahamut_zero_bg_star_graphics_data_7F6748 + 0xA,  512);
+#
+# It is the same defect as every other entry in this module: the quad is sized
+# in game units for a 640-wide frame, `ws-3d` makes the visible range 853, and
+# a 640-unit layer with a hard border ends 107 units inside each edge. It does
+# not get culled -- this port has no scissor at all -- it simply stops.
+#
+# WHY IT WAS NOT SHIPPED IN 254, AND WHY IT SHIPS NOW
+# ---------------------------------------------------
+# 254 found the five code sites and stopped, because the two DATA words could
+# not be located: the 32-byte block at guest 0x7F6748 does not appear anywhere
+# in `exefs/main`, and the only ARM site that materialises that address treats
+# the first dword as a runtime pointer and writes through it at +0x18/+0x1a.
+# Shipping five of seven would move the stars onto a 512-unit grid while each
+# quad stayed 256 -- gaps between them, worse than what shipped.
+#
+# The block is not in `main` because it does not need to be. It is in
+# **ff7_en's .data**, at file offset 0x3F4F50, and this port runs the guest's
+# own data image: `EXE_CONFIRMED` has been patching ff7_en .data since the
+# beginning -- the battle limiter divisor at 0x7C0B00 and the 60 FPS
+# compatibility flag at 0x914B21 are both `.data` and both demonstrably work.
+# Nothing in x86 .text references 0x7F6750 absolutely; the structure's ADDRESS
+# is pushed (0x485B9F, 0x485BCD, 0x485BFD) and the consumer reads +8/+0xA
+# through the pointer. So the bytes are what matter, and the bytes are in
+# ff7_en.
+#
+# All seven land together or the build refuses. That was 254's actual
+# requirement and it is met, not worked around.
+BZ_STARS_X86 = 0x4859AA
+BZ_STARS_DATA_VA = 0x7F6748
+
+# (module offset, stock, patched, what FFNx writes)
+# Verified in `exefs/main`: all five survive recompilation as in-place ARM
+# immediates inside the translated body of 0x4859AA (+0x250240..0x251260),
+# the ARM order matches the x86 order (three adds then two subs), and the
+# register pair is identical at every site. `-512` is the same instruction
+# with the opcode flipped from ADD (0x11...) to SUB (0x51...).
+BZ_STARS_SITES = (
+    ('star quad x offset  +0x100 -> -512',  0x2509D0, 0x11040117, 0x51080117),
+    ('star quad y offset  +0x100 -> 1024',  0x250A68, 0x11040117, 0x11100117),
+    ('star quad x offset  +0x100 ->  512',  0x250B00, 0x11040117, 0x11080117),
+    ('star quad x offset  -0x100 -> -512',  0x250B98, 0x51040116, 0x51080116),
+    ('star quad y offset  -0x100 -> -512',  0x250C30, 0x51040116, 0x51080116),
+)
+
+# (label, guest VA, stock u16, patched u16) in ff7_en's .data.
+BZ_STARS_EXE = (
+    ('star quad width  256 -> 512',  BZ_STARS_DATA_VA + 0x8, 256, 512),
+    ('star quad height 256 -> 512',  BZ_STARS_DATA_VA + 0xA, 256, 512),
+)
+
+
+def bz_stars_plan(m, revert=False):
+    """(patches, notes, problems) for the five `main` words."""
+    img = m.img
+    patches, problems = [], []
+    for label, va, stock, wide in BZ_STARS_SITES:
+        got = _word(img, va)
+        if got not in (stock, wide):
+            problems.append('bahamut zero stars: +0x%X is %08X, neither the '
+                            'stock %08X nor the widened %08X'
+                            % (va, got, stock, wide))
+            continue
+        want = stock if revert else wide
+        if got != want:
+            patches.append({'name': 'bahamut zero stars (%s)' % label,
+                            'va': hex(va),
+                            'expect': struct.pack('<I', got).hex(),
+                            'set': struct.pack('<I', want).hex()})
+    if problems:
+        # All seven or none -- that is HANDOFF-254's requirement, and it has
+        # to hold in the PLAN, not only in the caller that refuses on a
+        # non-empty `problems`. Returning four writes alongside a complaint
+        # invites a future caller to apply them and land exactly the
+        # half-patched state the note refused to ship.
+        return [], [], problems
+    notes = []
+    if patches:
+        notes.append('    %s the 512x512 star quad geometry (%d of %d word(s))'
+                     % ('restoring' if revert else 'widening',
+                        len(patches), len(BZ_STARS_SITES)))
+        notes.append('    the two companion SIZE words live in ff7_en .data '
+                     'and are written separately -- all seven or none')
+    return patches, notes, problems
+
+
+def apply_bz_stars(main, revert=False, log=print) -> int:
+    """The five ARM immediates in `exefs/main`."""
+    import nso_patcher
+
+    main = Path(main)
+    m = nxmap.Main(str(main))
+    patches, notes, problems = bz_stars_plan(m, revert=revert)
+    if problems:
+        for p in problems:
+            log('  ! ' + p)
+        log('  refusing to touch the Bahamut ZERO star geometry.')
+        return 1
+    log('  Bahamut ZERO star field (x86 0x%X, FFNx widescreen.cpp):'
+        % BZ_STARS_X86)
+    for n in notes:
+        log(n)
+    if not patches:
+        log('    nothing to do -- already in the requested state')
+        return 0
+    nso = nso_patcher.read_nso(main)
+    for line in nso_patcher.apply_spec(
+            nso, {'name': 'ff7nx_battlewide_bz_stars', 'patches': patches}):
+        log('    ' + line)
+    fd, tmp = tempfile.mkstemp(dir=str(main.parent), prefix='.bzstars-')
+    os.close(fd)
+    try:
+        Path(tmp).write_bytes(nso_patcher.rebuild(nso))
+        shutil.move(tmp, str(main))
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+    log('  %d Bahamut ZERO star word(s) written' % len(patches))
+    return 0
+
+
+def apply_exe_bz_stars(exe, revert=False, log=print) -> int:
+    """The two quad-size words in ff7_en's .data.
+
+    Without these the five position patches move the stars onto a 512-unit
+    grid while each quad stays 256 units across -- gaps between the stars,
+    which is worse than the popping. They are the half HANDOFF-254 could not
+    place, and they are file-backed `.data`, the same kind of guest data the
+    battle limiter divisor has been patched in since the first build.
+    """
+    import exe_patch
+
+    exe = Path(exe)
+    try:
+        data = exe.read_bytes()
+    except OSError as e:
+        log('  ! bahamut zero stars: cannot read %s: %s' % (exe, e))
+        return 1
+    if not exe_patch.is_ff7_exe(data):
+        log('  ! bahamut zero stars: not the FF7 x86 executable: %s' % exe)
+        return 1
+    try:
+        pe = exe_patch.parse_pe(data)
+    except Exception as e:                                      # noqa: BLE001
+        log('  ! bahamut zero stars: cannot parse PE: %s' % e)
+        return 1
+
+    out = bytearray(data)
+    wrote = 0
+    for label, va, stock, wide in BZ_STARS_EXE:
+        off = exe_patch.va_to_offset(pe, va)
+        if off is None or off + 2 > len(data):
+            log('  ! bahamut zero stars: VA %#x is not file-backed' % va)
+            return 1
+        cur = struct.unpack_from('<H', out, off)[0]
+        if cur not in (stock, wide):
+            log('  ! bahamut zero stars: %#x contains %d, expected %d or %d'
+                % (va, cur, stock, wide))
+            return 1
+        want = stock if revert else wide
+        if cur != want:
+            struct.pack_into('<H', out, off, want)
+            wrote += 1
+            log('    .data %#x  %s  (%d -> %d)' % (va, label, cur, want))
+    if not wrote:
+        log('    star quad size: already in the requested state')
+        return 0
+    fd, tmp = tempfile.mkstemp(dir=str(exe.parent), prefix='.bzstars-exe-')
+    os.close(fd)
+    try:
+        Path(tmp).write_bytes(out)
+        shutil.copymode(exe, tmp)
+        os.replace(tmp, exe)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+    log('  %d x86 Bahamut ZERO star size word(s) written' % wrote)
+    return 0
+
+
+
+# ==========================================================================
+# PANDORA'S BOX  (BUILD 388)
+# ==========================================================================
+#
+# FFNx, in ff7_widescreen_hook_init():
+#
+#     patch_code_int(pandora_box_skill_draw_bg_flash_effect_568371 + 0x3D,
+#                    wide_viewport_x - 170);
+#
+# With this port's wide viewport that is -107 - 170 = -277.
+#
+# Pandora's Box's background flash is built from a local origin at x86
+# `+0x3A  mov dword [ebp-0x22], -170` -- FFNx's +0x3D names the IMMEDIATE
+# FIELD inside that instruction, the same convention as the rest of this
+# module. The flash is a full-frame wash, so at 16:9 it stops 107 units inside
+# each edge exactly like Bahamut ZERO's stars did.
+#
+# The recompiler kept it as a one-word `movn w8, #0xaa`, so this is a single
+# in-place immediate with no cave and no companion constant: FFNx patches one
+# site in this function and so does this.
+#
+# Its siblings are already covered elsewhere and are NOT duplicated here:
+# shadow_flare_draw_white_bg_57747E is `apply_white_flash`, battle_sub_5BCF9D
+# and battle_sub_5BD050 are group 2, and highway/menu/swirl have their own
+# modules. That check was worth making -- the first draft of this block was a
+# second copy of the shadow-flare patch.
+PANDORA_X86 = 0x568371
+PANDORA_SITE = 0x0063DA38
+PANDORA_STOCK = 0x12801528              # movn w8, #0xaa   -> -170
+PANDORA_WIDE = 0x12802288               # movn w8, #0x114  -> -277
+
+
+def pandora_plan(m, revert=False):
+    img = m.img
+    cur = _word(img, PANDORA_SITE)
+    if cur not in (PANDORA_STOCK, PANDORA_WIDE):
+        return [], [], ['pandora box flash: +0x%X is %08X, neither the stock '
+                        '%08X nor the widened %08X'
+                        % (PANDORA_SITE, cur, PANDORA_STOCK, PANDORA_WIDE)]
+    want = PANDORA_STOCK if revert else PANDORA_WIDE
+    if cur == want:
+        return [], [], []
+    return ([{'name': "pandora's box flash origin -170 -> -277",
+              'va': hex(PANDORA_SITE), 'expect': _fmt_word(cur),
+              'set': _fmt_word(want)}],
+            ['    %s the full-frame flash origin (%d -> %d)'
+             % ('restoring' if revert else 'widening',
+                -170 if not revert else -277, -277 if not revert else -170)],
+            [])
+
+
+def apply_pandora(main, revert=False, log=print) -> int:
+    import nso_patcher
+
+    main = Path(main)
+    m = nxmap.Main(str(main))
+    patches, notes, problems = pandora_plan(m, revert=revert)
+    if problems:
+        for p in problems:
+            log('  ! ' + p)
+        log("  refusing to touch Pandora's Box.")
+        return 1
+    log("  Pandora's Box background flash (x86 0x%X):" % PANDORA_X86)
+    for n in notes:
+        log(n)
+    if not patches:
+        log('    nothing to do -- already in the requested state')
+        return 0
+    nso = nso_patcher.read_nso(main)
+    for line in nso_patcher.apply_spec(
+            nso, {'name': 'ff7nx_battlewide_pandora', 'patches': patches}):
+        log('    ' + line)
+    fd, tmp = tempfile.mkstemp(dir=str(main.parent), prefix='.pandora-')
+    os.close(fd)
+    try:
+        Path(tmp).write_bytes(nso_patcher.rebuild(nso))
+        shutil.move(tmp, str(main))
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+    log('  1 Pandora\'s Box word written')
+    return 0
+
+
+# ==========================================================================
+# IFRIT'S HEAT-WAVE EFFECT  (BUILD 389)
+# ==========================================================================
+#
+# Reported: "the heat warping effect with ifrit that happens at the end of the
+# attack" is not proper 16:9.
+#
+# FFNx calls this the "Battle summon fix" and it is the only entry in
+# widescreen.cpp that is a call WRAPPER rather than a constant:
+#
+#     replace_call_function(ifrit_sub_595A05 + 0x930, ifrit_first_wave_...);
+#     replace_call_function(ifrit_sub_595A05 + 0xAEC, ifrit_second_third_...);
+#     replace_call_function(ifrit_sub_595A05 + 0xCC0, ifrit_second_third_...);
+#
+# Each wrapper nudges four shorts in the wave's vertex data and then makes the
+# original call:
+#
+#     fix1 = ceil(255.f / game_width * wide_viewport_width) - 255
+#     fix2 = ceil( 65.f / game_width * wide_viewport_width) -  65
+#
+#     first wave        +8 += x            +16 += x + fix1*2
+#                       +24 += x           +32 += x + fix1*2
+#     second and third  +8 += x + fix1*2   +16 += x + (fix1+fix2)*2
+#                       +24 += x + fix1*2  +32 += x + (fix1+fix2)*2
+#
+# game_width is the engine's internal width, 640, and this port's wide
+# viewport is x=-107 w=854 -- the same values every other group here uses. So
+# fix1 = 86, fix2 = 22 and the whole thing collapses to two sets of four
+# constants. They are computed below from FFNx's formula rather than typed in,
+# so a viewport change cannot leave them stale.
+#
+# WHY A CAVE, AND WHY IT IS A SAFE ONE
+# ------------------------------------
+# There is no immediate to patch: the adjustment has to happen between the
+# vertex data being built and the draw. All three ARM sites are byte-identical
+# in shape, and the pointer is available two ways -- in a callee-saved
+# register (w27 at the first site, w23 at the other two) and in the guest's
+# own ECX slot at [x24, #4], written four instructions earlier. The cave reads
+# ECX, so it does not depend on which register the recompiler happened to
+# choose, and the register that would have been hardcoded is asserted in the
+# signature instead.
+#
+# x24 survives the address translator because the surrounding translated code
+# already relies on it doing so -- `bl TRANSLATE` followed by
+# `ldr w8,[x24,#0x10]` is right there at every site. x30 needs no saving: the
+# `bl` this cave replaces was going to clobber it anyway. Nothing is spilled
+# and the stack is untouched.
+IFRIT_ENV = 'SEVENTH_NX_FX_IFRIT_WAVE'
+
+
+def ifrit_mode() -> str:
+    """'wide' (default), 'flat', 'strip' or 'off'.
+
+        SEVENTH_NX_FX_IFRIT_WAVE=wide    the fixed warp (default, build 411)
+        SEVENTH_NX_FX_IFRIT_WAVE=flat    the fixed warp with no shimmer
+        SEVENTH_NX_FX_IFRIT_WAVE=strip   remove the warp entirely (build 399)
+        SEVENTH_NX_FX_IFRIT_WAVE=0       stock: the warp, 4:3-squeezed
+
+    BUILD 411 PUTS THIS BACK ON. Build 399 removed it by request, on this
+    reading: "the effect replaces the battle viewport with a 320x166-TEXEL copy
+    of itself ... roughly 1:4 here -- so while it is up the picture is a
+    quarter-resolution version of itself. That is the effect's own texel
+    budget, capped by 8-bit UVs, not something the geometry work could reach."
+
+    Both halves of that were wrong.
+
+    The 4x was real but it was not the texel budget. `ff7nx_fbsurf` scales
+    `fb_tex` with k while `tex_format` stays at the authored size, and
+    `ff7nx_gpucap` then makes the GPU target `tex_format` -- so wave 1 was
+    rendered into 256 texels for 1012 screen pixels. `ff7nx_ifritsrc` raises
+    the AUTHORED size instead, which the mapping is invariant to (tex_w
+    cancels in `fb_tex.x + u * xscale`), and the same measurement comes out at
+    1.98 px/texel. Nothing about the UVs changed.
+
+    And the geometry work could reach the real defect, which was never
+    resolution: the bands were drawn over 640 overlay units on a path that
+    multiplies x by WS_SCALE = 0.75. See _ifrit_ops.
+    """
+    v = os.environ.get(IFRIT_ENV)
+    if v is None:
+        return 'wide'
+    v = v.strip().lower()
+    if v in ('0', 'off', 'no', 'false', 'stock'):
+        return 'off'
+    if v == 'strip':
+        return 'strip'
+    if v == 'flat':
+        return 'flat'
+    return 'wide'
+
+
+def ifrit_stripped() -> bool:
+    return ifrit_mode() == 'strip'
+
+
+def ifrit_flat() -> bool:
+    return ifrit_mode() == 'flat'
+
+
+def ifrit_enabled() -> bool:
+    """Whether the destination transform is wanted.
+
+    Not for 'off' (stock, squeezed) and not for 'strip' (nothing is drawn, so
+    the caves would never run -- reverting them hands the words back to the
+    padding pool).
+    """
+    return ifrit_mode() in ('wide', 'flat')
+
+
+IFRIT_TALL_ENV = 'SEVENTH_NX_FX_IFRIT_TALL'
+
+
+def ifrit_tall() -> bool:
+    """ON, and only meaningful together with the widening.
+
+    `SEVENTH_NX_FX_IFRIT_TALL=0` keeps the warp at the stock 332 rows, which
+    is the A/B for the vertical half alone.
+
+    Build 397 raised the band layout and the capture heights and reported "a
+    warped copy of the UI over itself, plus a seam on the right". Build 398
+    then retracted it as "there is nothing down there to warp", which the
+    Escape work has since disproved -- BUILD-410 reaches game y 480 and the UI
+    band comes through correctly, so the capture surface does hold it.
+
+    What 397 actually got wrong is that it changed the band layout instead of
+    scaling geometry and sampling by the same factor. Here: y' = 3y/2 in the
+    cave, the capture yscale 2 -> 3, and cap3.y 176 -> 264 so wave 3 still
+    starts where wave 2 stops. Those three are one change; `ff7nx_ifritsrc`
+    refuses to install its two without this one.
+    """
+    if not ifrit_enabled():
+        return False
+    v = os.environ.get(IFRIT_TALL_ENV)
+    if v is None:
+        return True
+    return v.strip().lower() not in ('0', 'off', 'false', 'no')
+
+
+# BUILD 392: WHY THIS IS OFF. TWO CLAIMS FROM 391 ARE RETRACTED.
+# ==============================================================
+# What is established:
+#
+#   * The coordinates are right. After build 390 all four are numerically
+#     identical to FFNx's -- `raw*scale + rect.x + wrapper`, with this port
+#     supplying the rect origin FFNx gets from its rewritten rect. Tested
+#     against a transcription of both C++ wrappers, end to end.
+#
+#   * Widening the quad alone visibly breaks the effect on hardware: the right
+#     edge cut short, the background mountains displaced against the warped
+#     copy, and what the first report called aspect distortion. Three separate
+#     observations, all appearing only once the quad got wider.
+#
+# RETRACTION 1 -- "the wave samples the framebuffer capture".
+# I asserted that in build 391 and it is NOT VERIFIED. The evidence against
+# it: the capture at x86 0x673F5C has exactly ONE direct caller (0x6744B4),
+# which is not in Ifrit's band, and `ifrit_sub_595A05`'s own 36 direct calls
+# include none that reach it. The only thing that ever supported the claim was
+# a 3,615-function transitive walk, which is the method HANDOFF-273 section 6
+# records as having produced six plausible wrong answers in a row. It is not
+# evidence and it should not have been written down as if it were.
+#
+# RETRACTION 2 -- "the fix is to scale the capture width by 640/854".
+# That is a documented, hardware-disproven dead end. FINDINGS-308: builds
+# 245-266 scaled `fb_tex.w`, and because `w` is the capture texture's ACTUAL
+# PIXEL WIDTH rather than just a copy extent, shrinking it made consumers with
+# hard-coded UVs sample past the edge -- Kujata's black tiles, and fifteen
+# further experiments that changed nothing because the defect was inside the
+# texture. `ff7nx_fbcapture`'s docstring says `w' = w` is deliberate. Build
+# 391 pointed the next session straight at that wall.
+#
+# SO: the mechanism is not known. What is known is that the quad got wider and
+# the picture got worse, which is enough to keep this off.
+#
+# THE MEASUREMENT THAT WOULD SETTLE IT, before any more theory:
+# whether the mountain displacement is UNIFORM across the frame or GROWS
+# toward one side.
+#
+#   grows toward the right   the source is fixed and the wider quad is
+#                            stretching it -- a quad/source mismatch, and the
+#                            source is whatever this effect actually samples
+#   uniform                  the source is the right size and simply offset,
+#                            which is an origin problem and a different fix
+#
+# That is one observation off a screenshot, costs no build, and rules out half
+# the possibilities. It is also emphatically not Kujata's defect: that one was
+# black tiles in a staircase on one side, from a texture that had been made
+# too NARROW. Nothing here is black and nothing here was shrunk.
+IFRIT_X86 = 0x595A05
+IFRIT_ENGINE_DRAW = 0x00ACD360          # translated engine_draw_sub_66A47E
+IFRIT_CTX = 24                          # the guest context register
+IFRIT_ECX = 4                           # guest ECX, holding the wave pointer
+
+_IFRIT_GAME_WIDTH = 640
+
+
+def ifrit_ffnx_wrapper_deltas(x=None, w=None):
+    """FFNx's two wrappers, reduced to constants for this port's viewport.
+
+    These are what FFNx ADDS at the call. They are not what this port's cave
+    adds -- see _ifrit_deltas for the missing half.
+    """
+    import math
+    x = FFNX_DEFAULT['x'] if x is None else x
+    w = FFNX_DEFAULT['w'] if w is None else w
+    fix1 = math.ceil(255.0 / _IFRIT_GAME_WIDTH * w) - 255
+    fix2 = math.ceil(65.0 / _IFRIT_GAME_WIDTH * w) - 65
+    first = (x, x + fix1 * 2, x, x + fix1 * 2)
+    rest = (x + fix1 * 2, x + (fix1 + fix2) * 2,
+            x + fix1 * 2, x + (fix1 + fix2) * 2)
+    return first, rest
+
+
+def _ifrit_deltas(x=None, w=None):
+    """What THIS port's cave adds. Identical to FFNx's wrapper. No more.
+
+    BUILD 394 REVERTS BUILD 390. 390 added a second copy of `wide_viewport_x`
+    on the premise that "FFNx rewrites the battle rect to x = -107, and this
+    port keeps it stock, so the cave must supply the origin itself".
+
+    **That premise is false.** FFNx patches four places in `battle_enter`, and
+    the two that touch the rect's x and w are patch_code_DWORD -- they rewrite
+    a memory OPERAND, not an immediate:
+
+        +0x1E2  mov [0x9A89E4], 0x4A     imm at +0x1E8  <- wide_viewport_y
+        +0x1EC  mov [0x9AAD4C], 0        imm at +0x1F2  -- UNTOUCHED  rect.x
+        +0x1F6  mov [0x9AAD50], 0        imm at +0x1FC  -- UNTOUCHED  rect.y
+        +0x200  mov [0x9AAD5C], 640      imm at +0x206  -- UNTOUCHED  rect.w
+        +0x214  mov [0x9AAD68], 332      imm at +0x21A  <- wide_viewport_height
+        +0x21E  mov [0x9AD1A8], 2        imm at +0x224  -- UNTOUCHED  scale
+        +0x228  mov eax,[0x9AAD5C]      addr at +0x229  <- &wide_viewport_width
+        +0x22D  mov ecx,[0x9AAD4C]      addr at +0x22F  <- &wide_viewport_x
+
+    The last two are READS, feeding `[0x9AC108] = x + w - 1` (the right clip
+    bound). FFNx leaves the STORED rect at x=0, w=640 -- exactly like this port
+    -- and redirects consumers one at a time, which is this port's strategy
+    too. Only rect.h becomes 480, and the wave's y never reads it.
+
+    So `final = raw*scale + rect.x` has rect.x = 0 on BOTH sides, build 389 was
+    already right, and 390 pushed the whole effect 107 units left. That is what
+    "extended to the left now, but its still not under the ui and extended to
+    the right" was, and what displaced the mountains.
+
+    The `x`/`w` parameters are kept so a caller can re-derive for another
+    aspect; they now feed the wrapper only.
+    """
+    return ifrit_ffnx_wrapper_deltas(x, w)
+
+
+# (label, hook, stock `bl` word, which wrapper, the register the push used)
+IFRIT_SITES = (
+    ('first wave',  0x007101D0, 0x940EF464, 'first', 27),
+    ('second wave', 0x007108BC, 0x940EF2A9, 'rest',  23),
+    ('third wave',  0x00710EF8, 0x940EF11A, 'rest',  23),
+)
+
+# The four words before each hook, which make the site unmistakable: the guest
+# push of the pointer, ECX receiving it, and the two ESP adjustments.
+def _ifrit_signature(reg):
+    return (
+        (-0x10, 0xB9000000 | (0 << 5) | reg),          # str wP, [x0]
+        (-0x0C, 0xB9401308),                           # ldr w8, [x24,#0x10]
+        (-0x08, 0x51001108),                           # sub w8, w8, #4
+        (-0x04, 0xB9001308),                           # str w8, [x24,#0x10]
+    )
+
+
+# The four vertices are a POLY_FT4 in the usual order -- top-left, top-right,
+# bottom-left, bottom-right -- and the x pattern confirms it: FFNx gives +8 and
+# +0x18 one delta and +0x10 and +0x20 another, i.e. a left pair and a right
+# pair. So the record is:
+#
+#     +0x08 x0  +0x0A y0   top-left       +0x10 x1  +0x12 y1   top-right
+#     +0x18 x2  +0x1A y2   bottom-left    +0x20 x3  +0x22 y3   bottom-right
+#
+# FFNx never touches y: on the PC the frame is already the right height.
+IFRIT_X = (0x08, 0x10, 0x18, 0x20)        # x0, x1, x2, x3
+IFRIT_Y = (0x0A, 0x12, 0x1A, 0x22)        # y0, y1, y2, y3
+
+
+# BUILD 394: WHY "cover" MODE IS GONE, AND WHY NOTHING LIKE IT CAN WORK.
+# ======================================================================
+# Build 393's cover mode pinned x1/x3 to 747 and y2/y3 to 480 so the warp would
+# reach the field right of the UI and below it. On hardware that produced a
+# full-screen smear of horizontal bands with a seam two thirds across.
+#
+# The reason is the loop structure, which I had not read. Each of the three
+# `engine_draw_sub_66A47E` calls FFNx replaces is INSIDE A LOOP, and draws ONE
+# horizontal band per iteration (x86 0x596186..0x59633A, 21 iterations;
+# 0x596351.., 11 iterations):
+#
+#     wave 1   21 bands   y raw i*8 .. i*8+8 (last 0xA6)   x raw s .. s+0xFF
+#     wave 2   11 bands   y raw i*8 .. i*8+8               x raw s+0xFF .. +0x41
+#     wave 3   same as wave 2, lower half
+#
+# where `s` is a per-band sine (0x662538) -- that IS the heat shimmer. So
+# setting y2/y3 to 480 made EVERY band full height: 21 copies of the frame
+# stacked on each other. And pinning x1/x3 discarded the per-band sine on the
+# right edge, which is the seam. Cover mode was never a trade-off; it was a
+# misreading of what a "wave" is.
+#
+# NOW THE USEFUL PART -- what the geometry actually is.
+#
+# Raw units are HALF-RES TEXELS: 1 raw unit = 1 texel = 2 game units (scale
+# [0x9AD1A8] = 2). Wave 1 is 0xFF = 255 wide, waves 2/3 are 0x41 = 65 and start
+# at 0xFF. 255 + 65 = 320 texels = 640 game units, and y tops out at 0xA6 = 166
+# = 332 game units. **The three waves tile the stock battle viewport exactly.**
+#
+# And the source is three captures, set up at x86 0x595DE7 with the widths as
+# HARD-CODED IMMEDIATES, the origin from the battle rect (mode [0x9ACB5C] = 1):
+#
+#     capture 1  (rect.x,        rect.y       )  w 0x100  h 0xA6   -> [0x8C00B4]
+#     capture 2  (rect.x + 0x100, rect.y      )  w 0x41   h 0x58   -> [0x8C00B8]
+#     capture 3  (rect.x + 0x100, rect.y+0x58 )  w 0x41   h 0x58   -> [0x8C00BC]
+#
+# (the descriptor's +0xDC/+0xE0/+0xE4/+0xE8 = x/y/w/h, +0x10C/+0x110 = scale,
+# +0x114 = the resulting handle). Those are FINDINGS-393's "five unidentified
+# texture handles", found at last -- there are three and they are right here in
+# the draw code, not at 0xD8F638.
+#
+# So the capture is 0x100 + 0x41 = 321 texels = 642 game units wide and CANNOT
+# be widened usefully: the u coordinates that sample it are 8-bit literals
+# (1..254 and 1..64), so a wider capture would just be sampled short.
+#
+# THEREFORE FFNx STRETCHES TOO. It widens the quads to span 854 while the
+# source still holds 642 game units of frame -- a flat 854/640 = 1.33x
+# horizontal stretch, anchored at the left edge. That is not a defect in this
+# port. It is what FFNx looks like, and it is the "aspect ratio distortion"
+# reported against build 389.
+#
+# Full coverage with no stretch would need MORE BANDS -- two further captures
+# and two further draw loops for game x -107..0 and 640..747 -- which is real
+# new code for a one-second shimmer. Stock (no patch) is the other honest
+# option: the effect is then correctly proportioned and, since 0..640 centres
+# in -107..747, correctly centred, leaving 107 units unwarped at each side.
+def _ifrit_ops(legacy_tall=False):
+    """[(offset, words_fn)] for one wave -- the DESTINATION transform, X ONLY.
+
+    BUILD 411 replaced FFNx's per-vertex deltas here, and the reason is the
+    error in the block above: "the capture is 0x100 + 0x41 = 321 texels = 642
+    game units wide and CANNOT be widened usefully". 321 texels is not 642 game
+    units. It is 642 columns of the **staging surface**, and that surface holds
+    the whole 16:9 frame anamorphically -- `ff7nx_fbcapture` 2-4: "640 staging
+    columns are NOT 640 game units".
+
+    Reading the chain the way BUILD-409 established it for Escape, a mesh UV
+    lands on `fb_tex.x + u * xscale` (the power-of-two tex_w cancels exactly),
+    so the three captures sample:
+
+        cap1  u 1..254  ->  staging   2..508   = game -104 .. 570
+        cap2  u 1..64   ->  staging 514..640   = game  578 .. 747
+        cap3  u 1..64   ->  staging 514..640   = game  578 .. 747
+
+    **The captures already cover the entire frame.** What does not is the
+    destination: the bands are drawn at `raw * scale + rect.x` over 0..640
+    overlay units, and the 2D overlay path multiplies x by WS_SCALE = 0.75, so
+    they land in the central 4:3 -- the whole wide picture, squeezed. Which is
+    the reported symptom, word for word.
+
+    FFNx widens at the source because FFNx's source really is 642 game units
+    wide. This port's source is the wide render target already, so the fix is
+    `ff7nx_swirlscale`'s and `ff7nx_escapescale`'s: leave the matrix alone and
+    widen the geometry about the frame centre. The transform is imported from
+    `ff7nx_escapescale` rather than re-derived, and a test asserts the words are
+    byte-identical between the two.
+
+    WHY THIS CAVE MUST NEVER TOUCH Y -- BUILD 411b
+    ==============================================
+    Build 411a also applied `y' = 3y/2` to the four y shorts here, and on
+    hardware the picture magnified further every frame until the coordinates
+    overflowed their `strh` and the screen became vertical stripes of single
+    texels. The cause is which pass writes what:
+
+        x86 0x595A20  ldrsh the effect's frame counter at state+2
+        x86 0x595A26  jne -> SKIP the build pass        (ARM +0x70EAA8 cbz)
+
+    The build pass -- the 42 records, their UVs, and **their y coordinates** --
+    runs ONLY on frame 0. Every later frame resets the display-list pointer and
+    runs the draw loops, which rewrite **x alone**, fresh from the sine.
+
+    So a transform applied in this cave is idempotent for x and COMPOUNDING for
+    y: 332 * 1.5^n overflows int16 in about eleven frames, which is exactly
+    where the recording turns to stripes. The y scaling therefore belongs where
+    y is written -- `ff7nx_ifritsrc` does it as six one-word changes to the
+    build pass's own `v * scale` multiply, which runs once and cannot compound.
+
+    `legacy_tall` exists only so `revert` can still recognise and remove a
+    411a cave. Nothing installs it.
+    """
+    import ff7nx_escapescale as _ES
+    ops = [(off, lambda: _ES.body('w9', 'w10')) for off in IFRIT_X]
+    if legacy_tall:
+        import ff7nx_escapetall as _ET
+        ops += [(off, lambda: _ET.body('w9', 'w10')) for off in IFRIT_Y]
+    return ops
+
+
+def ifrit_expected_x(x):
+    import ff7nx_escapescale as _ES
+    return _ES.expected(x)
+
+
+def ifrit_expected_y(y):
+    """What the build pass now produces: `v * 3` where it made `v * 2`.
+
+    Numerically the same as 3y/2 on the finished y, but it is not the same
+    change -- this one happens where y is written, once.
+    """
+    return y * 3 // 2
+
+
+def _ifrit_body(hook, legacy_tall=False):
+    """The cave: transform the four vertex x shorts, then make the original
+    call. `legacy_tall` reproduces build 411a's body for revert only."""
+    import a64 as A
+    w = []
+    for off, words_fn in _ifrit_ops(legacy_tall):
+        w.append(A.ldr(0, IFRIT_CTX, IFRIT_ECX))       # w0 = guest ECX
+        w.append(A.add_imm(0, 0, off))
+        w.append(0)                                    # bl TRANSLATE -- fixed up
+        # `ldrsh` rather than `ldrh` to mirror the C++ `short` arithmetic --
+        # and here it MATTERS, where for build 389's `add` it did not: the
+        # widened x runs negative (game -106 at the left edge of a 16:9
+        # frame), and (4x-320)/3 on a zero-extended 0xFFxx would be nonsense.
+        w.append(A.ldrsh(9, 0, 0))
+        w.extend(words_fn())
+        w.append(A.strh(9, 0, 0))
+    w.append(0)                                        # bl ENGINE_DRAW
+    w.append(0)                                        # b back
+    return w
+
+
+def _ifrit_fixup(words, addrs, hook):
+    """Patch the three PC-relative words once the layout is known."""
+    import a64 as A
+    import ff7nx_dispatch as _D
+    out = list(words)
+    for i, word in enumerate(out):
+        if word != 0:
+            continue
+        if i == len(out) - 1:
+            out[i] = A.b(addrs[i], hook + 4)
+        elif i == len(out) - 2:
+            out[i] = A.bl(addrs[i], IFRIT_ENGINE_DRAW)
+        else:
+            out[i] = A.bl(addrs[i], _D.TRANSLATE)
+    return out
+
+
+def ifrit_plan(m, revert=False):
+    """(patches, notes, problems) for all three wave sites.
+
+    All three or none: a first wave adjusted to a wide frame followed by two
+    unadjusted ones would be worse than the stock effect, which is at least
+    self-consistent.
+    """
+    import ff7nx_cave
+    img = m.img
+    patches, notes, problems = [], [], []
+    lo, hi = m.extent(IFRIT_X86)
+    for label, hook, stock, which, reg in IFRIT_SITES:
+        if not (lo <= hook < hi):
+            problems.append('ifrit %s: +0x%X is outside the translated body '
+                            'of 0x%X' % (label, hook, IFRIT_X86))
+            continue
+        for off, want in _ifrit_signature(reg):
+            got = _word(img, hook + off)
+            if got != want:
+                problems.append('ifrit %s: +0x%X is %08X, expected %08X -- '
+                                'this is not the guest push it should be'
+                                % (label, hook + off, got, want))
+        cur = _word(img, hook)
+        tgt = _branch_target(hook, cur)
+        if cur != stock and tgt is None:
+            problems.append('ifrit %s: +0x%X is %08X, neither the stock call '
+                            'nor a branch to a cave' % (label, hook, cur))
+    if problems:
+        return [], [], problems
+
+    pool = None
+    for label, hook, stock, which, reg in IFRIT_SITES:
+        cur = _word(img, hook)
+        tgt = _branch_target(hook, cur)
+        if revert:
+            if tgt is None:
+                continue
+            # The installed cave may be the widened one or the widened+tall
+            # one, and on revert the env may say neither. So try both rather
+            # than trusting the current mode -- otherwise a mode change
+            # between apply and revert leaves the cave stranded, which is the
+            # bug build 406 shipped in escapescale's revert.
+            hit = None
+            for cand in (False, True):       # False = 411b, True = 411a legacy
+                body = _ifrit_body(hook, cand)
+                addrs, why = _ifrit_walk(img, hook, len(body))
+                if addrs is None:
+                    continue
+                payload = [a for a in addrs
+                           if _branch_target(a, _word(img, a)) is None
+                           or a == addrs[-1]]
+                want = _ifrit_fixup(body, payload, hook)
+                if [_word(img, a) for a in payload] == want:
+                    hit = (body, addrs)
+                    break
+            if hit is None:
+                problems.append('ifrit %s: the cave at +0x%X is not one this '
+                                'module wrote' % (label, tgt))
+                continue
+            body, addrs = hit
+            patches.append({'name': 'restore ifrit %s call' % label,
+                            'va': hex(hook), 'expect': _fmt_word(cur),
+                            'set': _fmt_word(stock)})
+            for a in addrs:
+                patches.append({'name': 'clear ifrit cave +0x%X' % a,
+                                'va': hex(a),
+                                'expect': _fmt_word(_word(img, a)),
+                                'set': '00000000'})
+            notes.append('    %-12s restored (%d cave word(s) returned)'
+                         % (label, len(addrs)))
+            continue
+
+        if tgt is not None:
+            continue                                   # already applied
+        if pool is None:
+            pool = ff7nx_cave.HolePool(img, starts=set(m.arm_starts))
+        body = _ifrit_body(hook)
+        try:
+            entry, placed = ff7nx_cave.emit_chained(pool, body)
+        except ff7nx_cave.NoRoom as exc:
+            problems.append('ifrit %s: %s' % (label, exc))
+            break
+        addrs = [a for a in sorted(placed)]
+        # emit_chained inserts a `b next` between runs; the cave's own words
+        # are the ones that are not those links, in order.
+        own = _cave_own_addrs(placed, len(body), entry)
+        if own is None:
+            problems.append('ifrit %s: could not identify the cave layout'
+                            % label)
+            break
+        final = _ifrit_fixup(body, own, hook)
+        for a, wd in zip(own, final):
+            placed[a] = wd
+        bad = [a for a in placed if _word(img, a) != 0]
+        if bad:
+            problems.append('ifrit %s: padding at +0x%X is not zero'
+                            % (label, bad[0]))
+            break
+        for a in sorted(placed):
+            patches.append({'name': 'ifrit %s cave +0x%X' % (label, a),
+                            'va': hex(a), 'expect': '00000000',
+                            'set': _fmt_word(placed[a])})
+        patches.append({'name': 'ifrit %s -> widescreen wave' % label,
+                        'va': hex(hook), 'expect': _fmt_word(cur),
+                        'set': _fmt_word(A_b(hook, entry))})
+        notes.append('    %-12s x\' = (4x-320)/3  (%d cave word(s) at '
+                     '+0x%07X)' % (label, len(placed), entry))
+
+    if problems:
+        return [], [], problems
+    return patches, notes, problems
+
+
+def A_b(frm, to):
+    import a64 as A
+    return A.b(frm, to)
+
+
+def _cave_own_addrs(placed, n, entry):
+    """The `n` payload addresses of an emit_chained layout, in order.
+
+    emit_chained returns payload words plus one `b` linking each run to the
+    next. Walking from the ENTRY and following those links recovers the
+    payload order without having to know the hole layout.
+
+    Starting at min(placed) instead of the entry is wrong and was: the pool
+    allocates biggest-hole-first, not lowest-address-first, so the entry is
+    usually not the lowest word. The cave still assembled, but every
+    PC-relative word in it was fixed up against the wrong address -- which
+    the emulated test caught as a `bl` to nowhere.
+    """
+    if not placed:
+        return None
+    va = entry
+    out, seen = [], 0
+    while len(out) < n:
+        seen += 1
+        if seen > 4 * n + 16 or va not in placed:
+            return None
+        wd = placed[va]
+        # a chaining link is a `b` this function emitted to the next run
+        if (wd & 0xFC000000) == 0x14000000:
+            imm = wd & 0x3FFFFFF
+            if imm & (1 << 25):
+                imm -= (1 << 26)
+            nxt = va + imm * 4
+            if nxt in placed:
+                va = nxt
+                continue
+        out.append(va)
+        va += 4
+    return out
+
+
+def _ifrit_walk(img, hook, n, limit=None):
+    """Every word one installed Ifrit cave owns, chaining links included.
+
+    BUILD 411: `limit` now derives from `n`. It was a flat 80, which was ample
+    for build 389's 38-word body and silently too small for the 70-word one --
+    the walk ran off the end and revert reported "not one this module wrote",
+    stranding the cave. Exactly the shape of build 406's revert bug.
+
+    Same shape as _walk_stride_cave: follow every `b` and stop when the walk
+    arrives back at hook+4. `bl` is deliberately not followed -- _branch_target
+    only matches `b` -- so the two calls inside the cave are payload, not
+    links.
+    """
+    # The pool hands out runs as small as three words, so a body of n words
+    # can need up to ~n/2 link branches on top; 4n is a generous ceiling that
+    # still terminates.
+    limit = limit if limit is not None else max(80, 4 * n)
+    pc = _branch_target(hook, _word(img, hook))
+    if pc is None:
+        return None, 'hook +0x%X is not a branch' % hook
+    out = []
+    for _ in range(limit):
+        if pc == hook + 4:
+            payload = sum(1 for a in out
+                          if _branch_target(a, _word(img, a)) is None)
+            if payload + 1 != n:
+                return None, ('cave from +0x%X holds %d payload word(s), '
+                              'expected %d' % (hook, payload + 1, n))
+            return out, None
+        out.append(pc)
+        tgt = _branch_target(pc, _word(img, pc))
+        pc = tgt if tgt is not None else pc + 4
+    return None, ('cave from +0x%X did not return within %d words'
+                  % (hook, limit))
+
+
+def apply_ifrit(main, revert=False, log=print) -> int:
+    """Ifrit's three heat-wave draws, widened."""
+    import nso_patcher
+
+    main = Path(main)
+    m = nxmap.Main(str(main))
+    patches, notes, problems = ifrit_plan(m, revert=revert)
+    if problems:
+        for p in problems:
+            log('  ! ' + p)
+        log('  refusing to touch the Ifrit wave effect.')
+        return 1
+    log('  Ifrit heat-wave effect (x86 0x%X, FFNx "Battle summon fix"):'
+        % IFRIT_X86)
+    for n in notes:
+        log(n)
+    if not patches:
+        log('    nothing to do -- already in the requested state')
+        return 0
+    nso = nso_patcher.read_nso(main)
+    for line in nso_patcher.apply_spec(
+            nso, {'name': 'ff7nx_battlewide_ifrit', 'patches': patches}):
+        log('    ' + line)
+    fd, tmp = tempfile.mkstemp(dir=str(main.parent), prefix='.ifrit-')
+    os.close(fd)
+    try:
+        Path(tmp).write_bytes(nso_patcher.rebuild(nso))
+        shutil.move(tmp, str(main))
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+    log('  %d Ifrit wave word(s) written' % len(patches))
+    return 0
+
+
+# =====================================================================
+# IFRIT'S HEAT WAVE, PART 2: MAKE IT COVER THE WHOLE FRAME  (BUILD 397)
+# =====================================================================
+# Reported, twice: "its stopping at the ui's top, not extending to the sides
+# of the ui and below it".
+#
+# It is not an oversight, it is an exact structural limit. The effect is two
+# columns of horizontal bands, ONE DISPLAY-LIST RECORD PER BAND, and the record
+# array at guest 0xBCBFE0 has exactly 42 slots -- the walking pointer 0xBCC670
+# sits on the first byte past its end, with Ifrit's own rotation matrix and
+# vector state just beyond, so it cannot grow:
+#
+#     2 columns x 21 bands x 8 texels = 168 texels = 336 game units
+#     the 4:3 battle viewport is                     332 game units
+#
+# Sized for 4:3 to the band. The 16:9 frame is 480 units = 240 texels, which at
+# 8-texel bands is 2 x 30 = 60 records. Eighteen more than exist.
+#
+# WHY NOT RELOCATE THE ARRAY
+# --------------------------
+# Mechanically it is one word -- the recompiler derives the base as
+# `sub w8, w21, #0x690` (pointer minus 42*0x28) at +0x70EBD4. But the guest
+# memory below it is live (0xBCBFA0/A8/B0/D4 are all referenced) and no other
+# region could be PROVEN free: an unreferenced zero-filled run is
+# indistinguishable from a buffer indexed off a base outside the run. Writing
+# the wave records into live game state is a far worse bug than a coarse
+# shimmer.
+#
+# WHY NOT INTERLEAVE BUILD AND DRAW
+# ---------------------------------
+# Tempting -- the array is filled in one pass and read in another, so if each
+# wave were built and drawn in turn only 30 records would ever be live. But the
+# recompiler hoists each phase's constants into the SAME callee-saved registers
+# with DIFFERENT meanings (build: w21=0xBCC670, w19=0x9AD1A8, w20=0x14, w25=0xfe;
+# draw: w19=0xBCC670, w20=0x9AD1A8, w21=0x9AAD4C, w22=0x8C00B4). A liveness scan
+# says w19-w24, w26 and w27 all conflict, so every phase switch would have to
+# restore eight registers exactly right, and getting one wrong is a wild write
+# through a bad guest pointer. Not worth it for this.
+#
+# WHAT THIS DOES INSTEAD: DOUBLE THE BAND HEIGHT
+# ----------------------------------------------
+# The band step is `lsl #3` and `add #8` -- single words, twelve and five of
+# them. Taking the step to 16 texels covers the full frame with 30 records:
+#
+#     wave 1  left column   15 bands x 16 = 240 texels = 480 game units
+#     wave 2  right, upper   8 bands x 16 = 128 texels
+#     wave 3  right, lower   7 bands x 16 = 112 texels  (starts at 128)
+#                                          ---
+#                                           30 records, against 42
+#
+# The capture heights move with it. cap2 and cap3 share register w23, so the
+# right column must split into equal halves: both become 128 (0x80), and the
+# lower one starts at 128. Rows 240..256 of cap3 fall past the 480-row staging
+# surface, but no band ever samples them -- wave 3 stops at 240 -- so the copy
+# loop's own clamp just leaves them unwritten and unread.
+#
+# THE COST, STATED PLAINLY
+# ------------------------
+# Vertical TEXEL density is unchanged: 240 texels over 480 game units is the
+# same 2.0 units per texel as 166 over 332. What doubles is the band height --
+# each shimmer strip becomes 32 game units instead of 16, so the wobble is half
+# as fine-grained vertically. That is the price of the 42-slot array, and it is
+# the only price: nothing gets blurrier, the effect just ripples in coarser
+# strips while now covering the whole field including behind the UI.
+#
+# Horizontal density (2.67 units/texel) is NOT addressed here -- that needs
+# xscale 2 -> 1 and a third capture column, which is 3 x 30 = 90 records and
+# therefore blocked on the same array. Separate job.
+IFRIT_VC_ENV = 'SEVENTH_NX_FX_IFRIT_VCOVER'
+
+
+def ifrit_vcover_enabled() -> bool:
+    """OFF. BUILD 398 RETRACTED THIS -- the premise was wrong.
+
+    `SEVENTH_NX_FX_IFRIT_VCOVER=1` turns it on again; there is no good reason to.
+
+    397 extended the warp from game y 0..332 to 0..480 on the assumption that
+    there was field down there to warp. There is not. `battle_enter` stores
+    **rect.h = 332** (x86 0x41B300 +0x214, [0x9AAD68] = 0x14C) and this port
+    keeps the battle rect stock, so the 3D scene is rendered 332 game units tall
+    and everything below that is UI on black.
+
+    FFNx patches exactly that immediate (+0x21A) to `wide_viewport_height` =
+    480, which is why the full-height wave is right THERE and wrong HERE. The
+    effect samples the composited frame, so extending it past 332 captures the
+    UI and redraws a warped copy of it over itself -- "this effect appears to be
+    copying an image of the ui itself", plus a seam on the right where the two
+    columns' lower halves disagree.
+
+    The warp stopping at the UI's top edge is therefore CORRECT for this port:
+    it covers the whole 3D viewport, which is all there is. Making it cover more
+    means making the viewport itself 480 tall like FFNx, which is a battle-wide
+    renderer change, not an Ifrit one -- and BUILD-390 records that keeping the
+    stored rect stock is what lets ff7nx_letterbox's uncrop leg keep matching.
+    """
+    v = os.environ.get(IFRIT_VC_ENV)
+    if v is None:
+        return False
+    return v.strip().lower() not in ('0', 'off', 'no', 'false')
+
+
+def _enc_lsl(rd, rn, sh):
+    """32-bit LSL Wd, Wn, #sh  (UBFM form)."""
+    immr, imms = (32 - sh) & 31, 31 - sh
+    return 0x53000000 | (immr << 16) | (imms << 10) | (rn << 5) | rd
+
+
+def _enc_addsub_imm(op, rd, rn, imm):
+    base = 0x11000000 if op == 'add' else 0x51000000
+    return base | ((imm & 0xFFF) << 10) | (rn << 5) | rd
+
+
+def _enc_movz(rd, imm):
+    return 0x52800000 | ((imm & 0xFFFF) << 5) | rd
+
+
+# (label, va, old, new).  Every one is a single word, verified before writing.
+def _ifrit_vc_sites():
+    S = []
+    # -- band step: v_top = i*8 -> i*16 --------------------------------
+    for va, rd, rn in ((0x0070EFAC, 22, 8), (0x0070F020, 8, 8),
+                       (0x0070F2A8, 22, 8), (0x0070F2D0, 9, 8),
+                       (0x0070F6E0, 22, 8), (0x0070F754, 8, 8),
+                       (0x00710278, 27, 8), (0x007102F0, 8, 8),
+                       (0x00710318, 23, 8), (0x00710344, 8, 8),
+                       (0x00710FA0, 9, 8), (0x00711018, 9, 8)):
+        S.append(('band step x8->x16', va, _enc_lsl(rd, rn, 3), _enc_lsl(rd, rn, 4)))
+    # -- band bottom: +8 -> +16 ----------------------------------------
+    for va, rd, rn in ((0x0070F024, 22, 8), (0x0070F2D4, 22, 9),
+                       (0x0070F758, 22, 8), (0x007102F4, 28, 8),
+                       (0x00710348, 23, 8)):
+        S.append(('band bottom +8->+16', va,
+                  _enc_addsub_imm('add', rd, rn, 8),
+                  _enc_addsub_imm('add', rd, rn, 16)))
+    # -- wave 3 vertical origin, 88 -> 128 -----------------------------
+    S.append(('draw3 v_top  +0x58->+0x80', 0x00710FA4,
+              _enc_addsub_imm('add', 23, 9, 0x58),
+              _enc_addsub_imm('add', 23, 9, 0x80)))
+    S.append(('draw3 v_bot  +0x60->+0x90', 0x0071101C,
+              _enc_addsub_imm('add', 23, 9, 0x60),
+              _enc_addsub_imm('add', 23, 9, 0x90)))
+    for va in (0x0070F500, 0x0070F5B4):
+        S.append(('build3 y origin 88->128', va,
+                  _enc_addsub_imm('add', 8, 8, 0x58),
+                  _enc_addsub_imm('add', 8, 8, 0x80)))
+    # -- loop bounds: 21->15, 11->8, 10->7 -----------------------------
+    for va, old, new in ((0x0070EF78, 0x15, 0xF), (0x00710244, 0x15, 0xF),
+                         (0x0070F274, 0xB, 8), (0x00710930, 0xB, 8),
+                         (0x0070F6AC, 0xA, 7), (0x00710F6C, 0xA, 7)):
+        S.append(('loop bound %d->%d' % (old, new), va,
+                  _enc_addsub_imm('sub', 9, 8, old),
+                  _enc_addsub_imm('sub', 9, 8, new)))
+    # -- clamp indices: last band of each wave -------------------------
+    for va, old, new in ((0x0070EFE0, 0x14, 0xE), (0x007102B0, 0x14, 0xE),
+                         (0x0070F714, 9, 6), (0x00710FDC, 9, 6)):
+        S.append(('clamp index %d->%d' % (old, new), va,
+                  _enc_addsub_imm('sub', 9, 8, old),
+                  _enc_addsub_imm('sub', 9, 8, new)))
+    # -- clamp values: the last band's bottom edge ---------------------
+    for va, rd, old, new in ((0x0070F008, 22, 0xA6, 0xF0),
+                             (0x007102D8, 28, 0xA6, 0xF0),
+                             (0x00711004, 23, 0xA6, 0xF0),
+                             (0x0070F73C, 22, 0x4E, 0x70)):
+        S.append(('clamp value %d->%d' % (old, new), va,
+                  _enc_movz(rd, old), _enc_movz(rd, new)))
+    # -- capture heights, and where the lower right capture starts -----
+    S.append(('cap1 tex_h 166->240', 0x0070F944, _enc_movz(8, 0xA6),
+              _enc_movz(8, 0xF0)))
+    S.append(('cap2+3 tex_h 88->128', 0x0070F990, _enc_movz(23, 0x58),
+              _enc_movz(23, 0x80)))
+    S.append(('cap3 y 88->128', 0x0070FAFC,
+              _enc_addsub_imm('add', 20, 8, 0x58),
+              _enc_addsub_imm('add', 20, 8, 0x80)))
+    return tuple(S)
+
+
+IFRIT_VC_SITES = _ifrit_vc_sites()
+
+
+def _ifrit_vcover_installed(img) -> bool:
+    """True only if a majority of vcover's own words are the patched value.
+
+    A majority rather than all, so that a partial state is still cleaned up --
+    but not a single shared word, which `ff7nx_ifritsrc` may own.
+    """
+    on = 0
+    for _label, va, _old, new in IFRIT_VC_SITES:
+        if struct.unpack_from('<I', img, va)[0] == new:
+            on += 1
+    return on * 2 > len(IFRIT_VC_SITES)
+
+
+def ifrit_vcover_plan(m, revert=False):
+    """(patches, notes, problems). All or nothing: a half-extended effect
+    would draw bands over a capture that does not reach them.
+
+    BUILD 411: this is retracted and off, and two of its words (+0x70F944 and
+    the lower-right capture origin) are now owned by `ff7nx_ifritsrc`, which
+    reaches game y 480 by scaling geometry and sampling together instead of by
+    re-laying the bands. So a revert with nothing installed now returns early
+    rather than verifying words another module legitimately holds -- otherwise
+    a default build refuses. The two are mutually exclusive by construction
+    and `installed` is what decides which one is in force.
+    """
+    img = m.img
+    patches, problems = [], []
+    lo, hi = m.extent(IFRIT_X86)
+    if revert and not _ifrit_vcover_installed(img):
+        return [], [], []
+    for label, va, old, new in IFRIT_VC_SITES:
+        if not (lo <= va < hi):
+            problems.append('ifrit vcover: +0x%X (%s) is outside the body of '
+                            '0x%X' % (va, label, IFRIT_X86))
+            continue
+        want, set_to = (new, old) if revert else (old, new)
+        cur = struct.unpack_from('<I', img, va)[0]
+        if cur == set_to:
+            continue                       # already in the target state
+        if cur != want:
+            problems.append('ifrit vcover: +0x%X (%s) is %08X, expected %08X'
+                            % (va, label, cur, want))
+            continue
+        patches.append({'name': 'ifrit vcover %s' % label, 'va': hex(va),
+                        'expect': _fmt_word(cur), 'set': _fmt_word(set_to)})
+    if problems:
+        return [], [], problems
+    notes = []
+    if patches:
+        notes.append('    Ifrit heat wave: bands 8 -> 16 texels, '
+                     'waves 15/8/7 = 30 records (array holds 42)')
+        notes.append('    capture heights 240 / 128 / 128, lower right at 128 '
+                     '-> the warp now covers game y 0..480')
+    return patches, notes, problems
+
+
+def apply_ifrit_vcover(main, revert=False, log=print) -> int:
+    import nso_patcher
+
+    main = Path(main)
+    m = nxmap.Main(str(main))
+    patches, notes, problems = ifrit_vcover_plan(m, revert=revert)
+    if problems:
+        for p in problems:
+            log('  ! %s' % p)
+        log('  refusing to touch the Ifrit band layout.')
+        return 1
+    for n in notes:
+        log(n)
+    if not patches:
+        return 0
+    nso = nso_patcher.read_nso(main)
+    for line in nso_patcher.apply_spec(
+            nso, {'name': 'ff7nx_battlewide_ifrit_vcover', 'patches': patches}):
+        log('    ' + line)
+    fd, tmp = tempfile.mkstemp(dir=str(main.parent), prefix='.ifritvc-')
+    os.close(fd)
+    try:
+        Path(tmp).write_bytes(nso_patcher.rebuild(nso))
+        shutil.move(tmp, str(main))
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+    log('  %d Ifrit band-layout word(s) written' % len(patches))
+    return 0
+
+
+# =====================================================================
+# IFRIT'S HEAT WAVE, PART 3: TAKE IT OUT  (BUILD 399)
+# =====================================================================
+# "lets just remove this warp capture effect for ifrit. we can come back to it
+#  later if we really want to, and make note of it. it will look much better"
+#
+# Agreed, and here is the reason it never looked right, which is worth writing
+# down because it is not a bug anyone introduced:
+#
+#   The effect replaces the whole battle viewport with a copy of ITSELF taken
+#   through the capture path, and that copy is 320 x 166 TEXELS. On a PSX,
+#   drawn on a 320-wide screen, that is 1:1 and invisible. Here it is drawn
+#   across 854 game units on a 1280-wide output -- roughly 1:4. So for the
+#   second it is up, the screen is replaced by a quarter-resolution version of
+#   itself. No amount of geometry work fixes that; the texel budget is the
+#   effect's own design and the 8-bit UVs cap it at 255 per column.
+#
+# THE RED IS A SEPARATE EFFECT AND SURVIVES THIS
+# ----------------------------------------------
+# I briefly claimed the opposite and was wrong. The band records do carry
+# `0x2E8080FF` at +4 -- a PSX packet word, code 0x2E = POLY_FT4 with the
+# semi-transparent bit, b=128 g=128 r=255 -- and the draw loop rewrites the low
+# byte (r) each frame from the phase ramp at [ebp-0x1c]. So the quads ARE
+# faintly red-tinted, and I reasoned from that to "the red wash is these quads".
+#
+# It is not. Patrick caught a frame with the capture warp visible and NO red
+# yet: the strong red arrives afterwards, from elsewhere in Ifrit's animation.
+# The quads' own tint is a mild semi-transparent wash on top of that, not the
+# source of it. **Removing the bands leaves the red intact.**
+#
+# The lesson is the one from build 391: a colour constant in a packet is
+# evidence about that packet, not about what the player sees a second later.
+#
+# THE TWO WAYS OUT
+# ----------------
+#   strip   Three words. Each draw loop's bound becomes 0, so it runs zero
+#           iterations and nothing is drawn. Build loops and captures still run
+#           (harmless, and leaving them alone keeps the patch minimal and the
+#           timing identical). The widening caves are reverted too, which hands
+#           114 words back to the padding pool.
+#
+#   flat    Six words. Keeps the bands but zeroes the per-band sine, so each
+#           lands at its true position instead of wobbling: the captured copy
+#           with its faint tint and no displacement. Kept as an option only --
+#           it is still a quarter-res overlay of the screen on itself, so
+#           `strip` is the better answer and the default.
+#
+# COMING BACK TO IT LATER -- WHAT WOULD HAVE TO BE TRUE
+# ----------------------------------------------------
+#   1. Horizontal sharpness needs xscale 2 -> 1 and a THIRD capture column
+#      (the engine has a spare render-target slot; 0x4299B4 allows four).
+#      That is 3 columns x 30 bands = 90 records against a 42-slot array.
+#   2. Covering below the UI needs the battle viewport to be 480 tall as FFNx
+#      makes it (battle_enter +0x21A), not this port's stock 332. Until then
+#      there is no scene down there and the warp correctly stops at the UI.
+#   3. Both therefore need more records than exist, and the two routes to that
+#      are a relocation of the array at 0xBCBFE0 (one word -- `sub w8, w21,
+#      #0x690` at +0x70EBD4 -- but no provably free destination) or interleaving
+#      the build and draw passes (needs eight callee-saved registers restored
+#      at each phase switch; see the liveness note in part 2).
+IFRIT_STRIP_BOUNDS = ((0x00710244, 0x15), (0x00710930, 0xB), (0x00710F6C, 0xA))
+IFRIT_FLAT_SHIFTS = (0x0070FD30, 0x0070FE1C, 0x00710414,
+                     0x00710500, 0x00710A50, 0x00710B3C)
+_ASR_W8_10 = 0x130A7D08          # asr w8, w8, #0xa
+_MOV_W8_WZR = 0x2A1F03E8         # mov w8, wzr
+
+
+def _ifrit_strip_sites():
+    return tuple(('draw loop bound %d -> 0' % n, va,
+                  _enc_addsub_imm('sub', 9, 8, n),
+                  _enc_addsub_imm('sub', 9, 8, 0))
+                 for va, n in IFRIT_STRIP_BOUNDS)
+
+
+def _ifrit_flat_sites():
+    return tuple(('band wobble -> 0', va, _ASR_W8_10, _MOV_W8_WZR)
+                 for va in IFRIT_FLAT_SHIFTS)
+
+
+IFRIT_STRIP_SITES = _ifrit_strip_sites()
+IFRIT_FLAT_SITES = _ifrit_flat_sites()
+
+
+def _ifrit_word_plan(m, sites, what, revert=False):
+    img = m.img
+    patches, problems = [], []
+    lo, hi = m.extent(IFRIT_X86)
+    for label, va, old, new in sites:
+        if not (lo <= va < hi):
+            problems.append('%s: +0x%X (%s) is outside the body of 0x%X'
+                            % (what, va, label, IFRIT_X86))
+            continue
+        want, set_to = (new, old) if revert else (old, new)
+        cur = struct.unpack_from('<I', img, va)[0]
+        if cur == set_to:
+            continue
+        if cur != want:
+            problems.append('%s: +0x%X (%s) is %08X, expected %08X'
+                            % (what, va, label, cur, want))
+            continue
+        patches.append({'name': '%s %s' % (what, label), 'va': hex(va),
+                        'expect': _fmt_word(cur), 'set': _fmt_word(set_to)})
+    return (([], problems) if problems else (patches, []))
+
+
+def _ifrit_write(main, patches, tag, log):
+    import nso_patcher
+
+    main = Path(main)
+    nso = nso_patcher.read_nso(main)
+    for line in nso_patcher.apply_spec(nso, {'name': tag, 'patches': patches}):
+        log('    ' + line)
+    fd, tmp = tempfile.mkstemp(dir=str(main.parent), prefix='.ifritfx-')
+    os.close(fd)
+    try:
+        Path(tmp).write_bytes(nso_patcher.rebuild(nso))
+        shutil.move(tmp, str(main))
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+    return 0
+
+
+def apply_ifrit_strip(main, revert=False, log=print) -> int:
+    """Draw nothing at all: three loop bounds to zero."""
+    m = nxmap.Main(str(main))
+    patches, problems = _ifrit_word_plan(m, IFRIT_STRIP_SITES,
+                                         'ifrit strip', revert=revert)
+    if problems:
+        for p in problems:
+            log('  ! %s' % p)
+        return 1
+    if not patches:
+        return 0
+    log('    Ifrit heat wave: REMOVED (three draw loops run zero times).')
+    log("    Ifrit's red flash is a separate effect and is untouched.")
+    return _ifrit_write(main, patches, 'ff7nx_battlewide_ifrit_strip', log)
+
+
+def apply_ifrit_flat(main, revert=False, log=print) -> int:
+    """Keep the red wash, drop the displacement."""
+    m = nxmap.Main(str(main))
+    patches, problems = _ifrit_word_plan(m, IFRIT_FLAT_SITES,
+                                         'ifrit flat', revert=revert)
+    if problems:
+        for p in problems:
+            log('  ! %s' % p)
+        return 1
+    if not patches:
+        return 0
+    log('    Ifrit heat wave: bands drawn flat -- red wash kept, no warp.')
+    return _ifrit_write(main, patches, 'ff7nx_battlewide_ifrit_flat', log)
+
+
+# =====================================================================
+# ESCAPE: MAKE THE BATTLE CAPTURES COVER THE WHOLE SURFACE  (BUILD 402)
+# =====================================================================
+# Reported: the party appears twice, the effect covers only the 4:3 region
+# with black margins, and the game hitches for about a second.
+#
+# FINDINGS-402 maps the whole effect. The mesh (41x22 points, x = col*8,
+# y = row*8, times scale 2 plus rect.x/rect.y = 640x336 game units) and the
+# UVs (u = col*8 for tile A, col*8 - 0xA0 for tile B, 1:1 over 160-texel
+# tiles, with the last column of each half deliberately pulled in to 159) are
+# all internally consistent and correct. So the repetition is not in the
+# geometry; it is in what the two captures CONTAIN.
+#
+# THE ASYMMETRY THIS PROBES
+# -------------------------
+# `escape_setup` (x86 0x5D577B) picks its capture rects on `[0x9ACB5C]`:
+#
+#     mode 1 BATTLE     A = (rect.x,       rect.y, 160, 168)  scale 1
+#                       B = (rect.x + 160, rect.y, 160, 168)  scale 1
+#     mode 2 default    A = (0,   0, 160, 168)                scale 2
+#                       B = (320, 0, 160, 168)                scale 2
+#
+# Same tiles, but battle asks for HALF the source extent. Ifrit gives the
+# semantics: its three captures tile gap-free only if both `x` and `tex_w` are
+# multiplied by `xscale` (cap1 256*2 = 512 source units; cap2 starts at
+# 256*2 = 512), and its total of 642 demonstrably covers the whole 640-column
+# staging surface -- confirmed on hardware, that capture holds the entire 16:9
+# frame. By the same arithmetic Escape in battle covers source 0..320: half
+# the surface.
+#
+# So this makes battle ask for what every other mode asks for. Two words:
+#
+#     +0x83B5F4   add w19, w8, #0xa0   ->  #0x140    B.x = rect.x + 320
+#     +0x83B624   mov w20, #1          ->  #2        scale
+#
+# The second word is copied from the default branch's own `mov w20, #2` at
+# +0x83B6B4, so the encoding is the binary's, not mine.
+#
+# IT IS A PROBE, AND EITHER ANSWER IS WORTH A BUILD
+# -------------------------------------------------
+#   the doubling goes away          -> the captures were reading half the
+#                                      surface; this is the fix, and the
+#                                      coverage work can then widen the mesh
+#   the picture halves in scale     -> x is NOT scaled by xscale, only tex_w,
+#                                      and B.x must stay at 160
+#   nothing changes                 -> the descriptor fields do not mean what
+#                                      Ifrit's tiling implies, and the next
+#                                      step is the engine side rather than
+#                                      more arithmetic
+#
+# It does NOT address the black margins (that needs the mesh constants
+# 0xA0/0x78/0x29/0x16 and the rect origin) or the hitch (40 draw calls plus 40
+# render-state changes per frame for 30 frames, still unmeasured -- and NOT
+# the swirl's CPU readback: both captures set field_0 = 0, the GPU path).
+ESCAPE_X86 = 0x5D577B
+ESCAPE_ENV = 'SEVENTH_NX_FX_ESCAPE_FULLSRC'
+
+#: (label, va, old word, new word)
+ESCAPE_SITES = (
+    ('capture B origin 160 -> 320', 0x0083B5F4, 0x11028113, 0x11050113),
+    ('capture scale 1 -> 2',        0x0083B624, 0x320003F4, 0x321F03F4),
+)
+
+
+def escape_fullsrc() -> bool:
+    """OFF. BUILD 403 RETRACTED THIS -- it made the picture worse.
+
+    Build 402 set battle's captures to the non-battle extent (B.x 160 -> 320,
+    scale 1 -> 2) on the theory that battle was reading half the surface. On
+    hardware the LEFT tile came back as noise and the right tile showed a
+    single magnified character. Neither the doubling nor the split went away.
+
+    So the premise is wrong: the descriptor's `x` and `tex_w * xscale` do NOT
+    address the surface the way Ifrit's tiling implied. I reasoned from one
+    effect's arithmetic to another's and shipped it as a probe. Kept behind
+    the switch only as a recorded negative result.
+    """
+    v = os.environ.get(ESCAPE_ENV)
+    if v is None:
+        return False
+    return v.strip().lower() not in ('0', 'off', 'no', 'false')
+
+
+def escape_plan(m, revert=False):
+    img = m.img
+    patches, problems = [], []
+    lo, hi = m.extent(ESCAPE_X86)
+    for label, va, old, new in ESCAPE_SITES:
+        if not (lo <= va < hi):
+            problems.append('escape: +0x%X (%s) is outside the body of 0x%X'
+                            % (va, label, ESCAPE_X86))
+            continue
+        want, set_to = (new, old) if revert else (old, new)
+        cur = struct.unpack_from('<I', img, va)[0]
+        if cur == set_to:
+            continue
+        if cur != want:
+            problems.append('escape: +0x%X (%s) is %08X, expected %08X'
+                            % (va, label, cur, want))
+            continue
+        patches.append({'name': 'escape %s' % label, 'va': hex(va),
+                        'expect': _fmt_word(cur), 'set': _fmt_word(set_to)})
+    return (([], problems) if problems else (patches, []))
+
+
+def apply_escape(main, revert=False, log=print) -> int:
+    m = nxmap.Main(str(main))
+    patches, problems = escape_plan(m, revert=revert)
+    if problems:
+        for p in problems:
+            log('  ! %s' % p)
+        log('  refusing to touch the Escape captures.')
+        return 1
+    if not patches:
+        return 0
+    log('    Escape: battle captures now cover the whole surface '
+        '(B origin 320, scale 2) -- probe, see FINDINGS-402.')
+    return _ifrit_write(main, patches, 'ff7nx_battlewide_escape', log)

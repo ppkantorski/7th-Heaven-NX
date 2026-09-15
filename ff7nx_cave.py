@@ -5,10 +5,19 @@ patch costs the 60 FPS budget nothing at all.
 
 WHY
 ---
-Caves are appended into the 2,464-byte gap between .text and .rodata. The
-shipping 60 FPS preset uses 2,460. There is no room for anything else and no
-way to enlarge the gap -- .rodata's address is baked into every adrp that
-reaches it.
+Caves used to be appended into the 2,464-byte gap between .text and .rodata,
+and the shipping 60 FPS preset used 2,416 of it. There is no way to enlarge
+that gap -- .rodata's address is baked into every adrp that reaches it.
+
+BUILD 383 moved the three dispatcher first-frame scalers in here as well, which
+took the gap from 48 bytes free to 1,124 and left ~27 KB still unclaimed in the
+pool. **New caves belong here, not in the tail gap.** A builder joins by taking
+the emit_laid_out contract -- `build(entry_va, addr)`, every internal label
+resolved through `addr(i)` -- and its site being marked `place: 'padding'`.
+tests/test_cave_relocation.py is the guard: it runs the same builder on a
+contiguous and on a maximally scattered layout and asserts the two decode to
+the same instruction stream, then walks the real allocator output and checks
+the executed sequence matches word for word.
 
 But the recompiled functions are 16-byte aligned, so nearly all of them end
 in 1-3 words of zero padding: ~62 KB of it that passes every safety test

@@ -147,11 +147,66 @@ ANCHORS = {
     0x471FC4: 0x79000AD4,          # strh w20, [x22, #4] (guest eax again)
 }
 
-# DISPROVEN ON HARDWARE, BUILD 271.  Moving the window to (192, 112) changes
-# every pixel the capture texture contains, and the black band did not move by
-# a single pixel.  So the black is NOT captured content, and this module is OFF
-# by default and kept only because that negative result is worth being able to
-# reproduce.  Set both env vars to re-arm it.
+# BUILD 359.  RE-ARMED, WITH A DERIVED VALUE INSTEAD OF A GUESS.
+#
+# Build 271 set this to (192, 112) to chase the BLACK BAND, and the band did
+# not move -- a correct negative result about the band, which is why this went
+# to None.  It says nothing about REGISTRATION, and registration is the whole
+# remaining defect: "the origin where I see symmetry is offset closer to the
+# enemies than where it is before the animated layer kicks in."
+#
+# The two things that fix the origin are now both known and neither is a
+# guess:
+#
+#   1  the window is a CONSTANT, `rect = (0, 0, 256, 256)` in game units,
+#      camera-independent (FINDINGS-308 section 11.4, read out of x86
+#      0x500858).  The effect photocopies the TOP-LEFT 256x256 game units of
+#      the frame -- it never was a picture of the ground beneath it
+#
+#   2  the disc samples the texture's CENTRE at its own centre, because the
+#      polar UVs at 0x500B78 are `u = 0x80 + (r*rsin >> 12)` as BYTES.  So
+#      texel (128,128) must hold the frame pixel the disc's centre is drawn
+#      over, and `FIT_HUV` -- the hardware-fitted screen<->UV homography,
+#      validated four times -- says where that is:
+#
+#          FIT_HUV^-1(128,128) = (0.6801, 0.3845) of the frame
+#
+#      while the stock window puts texel (128,128) at (0.2746, 0.2667).
+#      That is the misregistration, and it is 519 px across and 85 px down on
+#      a 1280x720 frame.
+#
+# Solving for the window that lands one on the other, through fbcapture's own
+# corrected origin and the resample's own step, gives the SAME answer at both
+# surface scales, which is the check that it is not an artefact of k:
+#
+#       k = 1   ->  rect.x = 347.0   rect.y = 56.6
+#       k = 4   ->  rect.x = 346.0   rect.y = 56.6
+#
+# and the clamp `min(x', 640k - w)` does not bite at either (340 of 384;
+# 1358 of 1536).
+#
+# THE ONE THING THIS CANNOT DO, STATED UP FRONT.  The disc's centre moves
+# across the screen with the camera; the window is a compile-time constant and
+# cannot follow it.  So this registers the field at the camera FIT_HUV was
+# fitted to and drifts away from it as the camera moves -- which is already
+# true of vanilla, and is the ceiling on any constant window.  Making it
+# follow the camera means computing the disc centre's projection at capture
+# time, and that is a different build.
+#
+# Revert with `SEVENTH_NX_FX_SNAP_X=stock SEVENTH_NX_FX_SNAP_Y=stock`, or move
+# it with integers -- both env vars still override.
+# BUILD 360: BACK TO None. The window was the wrong object.
+#
+# It decides WHAT is painted on the disc. It cannot decide WHERE the disc is
+# drawn, and "where" is the whole of the operator's complaint. He tested
+# (346, 57) and reported the origin still behind the enemies -- correctly,
+# because moving the window cannot move it. `ff7nx_fxorigin` moves the disc
+# itself, and this goes back to stock so that exactly one thing changes.
+#
+# The 359 derivation is not wrong, it is answering a different question --
+# "which part of the frame does the disc's centre display" -- and that
+# question only becomes answerable once the disc is in the right place. Keep
+# the numbers; they are re-derived by the tests in tests/test_fxsnap.py.
 DEFAULT_X = None
 DEFAULT_Y = None
 

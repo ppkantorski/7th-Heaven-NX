@@ -381,7 +381,7 @@ def part3_multi_site_shared():
         entry_va[tag] = TABLE_BASE + 12 * i
         sym = {n: va for n, va, _s, _g in d['cases']}
         cases = [(n, s, g) for n, _v, s, g in d['cases']]
-        w = SP.build_cave_shared(cursor, site, d['mask_bits'], entry_va[tag],
+        w = SP.build_cave_shared(cursor, None, site, d['mask_bits'], entry_va[tag],
                                  SHARED_VA, d['data_base'], d['stride'],
                                  d['fields'], cases, sym, K)
         site_va[tag] = cursor
@@ -407,7 +407,7 @@ def part3_multi_site_shared():
         d, site = dsite[tag]
         sym = {n: va for n, va, _s, _g in d['cases']}
         cases = [(n, s, g) for n, _v, s, g in d['cases']]
-        ref = D.build_cave(CAVE, site, d['flag'], d['mask_bits'],
+        ref = D.build_cave(CAVE, None, site, d['flag'], d['mask_bits'],
                            d['data_base'], d['stride'], d['fields'], cases,
                            sym, K)
         ref_total += len(ref)

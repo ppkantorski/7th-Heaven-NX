@@ -1764,6 +1764,693 @@ def _convert_world_dds(mod_files, van, log=lambda *_: None):
     return out
 
 
+# ---------------------------------------------------------------------------
+# WORLD TRUECOLOR MOD TEX -> NATIVE INDEXED
+# ---------------------------------------------------------------------------
+WORLD_TRUECOLOR_CACHE = os.path.join(HERE, 'cache', '_world_truecolor')
+WORLD_TRUECOLOR_ENV = 'SEVENTH_NX_WORLD_TRUECOLOR'
+
+# MEASURED, this build's shipped world_us.lgp: 998 of its 1011 entries are
+# 8-bit indexed and thirteen are not --
+#
+#   bg cbha ci cl gr hw1 jess rsb sb solj1 tb tf   24-bit (bytesperpixel 3)
+#   cia                                            32-bit (bytesperpixel 4)
+#
+# every one of them a NinoStyle Chibi world model skin. Vanilla world_us.lgp
+# has NO truecolor entry at all: all 415 of its TEX files are 8-bit with a
+# 16-colour palette, and the Cosmos Gaia terrain this port converts is emitted
+# as 8-bit/256 precisely because that is the only world format hardware has
+# ever rendered correctly here (see _convert_world_dds: 32-bit world TEX
+# rendered BLACK in build 179 while the same file was fine in field/battle).
+#
+# `hw1.tex` is the Highwind's skin and the one truecolor world texture that is
+# ever large on screen. Its shipped bytes decode to a clean grey-metal atlas
+# and the model's UVs resolve onto it correctly (verified offline by
+# rasterising CHA/CJA/CLA/CLC with the shipped TEX), yet on hardware the ship
+# renders with a smoothly-sweeping iridescent tint: ~2.6x the chroma its own
+# texture contains. The colour is added at draw time, not stored.
+#
+# So this pass exists to answer one question with one build: is the world
+# module's TRUECOLOR path the thing adding it? Convert the probe entry to the
+# byte-for-byte same paletted layout the Gaia terrain already uses and
+# nothing else changes -- same dimensions, same colour key, same UVs.
+#
+#   unset / "off"    -> convert nothing        <- DEFAULT, see below
+#   "all"            -> convert every truecolor world entry
+#   "probe"          -> convert hw1.tex only
+#   "a.tex,b.tex"    -> convert exactly those
+#
+# BUILD 412 RAN THIS AND THE ANSWER WAS NO. `hw1.tex` shipped as a verified
+# 768x768 8-bit/256 indexed TEX and the Highwind rendered exactly as before,
+# pixel for pixel. The world module's truecolor path is NOT what adds the
+# colour, so this pass no longer changes anything by default -- carrying an
+# unexplained asset change would only muddy the next measurement.
+#
+# The switch stays because `all` is still worth about 12 MiB of the world
+# texture cache FINDINGS-306 measured leaking (18.4 -> 6.1 MiB across the
+# thirteen). That is a MEMORY question, to be judged on its own, not a fix.
+WORLD_TRUECOLOR_PROBE = ('hw1.tex',)
+
+
+def _world_truecolor_targets():
+    """Which world TEX names this pass may convert. None means 'all of them'."""
+    raw = os.environ.get(WORLD_TRUECOLOR_ENV, '').strip().lower()
+    if raw == 'probe':
+        return set(WORLD_TRUECOLOR_PROBE)
+    if raw == '':
+        return set()
+    if raw in ('0', 'off', 'no', 'none', 'false'):
+        return set()
+    if raw in ('1', 'on', 'yes', 'true', 'all'):
+        return None
+    return {part.strip() for part in raw.split(',') if part.strip()}
+
+
+def _convert_world_truecolor(mod_files, log=lambda *_: None):
+    """
+    Re-encode truecolor mod TEX bound for ``world_us.lgp`` as 8-bit indexed.
+
+    Runs AFTER the world texture cap, so dimensions are already final and this
+    pass changes the pixel FORMAT and nothing else. The output is the same
+    layout `_convert_world_dds` emits for Gaia terrain -- one 256-colour
+    palette, standard 8-bit header, entry 0 reserved for the colour key when
+    the source had one -- because that layout is the one this port has already
+    proven on hardware for this archive.
+
+    The colour key is reproduced exactly as the engine reads it on a truecolor
+    TEX: `pixel & ~alpha_mask == 0`, i.e. a pixel whose colour bits are all
+    zero. Nothing else becomes transparent, so no texel that is drawn today
+    stops being drawn.
+
+    A texture that cannot be converted is left exactly as it is; this pass can
+    only ever be a no-op, never a drop.
+    """
+    targets = _world_truecolor_targets()
+    if targets is not None and not targets:
+        return mod_files
+    os.makedirs(WORLD_TRUECOLOR_CACHE, exist_ok=True)
+    out = {}
+    converted = 0
+    source_bytes = output_bytes = 0
+    for low, pair in mod_files.items():
+        src, mod = pair
+        out[low] = pair
+        if not low.endswith('.tex'):
+            continue
+        if targets is not None and low not in targets:
+            continue
+        try:
+            with open(src, 'rb') as f:
+                data = f.read()
+        except OSError:
+            continue
+        parsed = tex.parse(data)
+        if parsed is None or parsed['palette_flag'] or \
+                parsed['bytes_per_pixel'] < 3:
+            continue
+        # The version tag is part of the key on purpose: the rules below
+        # (which texels are keyed, what alpha is refused) are CODE, and a
+        # cache written by older rules must not be silently reused.
+        key = ('WORLD-TRUECOLOR-V2-256PAL-GRADED-ALPHA-REFUSED-' + _sig(src))
+        cached = os.path.join(
+            WORLD_TRUECOLOR_CACHE,
+            '%s.%s' % (low, hashlib.sha1(key.encode()).hexdigest()[:16]))
+        if not os.path.isfile(cached):
+            try:
+                converted_tex, note = _world_truecolor_tex(data, parsed)
+            except Exception as exc:                           # noqa: BLE001
+                log('  ! world truecolor %s: %s; keeping the truecolor TEX'
+                    % (low, exc))
+                continue
+            tmp = cached + '.tmp'
+            with open(tmp, 'wb') as f:
+                f.write(converted_tex)
+            os.replace(tmp, cached)
+            log('  world truecolor %s: %s' % (low, note))
+        out[low] = (cached, mod)
+        converted += 1
+        source_bytes += len(data)
+        output_bytes += os.path.getsize(cached)
+    if converted:
+        log('  world_us.lgp: %d truecolor mod texture(s) re-encoded as native '
+            '8-bit indexed TEX (%.1f MiB -> %.1f MiB); set %s=off to keep '
+            'them truecolor, %s=all to convert every one'
+            % (converted, source_bytes / (1024 * 1024),
+               output_bytes / (1024 * 1024),
+               WORLD_TRUECOLOR_ENV, WORLD_TRUECOLOR_ENV))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# WORLD TEXTURE PROBE -- diagnostic, never ships enabled
+# ---------------------------------------------------------------------------
+WORLD_TEX_PROBE_ENV = 'SEVENTH_NX_WORLD_TEX_PROBE'
+
+# BUILD 413. Nine world models are UNTEXTURED in vanilla and textured by
+# Ninostyle Chibi -- buggy_sk, chocobo_sk, highwind_sk, highwind2_sk,
+# sbmrn_sk x2, tail_sk, tinybronco_sk, warship_sk. Every world model that
+# renders WRONG is in that list. Every world model that renders RIGHT
+# (sd_cloud_sk, sd_tifa_sk, sd_cid_sk and the sixteen scenery/Weapon models)
+# already had a texture in vanilla. That is the whole correlation, and
+# BUILD-412 proved the pixel FORMAT is not the axis.
+#
+# So the question left is the simplest one there is: when the world module
+# draws the Highwind, is it sampling `hw1.tex` at all?
+#
+# This replaces the named entry with a FLAT texture -- one colour everywhere
+# an opaque texel used to be, index 0 everywhere a keyed one used to be, same
+# dimensions, same colour key. A flat texture has no content left to misread,
+# so whatever colour reaches the screen did not come from it. Three outcomes,
+# all of them conclusive:
+#
+#   ship turns flat white   -> hw1 IS sampled and nothing tints it; the old
+#                              rainbow came out of the texture's own content
+#   ship keeps its rainbow  -> hw1 is NOT what the model samples; the world
+#                              module has it bound to something else
+#   ship is white x colour  -> hw1 IS sampled and something multiplies a
+#                              colour field into it, now directly readable
+#
+# Format: `name.tex` or `name.tex:rrggbb`, comma separated. Off when unset.
+def _world_tex_probe_targets():
+    raw = os.environ.get(WORLD_TEX_PROBE_ENV, '').strip()
+    if raw.lower() in ('', '0', 'off', 'no', 'none', 'false'):
+        return {}
+    out = {}
+    for part in raw.split(','):
+        part = part.strip()
+        if not part:
+            continue
+        name, _, colour = part.partition(':')
+        name = name.strip().lower()
+        if not name.endswith('.tex'):
+            name += '.tex'
+        rgb = (255, 255, 255)
+        colour = colour.strip()
+        if len(colour) == 6:
+            try:
+                rgb = tuple(int(colour[i:i + 2], 16) for i in (0, 2, 4))
+            except ValueError:
+                rgb = (255, 255, 255)
+        out[name] = rgb
+    return out
+
+
+def _convert_world_tex_probe(mod_files, log=lambda *_: None):
+    """Flatten the named world TEX entries to one colour. Diagnostic only."""
+    targets = _world_tex_probe_targets()
+    if not targets:
+        return mod_files
+    log('  ! %s IS SET. This build is a DIAGNOSTIC and must not be kept: '
+        'the named world textures are replaced by flat colour.'
+        % WORLD_TEX_PROBE_ENV)
+    os.makedirs(WORLD_TRUECOLOR_CACHE, exist_ok=True)
+    out = dict(mod_files)
+    for low, rgb in sorted(targets.items()):
+        pair = mod_files.get(low)
+        if pair is None:
+            log('  ! world probe %s: not in this build\'s world_us.lgp; '
+                'nothing replaced' % low)
+            continue
+        try:
+            with open(pair[0], 'rb') as f:
+                data = f.read()
+            flat, note = _world_flat_tex(data, rgb)
+        except Exception as exc:                               # noqa: BLE001
+            log('  ! world probe %s: %s; left alone' % (low, exc))
+            continue
+        cached = os.path.join(
+            WORLD_TRUECOLOR_CACHE,
+            '%s.probe-%02x%02x%02x.%s'
+            % (low, rgb[0], rgb[1], rgb[2],
+               hashlib.sha1(_sig(pair[0]).encode()).hexdigest()[:12]))
+        tmp = cached + '.tmp'
+        with open(tmp, 'wb') as f:
+            f.write(flat)
+        os.replace(tmp, cached)
+        out[low] = (cached, pair[1])
+        log('  ! world probe %s: %s' % (low, note))
+    return out
+
+
+def _world_flat_tex(data, rgb):
+    """One flat colour wherever the source was drawn, key wherever it wasn't."""
+    parsed = tex.parse(data)
+    if parsed is None:
+        raise ValueError('not a TEX')
+    w, h = parsed['width'], parsed['height']
+    bypp = parsed['bytes_per_pixel']
+    px = bytes(parsed['pixels'])
+    colorkey = bool(struct.unpack_from('<I', data, tex.O_COLORKEY)[0])
+
+    # Reproduce the destination's own transparency exactly, so the silhouette
+    # on screen is identical to the one being diagnosed.
+    drawn = bytearray(w * h)
+    if parsed['palette_flag'] and bypp == 1:
+        pal = bytes(parsed['palette'])
+        for i, idx in enumerate(px[:w * h]):
+            if colorkey and idx == 0:
+                continue
+            o = idx * 4
+            if not colorkey and pal[o + 3] < 128:
+                continue
+            drawn[i] = 1
+    elif bypp in (3, 4):
+        for i in range(w * h):
+            o = i * bypp
+            opaque = bool(px[o] or px[o + 1] or px[o + 2])
+            if bypp == 4 and px[o + 3] < 128:
+                opaque = False
+            drawn[i] = 1 if (opaque or not colorkey) else 0
+    else:
+        raise ValueError('unsupported source layout')
+
+    entries = [(0, 0, 0, 0), (rgb[0], rgb[1], rgb[2], 255)]
+    entries += [(0, 0, 0, 255)] * (256 - len(entries))
+    pal_bytes = bytearray()
+    for r, g, b, a in entries:
+        pal_bytes += bytes((b, g, r, a))
+    if not colorkey:
+        # No key on this entry: entry 0 must be the flat colour too, so a
+        # texel that used to be drawn as black still draws.
+        pal_bytes[0:4] = bytes((rgb[2], rgb[1], rgb[0], 255))
+    hdr = tex._paletted_header(data, w, h, 1, 256)
+    struct.pack_into('<I', hdr, tex.O_COLORKEY, int(colorkey))
+    flat = bytes(hdr) + bytes(pal_bytes) + bytes(drawn)
+    if tex.parse(flat) is None:
+        raise ValueError('flat payload failed TEX validation')
+    note = ('%dx%d flattened to #%02X%02X%02X, %d of %d texels drawn, '
+            'colour key %s' % (w, h, rgb[0], rgb[1], rgb[2], sum(drawn),
+                               w * h, 'on' if colorkey else 'off'))
+    return flat, note
+
+
+# ---------------------------------------------------------------------------
+# WORLD NORMAL PROBE -- diagnostic, never ships enabled
+# ---------------------------------------------------------------------------
+WORLD_NORMAL_PROBE_ENV = 'SEVENTH_NX_WORLD_NORMAL_PROBE'
+
+# BUILD 414. With `hw1.tex` flattened to white, the Highwind came back a
+# full-strength pastel rainbow: smooth Gouraud sweeps over every curved
+# surface, and FLAT colour over every flat plate. Measured over the ship,
+# hue is uniform across the whole wheel, mean saturation 0.46, mean value
+# 162, with almost nothing clipped at 0 or 255.
+#
+# Flat-plate-flat-colour is the whole finding. `CJA.P` has 64 vertices that
+# share one normal (0,0,1) while spanning 37.5 units of position and 0.41 of
+# UV; `CHA.P` has 96 more. If the colour were coming from position floats or
+# texcoord floats read as bytes -- which match the hue/saturation signature
+# just as well -- those 64 texels could not possibly come out one flat
+# colour. They do. So the per-vertex colour is a function of the vertex
+# NORMAL and of nothing else: these models are being LIT, and the light
+# state reaching them is close enough to identity that the lit colour is
+# essentially the normal.
+#
+# This probe replaces the normals of the named world `.p` entries with one
+# constant vector. If that reading is right, every polygon of a probed part
+# collapses to a SINGLE FLAT COLOUR while the parts left alone keep their
+# rainbow -- both in the same screenshot, no interpretation required.
+#
+# Format: `name.p` or `name.p:x,y,z`, comma separated between entries with
+# `;` -- e.g. `cha.p;cja.p:0,1,0`. Off when unset.
+def _world_normal_probe_targets():
+    raw = os.environ.get(WORLD_NORMAL_PROBE_ENV, '').strip()
+    if raw.lower() in ('', '0', 'off', 'no', 'none', 'false'):
+        return {}
+    out = {}
+    for part in raw.split(';'):
+        part = part.strip()
+        if not part:
+            continue
+        name, _, vec = part.partition(':')
+        name = name.strip().lower()
+        if not name.endswith('.p'):
+            name += '.p'
+        normal = (0.0, 0.0, 1.0)
+        if vec.strip():
+            try:
+                xs = [float(v) for v in vec.split(',')]
+                if len(xs) == 3 and any(xs):
+                    length = math.sqrt(sum(v * v for v in xs))
+                    normal = tuple(v / length for v in xs)
+            except ValueError:
+                pass
+        out[name] = normal
+    return out
+
+
+def _convert_world_normal_probe(mod_files, log=lambda *_: None):
+    """Replace the normals of the named world .p entries with one constant."""
+    targets = _world_normal_probe_targets()
+    if not targets:
+        return mod_files
+    log('  ! %s IS SET. This build is a DIAGNOSTIC and must not be kept: '
+        'the named world meshes have had their normals replaced.'
+        % WORLD_NORMAL_PROBE_ENV)
+    os.makedirs(WORLD_TRUECOLOR_CACHE, exist_ok=True)
+    out = dict(mod_files)
+    for low, normal in sorted(targets.items()):
+        pair = mod_files.get(low)
+        if pair is None:
+            log('  ! world normal probe %s: not in this build\'s '
+                'world_us.lgp; nothing replaced' % low)
+            continue
+        try:
+            with open(pair[0], 'rb') as f:
+                data = f.read()
+            flat, note = _world_flat_normals(data, normal)
+        except Exception as exc:                               # noqa: BLE001
+            log('  ! world normal probe %s: %s; left alone' % (low, exc))
+            continue
+        cached = os.path.join(
+            WORLD_TRUECOLOR_CACHE,
+            '%s.normprobe-%s.%s'
+            % (low, '_'.join('%+.3f' % v for v in normal),
+               hashlib.sha1(_sig(pair[0]).encode()).hexdigest()[:12]))
+        tmp = cached + '.tmp'
+        with open(tmp, 'wb') as f:
+            f.write(flat)
+        os.replace(tmp, cached)
+        out[low] = (cached, pair[1])
+        log('  ! world normal probe %s: %s' % (low, note))
+    return out
+
+
+def _world_flat_normals(data, normal):
+    """Rewrite a .p file's normal array in place. Nothing else moves."""
+    if len(data) < 128:
+        raise ValueError('too short to be a .p file')
+    (version, _f4, _vtype, numverts, numnormals, f14) = struct.unpack_from(
+        '<6I', data, 0)
+    if version != 1:
+        raise ValueError('not a version 1 .p file')
+    if not numnormals:
+        raise ValueError('this part has no normals')
+    # The loader reads field_48 (f14 vector3s), then vertices, then normals.
+    off = 128 + f14 * 12 + numverts * 12
+    end = off + numnormals * 12
+    if end > len(data):
+        raise ValueError('normal block runs past the end of the file')
+    out = bytearray(data)
+    one = struct.pack('<3f', *normal)
+    for i in range(numnormals):
+        out[off + i * 12:off + i * 12 + 12] = one
+    note = ('%d normal(s) forced to (%+.3f, %+.3f, %+.3f); %d vertices, '
+            '%d bytes unchanged either side'
+            % (numnormals, normal[0], normal[1], normal[2], numverts,
+               len(data) - numnormals * 12))
+    return bytes(out), note
+
+
+# ---------------------------------------------------------------------------
+# WORLD PRE-LIT MODELS -- the iridescent Highwind
+# ---------------------------------------------------------------------------
+WORLD_PRELIT_CACHE = os.path.join(HERE, 'cache', '_world_prelit')
+WORLD_PRELIT_ENV = 'SEVENTH_NX_WORLD_PRELIT'
+
+# FINDINGS-411. The rainbow is not in any texture. It is the `vertextype`
+# field of the mod's world `.p` files.
+#
+# WHAT `vertextype` IS
+# --------------------
+# Word 2 of the 128-byte `.p` header. It names the Direct3D vertex format the
+# part's vertices are in, and FF7 only ever uses three:
+#
+#   0  D3DVERTEX    x,y,z + NORMAL   + u,v     UNLIT. The colour of every
+#                                              vertex is COMPUTED at draw time
+#                                              from the normal and the current
+#                                              light state.
+#   1  D3DLVERTEX   x,y,z + w,COLOUR,specular + u,v   PRE-LIT. The colour is
+#                                              taken from the model's own
+#                                              `vertexcolordata` array. No
+#                                              lighting is applied.
+#   2  D3DTLVERTEX  already transformed        2D.
+#
+# All three are 32 bytes and the middle 12 are a UNION: the normal of a
+# D3DVERTEX occupies exactly the bytes a D3DLVERTEX uses for `w`, `colour`
+# and `specular`.
+#
+# MEASURED, this port's binary. The world/field 3D submission path builds ONE
+# vertex layout and never varies it (`main+0x10DA3EC`..`+0x10DA45C`, three
+# attribute bindings, stride 0x20):
+#
+#   location 0  VertexCoord    format 1   (3 floats)  offset 0x00
+#   location 1  TextureCoord   format 3   (2 floats)  offset 0x18
+#   location 2  Color          format 15  (4 bytes N) offset 0x10
+#
+# and `romfs/ff7/shaders/lmain_vv.glsl` -- the only vertex shader the 3D path
+# has -- is `vColor = Color.bgra`. There is no normal attribute and no
+# lighting in any shipped shader. So a D3DVERTEX part can only reach the
+# screen if something on the CPU turns its normal into those four bytes
+# first, which is precisely what the unlit vertex type asks for.
+#
+# `main+0x10D8310` is `gfx_drv_field_78` (the project's own gfx_drv_table
+# names it). At `+0x10D8CF0` it reads `ldp w20, w22, [x8, #8]` -- the
+# indexed_primitive's `primitivetype` and `vertextype` -- and at `+0x10D8DB0`
+# passes `w22` straight to the draw helper as the vertex type. Every other
+# call site of that helper passes a constant (2 for 3D, 3 for 2D). So the
+# per-model vertextype reaches the renderer through exactly one door, and
+# only 3D models go through it.
+#
+# THE SPLIT, MEASURED ACROSS THE ARCHIVES
+# ---------------------------------------
+#                                  vertextype 1     vertextype 0
+#   vanilla world_us.lgp  .p            228                0
+#   shipped world_us.lgp  .p            127              107     <- the mod
+#   vanilla char.lgp      .p           4180                0
+#   shipped char.lgp      .p            904             3689     <- the mod
+#
+# Vanilla has NO unlit part anywhere. Ninostyle Chibi exports unlit parts
+# everywhere, because unlit is what it wants: its field models are shaded by
+# the field's own light data and look right doing it. The field sets light
+# data; the WORLD MODULE NEVER DOES, because vanilla gave it nothing to light.
+# So on the world map the computed colour comes out of whatever is left in
+# the light state, and that is the oil-slick.
+#
+# Resolving the 107 against the skeletons gives every vehicle in the game --
+# buggy, chocobo, Highwind, Highwind's tail, both submarines, Tiny Bronco,
+# cargo ship -- plus the world Cloud/Tifa/Cid, who are 25 px tall.
+#
+# WHY THIS IS THE FIX AND NOT A WORKAROUND
+# ----------------------------------------
+# The parts already carry the colours: every one of the 107 has
+# `numvertcolors == numverts`, and all 24,832 entries are neutral greys
+# (r == g == b, 40..255, mean 231, alpha 128) -- baked ambient shading the
+# exporter wrote and the unlit flag then told the engine to ignore. Setting
+# the flag to PRE-LIT hands the engine the artist's own shading and the true
+# colour skin on top of it, which is exactly what FFNx draws on PC: its
+# `Renderer::bindVertexBuffer` takes `inVertex[idx].color.color` for every
+# vertex type, so a D3DVERTEX part is drawn from `vertexcolordata` there and
+# the same asset looks correct.
+#
+# PRECEDENT, AND IT IS THIS PORT'S OWN. `p.enable_vertex_colors` already
+# makes this exact edit -- header +0x08, 0 -> 1 -- for BATTLE player parts,
+# under the name `vcolType`, and it has shipped and been confirmed on
+# hardware: Nino parts "contain a complete colour entry for every vertex but
+# commonly leave the header's vcolType at zero", and the summon fade, which
+# re-renders a part through its vertex colours, had nothing to shade and the
+# part popped off. The D3D reading above is why that repair works -- a
+# D3DVERTEX carries a normal in the bytes a D3DLVERTEX carries its colour in,
+# so the flag does not "enable" a colour array so much as choose between the
+# two halves of a union. This pass is the same repair for the world archive,
+# plus a guard `enable_vertex_colors` does not need: it refuses a part that
+# does not carry one colour per vertex.
+#
+# SCOPE. world_us.lgp ONLY. char.lgp's 3689 unlit parts are lit correctly by
+# the field and must not be touched -- flattening them would throw away the
+# field lighting that makes them look right.
+WORLD_PRELIT_ARCHIVE = 'world_us.lgp'
+
+
+def _world_prelit_enabled():
+    raw = os.environ.get(WORLD_PRELIT_ENV, '').strip().lower()
+    return raw not in ('0', 'off', 'no', 'none', 'false')
+
+
+def _is_p_entry(low):
+    """`cha.p`, `cha.1.p`, `elb.4.p` -- an LGP model part, not a .tex/.hrc."""
+    return bool(re.search(r'\.[0-9]*p$', low))
+
+
+def _world_prelit_p(data):
+    """
+    (bytes, note) for one unlit world `.p`. Raises on refusal.
+
+    Changes FOUR BYTES: header word 2, `vertextype`, from 0 (D3DVERTEX,
+    unlit) to 1 (D3DLVERTEX, pre-lit). Nothing else in the file moves, so
+    vertices, normals, UVs, polygons, groups, hundreds and the bounding box
+    are byte-for-byte what the mod shipped.
+    """
+    if len(data) < 128:
+        raise ValueError('too short to be a .p file')
+    (version, _f4, vertextype, numverts, _numnormals, _f14, _numtexcoords,
+     numvertcolors) = struct.unpack_from('<8I', data, 0)
+    if version != 1:
+        raise ValueError('not a version 1 .p file')
+    if vertextype != 0:
+        raise ValueError('already vertextype %d' % vertextype)
+    if not numverts:
+        raise ValueError('no vertices')
+    # Pre-lit means the colour comes from `vertexcolordata`. If the part has
+    # no colour for every vertex, the engine would draw whatever the vertex
+    # buffer was allocated with -- refuse rather than trade one wrong colour
+    # for another.
+    if numvertcolors != numverts:
+        raise ValueError('numvertcolors %d != numverts %d; cannot be pre-lit'
+                         % (numvertcolors, numverts))
+    out = bytearray(data)
+    struct.pack_into('<I', out, 8, 1)
+    return bytes(out), ('vertextype 0 (D3DVERTEX, unlit) -> 1 (D3DLVERTEX, '
+                        'pre-lit); %d vertex colour(s) now used, %d of %d '
+                        'bytes unchanged'
+                        % (numvertcolors, len(data) - 4, len(data)))
+
+
+def _convert_world_prelit(mod_files, log=lambda *_: None):
+    """
+    Mark the mod's unlit world model parts pre-lit. See FINDINGS-411 above.
+
+    Refusals are logged and leave the part exactly as the mod shipped it, so
+    this pass can only ever be a no-op, never a corruption.
+    """
+    if not _world_prelit_enabled():
+        log('  ! %s is off: the mod\'s unlit world parts keep vertextype 0 '
+            'and the world module will light them' % WORLD_PRELIT_ENV)
+        return mod_files
+    os.makedirs(WORLD_PRELIT_CACHE, exist_ok=True)
+    out = {}
+    changed = refused = already = 0
+    for low, pair in sorted(mod_files.items()):
+        src, mod = pair
+        out[low] = pair
+        if not _is_p_entry(low):
+            continue
+        try:
+            with open(src, 'rb') as f:
+                data = f.read()
+        except OSError:
+            continue
+        if len(data) < 128:
+            continue
+        version, _field_4, vertextype = struct.unpack_from('<3I', data, 0)
+        if version != 1:
+            continue
+        if vertextype != 0:
+            already += 1
+            continue
+        cached = os.path.join(
+            WORLD_PRELIT_CACHE,
+            '%s.prelit.%s'
+            % (low, hashlib.sha1(('WORLD-PRELIT-V1-' + _sig(src))
+                                 .encode()).hexdigest()[:16]))
+        if not os.path.isfile(cached):
+            try:
+                fixed, _note = _world_prelit_p(data)
+            except Exception as exc:                           # noqa: BLE001
+                log('  ! world pre-lit %s: %s; left unlit' % (low, exc))
+                refused += 1
+                continue
+            tmp = cached + '.tmp'
+            with open(tmp, 'wb') as f:
+                f.write(fixed)
+            os.replace(tmp, cached)
+        out[low] = (cached, mod)
+        changed += 1
+    if changed or refused:
+        log('  %s: %d model part(s) re-flagged PRE-LIT (vertextype 0 -> 1), '
+            '%d already pre-lit, %d refused; set %s=off to restore the '
+            'unlit parts'
+            % (WORLD_PRELIT_ARCHIVE, changed, already, refused,
+               WORLD_PRELIT_ENV))
+    return out
+
+
+def _world_truecolor_tex(data, parsed):
+    """(bytes, note) for one truecolor world TEX. Raises on refusal."""
+    w, h, bypp = parsed['width'], parsed['height'], parsed['bytes_per_pixel']
+    pixels = bytes(parsed['pixels'])
+    if len(pixels) < w * h * bypp:
+        raise ValueError('short pixel payload')
+    if bypp == 3:
+        image = Image.frombytes('RGB', (w, h), pixels[:w * h * 3],
+                                'raw', 'BGR').convert('RGBA')
+    elif bypp == 4:
+        image = Image.frombytes('RGBA', (w, h), pixels[:w * h * 4],
+                                'raw', 'BGRA')
+    else:
+        raise ValueError('unsupported bytes_per_pixel %d' % bypp)
+
+    colorkey = bool(struct.unpack_from('<I', data, tex.O_COLORKEY)[0])
+    alpha_bits = struct.unpack_from('<I', data, 0x78)[0]
+    if bypp == 4 and alpha_bits:
+        # An indexed destination has one bit of transparency, not eight. A
+        # 32-bit source whose alpha is anything other than "opaque" is
+        # carrying coverage this format cannot express, so leave it alone
+        # rather than silently flattening it.
+        graded = sum(1 for a in image.getchannel('A').tobytes() if a != 255)
+        if graded:
+            raise ValueError(
+                '32-bit source has %d texel(s) of graded alpha, which an '
+                'indexed TEX cannot carry' % graded)
+    rgb = image.convert('RGB')
+    source_rgb = rgb.tobytes()
+    alpha = image.getchannel('A').tobytes()
+
+    # Exactly the engine's own truecolor colour-key test: the colour bits are
+    # all zero. A 32-bit source additionally keys on its own alpha, which a
+    # paletted destination cannot express as a gradient.
+    transparent = bytearray(w * h)
+    if colorkey:
+        for pos in range(w * h):
+            off = pos * 3
+            if not (source_rgb[off] or source_rgb[off + 1]
+                    or source_rgb[off + 2]):
+                transparent[pos] = 1
+        if bypp == 4 and alpha_bits:
+            for pos in range(w * h):
+                if alpha[pos] < 128:
+                    transparent[pos] = 1
+
+    usable = 255 if colorkey else 256
+    indexed = rgb.quantize(colors=usable, method=Image.Quantize.MEDIANCUT,
+                           dither=Image.Dither.NONE)
+    raw_indices = bytearray(indexed.tobytes())
+    if colorkey:
+        raw_indices = bytearray(
+            0 if transparent[pos] else idx + 1
+            for pos, idx in enumerate(raw_indices))
+
+    pillow_pal = indexed.getpalette() or []
+    entries = [(0, 0, 0, 0)] if colorkey else []
+    used = (max(indexed.tobytes()) + 1) if indexed.tobytes() else 0
+    for i in range(used):
+        o = i * 3
+        entries.append((pillow_pal[o], pillow_pal[o + 1], pillow_pal[o + 2],
+                        255))
+    entries += [(0, 0, 0, 255)] * (256 - len(entries))
+    pal_bytes = bytearray()
+    for r, g, b, a in entries[:256]:
+        pal_bytes += bytes((b, g, r, a))
+    if colorkey:
+        # Entry 0 is invisible, but the GPU still bilinear-filters through it.
+        # Give it the mean of the texels that border transparency so the
+        # atlas does not grow a dark seam along every silhouette.
+        edge = tex._boundary_colour(raw_indices, w, h, pal_bytes, 256, 0)
+        if edge is not None:
+            pal_bytes[0:4] = bytes((edge[2], edge[1], edge[0], 0))
+
+    hdr = tex._paletted_header(data, w, h, 1, 256)
+    struct.pack_into('<I', hdr, tex.O_COLORKEY, int(colorkey))
+    converted_tex = bytes(hdr) + bytes(pal_bytes) + bytes(raw_indices)
+    if tex.parse(converted_tex) is None:
+        raise ValueError('converted payload failed TEX validation')
+    note = ('%dx%d %d-bit -> 8-bit indexed, %d/256 colours, colour key %s '
+            '(%d keyed texel(s)), %d -> %d bytes'
+            % (w, h, bypp * 8, used + (1 if colorkey else 0),
+               'on' if colorkey else 'off', sum(transparent),
+               len(data), len(converted_tex)))
+    return converted_tex, note
+
+
 _HRC_PIECE = re.compile(r'^\d+[ \t]+(.+)$', re.MULTILINE)
 _RSD_PIECE = re.compile(r'(?:PLY|TEX\[\d+\])=(\S+)')
 
@@ -6050,6 +6737,26 @@ def _build_model_archive(name, archive_path, mod_files, romfs, pack_lgp,
         if cap:
             mod_files = _cap_field_textures(name, mod_files, log, cap)
 
+    # Vanilla world_us.lgp has no truecolor entry at all and this port's own
+    # Gaia terrain is emitted 8-bit for that reason. A mod's truecolor model
+    # skin is the one thing that still reaches the world module unconverted.
+    # AFTER the cap so this only ever changes the pixel FORMAT, and before
+    # _debleed_textures so the result is de-fringed like any other indexed
+    # colour-keyed texture. See _convert_world_truecolor.
+    if name == 'world_us.lgp':
+        mod_files = _convert_world_truecolor(mod_files, log)
+        # Diagnostic, off unless asked for. Last, so it wins over everything.
+        mod_files = _convert_world_tex_probe(mod_files, log)
+
+    # The Highwind's iridescence. Touches `.p` model parts only, so it is
+    # independent of every texture pass above and their order does not
+    # matter. world_us.lgp ONLY -- char.lgp's unlit parts are lit correctly
+    # by the field. See FINDINGS-411 / _convert_world_prelit.
+    if name == WORLD_PRELIT_ARCHIVE:
+        mod_files = _convert_world_prelit(mod_files, log)
+        # Diagnostic, off unless asked for.
+        mod_files = _convert_world_normal_probe(mod_files, log)
+
     # Every model archive, and AFTER both the battle conversion and the field
     # cap so neither can undo it. Idempotent on anything already de-fringed.
     mod_files = _debleed_textures(name, mod_files, van, log)
@@ -7946,18 +8653,40 @@ FPS_SIG_TAG = 'fps='
 # field file. Adding a name here is only safe under that rule.
 MAIN_ONLY_ENV = frozenset((
     'SEVENTH_NX_FX_DISC',        # ff7nx_fxdisc      the floor disc radius
+    'SEVENTH_NX_FX_DEPTH',       # ff7nx_fxdepth     the disc's DEPTH only
+    'SEVENTH_NX_FX_ORIGIN_Z',    # ff7nx_fxorigin    where the disc's centre is
     'SEVENTH_NX_FX_SCALE',       # ff7nx_fxscale     ditto, by whole bits
     'SEVENTH_NX_FX_RIM',         # ff7nx_fxrim       the rim UV cap
-    'SEVENTH_NX_FX_SNAP',        # ff7nx_fxsnap      the snapshot window
-    'SEVENTH_NX_FX_CAPSCALE',    # ff7nx_fxcapscale  Kujata's xscale/yscale
+    'SEVENTH_NX_FX_SNAP',        # ff7nx_fxsnap      the snapshot origin
+    'SEVENTH_NX_FX_WINDOW',      # ff7nx_fxwindow    the snapshot SIZE
+    'SEVENTH_NX_FX_SUMMONHOLD',  # ff7nx_summonhold  the 60fps pause guard
+    'SEVENTH_NX_FX_MODELINTERP', # ff7nx_60fps       summon model hold
+    'SEVENTH_NX_FX_CAMERAHOLD',  # ff7nx_60fps       summon camera hold
+    'SEVENTH_NX_FX_SNAP_X',      # ...and the two names it actually reads, so
+    'SEVENTH_NX_FX_SNAP_Y',      #    overriding it does not force a rebuild
+    'SEVENTH_NX_FX_CAPSCALE',    # ff7nx_fxcapscale  Kujata's xscale
+    'SEVENTH_NX_FX_CAPSCALE_Y',  # ff7nx_fxcapscale  ... and its yscale
     'SEVENTH_NX_FB_RESAMPLE',    # ff7nx_fbresample
     'SEVENTH_NX_FB_PROBE',       # ff7nx_fbresample  the diagnostic modes
     'SEVENTH_NX_FB_SPAN',        # ff7nx_fbresample  the source span
+    'SEVENTH_NX_FB_CHECK',       # ff7nx_fbresample  the checker square
+    'SEVENTH_NX_FB_BAR',         # ff7nx_fbresample  the projbar shift
+    'SEVENTH_NX_FB_DIRECT',      # ff7nx_fbdirect    read the scene target
     'SEVENTH_NX_FB_FIT',         # ff7nx_fbfit
     'SEVENTH_NX_FB_WINDOW',      # ff7nx_fbwindow
     'SEVENTH_NX_FB_PATH',        # ff7nx_fbpath
+    'SEVENTH_NX_FX_IFRIT_WAVE',  # ff7nx_battlewide  the heat-wave widening
+    'SEVENTH_NX_FX_IFRIT_TALL',  # ff7nx_battlewide  ... and its height
+    'SEVENTH_NX_FX_IFRIT_SRC',   # ff7nx_ifritsrc    the capture descriptors
+    'SEVENTH_NX_FX_IFRIT_VCOVER',  # ff7nx_battlewide  its full-frame bands
+    'SEVENTH_NX_FX_ESCAPE_FULLSRC',  # ff7nx_battlewide  Escape's capture extent
+    'SEVENTH_NX_ESCAPE_GPU',     # ff7nx_escapegpu    full-frame GPU snapshot
+    'SEVENTH_NX_ESCAPE_SCALE',   # ff7nx_escapescale  the ripple's width
+    'SEVENTH_NX_ESCAPE_UV',      # ff7nx_escapeuv     one screen, not two
+    'SEVENTH_NX_ESCAPE_TALL',    # ff7nx_escapetall   reach below the UI
     'SEVENTH_NX_FB_SIZE',        # ff7nx_fbsize
     'SEVENTH_NX_FB_SURFACE',     # ff7nx_fbsurf     the capture resolution
+    'SEVENTH_NX_FB_AUTHORED',    # ff7nx_fbauthored k scales source, not tex
     'SEVENTH_NX_FB_FILTER',      # ff7nx_fbfilter   the capture blit filter
     'SEVENTH_NX_SWIRL_SEAM',     # ff7nx_swirlseam  the entry swirl's UVs
     'SEVENTH_NX_SWIRL_GPU',      # ff7nx_swirlgpu   its capture path
@@ -7968,10 +8697,14 @@ MAIN_ONLY_ENV = frozenset((
 # The modules those settings reach, by the same rule: each writes into
 # `exefs/main` and nothing else, so editing one cannot change archive bytes.
 MAIN_ONLY_MODULES = frozenset((
-    'ff7nx_fxdisc.py', 'ff7nx_fxscale.py', 'ff7nx_fxrim.py', 'ff7nx_fxsnap.py',
+    'ff7nx_fxdisc.py', 'ff7nx_fxdepth.py', 'ff7nx_fxscale.py', 'ff7nx_fxrim.py', 'ff7nx_fxsnap.py',
+    'ff7nx_fxorigin.py', 'ff7nx_fxwindow.py', 'ff7nx_summonhold.py',
     'ff7nx_fxcapscale.py', 'ff7nx_fbresample.py', 'ff7nx_fbfit.py',
+    'ff7nx_fbdirect.py',
     'ff7nx_fbwindow.py', 'ff7nx_fbpath.py', 'ff7nx_fbsize.py',
-    'ff7nx_fbsurf.py', 'ff7nx_fbfilter.py', 'ff7nx_swirlseam.py',
+    'ff7nx_fbsurf.py', 'ff7nx_fbauthored.py',
+    'ff7nx_fbfilter.py', 'ff7nx_swirlseam.py', 'ff7nx_escapegpu.py',
+    'ff7nx_ifritsrc.py',
     'ff7nx_swirlgpu.py', 'ff7nx_gpucap.py',
     'ff7nx_summonreach.py',
 ))
@@ -9613,13 +10346,27 @@ def apply_fbcapture(sdout, dump, log=lambda *_: None, produced=()):
     # back. The rect that addresses the surface is computed in those same
     # virtual units by a multiply-and-divide that is currently an identity, so
     # scaling the surface and the rect together is five single-word patches.
-    # tex_format.width stays at the authored 256, which is the only field read
-    # as a UV scale, so the geometry does not move. See FINDINGS-308/PLAN-309.
     # ff7nx_fbresample's gate follows this via ff7nx_fbsurf.scale(), which is
     # read from the environment rather than from the image, so the order these
     # two run in does not matter -- but they can never disagree.
+    #
+    # BUILD 356 CORRECTS THE LINE THAT USED TO BE HERE. It said "tex_format.
+    # width stays at the authored 256, which is the only field read as a UV
+    # scale, so the geometry does not move". That is false, and this file's
+    # own sibling proves it: +0x10D6E6C picks &fb_tex.w over &tex_format.width
+    # whenever the header carries version 100, which these captures always do
+    # (ff7nx_fbcapture.FB_TEX_SIZE_CHOICE). Scaling the rect therefore scaled
+    # the TEXTURE, and Kujata's disc addresses it with UVs hard-coded to
+    # absolute texels 1..255 -- so at k = 4 the disc could only ever reach the
+    # top-left quarter of a 1024x1024 texture. ff7nx_fbauthored undoes exactly
+    # that, in three words, and is the identity at k = 1.
     import ff7nx_fbsurf
     ff7nx_fbsurf.apply_all(dest, revert=not ff7nx_fbsurf.enabled(), log=log)
+
+    import ff7nx_fbauthored
+    ff7nx_fbauthored.apply_all(
+        dest, revert=not (ff7nx_fbsurf.enabled()
+                          and ff7nx_fbauthored.enabled()), log=log)
 
     # BUILD 312. The scene target is cleared to (0,0,0,0) and has hard edges,
     # so every pixel in it is either drawn (C, 255) or untouched (0,0,0,0).
@@ -10010,6 +10757,86 @@ def apply_field_frame(sdout, dump, log=lambda *_: None, produced=()):
     # --verify; FINDINGS-99 4 is the build that proved it matters.
     if want_battle:
         rc |= ff7nx_battlewide.apply_all(dest, log=log)
+        # BUILD 386: Bahamut ZERO's star field, the five `main` immediates.
+        # Its two companion SIZE words are ff7_en .data and are written in
+        # the exe pass below -- all seven land or neither does, which is the
+        # condition HANDOFF-254 set and could not meet at the time.
+        rc |= ff7nx_battlewide.apply_bz_stars(dest, log=log)
+        # BUILD 388: Pandora's Box's full-frame flash, one in-place immediate.
+        rc |= ff7nx_battlewide.apply_pandora(dest, log=log)
+        # BUILD 389: Ifrit's heat-wave effect. FFNx's only call-wrapper entry
+        # in widescreen.cpp, ported as three caves that adjust the wave's four
+        # vertex shorts and then make the original draw call.
+        rc |= ff7nx_battlewide.apply_ifrit(
+            dest, revert=not ff7nx_battlewide.ifrit_enabled(), log=log)
+        # BUILD 411: the source half. The three captures already cover the
+        # whole 16:9 frame (staging 2..508 and 514..640 -- the note in
+        # ff7nx_battlewide that said otherwise converted staging columns into
+        # game units), so the widening above is the whole horizontal fix. This
+        # raises the capture yscale and cap3.y so the sampling reaches game
+        # y 480 with the cave's y' = 3y/2, and raises wave 1's authored size
+        # so ff7nx_gpucap stops rendering 79% of the screen into 256 texels.
+        import ff7nx_ifritsrc
+        rc |= ff7nx_ifritsrc.apply(
+            dest, revert=not ff7nx_ifritsrc.enabled(), log=log)
+        # BUILD 397, RETRACTED IN 398: the full-frame band layout. Off -- this
+        # port's battle viewport is 332 tall, so below it there is only UI and
+        # a taller warp redraws the UI over itself.
+        rc |= ff7nx_battlewide.apply_ifrit_vcover(
+            dest, revert=not ff7nx_battlewide.ifrit_vcover_enabled(), log=log)
+        # BUILD 399: remove the warp altogether (the default). It replaces the
+        # viewport with a quarter-resolution copy of itself for about a second.
+        # Ifrit's red flash is a separate effect and is untouched.
+        rc |= ff7nx_battlewide.apply_ifrit_strip(
+            dest, revert=not ff7nx_battlewide.ifrit_stripped(), log=log)
+        rc |= ff7nx_battlewide.apply_ifrit_flat(
+            dest, revert=not ff7nx_battlewide.ifrit_flat(), log=log)
+        # BUILD 402, DEAD CODE: this probe rewrote escape_setup's mode-1 arm
+        # (x86 0x5D57DD). The graphics mode [0x9ACB5C] is 2 -- sub_404D80
+        # returns 2 unless the Windows registry says otherwise, and Kujata's
+        # rect builder at x86 0x500858 reaches its hardware-confirmed 256x256
+        # only on the `cmp [0x9ACB5C], 2` arm. So mode 1 never executes and
+        # this probe could never have changed a pixel. Stays off; see
+        # ff7nx_escapegpu for what mode 2 actually asks for.
+        rc |= ff7nx_battlewide.apply_escape(
+            dest, revert=not ff7nx_battlewide.escape_fullsrc(), log=log)
+        # BUILD 409: Escape's two captures tile the whole frame correctly
+        # (A staging 0..320, B staging 320..640), but fb_tex.w is
+        # xscale * POT(160) = 512 and therefore overhangs the 640-column
+        # surface -- so ff7nx_fbwindow slides B's origin to 128 and 30% of the
+        # screen gets drawn twice with a seam down the middle. fbwindow,
+        # fbfit and fbresample all hook inside the CPU readback branch, and
+        # that branch is also the 16 MB-per-capture byte loop behind the
+        # hitch. One change avoids all of it: route Escape's two descriptors
+        # down the GPU render-to-texture path, exactly as ff7nx_swirlgpu does
+        # for the battle-entry swirl. Kujata keeps field_0 = 1 and k = 4.
+        import ff7nx_escapegpu
+        rc |= ff7nx_escapegpu.apply_all(
+            dest, revert=not ff7nx_escapegpu.enabled(), log=log)
+        # BUILD 404: Escape's ripple is the swirl's squeeze -- a 640-unit grid
+        # on the 2D overlay path, landing in the central 4:3. Same fix shape as
+        # ff7nx_swirlscale: widen the geometry about the frame centre.
+        import ff7nx_escapescale
+        rc |= ff7nx_escapescale.apply(
+            dest, revert=not ff7nx_escapescale.enabled(), log=log)
+        # BUILD 407, OFF IN 409: the same widening on Y. The effect is 1:1
+        # vertically today (mesh y = raw*2, staging row = v*yscale = raw*2),
+        # so scaling only the geometry stretches the picture by 10/7, and the
+        # radial origin is fixed at raw row 120 of 168 -- 71% down the mesh --
+        # so any transform reaching 480 puts the ripple's centre at screen
+        # y 343. That is what came back as "not centered, focused higher".
+        import ff7nx_escapetall
+        rc |= ff7nx_escapetall.apply(
+            dest, revert=not ff7nx_escapetall.enabled(), log=log)
+        # BUILD 405/407, WITHDRAWN IN 409: bind one capture for every column
+        # and re-address the UVs across the mesh. Its premise -- that one
+        # target holds the whole frame -- is false at mode 2: each target
+        # holds half, the stock UVs are already 1:1, and one 160-unit UV span
+        # at xscale 2 can only ever reach 320 of the 640 staging columns. The
+        # record-layout measurement in it is sound and is kept for reuse.
+        import ff7nx_escapeuv
+        rc |= ff7nx_escapeuv.apply(
+            dest, revert=not ff7nx_escapeuv.enabled(), log=log)
         # The effect-owned 4:3 geometry FFNx never patched: Ultima's wash
         # (x86 0x57A20A / 0x57A38C) and KOTR's five-column BG_1 field
         # (x86 0x481867 / 0x481A4E).  Separate module because neither is an
@@ -10043,6 +10870,34 @@ def apply_field_frame(sdout, dump, log=lambda *_: None, produced=()):
         # is the void past the edge of the battleground model, which only
         # ws-3d is wide enough to show. Move the window and find out.
         # SEVENTH_NX_FX_SNAP_X / _Y; 'stock' on both turns it off.
+        # BUILD 369. The snapshot WINDOW -- its size, not its origin. PSX
+        # photographed 256 VRAM pixels of a 320-wide screen (80%); FF7 PC
+        # asks for 256 of a 640-wide frame (40%) and FFNx's own
+        # createBlitTexture/getInternalCoordX pass that through unchanged, so
+        # every version since the PSX has spread half as much picture over a
+        # disc whose world size never moved. Must run before fxsnap: they
+        # share a routine but no site, and fxsnap anchors the two loads this
+        # one leaves alone.
+        # BUILD 375. effect100-throttle forces g_is_battle_paused on three
+        # frames in four, and every summon camera/model routine begins
+        # `if (g_is_battle_paused) return` -- so on those frames the camera is
+        # not aimed and the model is not placed, and the battlefield shows
+        # through. summon-runtime already releases that guard for Shiva and
+        # Odin gunge (which is why those two do not flicker); this does the
+        # same for the ones that still do. Must run after summon-runtime: they
+        # share no word, and this module anchors the two that one owns.
+        import ff7nx_summonhold
+        if ff7nx_summonhold.enabled():
+            rc |= ff7nx_summonhold.apply_all(dest, log=log)
+        else:
+            rc |= ff7nx_summonhold.apply_all(dest, revert=True, log=log)
+
+        import ff7nx_fxwindow
+        if ff7nx_fxwindow.enabled():
+            rc |= ff7nx_fxwindow.apply_all(dest, log=log)
+        else:
+            rc |= ff7nx_fxwindow.apply_all(dest, revert=True, log=log)
+
         import ff7nx_fxsnap
         if ff7nx_fxsnap.enabled():
             rc |= ff7nx_fxsnap.apply_all(dest, log=log)
@@ -10091,6 +10946,15 @@ def apply_field_frame(sdout, dump, log=lambda *_: None, produced=()):
             rc |= ff7nx_fxcapscale.apply_all(dest, log=log)
         else:
             rc |= ff7nx_fxcapscale.apply_all(dest, revert=True, log=log)
+        # BUILD 355. Read the SCENE TARGET instead of the capture surface.
+        # Two words, both in the shared CPU loader, and they move together:
+        # the pixels and the geometry must come from the same handle or the
+        # loader reads one surface's bytes with another's stride.
+        import ff7nx_fbdirect
+        if ff7nx_fbdirect.enabled():
+            rc |= ff7nx_fbdirect.apply_all(dest, log=log)
+        else:
+            rc |= ff7nx_fbdirect.apply_all(dest, revert=True, log=log)
         import ff7nx_fxscale
         if ff7nx_fxscale.enabled():
             rc |= ff7nx_fxscale.apply_all(dest, log=log)
@@ -10109,6 +10973,29 @@ def apply_field_frame(sdout, dump, log=lambda *_: None, produced=()):
             rc |= ff7nx_fxdisc.apply_all(dest, log=log)
         else:
             rc |= ff7nx_fxdisc.apply_all(dest, revert=True, log=log)
+        # BUILD 360. The disc is centred at world z = -5000, 5000 units
+        # BEHIND the battlefield whose floor it is copying -- so its symmetry
+        # and the floor's can never coincide. fxdisc scales about the disc's
+        # own centre and fxscale shifts the radius; neither touches where the
+        # centre IS. This does, in one word at +0x473180, and it shares no
+        # site with either of them.
+        import ff7nx_fxorigin
+        if ff7nx_fxorigin.enabled():
+            rc |= ff7nx_fxorigin.apply_all(dest, log=log)
+        else:
+            rc |= ff7nx_fxorigin.apply_all(dest, revert=True, log=log)
+        # BUILD 364. fxdisc scales R, and R feeds BOTH axes, so it can only
+        # resize the shape. The operator's report is that the SHAPE is wrong:
+        # too long front-to-back and separately a little too wide. In the
+        # recompiled vertex builder the two axes are two different
+        # instructions -- width at +0x473314, depth at +0x473434 -- so the
+        # depth can be corrected on its own. Shares no site with fxdisc
+        # (+0x473248), fxscale (+0x473178) or fxorigin (+0x473180).
+        import ff7nx_fxdepth
+        if ff7nx_fxdepth.enabled():
+            rc |= ff7nx_fxdepth.apply_all(dest, log=log)
+        else:
+            rc |= ff7nx_fxdepth.apply_all(dest, revert=True, log=log)
         # The floor-warp summons build their own ground surfaces and
         # hard-code how much world one captured screen unit is worth (Kujata
         # 96, KOTR 288/3). ws-3d shows 854 game units of world where 4:3
@@ -10172,6 +11059,11 @@ def apply_field_frame(sdout, dump, log=lambda *_: None, produced=()):
                 battle_exe, revert=True, log=log)
             rc |= ff7nx_battlewide.apply_exe_ui_fade_x(
                 battle_exe, revert=True, log=log)
+            # The other half of the Bahamut ZERO star quad. Without these two
+            # the position patches above put the stars on a 512-unit grid
+            # while each quad stays 256 across, which is gaps between them --
+            # worse than the popping it is meant to fix.
+            rc |= ff7nx_battlewide.apply_exe_bz_stars(battle_exe, log=log)
     else:
         log('  battle overlays: OFF -- summon and limit-break flashes and '
             'the battle fade cover only the middle 4:3. '

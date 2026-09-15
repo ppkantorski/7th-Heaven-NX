@@ -213,6 +213,124 @@ def broken_wraps(vanilla_rgb, source_rgba):
     return out
 
 
+# 4. THE BORDER LINE.  BUILD 400, and it supersedes most of note 3.
+#
+#    Reported on Odin: "where these textures intersect with eachother, it
+#    creates this weird gradient that spans the height of the texture".
+#
+#    `kiri_2`'s wrap is not broken at all. Measured on SYW's 1024x512 source,
+#    column means across the width:
+#
+#        col0 167.2 | col1 13.9 | col2.. 23.2 22.7 22.4 22.6 ... 22.5 (colN)
+#
+#    Every interior column sits in the 22-70 band and a straight line fitted
+#    across the width is FLAT (46.6 -> 46.0). There is no brightness ramp and
+#    no tiling failure: **the first two columns are upscaler garbage.** Drop
+#    them and the seam falls from 144.70 to 2.53, against a column-to-column
+#    difference of 3.61 -- i.e. better than vanilla's own 3.83.
+#
+#    That matters because `_reseam_to_first` takes `view[0]` as its target.
+#    On this texture view[0] IS the garbage column, so the repair dragged 32
+#    columns of good art toward a bright artifact. The 145-level correction
+#    spread over 32 pixels is a smooth full-height ramp at every tile
+#    junction -- exactly the reported gradient. The repair was the artifact.
+#
+#    It is not one texture. 49 of the 1521 magic DDS files carry an outlier
+#    border line, including the two note 3 calls "total": `missil00` and
+#    `yami00` have a pure-white final ROW (+255). They were never tiling
+#    failures either.
+#
+#    So: repair the border line first, by replicating the nearest healthy one
+#    inward. The seam check then sees the real texture and, for kiri_2, stops
+#    firing at all -- no band blending, no gradient, and 1022 of 1024 columns
+#    of the upscale untouched.
+#: Every texture whose border this build repaired: [(name, {axis: (lead,
+#: trail)})]. The caller reports it, so a log proves the repair ran -- build
+#: 400 shipped without this and the reported "no change" turned out to be a
+#: cached archive, which no log line could have shown.
+BORDER_REPAIRS = []
+
+BORDER_MAX_PEEL = 2
+#: A border line is garbage when it differs from the line inside it by far
+#: more than neighbouring lines differ from each other. Deliberately strict:
+#: this rewrites art, so it must fire on `kiri_2`'s 153-level cliff and not on
+#: ordinary high-contrast edges.
+BORDER_FACTOR = 6.0
+BORDER_ABS = 20.0
+
+
+def _line(a, axis, i):
+    return a[i] if axis == 0 else a[:, i]
+
+
+def border_outliers(rgba, axis):
+    """How many lines at each end of `axis` are upscaler garbage.
+
+    Returns (lead, trail), each 0..BORDER_MAX_PEEL. A line counts only while
+    the step from it to the line inside it dwarfs the texture's ordinary
+    line-to-line step, so peeling stops as soon as the art becomes normal.
+    """
+    a = rgba[:, :, :3].astype(np.float64)
+    n = a.shape[axis]
+    if n < 8:
+        return (0, 0)
+    typical = float(np.abs(np.diff(a, axis=axis)).mean())
+    limit = max(BORDER_FACTOR * typical, BORDER_ABS)
+    out = []
+    for end in (0, 1):
+        k = 0
+        while k < BORDER_MAX_PEEL and k + 2 < n:
+            i, j = (k, k + 1) if end == 0 else (n - 1 - k, n - 2 - k)
+            step = float(np.abs(_line(a, axis, i) - _line(a, axis, j)).mean())
+            if step <= limit:
+                break
+            k += 1
+        out.append(k)
+    return tuple(out)
+
+
+def repair_border(rgba, axis, lead, trail):
+    """Replace garbage border lines with the nearest healthy line."""
+    if not lead and not trail:
+        return rgba
+    out = rgba.copy()
+    view = out if axis == 0 else out.transpose(1, 0, 2)
+    n = view.shape[0]
+    for k in range(lead):
+        view[k] = view[lead]
+    for k in range(trail):
+        view[n - 1 - k] = view[n - 1 - trail]
+    return out
+
+
+#: A peel is only kept if the axis's own wrap seam does not get worse by more
+#: than this. Measured over all 1521 magic DDS, peeling helps 39 textures
+#: enormously (mod_00: 254.8 -> 0.0) and hurts 4 -- `jibaku02`, `jo_b03`,
+#: `kumo_1` -- where the outer line is real art the wrap depends on. Checking
+#: the outcome is cheaper and safer than trying to tell those apart up front.
+BORDER_REGRESS_EPS = 0.5
+
+
+def repair_all_borders(rgba):
+    """Both axes, keeping only the peels that do not make the wrap worse.
+
+    Returns (image, {axis: (lead, trail)}) for logging.
+    """
+    done = {}
+    for axis in (1, 0):
+        lead, trail = border_outliers(rgba, axis)
+        if not (lead or trail):
+            continue
+        before, _t = _seam_stats(rgba, axis)
+        candidate = repair_border(rgba, axis, lead, trail)
+        after, _t2 = _seam_stats(candidate, axis)
+        if after > before + BORDER_REGRESS_EPS:
+            continue                      # the outer line was real art
+        rgba = candidate
+        done[axis] = (lead, trail)
+    return rgba, done
+
+
 def _reseam_axis(rgba, axis):
     """Blend the two edges of `axis` back into agreement.
 
@@ -728,6 +846,20 @@ def convert_group(vanilla_tex, dds_by_palette, scale=1,
     # Decided against VANILLA, which is the only evidence available that the
     # game tiles this texture on this axis, and applied at source resolution
     # so the taper has room to work.
+    # ---- BUILD 400: KILL UPSCALER BORDER GARBAGE FIRST -------------------
+    #
+    # Before any wrap decision, because a corrupt border line both CAUSES the
+    # apparent seam and is what the old repair anchored on.
+    border_fixed = {}
+    if reseam():
+        for _p in decoded:
+            decoded[_p], _done = repair_all_borders(decoded[_p])
+            for _ax, _lt in _done.items():
+                border_fixed.setdefault(_ax, _lt)
+    if border_fixed:
+        BORDER_REPAIRS.append(
+            (os.path.basename(texture_name or '?'), dict(border_fixed)))
+
     reseamed = []
     repair_axes = TARGETED_WRAP_REPAIRS.get(
         os.path.basename(texture_name or '').lower(), ())
@@ -737,6 +869,24 @@ def convert_group(vanilla_tex, dds_by_palette, scale=1,
             van['height'], van['width'])
         _vrgb = _vp[0][_vi]
         broken = set(broken_wraps(_vrgb, decoded[0]))
+        # BUILD 400: after the border repair the gross-failure test above
+        # usually stops firing, because the "failure" WAS the border line.
+        # What can remain is a small residual -- kiri_2 goes 144.70 -> 8.59
+        # against a 3.62 column step. Close that too, but only on an axis
+        # vanilla PROVES it tiles, and only when the residual is actually
+        # worse than vanilla's own seam. The taper is now anchored on a
+        # healthy first line, and an 8-level correction over 32 pixels is
+        # ~0.27 levels per pixel -- two orders below the 145-level ramp that
+        # was the reported gradient.
+        for _ax in repair_axes:
+            if _ax in broken:
+                continue
+            _vs, _vt = _seam_stats(_vrgb, _ax)
+            if _vs > max(_vt, SEAM_VANILLA_FLOOR):
+                continue                  # vanilla does not tile on this axis
+            _ss, _st = _seam_stats(decoded[0], _ax)
+            if _ss > max(_vs, _st):
+                broken.add(_ax)
         reseamed = [axis for axis in repair_axes if axis in broken]
 
     # A GROUP WITH NOTHING IN IT IS NOT A REPLACEMENT.

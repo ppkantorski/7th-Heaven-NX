@@ -1608,7 +1608,7 @@ def route(archive, files, log=lambda *_: None):
     return targets, report
 
 
-CONVERSION_VERSION = b'SPELLTEX-V40-LOGICAL-IN-WORD04'
+CONVERSION_VERSION = b'SPELLTEX-V41-BORDER-REPAIR'
 
 # Historical audit classes. Production conversion does not use either set;
 # every content-matched SYW target follows ``uniform_scale()``.
@@ -1935,11 +1935,24 @@ def summarise(report, stats):
               'untouched so palette cycling is unaffected; 92%% of replaced '
               'entries were capped at 16 colours before this.'
               % ('ON' if _D.wide_palette() else 'OFF', _D.WIDE_PALETTE_ENV))
+    _bp = _D.BORDER_REPAIRS
+    _bn = ', '.join(sorted(n for n, _d in _bp)[:6]) or 'none'
+    if len(_bp) > 6:
+        _bn += ' +%d more' % (len(_bp) - 6)
+    extra += ('\n  spell textures: upscaler border repair %s (%s=0 to revert) '
+              '-- %d texture(s) had a corrupt outer line replaced by the '
+              'line inside it [%s]. SYW\'s kiri_2 column 0 reads 167 against '
+              'an interior of 22, which is what made its wrap look 144.7 '
+              'levels out; peeling it gives 8.6 against a 3.6 column step. '
+              'A peel is kept only if the wrap seam does not get worse, so '
+              'the 4 textures whose outer line is real art are untouched.'
+              % ('ON' if _D.reseam() else 'OFF', _D.RESEAM_ENV, len(_bp), _bn))
     extra += ('\n  spell textures: targeted wrap repair %s (%s=0 to revert) '
-              '-- Odin 2 kiri_2 only: its horizontal SYW boundary jumps '
-              '144.7 levels where vanilla\'s scrolling boundary differs by '
-              '3.8; the final edge is tapered into the preserved first edge. '
-              'No archive-wide seam heuristic edits unrelated textures.'
+              '-- Odin 2 kiri_2 only, and only for whatever residual is left '
+              'AFTER the border repair above. Before build 401 this tapered '
+              'the final 32 columns into column 0 -- which on kiri_2 IS the '
+              'corrupt column, so it dragged good art toward an artifact and '
+              'drew the full-height gradient at every tile join.'
               % ('ON' if _D.reseam() else 'OFF', _D.RESEAM_ENV))
     extra += ('\n  spell textures: replacement alpha %s (%s=0 to revert) -- '
               'the 321 SYW magic DDS that carry a real silhouette now supply '

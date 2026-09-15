@@ -124,7 +124,54 @@ RX_STOCK = 0x5319616B
 RW_SITE = 0x10DBC80                # lsl  w9,  w9,  #7       (w multiply)
 RW_STOCK = 0x53196129
 
-LEGAL = (1, 2, 4)
+# BUILD 335. 8 added. It is the only lever that meaningfully raises the
+# field's RESOLUTION, which is a different quantity from its position and is
+# the one the operator has been describing all along:
+#
+#     texels the disc has per screen pixel, worst direction, k = 4
+#         y 260   0.59      y 420   0.35
+#         y 340   0.44      y 470   0.31
+#
+# i.e. one texel stretched over 1.7 to 3.2 screen pixels, against a floor that
+# has one texture pixel per screen pixel. k = 8 doubles every one of those.
+#
+# *** k = 8 WAS TESTED ON HARDWARE AND IT DOES NOT WORK. ***  BUILD 336.
+# The whole field came back BLACK, with texture corruption elsewhere. The
+# staging surface at k = 8 is 5120 x 3840 x 4 = 78.6 MB and the capture
+# texture another 16.8; the allocation either fails or lands somewhere it must
+# not. Do not ship it, and do not send anyone to it again.
+#
+# It is left legal ONLY so the number stays reachable for diagnosis, and
+# because the SAME doubling is available for a quarter of the memory through
+# ff7nx_fxcapscale, which grows Kujata's capture texture alone and leaves this
+# surface at 4. That is the supported route -- see BUILD-336.
+LEGAL = (1, 2, 4, 8)
+
+# BUILD 358. STAYS 4, AND 356/357 ARE RETRACTED.
+#
+# I argued, over two builds, that k crops the field: that `fb_tex.w` is the
+# texture's real width, that the disc addresses it with UVs hard-coded to
+# absolute texels 1..255, and that k therefore shrinks the disc's reach to
+# 1/k of the picture. It was internally consistent and it was WRONG.
+#
+# The operator settled it on hardware, comparing this dial against itself:
+#
+#     "alignment + scale. its exactly the same as k=4. just super low res"
+#
+# Identical framing, identical scale, k times the resolution. So the disc's
+# sample coordinate is NOT normalised by fb_tex.w -- whatever it divides by,
+# it is a constant, and the texture always covers the same region of the
+# capture however wide it is. k is a pure density dial. It always was.
+#
+# Which also means the arithmetic in that argument, though correct, was
+# answering a question nobody had asked, and the two builds I shipped on it
+# (356: force fb_tex.w back to the authored size; 357: k = 1) each threw the
+# resolution away. Both are off. Nothing in this module changed.
+#
+# What survives from it, and it is worth keeping: the region the texture
+# holds is `fb_tex.w / k` game units -- 256 at every k -- because the
+# resample's 640/854 step is independent of k. That is WHY the framing does
+# not move, and it is now confirmed from both sides.
 DEFAULT_SCALE = 4
 
 # Everything the five words feed, asserted unchanged. If the routine moves,
@@ -134,14 +181,18 @@ ANCHORS = {
     0x10D5978: 0xF90003E8,         # str  x8, [sp]        the descriptor
     0x10D5984: 0x97BCBAD7,         # bl   #0x44e0         create the texture
     0x10D5994: 0xB9000100,         # str  w0, [x8]        -> [0x12CE620]
+    # +0x10DBC6C and +0x10DBC88 -- the /480 and /640 reciprocal shifts -- used
+    # to be anchored here. BUILD 356 moves them: they are what cancels the k
+    # this module puts into the numerator, so that `fb_tex.w`/`.h` come out at
+    # the AUTHORED size instead of k times it. They belong to
+    # ff7nx_fbauthored now, which anchors their neighbours in turn. See that
+    # file's header for why a k-scaled fb_tex.w was fatal.
     0x10DBC3C: 0x0B1B0B6B,         # add  w11, w27, w27, lsl #2      x * 5
     0x10DBC40: 0x1B0D7F29,         # mul  w9,  w25, w13              y * 480
     0x10DBC58: 0x9BAC7D6B,         # umull x11, w11, w12   reciprocal /640
     0x10DBC64: 0x1B0D7E6A,         # mul  w10, w19, w13              h * 480
-    0x10DBC6C: 0xD368FD08,         # lsr  x8, x8, #0x28              /480
     0x10DBC7C: 0x0B150AA9,         # add  w9,  w21, w21, lsl #2      w * 5
     0x10DBC84: 0x9BAC7D29,         # umull x9, w9, w12     reciprocal /640
-    0x10DBC88: 0xD369FD29,         # lsr  x9, x9, #0x29              /640
     0x10DBC78: 0x2902A74B,         # stp  w11, w9, [x26, #0x14]   x, y
     0x10DBC94: 0x2903A349,         # stp  w9,  w8, [x26, #0x1c]   w, h
 }
@@ -179,7 +230,7 @@ def words_for(k):
     """The five words, in site order. k = 1 reproduces the stock encodings --
     except RH_SITE, whose stock form is an ORR logical immediate rather than a
     MOVZ, so k = 1 is written as the stock word verbatim."""
-    shift = {1: 7, 2: 8, 4: 9}[k]
+    shift = {1: 7, 2: 8, 4: 9, 8: 10}[k]
     return {
         SW_SITE: _movz64(8, VIRT_W * k),
         SH_SITE: _movk64(8, VIRT_H * k, 2),

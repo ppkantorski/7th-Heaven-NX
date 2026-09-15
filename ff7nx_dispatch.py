@@ -1874,10 +1874,22 @@ def _plan_dispatch(fields, cases, sym):
     return groups, shared
 
 
-def build_cave(cave, site, flag_addr, mask_bits, data_base, stride,
+def build_cave(cave, addr, site, flag_addr, mask_bits, data_base, stride,
                fields, cases, sym, k):
     """
     Emit the dispatcher cave. `cave` is the module offset the words land at.
+
+    `addr(i)` is the real address of the cave's i'th word -- the
+    ff7nx_cave.emit_laid_out contract, so this cave can be chained through
+    padding holes instead of spending the tail gap. Pass None for a
+    contiguous cave at `cave`, which is what the old signature meant.
+
+    EVERY address in here goes through `pc()`. That is not style: a single
+    surviving `cave + 4 * i` would encode a branch against a pretend
+    contiguous layout and land in the middle of an unrelated function once
+    the words are scattered. test_cave_relocation.py asserts the two layouts
+    decode to the same instruction sequence, which is what catches a missed
+    one.
 
         ldr   w16, [ctx, #idx_off]     ; idx, from the guest register slot
         and   w16, w16, #mask          ; provably inside the flag block
@@ -1905,9 +1917,18 @@ def build_cave(cave, site, flag_addr, mask_bits, data_base, stride,
 
     THE DISPATCH IS LAID OUT TO SHARE CODE
     --------------------------------------
-    The cave region is the page-alignment gap between the end of .text and
-    .rodata -- 2464 bytes for every cave in the build, and .text has no
-    internal padding to borrow from.  So the dispatch is emitted as:
+    BUILD 383: this paragraph used to say the cave region is the 2,464-byte
+    page-alignment gap between .text and .rodata, "and .text has no internal
+    padding to borrow from". That was true when it was written and stopped
+    being true when ff7nx_cave's verified hole allocator landed -- there are
+    ~7,600 usable words of inter-function padding, twelve times the whole tail
+    gap. Nobody updated the sentence, so every new cave kept being crammed into
+    the gap until it had 48 bytes left. This cave is now chained through
+    padding and costs the gap nothing.
+
+    The sharing below is therefore no longer load-bearing for space. It is
+    kept because it is already verified against build_cave_reference and
+    because fewer words is still fewer words. The dispatch is emitted as:
 
         <groups that do not use the shared op>   ... b OUT
         <groups that do>                         ... b SHARED
@@ -1925,7 +1946,8 @@ def build_cave(cave, site, flag_addr, mask_bits, data_base, stride,
     w = []
 
     def pc(i=None):
-        return cave + 4 * (len(w) if i is None else i)
+        j = len(w) if i is None else i
+        return addr(j) if addr is not None else cave + 4 * j
 
     w.append(A.ldr(16, ctx, io))
     w.append(A.and_mask(16, 16, mask_bits))
@@ -1980,7 +2002,7 @@ def build_cave(cave, site, flag_addr, mask_bits, data_base, stride,
                 w.append(0)                         # b.ne next -- patched
         body = len(w)
         for i in eq_jumps:
-            w[i] = A.bcond(cave + 4 * i, cave + 4 * body, A.EQ)
+            w[i] = A.bcond(pc(i), pc(body), A.EQ)
 
         if guard == 'n_frames>1':
             off, _width, _s = fields['n_frames']
@@ -2007,19 +2029,19 @@ def build_cave(cave, site, flag_addr, mask_bits, data_base, stride,
         w += _ops(fields, [shared], k)
 
     out = pc()
-    w[cbz_i] = A.cbz(16, cave + 4 * cbz_i, out)
+    w[cbz_i] = A.cbz(16, pc(cbz_i), out)
     for i in out_jumps:
-        w[i] = A.b(cave + 4 * i, out)
+        w[i] = A.b(pc(i), out)
     for i in guard_jumps:
-        w[i] = A.bcond(cave + 4 * i, out, A.LE)
+        w[i] = A.bcond(pc(i), out, A.LE)
     for i in shared_jumps:
-        w[i] = A.b(cave + 4 * i, cave + 4 * shared_at)
+        w[i] = A.b(pc(i), pc(shared_at))
     for i, gi in next_patches:
         # The LAST group's failing compare means nothing matched at all, so it
         # goes to OUT -- never to SHARED, which would apply the shared scale to
         # a function FFNx does not name.
-        nxt = cave + 4 * group_start[gi] if gi < len(ordered) else out
-        w[i] = A.bcond(cave + 4 * i, nxt, A.NE)
+        nxt = pc(group_start[gi]) if gi < len(ordered) else out
+        w[i] = A.bcond(pc(i), nxt, A.NE)
 
     w.append(site['displaced'])
     w.append(A.b(pc(), site['hook'] + 4))
@@ -2105,6 +2127,12 @@ def build_addfn_cave(cave, site, flag_addr, mask_bits, throttle=None):
         # Exact OneCall callbacks use a plain, sentinel-terminated address
         # table. Marker 0x10 is supplied by the registration cave itself.
         w += [va for _name, va in throttle.get('one_call', ())] + [0]
+        # The camera slots. Packed exactly like the model table:
+        # threshold-class:8 | guest_function:24. The class byte is CAM_BIG
+        # (0x08) for the routines FFNx gives an elevated teleport threshold
+        # and 0 for the rest; the registration cave ORs CAM_MARK into it.
+        w += [((cls & 0xFF) << 24) | (va & 0xFFFFFF)
+              for _name, va, cls in throttle.get('camera', ())] + [0]
     return w
 
 
@@ -2281,7 +2309,8 @@ def _addfn_throttle_words(cave, w, site, mask_bits, throttle, allow=False):
     special = throttle.get('kotr', ())
     model = throttle.get('model', ())
     one_call = throttle.get('one_call', ())
-    if special or model or one_call:
+    camera = throttle.get('camera', ())
+    if special or model or one_call or camera:
         w.append(A.str_(16, A.SP, 8))
     if special:
         special_adr_i = len(w)
@@ -2342,6 +2371,44 @@ def _addfn_throttle_words(cave, w, site, mask_bits, throttle, allow=False):
 
     # Exact OneCall callbacks are stored as plain guest addresses. Marker bit
     # 4 selects the stack-balanced skip path; its low bits remain the phase.
+    if camera:
+        camera_adr_i = len(w)
+        w.append(0)                                  # adr x17,CAMERA_TABLE
+        camera_loop_i = len(w)
+        w.append(A.ldr_post(0, 17, 4))
+        camera_end_i = len(w)
+        w.append(0)                                  # cbz -> ordinary result
+        # Same shape as the model loop: the low 24 bits are the address, the
+        # top byte is the threshold class (CAM_BIG or 0).
+        w.append(A.and_mask(16, 0, 24))
+        w.append(A.cmp_reg(16, fn))
+        w.append(A.bcond(pc(), cave + 4 * camera_loop_i, A.NE))
+        # The top byte is threshold/500. Resolve it here, once, rather than
+        # trying to smuggle a class through the marker: only one summon camera
+        # is live at a time, which is the same assumption prev/next already
+        # make.
+        w.append(A.lsr(16, 0, 24))
+        w.append(A.movz(1, CAM_THRESH_UNIT))
+        w.append(A.mul(16, 16, 1))
+        w.append(A.adrp(17, pc(), ctr & ~0xFFF))
+        w.append(A.add_imm64(17, 17, ctr & 0xFFF))
+        w.append(A.strh(16, 17, throttle['cam_thr'] - ctr))
+        w.append(A.movz(16, CAM_MARK))
+        # A NEW routine is taking this slot, so the interpolation endpoints
+        # from whatever ran last are meaningless. Without this the first cycle
+        # of every summon after the first would slide out of the PREVIOUS
+        # summon's final camera -- the endpoints are global, so nothing else
+        # clears them. x17 still points at the throttle block from the
+        # threshold store above, and is re-derived at final_store anyway.
+        w.append(A.strb(A.WZR, 17, throttle['cam_init'] - ctr))
+        w.append(A.strb(A.WZR, 17, throttle['cam_final'] - ctr))
+        camera_done_jump = len(w)
+        w.append(0)                                  # b -> final slot store
+        camera_miss = pc()
+        w[camera_end_i] = A.cbz(0, cave + 4 * camera_end_i, camera_miss)
+    else:
+        camera_adr_i = camera_done_jump = None
+
     if one_call:
         one_call_adr_i = len(w)
         w.append(0)                                  # adr x17,ONE_CALL_TABLE
@@ -2360,7 +2427,7 @@ def _addfn_throttle_words(cave, w, site, mask_bits, throttle, allow=False):
     else:
         one_call_adr_i = one_call_done_jump = None
 
-    if special or model or one_call:
+    if special or model or one_call or camera:
         w.append(A.ldr(16, A.SP, 8))                 # ordinary exclusion result
 
     final_store = pc()
@@ -2370,6 +2437,8 @@ def _addfn_throttle_words(cave, w, site, mask_bits, throttle, allow=False):
         w[model_done_jump] = A.b(cave + 4 * model_done_jump, final_store)
     if one_call_done_jump is not None:
         w[one_call_done_jump] = A.b(cave + 4 * one_call_done_jump, final_store)
+    if camera_done_jump is not None:
+        w[camera_done_jump] = A.b(cave + 4 * camera_done_jump, final_store)
     w.append(A.ldr(0, ctx, io))
     w.append(A.and_mask(0, 0, mask_bits))
     w.append(A.adrp(17, pc(), ctr & ~0xFFF))
@@ -2395,7 +2464,64 @@ def _addfn_throttle_words(cave, w, site, mask_bits, throttle, allow=False):
                        + len(throttle.get('model', ())) + 1)
         w[one_call_adr_i] = A.adr(17, cave + 4 * one_call_adr_i,
                                   cave + 4 * one_call_at)
+    if camera_adr_i is not None:
+        camera_at = (table_at + len(throttle['table']) + 1
+                     + len(throttle.get('kotr', ())) + 1
+                     + len(throttle.get('model', ())) + 1
+                     + len(throttle.get('one_call', ())) + 1)
+        w[camera_adr_i] = A.adr(17, cave + 4 * camera_adr_i,
+                                cave + 4 * camera_at)
     return w, table_at
+
+
+# The camera slots' marker bit. 0x80/0x40/0x20/0x10 are excluded / KOTR /
+# model / OneCall and the low two bits are the phase, so 0x04 is the only
+# value left that cannot be confused with any of them.
+CAM_MARK = 0x04
+
+# FFNx's teleport threshold is per ROUTINE -- 1500 for most, 4000 and 5000 for
+# a named handful -- and the marker byte has no room left to carry it (0x80
+# excluded, 0x40 KOTR, 0x20 model, 0x10 OneCall, 0x08 spare, 0x04 CAM_MARK,
+# 0x03 phase).
+#
+# BUILD 385 stops trying. The interpolation endpoints are already ONE global
+# pair rather than one per slot -- only a single summon camera is ever live --
+# so the threshold is stored the same way: the registration cave resolves it
+# once, from the table, into two bytes of BSS. That is exact for every value
+# FFNx uses instead of rounding to the nearest of two classes, and it deletes
+# the class bit from the marker and from `did` rather than adding to them.
+#
+# Table entries carry threshold/500, which keeps every FFNx value inside a
+# byte and costs one multiply at registration.
+CAM_THRESH_UNIT = 500
+CAM_THRESH_DEFAULT = 1500
+
+# `did` values the pre cave leaves for the post cave. Everything >= 9 is the
+# camera arm's; the model arm owns 4..8 and KOTR 2..3.
+CAM_DID_REAL = 10          # the advancing call: capture the new endpoint
+CAM_DID_REPEAT = 12        # | phase (0, 2 or 3) -- a paused frame
+
+# The phase occupies the marker's low two bits by construction -- CAM_MARK is
+# 0x04, so anything wider would collide with it. The pre cave asserts that the
+# throttle's own `freq_bits` agrees, which is what lets the post cave recover
+# the phase from `did` without being told.
+CAM_PHASE_BITS = 2
+
+
+def _cam_ptrs(w, pc, throttle, base):
+    """Translate both camera globals and stash the host pointers.
+
+    Called with a 16-byte spill frame already in place and x0 free. Leaves
+    x17 pointing at the throttle block, which both callers rely on.
+    """
+    for guest, slot in ((throttle['cam_pos_guest'], throttle['cam_pos_ptr']),
+                        (throttle['cam_foc_guest'], throttle['cam_foc_ptr'])):
+        w.append(A.movz(0, guest & 0xFFFF))
+        w.append(A.movk_hi(0, (guest >> 16) & 0xFFFF))
+        w.append(A.bl(pc(), TRANSLATE))
+        w.append(A.adrp(17, pc(), base & ~0xFFF))
+        w.append(A.add_imm64(17, 17, base & 0xFFF))
+        w.append(A.str64(0, 17, slot - base))
 
 
 def build_throttle_pre_cave(cave, site, throttle, paused_guest, mask_bits,
@@ -2498,6 +2624,11 @@ def build_throttle_pre_cave(cave, site, throttle, paused_guest, mask_bits,
         w.append(A.cmp_imm(16, 0x10))
         one_call_i = len(w)
         w.append(0)                                 # b.hs ONE_CALL
+    camera_i = None
+    if throttle.get('camera'):
+        w.append(A.cmp_imm(16, CAM_MARK))
+        camera_i = len(w)
+        w.append(0)                                 # b.hs CAMERA
     w.append(A.add_imm(16, 16, 1))
     w.append(A.and_mask(16, 16, freq_bits))
     w.append(A.strb(16, 17, 0))
@@ -2550,6 +2681,129 @@ def build_throttle_pre_cave(cave, site, throttle, paused_guest, mask_bits,
         w.append(A.add_imm(e, e, 4))                # cancel guest ESP -= 4
         w.append(site['displaced'])                 # publish restored guest ESP
         w.append(A.b(pc(), throttle['post']))       # skip thunk, run post hook
+
+    # FFNx's CameraInterpolationEffectDecorator, reduced to its load-bearing
+    # half: the HOLD.
+    #
+    # The decorator keeps the pause guard -- every summon camera routine begins
+    # `if (g_is_battle_paused) return`, and that is correct, it is what stops
+    # the camera script advancing four times too fast. What it adds is that
+    # after EVERY call, advancing or paused, it writes g_battle_camera_position
+    # and g_battle_camera_focal_point itself. Without that write the summon
+    # camera is simply not re-applied on the three paused frames, and the
+    # DEFAULT battle camera -- which runs every frame -- is what the viewer
+    # sees. That is the operator's "i see the summon then i see the regular
+    # field, back and forth rapidly": two cameras alternating at 15 Hz.
+    #
+    # FFNx interpolates between the endpoints; this holds the last real one.
+    # A hold removes the alternation outright and leaves the camera stepping
+    # at the rate the original game steps it. Interpolation on top is a
+    # separate, purely cosmetic change.
+    #
+    # did = 9  repeated frame -- undo the pause, then re-apply the saved pair
+    # did = 10 real step      -- capture the pair the routine just produced
+    #
+    # Both host pointers are obtained fresh each frame rather than cached,
+    # for the same reason the generic arm re-derives `pptr`: nothing here
+    # assumes the guest-to-host mapping is stable over time.
+    camera_real_i = camera_done_i = camera_out_i = None
+    if throttle.get('camera'):
+        camera = pc()
+        if freq_bits != CAM_PHASE_BITS:
+            raise SystemExit('the camera arm encodes the phase in the marker '
+                             'and in `did`, both two bits wide; this throttle '
+                             'uses %d' % freq_bits)
+        w[camera_i] = A.bcond(pc(camera_i), camera, A.HS)
+        # Advance the phase. The marker carries nothing but CAM_MARK and the
+        # phase now -- BUILD 385 moved the threshold out of it -- so this is
+        # back to the plain rebuild it was before interpolation.
+        w.append(A.add_imm(16, 16, 1))
+        w.append(A.and_mask(16, 16, freq_bits))      # phase 0..3
+        w.append(A.add_imm(16, 16, CAM_MARK))
+        w.append(A.strb(16, 17, 0))
+        # One spill frame and one pointer fetch for both paths -- emitting
+        # them per-path cost 18 words and the dispatcher cave is within a few
+        # bytes of .rodata.
+        #
+        # w16 IS spilled with them. It is IP0, which a veneer is entitled to
+        # clobber across the `bl` inside _cam_ptrs, so the marker does not
+        # survive the call -- the phase test read a destroyed register and
+        # every frame looked like a repeat. tests/test_camerahold.py caught
+        # it, and it is the same class of mistake as the build-214 w0 bug.
+        w.append(A.sub_imm64(A.SP, A.SP, 0x20))
+        w.append(A.str64(0, A.SP, 0))
+        w.append(A.str64(e, A.SP, 8))
+        w.append(A.str64(16, A.SP, 16))
+        _cam_ptrs(w, pc, throttle, base)
+        w.append(A.ldr64(16, A.SP, 16))
+        w.append(A.and_mask(16, 16, freq_bits))      # phase 0..3
+        w.append(A.cmp_imm(16, 1))                   # phase 1 = the real step
+        camera_real_i = len(w)
+        w.append(0)                                  # b.eq CAMERA_REAL
+
+        # Repeated frame: the ordinary pause trick, and a `did` that tells the
+        # post cave WHICH paused frame this is -- phases 2 and 3 display an
+        # interpolated camera and phase 0 displays the endpoint, so they are
+        # no longer interchangeable the way they were under the hold.
+        #
+        # did is computed BEFORE the TRANSLATE call and parked in the spill
+        # slot, because the call may clobber both w1 and w16.
+        w.append(A.add_imm(16, 16, CAM_DID_REPEAT))  # 12 | phase (12, 14, 15)
+        w.append(A.str64(16, A.SP, 16))
+        w.append(A.movz(0, paused_guest & 0xFFFF))
+        w.append(A.movk_hi(0, (paused_guest >> 16) & 0xFFFF))
+        w.append(A.bl(pc(), TRANSLATE))
+        w.append(A.adrp(17, pc(), base & ~0xFFF))
+        w.append(A.add_imm64(17, 17, base & 0xFFF))
+        w.append(A.str64(0, 17, pptr - base))
+        w.append(A.ldrb(16, 0, 0))
+        w.append(A.strb(16, 17, saved - base))
+        w.append(A.movz(16, 1))
+        w.append(A.strb(16, 0, 0))
+        w.append(A.ldr64(16, A.SP, 16))
+        w.append(A.strb(16, 17, did - base))
+        camera_done_i = len(w)
+        w.append(0)                                  # b CAMERA_DONE
+
+        # Real step: no pause. did=10 (+CAM_DID_BIG) tells post to advance the
+        # endpoints and show the first interpolation step. No call between the
+        # class extraction above and here, so w1 is still live.
+        camera_real = pc()
+        w[camera_real_i] = A.bcond(pc(camera_real_i), camera_real, A.EQ)
+        w.append(A.adrp(17, pc(), base & ~0xFFF))
+        w.append(A.add_imm64(17, 17, base & 0xFFF))
+        w.append(A.movz(16, CAM_DID_REAL))
+        w.append(A.strb(16, 17, did - base))
+        # The advancing call is the only one that can retire the effect, so it
+        # is the only one that needs the slot's field_0. Same fetch the model
+        # arm makes, and safe for the same reason: x0 is already spilled at
+        # SP+0 and restored at CAMERA_DONE.
+        if throttle.get('cam_slot_ptr') is not None:
+            data = throttle['data_base']
+            if throttle.get('stride') != 0x20:
+                raise SystemExit('the camera decorator requires effect100 '
+                                 'stride 0x20')
+            w.append(A.ldr(16, ctx, io))
+            w.append(A.and_mask(16, 16, mask_bits))
+            w.append(A.movz(0, data & 0xFFFF))
+            w.append(A.movk_hi(0, (data >> 16) & 0xFFFF))
+            w.append(A.add_reg_lsl(0, 0, 16, 5))
+            w.append(A.bl(pc(), TRANSLATE))
+            w.append(A.adrp(17, pc(), base & ~0xFFF))
+            w.append(A.add_imm64(17, 17, base & 0xFFF))
+            w.append(A.str64(0, 17, throttle['cam_slot_ptr'] - base))
+            w.append(A.ldrh(16, 0, 0))
+            w.append(A.strh(16, 17, throttle['cam_active'] - base))
+
+        camera_done = pc()
+        w[camera_done_i] = A.b(pc(camera_done_i), camera_done)
+        w.append(A.ldr64(0, A.SP, 0))
+        w.append(A.ldr64(e, A.SP, 8))
+        w.append(A.add_imm64(A.SP, A.SP, 0x20))
+        camera_out_i = len(w)
+        w.append(0)                                  # b OUT
+    else:
+        camera_out_i = None
 
     # FFNx's FixCounterExceptionEffectDecorator for the thirteen KOTR knights.
     # The function is called every rendered frame (so model animation is not
@@ -2638,36 +2892,52 @@ def build_throttle_pre_cave(cave, site, throttle, paused_guest, mask_bits,
     # carry into those marker bits.
     model_init_i = model_real_i = model_repeat_done_i = None
     if throttle.get('model'):
+        # BUILD 378 -- THE BUILD 214 ABORT, AND IT IS ONE REGISTER.
+        #
+        # This arm used w0 as its scratch: `and w0, w16, #0x1F` was its very
+        # first instruction. w0 is the LIVE guest function pointer -- the pre
+        # hook sits four instructions before `bl 0xa1a0` and that call reads
+        # it -- so every model-marked slot jumped to a garbage address the
+        # moment it registered. That is the instant crash on Choco/Mog and the
+        # 214 abort on Shiva, Alexander and Bahamut ZERO, which are exactly
+        # the marked ones.
+        #
+        # The sub-paths below DO spill x0, but they spill it after it has
+        # already been destroyed here, so the restore put garbage back.
+        #
+        # w1 is dead at this hook: between it and the call the only live
+        # values are w0 (the pointer) and w{e} (the displaced store), and x1
+        # is caller-saved across the imminent branch-with-link.
         model = pc()
         w[model_i] = A.bcond(pc(model_i), model, A.GE)
         # AND's helper takes a low-bit count, not a literal mask.  Keeping
         # the low five bits distinguishes uninitialized 0x20/0x28 from
         # initialized 0x30/0x38 without losing Alexander's bit 3.
-        w.append(A.and_mask(0, 16, 5))
-        w.append(A.cmp_imm(0, 0x10))
+        w.append(A.and_mask(1, 16, 5))
+        w.append(A.cmp_imm(1, 0x10))
         model_init_i = len(w)
         w.append(0)                                 # b.lo MODEL_INIT
 
         # Remember the current slot for the post-call half, then advance its
         # independent 0..3 interpolation phase.
-        w.append(A.ldr(0, ctx, io))
-        w.append(A.and_mask(0, 0, mask_bits))
+        w.append(A.ldr(1, ctx, io))
+        w.append(A.and_mask(1, 1, mask_bits))
         w.append(A.adrp(17, pc(), base & ~0xFFF))
         w.append(A.add_imm64(17, 17, base & 0xFFF))
-        w.append(A.strb(0, 17, throttle['model_idx'] - base))
-        w.append(A.add_reg64(17, 17, 0))
+        w.append(A.strb(1, 17, throttle['model_idx'] - base))
+        w.append(A.add_reg64(17, 17, 1))
         w.append(A.ldrb(16, 17, throttle['model_phase'] - base))
-        w.append(A.add_imm(0, 16, 1))
-        w.append(A.and_mask(0, 0, freq_bits))
-        w.append(A.strb(0, 17, throttle['model_phase'] - base))
+        w.append(A.add_imm(1, 16, 1))
+        w.append(A.and_mask(1, 1, freq_bits))
+        w.append(A.strb(1, 17, throttle['model_phase'] - base))
 
         # did = 5,6,7 for phases 1,2,3 and 8 for phase 0.  Only phase 1
         # advances the logical summon; the other three calls use the pause
         # trick and are overwritten with an interpolated model position.
         w.append(A.cmp_imm(16, 0))
         w.append(A.add_imm(16, 16, 4))
-        w.append(A.movz(0, 8))
-        w.append(A.csel(16, 0, 16, A.EQ))
+        w.append(A.movz(1, 8))
+        w.append(A.csel(16, 1, 16, A.EQ))
         w.append(A.adrp(17, pc(), base & ~0xFFF))
         w.append(A.add_imm64(17, 17, base & 0xFFF))
         w.append(A.strb(16, 17, did - base))
@@ -2703,12 +2973,12 @@ def build_throttle_pre_cave(cave, site, throttle, paused_guest, mask_bits,
         w[model_init_i] = A.bcond(pc(model_init_i), model_init, A.LT)
         w.append(A.add_imm(16, 16, 0x10))
         w.append(A.strb(16, 17, 0))                  # ctr[idx] marker
-        w.append(A.ldr(0, ctx, io))
-        w.append(A.and_mask(0, 0, mask_bits))
+        w.append(A.ldr(1, ctx, io))
+        w.append(A.and_mask(1, 1, mask_bits))
         w.append(A.adrp(17, pc(), base & ~0xFFF))
         w.append(A.add_imm64(17, 17, base & 0xFFF))
-        w.append(A.strb(0, 17, throttle['model_idx'] - base))
-        w.append(A.add_reg64(17, 17, 0))
+        w.append(A.strb(1, 17, throttle['model_idx'] - base))
+        w.append(A.add_reg64(17, 17, 1))
         w.append(A.movz(16, 1))
         w.append(A.strb(16, 17, throttle['model_phase'] - base))
         w.append(A.strb(A.WZR, 17, throttle['model_final'] - base))
@@ -2760,6 +3030,8 @@ def build_throttle_pre_cave(cave, site, throttle, paused_guest, mask_bits,
         w[model_repeat_done_i] = A.b(pc(model_repeat_done_i), out)
         w[model_init_done_i] = A.b(pc(model_init_done_i), out)
         w[model_real_done_i] = A.b(pc(model_real_done_i), out)
+    if throttle.get('camera'):
+        w[camera_out_i] = A.b(pc(camera_out_i), out)
     w.append(site['displaced'])
     w.append(A.b(pc(), site['hook'] + 4))
     return w
@@ -2808,6 +3080,13 @@ def build_throttle_post_cave(cave, site, throttle, addr=None):
     cbz_i = len(w)
     w.append(0)                                     # cbz w16, OUT -- patched
 
+    camera_i = None
+    if throttle.get('camera'):
+        # did 9/10 sit numerically above the model arm's 4..8, so this split
+        # must come first or a camera frame is interpolated as a model one.
+        w.append(A.cmp_imm(16, 9))
+        camera_i = len(w)
+        w.append(0)                                 # b.ge CAMERA -- did 9/10
     model_i = None
     if throttle.get('model'):
         w.append(A.cmp_imm(16, 4))
@@ -2826,7 +3105,7 @@ def build_throttle_post_cave(cave, site, throttle, addr=None):
     w.append(A.ldr64(17, 17, pptr - base))
     w.append(A.strb(16, 17, 0))
     normal_out_i = None
-    if throttle.get('kotr') or throttle.get('model'):
+    if throttle.get('kotr') or throttle.get('model') or throttle.get('camera'):
         normal_out_i = len(w)
         w.append(0)                                 # b OUT
 
@@ -3039,6 +3318,249 @@ def build_throttle_post_cave(cave, site, throttle, addr=None):
         model_final_out_i = len(w)
         w.append(0)                                 # b OUT
 
+    # THE CAMERA HOLD.  did=10 captures the pair the routine just produced,
+    # did=9 puts it back on the three frames the routine declined to run.
+    #
+    # FFNx's CameraInterpolationEffectDecorator writes
+    # g_battle_camera_position and g_battle_camera_focal_point after EVERY
+    # call. Without that write the summon camera is not re-applied on the
+    # paused frames and the DEFAULT battle camera -- which runs every frame --
+    # is what is displayed. The two alternating at 15 Hz is the strobe:
+    # "i see the summon then i see the regular field, back and forth rapidly".
+    #
+    # x1, x2 and x3 are free for the same reason x16/x17 are: this hook is the
+    # instruction after the indirect call returns and the displaced
+    # instruction redefines w0, so every caller-saved register is dead.
+    camera_save_i = camera_restore_out_i = camera_save_out_i = None
+    camera_outs = []
+    camera_cbz_outs = []
+    if throttle.get('camera'):
+        cam_lbl = pc()
+        w[camera_i] = A.bcond(pc(camera_i), cam_lbl, A.GE)
+        cs = throttle['cam_next'] - base
+        cp = throttle['cam_pos_ptr'] - base
+        cf = throttle['cam_foc_ptr'] - base
+        cprev = throttle['cam_prev'] - base
+        cinit = throttle['cam_init'] - base
+        w.append(A.strb(A.WZR, 17, did - base))
+
+        if not throttle.get('cam_interp'):
+            # ---- THE HOLD (SEVENTH_NX_FX_CAMERAHOLD=hold) -----------------
+            # Build 380's behaviour, byte for byte: capture the pair on the
+            # advancing frame and put it back on the other three. Kept because
+            # it is the version with hardware history -- if interpolation ever
+            # looks wrong, this is the known-good fallback that still kills
+            # the strobe.
+            w.append(A.cmp_imm(16, CAM_DID_REAL))
+            camera_save_i = len(w)
+            w.append(0)                              # b.eq CAMERA_SAVE
+
+            w.append(A.ldrb(16, 17, saved - base))
+            w.append(A.ldr64(1, 17, pptr - base))
+            w.append(A.strb(16, 1, 0))
+            w.append(A.ldr64(1, 17, cp))
+            w.append(A.ldr64(2, 17, cf))
+            for off in (0, 2, 4):
+                w.append(A.ldrh(3, 17, cs + off))
+                w.append(A.strh(3, 1, off))
+            for off in (0, 2, 4):
+                w.append(A.ldrh(3, 17, cs + 6 + off))
+                w.append(A.strh(3, 2, off))
+            camera_restore_out_i = len(w)
+            w.append(0)                              # b OUT
+
+            camera_save = pc()
+            w[camera_save_i] = A.bcond(pc(camera_save_i), camera_save, A.EQ)
+            w.append(A.ldr64(1, 17, cp))
+            w.append(A.ldr64(2, 17, cf))
+            for off in (0, 2, 4):
+                w.append(A.ldrh(3, 1, off))
+                w.append(A.strh(3, 17, cs + off))
+            for off in (0, 2, 4):
+                w.append(A.ldrh(3, 2, off))
+                w.append(A.strh(3, 17, cs + 6 + off))
+            camera_save_out_i = len(w)
+            w.append(0)                              # b OUT
+            camera_outs = [camera_restore_out_i, camera_save_out_i]
+        else:
+            # ---- FFNx's CameraInterpolationEffectDecorator ----------------
+            #
+            #   phase 1  advance: previous = next; next = what the routine
+            #                     just computed; display step 1 of 4
+            #   phase 2  display step 2 of 4        (paused)
+            #   phase 3  display step 3 of 4        (paused)
+            #   phase 0  display `next` verbatim    (paused) -- FFNx's
+            #            "(frameCounter-1) % frequency == frequency-1" arm,
+            #            which lands the camera exactly on the endpoint before
+            #            the next advance rather than 4/4 of the way there.
+            #
+            # The camera therefore trails the logic by one 15 Hz tick and
+            # moves in four even steps instead of one jump, which is the whole
+            # difference between "stepping" and smooth.
+            # The registration cave already resolved this routine's teleport
+            # threshold; square it here so the distance test needs no sqrt,
+            # exactly as the model arm does. 5000^2 is 25,000,000 -- well
+            # inside 32 bits -- and the per-axis early-out below keeps the sum
+            # of squares inside them too.
+            w.append(A.ldrh(6, 17, throttle['cam_thr'] - base))
+            w.append(A.mul(7, 6, 6))
+
+            w.append(A.ldr64(1, 17, cp))             # host &camera_position
+            w.append(A.ldr64(2, 17, cf))             # host &camera_focal
+            w.append(A.cmp_imm(16, CAM_DID_REAL))
+            camera_save_i = len(w)
+            w.append(0)                              # b.eq CAMERA_ADVANCE
+
+            # A paused frame: undo the pause first, then display.
+            w.append(A.ldrb(4, 17, saved - base))
+            w.append(A.ldr64(5, 17, pptr - base))
+            w.append(A.strb(4, 5, 0))
+            w.append(A.and_mask(16, 16, CAM_PHASE_BITS))  # phase 0, 2 or 3
+            endpoint_i = len(w)
+            w.append(0)                              # cbz w16, ENDPOINT
+            step_ready_i = len(w)
+            w.append(0)                              # b INTERPOLATE
+
+            # The advancing frame. previous = next, then next = live camera.
+            # On the very first one `next` has never been written, so previous
+            # is seeded from it as well: that is FFNx's frameCounter == 0
+            # case, which this throttle has no separate frame for. The result
+            # is that the first cycle holds still instead of sliding out of
+            # uninitialised memory.
+            camera_advance = pc()
+            w[camera_save_i] = A.bcond(pc(camera_save_i), camera_advance, A.EQ)
+            for k in range(6):
+                w.append(A.ldrh(3, 17, cs + 2 * k))
+                w.append(A.strh(3, 17, cprev + 2 * k))
+            for off in (0, 2, 4):
+                w.append(A.ldrh(3, 1, off))
+                w.append(A.strh(3, 17, cs + off))
+            for off in (0, 2, 4):
+                w.append(A.ldrh(3, 2, off))
+                w.append(A.strh(3, 17, cs + 6 + off))
+            w.append(A.ldrb(3, 17, cinit))
+            seeded_i = len(w)
+            w.append(0)                              # cbnz w3, SEEDED
+            for k in range(6):
+                w.append(A.ldrh(3, 17, cs + 2 * k))
+                w.append(A.strh(3, 17, cprev + 2 * k))
+            w.append(A.movz(3, 1))
+            w.append(A.strb(3, 17, cinit))
+            seeded = pc()
+            w[seeded_i] = A.cbnz(3, pc(seeded_i), seeded)
+
+            # FFNx's finalFrame. If the routine retired itself during this
+            # call, put field_0 back and remember to retire at the endpoint
+            # frame three frames from now -- otherwise the dispatcher drops
+            # the slot immediately and the camera hands back to the battle
+            # camera one quarter of the way through its last move.
+            if throttle.get('cam_slot_ptr') is not None:
+                not_retired = []
+                w.append(A.ldr64(4, 17, throttle['cam_slot_ptr'] - base))
+                w.append(A.ldrh(5, 4, 0))
+                w.append(A.movz(9, 0xFFFF))
+                w.append(A.cmp_reg(5, 9))
+                not_retired.append((len(w), A.NE))
+                w.append(0)                          # b.ne NOT_RETIRED
+                w.append(A.ldrh(5, 17, throttle['cam_active'] - base))
+                w.append(A.cmp_reg(5, 9))
+                not_retired.append((len(w), A.EQ))
+                w.append(0)                          # b.eq NOT_RETIRED
+                w.append(A.strh(5, 4, 0))            # undo the retirement
+                w.append(A.movz(5, 1))
+                w.append(A.strb(5, 17, throttle['cam_final'] - base))
+                _tgt = pc()
+                for _bi, _cond in not_retired:
+                    w[_bi] = A.bcond(pc(_bi), _tgt, _cond)
+
+            w.append(A.movz(16, 1))                  # interpolation step 1
+            real_write_i = len(w)
+            w.append(0)                              # b INTERPOLATE
+
+            # phase 0 -- the endpoint, verbatim.
+            camera_endpoint = pc()
+            w[endpoint_i] = A.cbz(16, pc(endpoint_i), camera_endpoint)
+            for off in (0, 2, 4):
+                w.append(A.ldrh(3, 17, cs + off))
+                w.append(A.strh(3, 1, off))
+            for off in (0, 2, 4):
+                w.append(A.ldrh(3, 17, cs + 6 + off))
+                w.append(A.strh(3, 2, off))
+            if throttle.get('cam_slot_ptr') is not None:
+                # ...and this is the frame the deferred retirement lands on,
+                # which is FFNx's `finalFrame == frameCounter`.
+                w.append(A.ldrb(3, 17, throttle['cam_final'] - base))
+                no_retire_i = len(w)
+                w.append(0)                          # cbz w3, OUT
+                w.append(A.strb(A.WZR, 17, throttle['cam_final'] - base))
+                w.append(A.ldr64(4, 17, throttle['cam_slot_ptr'] - base))
+                w.append(A.movz(5, 0xFFFF))
+                w.append(A.strh(5, 4, 0))
+                camera_cbz_outs.append(no_retire_i)
+            camera_restore_out_i = len(w)
+            w.append(0)                              # b OUT
+
+            # INTERPOLATE: display previous + (next - previous) * step / 4.
+            camera_write = pc()
+            w[step_ready_i] = A.b(pc(step_ready_i), camera_write)
+            w[real_write_i] = A.b(pc(real_write_i), camera_write)
+            teleport_branches = []
+            # FFNx requires BOTH the position and the focal point to be smooth
+            # moves; if either jumps, BOTH snap. So the two distances are
+            # accumulated and tested separately, and either failing takes the
+            # same exit. Squared distance, so no sqrt -- with a per-axis
+            # early-out that also keeps the sum inside 32 bits.
+            for half in (0, 6):
+                w.append(A.movz(8, 0))
+                for off in (0, 2, 4):
+                    w.append(A.ldrsh(9, 17, cprev + half + off))
+                    w.append(A.ldrsh(10, 17, cs + half + off))
+                    w.append(A.sub_reg(11, 10, 9))
+                    w.append(A.cmp_reg(11, 6))
+                    teleport_branches.append((len(w), A.GE))
+                    w.append(0)                      # b.ge TELEPORT
+                    w.append(A.sub_reg(12, A.WZR, 6))
+                    w.append(A.cmp_reg(11, 12))
+                    teleport_branches.append((len(w), A.LE))
+                    w.append(0)                      # b.le TELEPORT
+                    w.append(A.mul(11, 11, 11))
+                    w.append(A.add_reg(8, 8, 11))
+                w.append(A.cmp_reg(8, 7))
+                teleport_branches.append((len(w), A.GE))
+                w.append(0)                          # b.ge TELEPORT
+
+            # The +3 bias on a negative product is what makes the shift divide
+            # toward zero, the way C++ integer division does. Same sequence as
+            # the model arm, for the same reason.
+            for k in range(6):
+                dst, off = (1, 2 * k) if k < 3 else (2, 2 * (k - 3))
+                w.append(A.ldrsh(9, 17, cprev + 2 * k))
+                w.append(A.ldrsh(10, 17, cs + 2 * k))
+                w.append(A.sub_reg(10, 10, 9))
+                w.append(A.mul(10, 10, 16))
+                w.append(A.lsr(11, 10, 31))
+                w.append(A.add_reg_lsl(10, 10, 11, 1))
+                w.append(A.add_reg(10, 10, 11))
+                w.append(A.asr(10, 10, 2))
+                w.append(A.add_reg(10, 9, 10))
+                w.append(A.strh(10, dst, off))
+            camera_save_out_i = len(w)
+            w.append(0)                              # b OUT
+
+            # A cut too large to interpolate: hold `previous`, exactly as FFNx
+            # does, rather than sliding the camera through the cut.
+            teleport = pc()
+            for bi, cond in teleport_branches:
+                w[bi] = A.bcond(pc(bi), teleport, cond)
+            for k in range(6):
+                dst, off = (1, 2 * k) if k < 3 else (2, 2 * (k - 3))
+                w.append(A.ldrh(3, 17, cprev + 2 * k))
+                w.append(A.strh(3, dst, off))
+            teleport_out_i = len(w)
+            w.append(0)                              # b OUT
+            camera_outs = [camera_restore_out_i, camera_save_out_i,
+                           teleport_out_i]
+
     out = pc()
     w[cbz_i] = A.cbz(16, pc(cbz_i), out)
     if normal_out_i is not None:
@@ -3055,6 +3577,14 @@ def build_throttle_post_cave(cave, site, throttle, addr=None):
         w[model_init_out_i] = A.b(pc(model_init_out_i), out)
         w[no_final_i] = A.cbz(6, pc(no_final_i), out)
         w[model_final_out_i] = A.b(pc(model_final_out_i), out)
+    if throttle.get('camera'):
+        # Two exits under the hold, three under interpolation (the teleport
+        # path is its own). Collected by the arm so adding one cannot leave a
+        # placeholder zero word behind, which would execute as `udf`.
+        for bi in camera_outs:
+            w[bi] = A.b(pc(bi), out)
+        for bi in camera_cbz_outs:
+            w[bi] = A.cbz(3, pc(bi), out)
     w.append(site['displaced'])
     w.append(A.b(pc(), site['hook'] + 4))
     return w
