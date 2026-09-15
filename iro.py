@@ -169,6 +169,11 @@ _FOLDER = re.compile(
     r'<(ModFolder|Conditional)\s+([^>]*?)(?:/>|>(.*?)</\1\s*>)', re.S)
 _ACTIVEWHEN = re.compile(r'<ActiveWhen\s*>(.*?)</ActiveWhen\s*>', re.S)
 _RUNTIMEVAR = re.compile(r'<RuntimeVar\s+([^>]*?)/?>')
+_ORDER_TAG = re.compile(r'<(Before|After)\b[^>]*>([^<]+)</\1\s*>', re.I)
+_COMPAT_REQUIRE = re.compile(r'<Require\s+([^>]*?)>', re.I)
+_FORBID = re.compile(r'<Forbid\s+([^>]*?)(?:/\s*>|>.*?</Forbid\s*>)',
+                     re.I | re.S)
+_SETTING = re.compile(r'<Setting\b[^>]*>(.*?)</Setting\s*>', re.I | re.S)
 
 
 def _flatten_activewhen(fragment):
@@ -248,6 +253,48 @@ class Manifest:
         self.version = fields.get('Version', '').strip()
         self.category = fields.get('Category', '').strip()
 
+        # 7th Heaven uses these declarations to build a safe profile before
+        # it maps a single replacement file. They are intentionally parsed
+        # from the raw text rather than ElementTree: many real-world mod.xml
+        # files contain decorative bare separator lines and are not XML.
+        self.order_before, self.order_after = [], []
+        for tag, value in _ORDER_TAG.findall(text):
+            value = value.strip().lower()
+            if value:
+                (self.order_before if tag.lower() == 'before'
+                 else self.order_after).append(value)
+        self.order_before = list(dict.fromkeys(self.order_before))
+        self.order_after = list(dict.fromkeys(self.order_after))
+
+        self.compat_requires = []
+        for attrs in _COMPAT_REQUIRE.findall(text):
+            mod_id = dict(_ATTRS.findall(attrs)).get('ModID', '').strip().lower()
+            if mod_id:
+                self.compat_requires.append(mod_id)
+        self.compat_requires = list(dict.fromkeys(self.compat_requires))
+
+        self.compat_forbids = []
+        for attrs in _FORBID.findall(text):
+            mod_id = dict(_ATTRS.findall(attrs)).get('ModID', '').strip().lower()
+            if mod_id:
+                self.compat_forbids.append(mod_id)
+        self.compat_forbids = list(dict.fromkeys(self.compat_forbids))
+
+        # {my option/value -> another mod's exact required option/value}.
+        # Empty/incomplete rules exist in a few manifests as UI hints; retain
+        # only rules a static builder can enforce without guessing.
+        self.compat_settings = []
+        for block in _SETTING.findall(text):
+            rule = dict(_FIELD.findall(block))
+            mine = rule.get('MyID', '').strip()
+            my_value = rule.get('MyValue', '').strip()
+            mod_id = rule.get('ModID', '').strip().lower()
+            theirs = rule.get('TheirID', '').strip()
+            require = rule.get('Require', '').strip()
+            if all((mine, my_value, mod_id, theirs, require)):
+                self.compat_settings.append((mine, my_value, mod_id,
+                                             theirs, require))
+
         self.options = []
         for block in _CONFIG.findall(text):
             fields = dict(_FIELD.findall(block))
@@ -281,6 +328,18 @@ class Manifest:
                        values, default))
 
         self.folders = []
+        # Folders declared with <Conditional> rather than <ModFolder>.
+        #
+        # 7th Heaven treats the two tags as different PRIORITY CLASSES, not
+        # just different syntax. AppWrapper/Wrap.cs:173-201 registers, per
+        # mod: every Conditional, THEN every ModFolder, THEN the mod root --
+        # two separate loops -- and AppWrapper/VFile.cs:292 `MapFile` returns
+        # the FIRST registered entry whose gate is currently true. So inside
+        # one mod a <Conditional> always outranks a <ModFolder>, whatever
+        # order they were declared in.
+        #
+        # See active_folders for how that is reproduced here.
+        self.conditional_folders = set()
         # folder -> [RuntimeVar names] for folders 7th Heaven switches LIVE
         # (equipped weapon, current field, story progress). A static SD build
         # cannot honour those, so they are recorded rather than evaluated and
@@ -295,6 +354,8 @@ class Manifest:
             if 'Folder' not in a:
                 continue
             folder = a['Folder'].replace('\\', os.sep)
+            if _tag == 'Conditional':
+                self.conditional_folders.add(folder)
             cond = a.get('ActiveWhen', '').strip()
             body = body or ''
             if not cond:
@@ -434,6 +495,22 @@ def evaluate(condition, settings):
         return False
     ident, op, value = m.group(1).strip(), m.group(2), int(m.group(3))
     current = settings.get(ident)
+    if current is None:
+        # CASE-INSENSITIVE, because 7th Heaven's is:
+        # `ProfileItem.IsConfigActive` matches the option id with
+        # `StringComparison.InvariantCultureIgnoreCase`.
+        #
+        # Ninostyle Chibi declares the option as `Dynamic Weapons` and then
+        # gates a folder on `dynamic weapons = 1`. An exact-match lookup read
+        # that as "option missing" -> false, so the folder carrying the whole
+        # Dynamic Weapons BASE MODEL SET -- the weapon bone on Cloud's field,
+        # world and Highwind skeletons -- was silently dropped while its
+        # sixteen <Conditional> siblings, spelled with capitals, were kept.
+        low = ident.lower()
+        for k, v in settings.items():
+            if k.lower() == low:
+                current = v
+                break
     if current is None:
         return False
     return current != value if op == '!=' else current == value
@@ -585,7 +662,26 @@ def exe_var_reader(data, va_to_offset):
 
 def active_folders(manifest, settings, read=None, log=None):
     """
-    Folders whose ActiveWhen passes, in declaration order.
+    Folders whose ActiveWhen passes, in 7TH HEAVEN'S PRECEDENCE ORDER.
+
+    Callers emplace this list left to right with LAST WRITE WINNING, so the
+    order returned here is the reverse of 7th Heaven's "first active match
+    wins". 7th Heaven's order is:
+
+        every <Conditional>, then every <ModFolder>, then the mod root
+
+    (AppWrapper/Wrap.cs:173-201, and VFile.cs:292 returns the first entry
+    whose gate is true). Reversed for last-write-wins, that is **ModFolders
+    first, Conditionals last**.  The order *within* each class must also be
+    reversed: a later declaration must not overwrite the earlier registration
+    that 7th Heaven would have returned first.
+
+    THIS USED TO RETURN PLAIN DECLARATION ORDER, and for Ninostyle Chibi that
+    is the exact opposite of 7th Heaven: its sixteen `Dynamic Weapons\\Cloud`
+    <Conditional>s are declared at positions 2..17 and `efryt\\fb`, a
+    <ModFolder> that supplies the same `AAAE1.P`, at position 44. Declaration
+    order gave Cloud's field sword to Efryt; 7th Heaven gives it to Dynamic
+    Weapons. See FINDINGS-412.
 
     When `read` is given, a folder that also carries a RuntimeVar condition
     must satisfy it. A condition that cannot be answered (live game state, a
@@ -593,7 +689,7 @@ def active_folders(manifest, settings, read=None, log=None):
     behaviour -- because those gates pick between cosmetic variants far more
     often than they pick between right and wrong.
     """
-    out = []
+    plain, conditional = [], []
     for folder, cond in manifest.folders:
         if not evaluate(cond, settings):
             continue
@@ -609,5 +705,24 @@ def active_folders(manifest, settings, read=None, log=None):
             if ok is None and log:
                 log('    %s: RuntimeVar gate could not be evaluated (%s) -- '
                     'kept' % (folder, ', '.join(sorted(set(runtime_vars(rt))))))
-        out.append(folder)
-    return out
+        # PROMOTED ONLY WHEN THE GATE IS KNOWN TO BE LIVE.
+        #
+        # 7th Heaven skips a <Conditional> whose gate is false and falls
+        # through to the next candidate, so a conditional only outranks a
+        # <ModFolder> while it is actually active. We cannot always tell: a
+        # gate on the equipped weapon or on story progress has no answer at
+        # build time, and those folders are KEPT (see above) because they
+        # usually pick between cosmetic variants. Keeping them AND promoting
+        # them would be a rule 7th Heaven does not have -- it would let a
+        # folder we merely failed to rule out beat one the user switched on.
+        #
+        # MEASURED on the full mod set: promoting only the gates we can read
+        # moves two entries (Cloud's `aaae1.p` and `bhjc1.p`, to Dynamic
+        # Weapons, which is the point). Promoting the unreadable ones as well
+        # also moved Cosmo Memory's `_opening.ogg` and `mkup.ogg` to folders
+        # gated on a story-progress window that is not open.
+        promote = (folder in getattr(manifest, 'conditional_folders', ())
+                   and (rt is None or (read is not None
+                                       and evaluate_runtime(rt, read) is True)))
+        (conditional if promote else plain).append(folder)
+    return list(reversed(plain)) + list(reversed(conditional))

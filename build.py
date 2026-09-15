@@ -28,6 +28,7 @@ import p as pfile
 import tex
 import battle_stage_bg
 import ff7nx_widescreen
+import ff7nx_dynweapon
 import ff7nx_gaia
 import ff7nx_ws
 import ff7nx_shaders
@@ -236,6 +237,10 @@ ARCHIVES = {
     'battle.lgp': 'data/battle/battle.lgp',
     'magic.lgp': 'data/battle/magic.lgp',
     'world_us.lgp': 'data/wm/world_us.lgp',
+    # Highwind's walkable deck uses its own model archive.  It is not a
+    # language fallback: the US build really opens this exact file, and
+    # Dynamic Weapons supplies Cloud's BSCA1 mesh there.
+    'high-us.lgp': 'data/minigame/high-us.lgp',
     'menu_us.lgp': 'data/menu/menu_us.lgp',
 }
 
@@ -663,13 +668,15 @@ FOLDER_ARCHIVE_HINTS = (
     ('battle', 'battle.lgp'),
     ('magic', 'magic.lgp'),
     ('world', 'world_us.lgp'),
+    ('high', 'high-us.lgp'),
     ('menu', 'menu_us.lgp'),
 )
 
 ARCHIVE_DISPLAY = {
     'char.lgp': 'char.lgp', 'flevel.lgp': 'flevel.lgp',
     'battle.lgp': 'battle.lgp', 'magic.lgp': 'magic.lgp',
-    'world_us.lgp': 'world_us.lgp', 'menu_us.lgp': 'menu_us.lgp',
+    'world_us.lgp': 'world_us.lgp', 'high-us.lgp': 'high-us.lgp',
+    'menu_us.lgp': 'menu_us.lgp',
     'music': 'music (.ogg)',
 }
 
@@ -788,6 +795,9 @@ class Plan:
                                      # 652 duplicate entry names and picking
                                      # the right one needs the archive's own
                                      # conflict table. See ff7nx_spelltex.
+        self.dynweapon = []          # per-weapon model variants emplaced
+                                     # under `z0...` names -- see
+                                     # ff7nx_dynweapon.emplace
         self.widescreen = None       # (config.toml, movie_config.toml, mod)
                                      # -- FFNx's per-field widescreen table,
                                      # baked into flevel.lgp section 8 by
@@ -1269,6 +1279,11 @@ def build_plan(mods, settings_by_mod, catalogs, log=lambda *_: None,
             continue
         if c['direct'] is None:
             added_new += 1
+        # Record where it actually went. A NEW model part -- and every
+        # Dynamic Weapons mesh is one -- has no name match, so its archive is
+        # only decided here by the folder vote. ff7nx_dynweapon.collect runs
+        # after this loop and needs the answer, not the guess.
+        c['target'] = target
         bucket = plan.archive_files.setdefault(target, {})
         if c['low'] in bucket and bucket[c['low']][1] is not c['mod']:
             plan.conflicts.append((target, c['base'],
@@ -1277,12 +1292,53 @@ def build_plan(mods, settings_by_mod, catalogs, log=lambda *_: None,
         bucket[c['low']] = (c['full'], c['mod'])
         plan.folder_of.setdefault(target, {})[c['low']] = c['option']
         versions.setdefault(target, {}).setdefault(c['low'], []).append(
-            (c['route'][1], c['full'], c['mod']))
+            (_model_subfolder(c['route'][1], c['mod']), c['full'], c['mod']))
 
-    # Reassemble each model from a single source, preferring the base set, so
-    # enabling an overlapping option can never mix pieces from two versions of
-    # a character. Only affects archives that use the .hrc model structure.
-    _assemble_models_atomically(plan, versions, log)
+    # Dynamic Weapons supplies its shared skeleton/RSD/texture set separately
+    # from the weapon mesh selected by its live RuntimeVar folders.  Treat the
+    # range base as a real member of that source *before* model assembly: it
+    # makes the Dynamic Weapons set complete, so its compatible RSD and TEX
+    # can win together with its weapon bone instead of being overwritten by
+    # Efryt merely because the mesh is synthesized later.
+    plan.dynweapon = ff7nx_dynweapon.emplace(
+        plan,
+        ff7nx_dynweapon.collect(plan, candidates, mods, log),
+        catalogs, log)
+    for item in plan.dynweapon:
+        target, low = item['archive'], item['entry']
+        src = plan.archive_files.get(target, {}).get(low)
+        if src is not None:
+            versions.setdefault(target, {}).setdefault(low, []).append(
+                (_model_subfolder('Dynamic Weapons', src[1]), src[0], src[1]))
+
+    # A Dynamic Weapons mesh is only useful through the matching RSD branch.
+    # A companion add-on can intentionally replace a texture or the emitted
+    # mesh, yet also offer a *static* HRC for the same character.  Selecting
+    # that static HRC independently makes it point at AAAD/AAAE while the
+    # dynamic RSD is AAAD1/AAAE1, leaving the weapon branch disconnected.
+    # Keep ordinary 7H per-file winners, but in this one case choose the
+    # highest-priority alternative HRC that actually reaches the selected
+    # dynamic RSD.  This is a graph-connection repair, not whole-model
+    # assembly: its RSD, mesh variants and textures retain their normal
+    # per-file winners.
+    _align_dynamic_model_roots(plan, versions, log)
+
+    # 7th Heaven resolves each archive entry independently.  Keep those
+    # winners exactly as the profile chose them: an add-on often replaces an
+    # HRC and texture while the base mod intentionally supplies its matching
+    # RSD, and forcing every node back to one "complete" folder breaks that
+    # legitimate stack.  `repoint` below makes the resulting live graph point
+    # at the dynamic ranges after the vanilla archive has been opened.
+    #
+    # `_assemble_models_atomically` remains available for forensic use, but
+    # is deliberately not part of normal builds.  Its old default made
+    # Efryt's complete Cloud model displace Chibi Fixes' selected Buster
+    # overlay, contrary to 7th Heaven's VFile per-file resolver.
+    if os.environ.get('SEVENTH_NX_MODEL_ATOMIC', '').strip().lower() in (
+            '1', 'true', 'yes', 'on'):
+        log('  ! SEVENTH_NX_MODEL_ATOMIC=1: forcing complete model sets; '
+            'this is a diagnostic override, not 7th Heaven layering')
+        _assemble_models_atomically(plan, versions, log)
 
     if added_new:
         log(f'routed {added_new} new files (added to archives, not just '
@@ -2463,28 +2519,55 @@ MODEL_IGNORE_ENV = 'SEVENTH_NX_MODEL_IGNORE'
 #
 # NinoStyle Chibi ships Efryt's Little Work and Dynamic Weapons with BYTE
 # IDENTICAL AAAA.hrc files -- both add the `aaad1` bone that carries a weapon
-# on Cloud's back -- so something has to break the tie. Efryt is first because
-# it is the one that is complete on its own: it ships the sword mesh AAAE1.p
-# and the recoloured cl.TEX its rsd samples, and neither changes at runtime.
-DEFAULT_MODEL_PREFER = 'Efryt,Lazaro'
+# on Cloud's back -- so something has to break the tie.
+#
+# 7th Heaven breaks it by TAG. `AppWrapper/Wrap.cs:173-201` registers, per
+# mod, every <Conditional> folder before every <ModFolder>, and
+# `AppWrapper/VFile.cs:292` takes the first registered entry whose gate is
+# live. Dynamic Weapons is a <Conditional> set and `efryt\fb` is a
+# <ModFolder> in the same mod, so on PC Dynamic Weapons wins -- whenever
+# NinoStyle Chibi's own "Dynamic Weapons" option is on. See FINDINGS-412.
+#
+# Efryt used to be first here, back when Dynamic Weapons could not be
+# completed on Switch: it ships the sword mesh AAAE1.p and the recoloured
+# cl.TEX its rsd samples, and neither changed at runtime. `ff7nx_dynweapon`
+# now supplies the per-weapon meshes and the port picks between them at
+# load, so the reason for the inversion is gone and the tag order stands.
+DEFAULT_MODEL_PREFER = 'Dynamic Weapons,Efryt,Lazaro'
 
-# Source subfolders excluded from model-set competition entirely.
-#
-# Dynamic Weapons is here because of what it is, not because it is broken. Its
-# Chibi/Char ships AAAD1.rsd -- the weapon bone -- but NOT the AAAE1.p that
-# rsd names. That mesh exists only inside its 16 per-weapon folders
-# ("Dynamic Weapons/Cloud/01 - Buster Sword/char/AAAE1.p" and so on), which
-# 7th Heaven copies in live as equipment changes. The Switch port has no
-# mechanism for that, so the model can never be complete here; the same is
-# true of its Cid and Aerith sets.
-#
-# The completeness gate below would reject it for those models anyway, which
-# is a nice independent confirmation. It is named here as well so the choice
-# is visible in the log rather than an emergent property. To try it anyway:
-#     SEVENTH_NX_MODEL_IGNORE=""
-#     SEVENTH_NX_MODEL_PREFER="Dynamic Weapons,Lazaro"
-# It will then win exactly those models it can actually supply whole.
-DEFAULT_MODEL_IGNORE = 'Dynamic Weapons'
+# Source subfolders excluded from the optional diagnostic model-set assembler.
+# Normal builds deliberately do not invoke that assembler: 7th Heaven's VFile
+# resolver selects individual archive entries in profile order, not a single
+# "complete" source folder for a whole model.  The diagnostic path below is
+# retained for forensic comparisons only.
+DEFAULT_MODEL_IGNORE = ''
+
+
+# For the optional diagnostic assembler, one mod's Dynamic Weapons tree is a
+# single overlay stack, not a set of competing folders. It must nevertheless
+# remain separate from another mod's Dynamic Weapons tree: a companion add-on
+# can deliberately replace only selected entries.
+_DW_SUBFOLDER = re.compile(r'^(.*?dynamic weapons)(?:[/\\].*)?$', re.I)
+
+
+def _model_subfolder(sub, mod=None):
+    """Identity of one mod's model source set.
+
+    Dynamic Weapons' base and weapon folders are one source set *within a
+    mod*.  They are not one set across every enabled mod: Ninostyle Chibi and
+    its Fixes companion can both contain ``Dynamic Weapons/...`` with the
+    same file names but different assets.  Collapsing them together made the
+    assembler take the first package's geometry even when normal 7H profile
+    order selected the later package.  Prefix with the mod filename to retain
+    the real ownership boundary, then collapse only that mod's DW tree.
+    """
+    m = _DW_SUBFOLDER.match((sub or '').replace('\\', '/'))
+    # Mod authors mix case freely, and Dynamic Weapons is intentionally one
+    # overlay stack even when its base lives in `dynamic weapons/chibi` while
+    # its runtime variants live in `Dynamic Weapons/Cloud/...`.
+    tree = (m.group(1) if m else (sub or '')).lower()
+    owner = (getattr(mod, 'filename', '') or '').lower()
+    return owner + '::' + tree if owner else tree
 
 
 def _model_pref():
@@ -2567,7 +2650,7 @@ def _assemble_models_atomically(plan, versions, log):
 
         def parts_of(hrc_low, sub):
             """
-            (geometry entry names, texture entry names, complete?)
+            (geometry entry names, complete?)
 
             Completeness is a GEOMETRY property only. A model must bring its
             own skeleton, every rsd and every .p, because those three describe
@@ -2575,11 +2658,18 @@ def _assemble_models_atomically(plan, versions, log):
             deliberately not required: sheets are shared between models
             (NinoStyle's cl.TEX serves several), and a mod that recolors one
             character legitimately ships a texture and nothing else.
+
+            Texture ownership is intentionally *not* returned here.  7th
+            Heaven resolves every file independently.  A later mod may ship
+            just a recolour for an otherwise earlier model -- exactly what
+            NinoStyle Chibi Fixes' ``Buster Sword Field Model`` does with
+            ``AAAA1.TEX``.  Letting the geometry winner reclaim that sheet
+            would turn a valid later overlay back into the earlier texture.
             """
             got = src_file(hrc_low, sub)
             if not got:
                 return [], [], False
-            geom, tex, ok = [], [], True
+            geom, ok = [], True
             for rsd in _hrc_parts(_read(got[0])):
                 key = rsd + '.rsd'
                 geom.append(key)
@@ -2587,14 +2677,13 @@ def _assemble_models_atomically(plan, versions, log):
                 if rf is None:
                     ok = False
                     continue
-                ply, ts = _rsd_refs(_read(rf[0]))
-                tex += [t + '.tex' for t in ts]
+                ply, _ts = _rsd_refs(_read(rf[0]))
                 if ply:
                     key = ply + '.p'
                     geom.append(key)
                     if src_file(key, sub) is None:
                         ok = False
-            return geom, tex, ok
+            return geom, ok
 
         # ---- pick a winner per model -----------------------------------
         def rank(item):
@@ -2604,7 +2693,6 @@ def _assemble_models_atomically(plan, versions, log):
             return (pi, -len(parts), 0 if sub == base else 1, sub.lower())
 
         owner = {}                      # part entry name -> winning subfolder
-        tex_claims = {}                 # texture entry name -> {subfolder}
         moved = []
         for hrc_low in sorted({h for hs in hrcs_of.values() for h in hs}):
             cand = []
@@ -2613,37 +2701,22 @@ def _assemble_models_atomically(plan, versions, log):
                     continue
                 if any(g in sub.lower() for g in ignore):
                     continue
-                geom, tex, ok = parts_of(hrc_low, sub)
+                geom, ok = parts_of(hrc_low, sub)
                 if ok:
-                    cand.append((sub, geom, tex))
+                    cand.append((sub, geom))
             if not cand:
                 continue
             cand.sort(key=lambda c: rank((c[0], c[1])))
-            win, geom, tex = cand[0]
+            win, geom = cand[0]
             owner[hrc_low] = win
             for p in geom:
                 owner.setdefault(p, win)
-            # A texture only follows the model if the WINNER ships it. Efryt's
-            # Little Work recolors cl.TEX and its sword rsd samples cl.TIM, so
-            # taking Efryt's mesh with the base sheet would texture the sword
-            # off the wrong image. Claims are collected and resolved after all
-            # models are decided, because one sheet can serve several.
-            for t in tex:
-                if src_file(t, win) is not None:
-                    tex_claims.setdefault(t, set()).add(win)
             if win != base and len(cand) > 1:
                 moved.append((hrc_low, win, len(geom),
                               [c[0] for c in cand[1:]]))
 
-        retex = 0
-        for t, subs in tex_claims.items():
-            best = min(subs, key=lambda s: rank((s, ())))
-            if best != base and owner.get(t) != best:
-                owner[t] = best
-                retex += 1
-
         # ---- apply ------------------------------------------------------
-        kept = claimed = dropped = data_only = 0
+        kept = claimed = data_only = 0
         for low, vs in byname.items():
             subs = {s for s, _, _ in vs}
             if not (subs & model_subs):
@@ -2660,35 +2733,18 @@ def _assemble_models_atomically(plan, versions, log):
                     else:
                         claimed += 1
                     continue
-            # Not part of any model we resolved. Keep it if the base set (or
-            # any non-ignored folder) provides it; otherwise fall back to
-            # vanilla rather than leave an orphaned piece of an alternate.
-            fallback = None
-            for sub in [base] + sorted(subs - {base}):
-                if any(g in sub.lower() for g in ignore):
-                    continue
-                v = src_file(low, sub)
-                if v is not None:
-                    fallback = (sub, v)
-                    break
-            if fallback is not None:
-                bucket[low] = fallback[1]
-                plan.folder_of.setdefault(target, {})[low] = fallback[0]
-                kept += 1
-            elif low in bucket:
-                del bucket[low]
-                plan.folder_of.get(target, {}).pop(low, None)
-                dropped += 1
+            # Not a geometry node of a model we resolved: preserve the normal
+            # per-file winner.  This includes texture-only overlays, animation
+            # files, and any other data a later 7th Heaven mod intentionally
+            # layers onto an earlier model set.  Choosing the geometry base
+            # here would silently undo that later mod.
+            data_only += 1
 
         msg = (f'  {target}: base model set "{base}" ({kept} files)')
         if claimed:
             msg += f'; {claimed} file(s) claimed by overlay models'
-        if retex:
-            msg += f' (incl. {retex} texture(s) following their model)'
-        if dropped:
-            msg += f'; dropped {dropped} orphaned piece(s)'
         if data_only:
-            msg += f'; kept {data_only} from data-only folders'
+            msg += f'; preserved {data_only} normal per-file overlay(s)'
         log(msg)
         if moved:
             log(f'  {target}: {len(moved)} model(s) taken from an overlay '
@@ -6248,8 +6304,29 @@ def _cap_field_textures(name, mod_files, log, max_dim):
 # next bone's name and parent as if they were RSD names. That inflated
 # BEEC.HRC from 22 parts to 64 and put bone names in the part list.
 def _provisional_target(c, route_target):
-    """Where a candidate goes on name-match-first rules (the old behaviour)."""
-    return c['direct'] or route_target.get(c['route'])
+    """Where a candidate goes on name-match-first rules.
+
+    A new model part normally inherits the archive voted by a sibling whose
+    name exists in vanilla.  Some legitimate option folders are *texture-only*
+    in one archive, though: Ninostyle's Buster Sword Field Model has new
+    ``world/`` and ``high/`` texture names with no vanilla anchor in either
+    archive.  Dropping those files makes the option apply to char.lgp but not
+    world_us.lgp/high-us.lgp.  Use the explicit archive leaf only as the final
+    fallback, after a real name match and a folder vote; this preserves the
+    chocobo/model routing guarantee above.
+    """
+    if c.get('direct'):
+        return c['direct']
+    voted = route_target.get(c['route'])
+    if voted:
+        return voted
+    leaf = os.path.basename(os.path.dirname(
+        c.get('rel', '').replace('\\', '/'))).lower()
+    return {
+        'char': 'char.lgp',
+        'world': 'world_us.lgp',
+        'high': 'high-us.lgp',
+    }.get(leaf)
 
 
 def _reroute_by_folder(candidates, route_target, route_pure=None):
@@ -6373,6 +6450,61 @@ def _rsd_refs(blob):
     return (ply.group(1).decode('ascii', 'replace').lower() if ply else None,
             [t.decode('ascii', 'replace').lower()
              for t in _RE_RSD_TEX.findall(blob)])
+
+
+def _align_dynamic_model_roots(plan, versions, log=lambda *_: None):
+    """Ensure selected HRC roots can reach a selected dynamic weapon RSD.
+
+    7th Heaven resolves files one at a time, which remains the default here.
+    A Dynamic Weapons conversion adds one extra invariant: a live HRC must
+    name the RSD whose PLY is being turned into the `z0...` range.  If a
+    higher-priority companion supplies a static HRC with another RSD stem,
+    choose a lower-priority HRC source only when it restores that missing
+    edge.  Do not take the alternative RSD, mesh, or texture with it.
+    """
+    dynamic_ply = {}
+    for item in plan.dynweapon:
+        if item.get('ext') == 'p':
+            dynamic_ply.setdefault(item['archive'], set()).add(item['stem'])
+
+    repaired = []
+    for target, ply_stems in dynamic_ply.items():
+        bucket = plan.archive_files.get(target)
+        if not bucket:
+            continue
+        dynamic_rsds = set()
+        for low, (src, _mod) in bucket.items():
+            if not low.endswith('.rsd'):
+                continue
+            ply, _tex = _rsd_refs(_read(src))
+            if ply in ply_stems:
+                dynamic_rsds.add(low.rsplit('.', 1)[0])
+        if not dynamic_rsds:
+            continue
+
+        for low, (src, mod) in list(bucket.items()):
+            if not low.endswith('.hrc'):
+                continue
+            if set(_hrc_parts(_read(src))) & dynamic_rsds:
+                continue
+            for _sub, alt_src, alt_mod in reversed(
+                    versions.get(target, {}).get(low, ())):
+                if set(_hrc_parts(_read(alt_src))) & dynamic_rsds:
+                    bucket[low] = (alt_src, alt_mod)
+                    plan.folder_of.setdefault(target, {})[low] = \
+                        'Dynamic Weapons compatibility root'
+                    repaired.append((target, low,
+                                     getattr(mod, 'display_name', '?'),
+                                     getattr(alt_mod, 'display_name', '?')))
+                    break
+    if repaired:
+        log('  dynamic weapons: restored %d HRC root(s) that reach the '
+            'selected dynamic RSD (kept the normal texture/mesh winners)'
+            % len(repaired))
+        for target, hrc, old, new in repaired[:6]:
+            log('      %s/%s: %s -> %s' % (target, hrc, old, new))
+        if len(repaired) > 6:
+            log('      ... and %d more' % (len(repaired) - 6))
 
 
 def _model_graph(van):
@@ -6642,7 +6774,7 @@ def _lookup_unreachable(path):
 
 def _build_model_archive(name, archive_path, mod_files, romfs, pack_lgp,
                          log, folder_of=None, battle_bg_native_names=None,
-                         spell_dds=None):
+                         spell_dds=None, dynweapon=None):
     """
     Rebuild a model LGP (char/battle/magic/world/menu) with PyFF7: reuse
     every untouched vanilla entry, overlay the mod's files unchanged, add any
@@ -6681,6 +6813,16 @@ def _build_model_archive(name, archive_path, mod_files, romfs, pack_lgp,
 
     van = vanilla_unpack(name, archive_path, log)
     filemap = dict(van)  # lowercase entry name -> disk path (unchanged bytes)
+
+    # Point the .rsd/.hrc that names a dynamic weapon part at the first
+    # member of its range. FIRST, before any texture pass, because it only
+    # rewrites model-reference text and every later pass should see the final
+    # set. The referrer is often a VANILLA entry the mod does not replace,
+    # which is why this waits for `van` rather than running in build_plan.
+    if dynweapon:
+        mod_files, _n = ff7nx_dynweapon.repoint(
+            name, mod_files, van, dynweapon,
+            os.path.join(HERE, 'cache', '_dynweapon', name), log)
 
     # The Switch battle module needs paletted textures for enemies and magic
     # (their dissolve/effects are palette-driven; truecolor replacements can
@@ -8586,7 +8728,9 @@ REUSE_ARCHIVE_ENV = {
     'battle.lgp': 'SEVENTH_NX_REUSE_BATTLE',
     'magic.lgp': 'SEVENTH_NX_REUSE_MAGIC',
     'world_us.lgp': 'SEVENTH_NX_REUSE_WORLD',
+    'high-us.lgp': 'SEVENTH_NX_REUSE_HIGH',
     'char.lgp': 'SEVENTH_NX_REUSE_CHAR',
+    'menu_us.lgp': 'SEVENTH_NX_REUSE_MENU',
 }
 # One switch for all of them, flevel included.
 REUSE_ALL_ENV = 'SEVENTH_NX_REUSE_ARCHIVES'
@@ -9214,7 +9358,8 @@ def apply_plan(plan, archive_paths, sdout, log=lambda *_: None,
                                     plan.folder_of.get(name),
                                     plan.battle_bg_native_names,
                                     plan.spell_dds
-                                    if name == 'magic.lgp' else None)
+                                    if name == 'magic.lgp' else None,
+                                    plan.dynweapon)
         if dest:
             produced.append(dest)
             _archive_cache_store(
@@ -10213,6 +10358,41 @@ def apply_spelluv(sdout, dump, log=lambda *_: None, produced=(), needed=False):
         return []
     os.replace(tmp, dest)
     return [dest] if not built else []
+
+
+def apply_dynweapon(sdout, dump, log=lambda *_: None, produced=()):
+    """
+    Hook `open_file`'s name select so the equipped weapon's mesh is the one
+    that loads. See ff7nx_dwhook, and FINDINGS-412 for why.
+
+    Runs LAST among the module patches, and takes its padding from whatever
+    the earlier caves left -- ff7nx_cave re-checks that every hole it hands
+    out is still zero in the module being patched, so ordering only affects
+    which holes this gets, never whether it is safe.
+
+    Pointless without the archive half: with no `z0...` entries the cave's
+    two byte compares never match and every file opens exactly as it does
+    today. It is installed anyway so the module and the archives cannot get
+    out of step across a partial rebuild.
+    """
+    import ff7nx_dwhook
+    if dump is None or not dump.nso:
+        return []
+    dest = os.path.join(sdout, 'atmosphere', 'contents', TITLE_ID, 'exefs',
+                        'main')
+    if not os.path.exists(dest):
+        log('! dynamic weapons: no exefs/main in sdout; skipped')
+        return []
+    exe = _find_base_exe({}, dump)
+    if not exe or not os.path.exists(exe):
+        log('! dynamic weapons: needs the ff7 exe to derive open_file; '
+            'skipped')
+        return []
+    log('')
+    log('dynamic weapon name select ...')
+    ff7nx_dwhook.apply_all(dest, exe,
+                           revert=not ff7nx_dwhook.enabled(), log=log)
+    return []
 
 
 def apply_fbcapture(sdout, dump, log=lambda *_: None, produced=()):

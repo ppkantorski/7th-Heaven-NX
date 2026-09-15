@@ -76,10 +76,10 @@ def _global_setting(key, default):
 #   AppWrapper/VFile.cs            MapFile() returns the FIRST override
 #                                    found for a file
 #
-# First match wins, and the sort is ascending, so the LOWEST category number
-# takes priority. Animations (1) therefore overrides Battle Models (2) and
-# Field Models (4) -- which is what makes the 60 FPS mod's interpolated
-# animations win against Ninostyle rather than the other way round.
+# First match wins. 7H can retain an explicit user-arranged profile, but NX
+# does not expose manual reordering; its old ``mod_load_order`` was therefore
+# merely the discovery sequence from an earlier run.  NX always applies the
+# same category auto-sort and procedural manifest moves that 7H shows.
 #
 # build.build_plan() applies its input later-wins, so run_build() hands it
 # this order reversed.
@@ -899,8 +899,106 @@ def mod_load_rank(mod):
     return MOD_LOAD_ORDER.get(mod_category(mod).lower(), UNKNOWN_ORDER)
 
 
-def discover_mods():
-    """Mods in 7th Heaven priority order: highest priority first."""
+def profile_mod_order(saved):
+    """Validated user profile order, highest priority first."""
+    raw = (saved or {}).get('__global__', {}).get('mod_load_order', [])
+    if not isinstance(raw, list):
+        return []
+    seen, out = set(), []
+    for item in raw:
+        if not isinstance(item, str) or item in seen:
+            continue
+        seen.add(item)
+        out.append(item)
+    return out
+
+
+def _mod_options_from_saved(mod, saved):
+    """Merge saved values with the current manifest's defaults.
+
+    IRO updates can add options or occasionally rename one.  Replacing the
+    old ``options`` dict wholesale made a newly-added option disappear from
+    build-time gating, and Ninostyle Chibi 26.08302 specifically renamed
+    ``efryt fb`` to ``efryt``.  Preserve explicit user values, migrate that
+    known stable ID, and let every new option use its author-declared default.
+    """
+    manifest = getattr(mod, 'manifest', None)
+    defaults = manifest.defaults() if manifest else {}
+    stored = (saved or {}).get(mod.filename, {}).get('options', {})
+    if not isinstance(stored, dict):
+        stored = {}
+    merged = dict(defaults)
+    merged.update(stored)
+    if (_manifest_id(mod) == '2b25060c-c60e-426e-ac46-f85439e903e2'
+            and 'efryt' not in stored and 'efryt fb' in stored):
+        merged['efryt'] = stored['efryt fb']
+    return merged
+
+
+def _manifest_id(mod):
+    return ((getattr(getattr(mod, 'manifest', None), 'mod_id', '') or '')
+            .strip().lower())
+
+
+def _autosort_7h(mods):
+    """Exactly mirror 7th Heaven's AutoSortBasedOnCategory().
+
+    7H does *not* topologically sort Before/After declarations.  It first
+    sorts by category and name, then walks that original sorted snapshot and
+    moves each declaring mod immediately before/after its named target.  The
+    distinction is observable with this set: a graph sort moves Cosmos FMV
+    after a transitive chain, while 7H correctly leaves it below Echo-S and
+    above 60 FPS.  Keeping this deliberately procedural also matches 7H's
+    behavior for imperfect third-party constraints.
+    """
+    ordered = sorted(mods, key=lambda m: (mod_load_rank(m),
+                                           m.display_name.casefold()))
+    by_id = {_manifest_id(mod): mod for mod in ordered if _manifest_id(mod)}
+    # Snapshot iteration is intentional: it is the `sortedList.ToList()` in
+    # 7H's MyModsViewModel.AutoSortBasedOnCategory().
+    for mod in list(ordered):
+        manifest = getattr(mod, 'manifest', None)
+        if not manifest:
+            continue
+        for target_id in getattr(manifest, 'order_after', ()):
+            target = by_id.get(target_id)
+            if target is not None and ordered.index(target) > ordered.index(mod):
+                ordered.remove(mod)
+                ordered.insert(ordered.index(target), mod)
+        for target_id in getattr(manifest, 'order_before', ()):
+            target = by_id.get(target_id)
+            if target is not None and ordered.index(target) < ordered.index(mod):
+                ordered.remove(mod)
+                ordered.insert(ordered.index(target), mod)
+    return ordered
+
+
+def _active_order_constraints(mods):
+    """Declared order edges present in this enabled profile, for the log."""
+    by_id = {_manifest_id(m): m for m in mods if _manifest_id(m)}
+    out, seen = [], set()
+    for mod in mods:
+        manifest = getattr(mod, 'manifest', None)
+        for target_id in getattr(manifest, 'order_before', ()):
+            target = by_id.get(target_id)
+            if target and (mod.filename, target.filename) not in seen:
+                seen.add((mod.filename, target.filename))
+                out.append((mod, target))
+        for target_id in getattr(manifest, 'order_after', ()):
+            target = by_id.get(target_id)
+            if target and (target.filename, mod.filename) not in seen:
+                seen.add((target.filename, mod.filename))
+                out.append((target, mod))
+    return out
+
+
+def discover_mods(order=None):
+    """Mods in the official 7H auto-sort priority order, highest first.
+
+    NX has no manual priority-reorder control, so a stale saved list is not
+    user intent: it is only retained for backwards compatibility.  Apply the
+    same auto-sort that 7H presents in its GUI every time instead.
+    """
     if not os.path.isdir(MODS_DIR):
         return []
     found = []
@@ -911,8 +1009,120 @@ def discover_mods():
             # the category is known before we sort.
             mod._load_manifest()
             found.append(mod)
-    found.sort(key=lambda m: (mod_load_rank(m), m.display_name.lower()))
-    return found
+    # `order` is deliberately not reapplied: older NX versions wrote their
+    # discovery sequence here, even though the UI offered no way to express a
+    # custom priority.  Reusing it would keep showing an order unlike 7H.
+    # Keep the parameter so older callers remain compatible.
+    del order
+    return _autosort_7h(found)
+
+
+def _option_key(settings, ident):
+    """Actual settings key for an IRO option ID, ignoring author casing."""
+    want = str(ident).casefold()
+    return next((key for key in settings if str(key).casefold() == want), None)
+
+
+def _option_value(mod, settings, ident):
+    key = _option_key(settings, ident)
+    if key is not None:
+        return settings[key]
+    manifest = getattr(mod, 'manifest', None)
+    option = next((o for o in getattr(manifest, 'options', ())
+                   if o.id.casefold() == str(ident).casefold()), None)
+    return option.default if option is not None else None
+
+
+def _compatibility_profile(mods, enabled, settings_by_mod, log):
+    """Return active mods and safe effective settings, or report a hard stop.
+
+    IRO compatibility rules are declarations, not heuristics. A forbidden or
+    missing required mod stops the build instead of silently dropping either
+    selected mod. A conditional Setting rule, however, names the exact option
+    and exact value that makes the pair compatible, so it is safely applied
+    to this build's in-memory settings and recorded in the build log.
+    """
+    active = [m for m in mods if enabled.get(m.filename)]
+    by_id = {_manifest_id(m): m for m in active if _manifest_id(m)}
+    effective = {m.filename: dict(settings_by_mod.get(m.filename, {}))
+                 for m in active}
+    bad = []
+    for mod in active:
+        manifest = getattr(mod, 'manifest', None)
+        for required in getattr(manifest, 'compat_requires', ()):
+            if required not in by_id:
+                bad.append('%s requires mod ID %s, which is not enabled'
+                           % (mod.display_name, required))
+        for forbidden in getattr(manifest, 'compat_forbids', ()):
+            target = by_id.get(forbidden)
+            if target is not None:
+                pair = tuple(sorted((mod.filename, target.filename)))
+                if pair not in {p[0] for p in bad if isinstance(p, tuple)}:
+                    bad.append((pair, '%s forbids %s'
+                                % (mod.display_name, target.display_name)))
+    if bad:
+        log('ERROR: declared IRO compatibility conflict(s); no output was built:')
+        for item in bad:
+            log('  - ' + (item[1] if isinstance(item, tuple) else item))
+        log('Resolve the listed selection in the mod UI, then build again.')
+        return None, None
+
+    # One rule can enable another; iterate to a fixed point. A bounded loop
+    # prevents malformed third-party manifests from spinning forever.
+    changed = []
+    for _pass in range(sum(len(getattr(m.manifest, 'compat_settings', ()))
+                           for m in active) + 1):
+        made_change = False
+        for mod in active:
+            manifest = getattr(mod, 'manifest', None)
+            mine = effective[mod.filename]
+            for my_id, my_value, target_id, their_id, required in \
+                    getattr(manifest, 'compat_settings', ()):
+                target = by_id.get(target_id)
+                if target is None:
+                    continue  # The rule applies only when both mods are on.
+                try:
+                    active_now = int(_option_value(mod, mine, my_id))
+                    trigger = int(my_value)
+                    want = int(required)
+                except (TypeError, ValueError):
+                    continue
+                if active_now != trigger:
+                    continue
+                target_settings = effective[target.filename]
+                target_key = _option_key(target_settings, their_id)
+                if target_key is None:
+                    option = next((o for o in getattr(target.manifest, 'options', ())
+                                   if o.id.casefold() == their_id.casefold()), None)
+                    if option is None:
+                        log('  ! compatibility rule ignored: %s names unknown '
+                            'option %s on %s' % (mod.display_name, their_id,
+                                                  target.display_name))
+                        continue
+                    target_key = option.id
+                old = _option_value(target, target_settings, target_key)
+                try:
+                    old_value = int(old)
+                except (TypeError, ValueError):
+                    # A third-party profile can contain an old textual value
+                    # for a Bool option.  The manifest's exact declared
+                    # value remains the safe correction; don't let malformed
+                    # saved state abort an otherwise valid build.
+                    old_value = None
+                if old_value != want:
+                    target_settings[target_key] = want
+                    changed.append((mod.display_name, my_id, trigger,
+                                    target.display_name, target_key, old, want))
+                    made_change = True
+        if not made_change:
+            break
+    if changed:
+        log('IRO compatibility: applied %d declared setting correction(s) '
+            'for this build:' % len(changed))
+        for source, mine, value, target, theirs, old, new in changed:
+            log('  %s (%s=%d) -> %s: %s %r -> %d'
+                % (source, mine, value, target, theirs, old, new))
+    return active, effective
 
 
 def run_build(mods, enabled, settings_by_mod, log, progress,
@@ -974,7 +1184,10 @@ def run_build(mods, enabled, settings_by_mod, log, progress,
         log('Expected e.g. .../workingdir/data/field/char.lgp')
         return False
 
-    active = [m for m in mods if enabled.get(m.filename)]
+    active, effective_settings = _compatibility_profile(
+        mods, enabled, settings_by_mod, log)
+    if active is None:
+        return False
     if not active:
         log('nothing enabled.')
         return False
@@ -984,7 +1197,13 @@ def run_build(mods, enabled, settings_by_mod, log, progress,
         mod.ensure_extracted(log, lambda i, n: progress(i, n, 'extracting'))
 
     log('')
-    log('mod priority (7th Heaven category order, first listed wins):')
+    constraints = _active_order_constraints(active)
+    if constraints:
+        log('IRO manifest order constraints applied:')
+        for before, after in constraints:
+            log('  %s  ->  %s' % (before.display_name, after.display_name))
+        log('')
+    log('mod priority (7th Heaven profile order, first listed wins):')
     for mod in active:
         log(f'   {mod_load_rank(mod):>2}  '
             f'{(mod_category(mod) or "Unknown"):<16} {mod.display_name}')
@@ -1017,7 +1236,7 @@ def run_build(mods, enabled, settings_by_mod, log, progress,
             log(f'note: RuntimeVar gates not evaluated ({exc}); every '
                 'conditional folder is kept')
     plan = build.build_plan(list(reversed(active)),
-                            settings_by_mod, catalogs, log,
+                            effective_settings, catalogs, log,
                             music_names=music_names,
                             runtime_read=runtime_read)
 
@@ -1181,6 +1400,12 @@ def run_build(mods, enabled, settings_by_mod, log, progress,
     # ON with 16:9 and OFF at 4:3 where the identity is already right -- the
     # same gate as ff7nx_battlewide. FINDINGS-247.
     produced += build.apply_fbcapture(SDOUT_DIR, DUMP, log, produced)
+    # Dynamic weapons: which mesh a model part resolves to is decided when
+    # the game opens the file, from the character's equipped weapon in the
+    # savemap. Last of the module patches, so its cave takes whatever padding
+    # the others left. Does nothing at all unless `ff7nx_dynweapon` put the
+    # per-weapon variants in the archives. See FINDINGS-412.
+    produced += build.apply_dynweapon(SDOUT_DIR, DUMP, log, produced)
     # The custom PIXEL shader sets (background scaler, FXAA). These touch no
     # module at all, so they can go anywhere -- but they must go BEFORE
     # prune_stale, because that is what deletes them again when the setting
@@ -1222,8 +1447,8 @@ def launch_ui():
     from tkinter import ttk, messagebox
     from tkinter import font as tkfont
 
-    mods = discover_mods()
     saved = build.load_settings(SETTINGS)
+    mods = discover_mods(profile_mod_order(saved))
     global_saved = saved.get('__global__', {})
     cap_label_by_value = dict(FIELD_TEX_CAP_CHOICES)
     value_by_cap_label = {v: k for k, v in FIELD_TEX_CAP_CHOICES}
@@ -2576,7 +2801,8 @@ def launch_ui():
                 'enabled': bool(var.get()) if var is not None else True,
                 'options': settings_by_mod.get(mod.filename, {}),
             }
-        persist['__global__'] = {'field_tex_cap': current_field_tex_cap(),
+        persist['__global__'] = {'mod_load_order': [m.filename for m in mods],
+                                 'field_tex_cap': current_field_tex_cap(),
                                  'world_tex_cap': current_world_tex_cap(),
                                  'battle_bg_tex_cap': current_battle_bg_tex_cap(),
                                  'spell_tex_cap': current_spell_tex_cap(),
@@ -3359,9 +3585,7 @@ def launch_ui():
             widget.bind('<Enter>', lambda e, f=mod.filename: on_row_enter(f))
             widget.bind('<Leave>', lambda e, f=mod.filename: on_row_leave(f))
 
-        settings_by_mod[mod.filename] = dict(
-            saved.get(mod.filename, {}).get('options', {})
-            or (mod.manifest.defaults() if mod.manifest else {}))
+        settings_by_mod[mod.filename] = _mod_options_from_saved(mod, saved)
 
     if mods:
         select(mods[0])
@@ -3673,8 +3897,8 @@ def launch_ui():
 
 def main():
     if '--cli' in sys.argv:
-        mods = discover_mods()
         saved = build.load_settings(SETTINGS)
+        mods = discover_mods(profile_mod_order(saved))
         if build.FIELD_TEX_CAP_ENV not in os.environ:
             cap_value = saved.get('__global__', {}).get('field_tex_cap', 0)
             os.environ[build.FIELD_TEX_CAP_ENV] = str(cap_value)
@@ -3849,9 +4073,7 @@ def main():
         settings = {}
         for m in mods:
             m.ensure_extracted(print)
-            settings[m.filename] = (saved.get(m.filename, {}).get('options')
-                                    or (m.manifest.defaults()
-                                        if m.manifest else {}))
+            settings[m.filename] = _mod_options_from_saved(m, saved)
         # --60fps / --no-60fps override the saved setting for this run.
         fps_60 = saved.get('__global__', {}).get('fps_60', False)
         if '--60fps' in sys.argv:

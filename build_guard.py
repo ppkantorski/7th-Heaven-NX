@@ -814,6 +814,25 @@ COUNTERS = (
 # corrected extractor creates a one-build false alarm (build 250's 93 -> 87).
 COUNTER_EXTRACT_VERSION = 2
 
+# These counters describe the field-background conversion pipeline.  They are
+# present only when flevel.lgp is actually rebuilt; FAST REUSE deliberately
+# omits them.  A Ninostyle/flevel input update can therefore make every one
+# appear (or disappear) without any change to the code path being guarded.
+FLEVEL_INPUT_OWNERS = frozenset({
+    'palette range', 'margin art', 'margin palette', 'margin page',
+    'transparency key', 'dense repack', 'page cap', 'palette clamp',
+    'field background',
+})
+
+
+def _flevel_archive_mode(text):
+    """Return ``built``/``reused`` when the log says how flevel was handled."""
+    if re.search(r'^\s*building flevel\.lgp \.\.\.', text, re.M):
+        return 'built'
+    if re.search(r'^\s*flevel\.lgp: FAST REUSE enabled', text, re.M):
+        return 'reused'
+    return None
+
 
 def extract(text):
     """{counter name: int} for everything this log mentions."""
@@ -934,6 +953,49 @@ class CounterGuard:
             self._log('  counter guard: warning-line extractor baseline '
                       'migrated; all named pass counters still compared.')
         unexpected, expected = compare(compare_old, compare_new, self.expect)
+        # flevel conversion counters are intentionally absent when the
+        # archive is FAST-REUSE'd.  When a mod update causes a rebuild (or a
+        # later build reuses it again), the counters transition between
+        # ``None`` and real values.  That is an input/archive-mode change,
+        # not a code-scope movement.  Suppress only presence/absence changes;
+        # ordinary value changes while both builds measured flevel remain
+        # strict and still fail the guard.
+        flevel_mode = _flevel_archive_mode(self.text())
+        old_flevel = {name for name in compare_old
+                      if _owner(name) in FLEVEL_INPUT_OWNERS}
+        new_flevel = {name for name in compare_new
+                      if _owner(name) in FLEVEL_INPUT_OWNERS}
+        # Require the whole flevel counter set to appear/disappear.  A single
+        # missing line while the archive is still being measured is more
+        # likely a broken diagnostic regex and must remain a guard failure.
+        archive_mode_transition = bool(
+            flevel_mode == 'built' and not old_flevel and new_flevel or
+            flevel_mode == 'reused' and old_flevel and not new_flevel)
+        input_driven = []
+        if archive_mode_transition:
+            for item in unexpected:
+                name, a, b = item
+                presence_changed = (a is None) != (b is None)
+                if (_owner(name) in FLEVEL_INPUT_OWNERS and
+                        presence_changed):
+                    input_driven.append(item)
+            # warning lines are global, but an flevel rebuild can add its
+            # conversion diagnostics.  If the same mode transition exposed
+            # flevel counters, treat that warning-count change as input
+            # driven too; unrelated warning changes remain visible.
+            if input_driven:
+                for item in unexpected:
+                    if (item[0] == 'warning lines' and
+                            item not in input_driven):
+                        input_driven.append(item)
+            if input_driven:
+                unexpected = [item for item in unexpected
+                              if item not in input_driven]
+                self._log(
+                    '  counter guard: %d flevel input counter(s) changed '
+                    'because flevel.lgp was %s; treated as input-driven '
+                    '(code-scope changes remain guarded).'
+                    % (len(input_driven), flevel_mode))
         if expected:
             self._log('  counter guard: expected movement -- '
                       + ', '.join(f'{n} {a} -> {b}' for n, a, b in expected))
