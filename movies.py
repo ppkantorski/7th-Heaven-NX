@@ -244,6 +244,12 @@ QUALITY_LEVELS = [
 QUALITY_CRF = {name: crf for name, crf, _label in QUALITY_LEVELS}
 QUALITY_DEFAULT = 'high'
 QUALITY_ENV = 'SEVENTH_NX_MOVIE_QUALITY'
+# Explicit tool paths, for a launcher that sanitises PATH. SEVENTH_NX_FFMPEG
+# is already `audio_dat`'s supported override, so the movie converter reuses it
+# rather than inventing a second name, and infers the adjacent ffprobe so a
+# headless build uses one coherent toolchain.
+FFMPEG_ENV = 'SEVENTH_NX_FFMPEG'
+FFPROBE_ENV = 'SEVENTH_NX_FFPROBE'
 
 # Target encode, taken from the port's own southmk.mp4 rather than invented.
 TARGET_VCODEC = 'libx264'
@@ -264,8 +270,59 @@ class MissingFFmpeg(Exception):
     pass
 
 
+def _tool(name):
+    """Resolve an FFmpeg tool, honouring the explicit overrides above."""
+    env_name = FFMPEG_ENV if name == 'ffmpeg' else FFPROBE_ENV
+    explicit = os.environ.get(env_name)
+    if explicit and os.path.isfile(explicit):
+        return explicit
+    if name == 'ffprobe':
+        ffmpeg = os.environ.get(FFMPEG_ENV)
+        if ffmpeg:
+            sibling = os.path.join(os.path.dirname(ffmpeg),
+                                   'ffprobe.exe' if os.name == 'nt'
+                                   else 'ffprobe')
+            if os.path.isfile(sibling):
+                return sibling
+    return shutil.which(name)
+
+
+_CFR_FLAG = None
+
+
+def _cfr_flag():
+    """
+    The constant-frame-rate flag this ffmpeg understands: `-fps_mode` or
+    `-vsync`.
+
+    `-vsync` is deprecated from FFmpeg 5 and REMOVED in FFmpeg 9; `-fps_mode`
+    is its per-output replacement and does not exist before FFmpeg 5. Neither
+    one is safe to hardcode, and getting it wrong is not a warning -- the
+    conversion fails outright, or (worse, on an older build that ignores the
+    unknown option) produces a variable-frame-rate mp4, which would make
+    `get_movie_frame` mean something different every run.
+
+    So it is asked, once, and cached. `-fps_mode` is preferred when both are
+    available because that is the direction ffmpeg is moving.
+    """
+    global _CFR_FLAG
+    if _CFR_FLAG is not None:
+        return _CFR_FLAG
+    _CFR_FLAG = '-vsync'
+    ffmpeg = _tool('ffmpeg')
+    if ffmpeg:
+        try:
+            helped = _run([ffmpeg, '-hide_banner', '-h', 'full'])
+            text = (helped.stdout or '') + (helped.stderr or '')
+            if '-fps_mode' in text:
+                _CFR_FLAG = '-fps_mode'
+        except OSError:
+            pass
+    return _CFR_FLAG
+
+
 def have_ffmpeg():
-    return bool(shutil.which('ffmpeg') and shutil.which('ffprobe'))
+    return bool(_tool('ffmpeg') and _tool('ffprobe'))
 
 
 def _run(cmd):
@@ -280,9 +337,10 @@ def probe(path):
          'fps_exact' ('15/1'), 'nb_frames', 'duration', 'has_audio',
          'profile', 'level', 'pix_fmt'}
     """
-    if not shutil.which('ffprobe'):
+    ffprobe = _tool('ffprobe')
+    if not ffprobe:
         raise MissingFFmpeg('ffprobe not found')
-    p = _run(['ffprobe', '-v', 'error', '-print_format', 'json',
+    p = _run([ffprobe, '-v', 'error', '-print_format', 'json',
               '-show_format', '-show_streams', path])
     if p.returncode != 0:
         return None
@@ -632,7 +690,7 @@ def convert(src, dest, vanilla=None, quality=QUALITY_DEFAULT,
     os.makedirs(os.path.dirname(dest), exist_ok=True)
     tmp = dest + '.part.mp4'
 
-    cmd = ['ffmpeg', '-y', '-nostdin', '-loglevel', 'error', '-i', src]
+    cmd = [_tool('ffmpeg'), '-y', '-nostdin', '-loglevel', 'error', '-i', src]
     if borrow_audio:
         cmd += ['-i', vanilla]
     cmd += ['-map', '0:v:0']
@@ -652,7 +710,7 @@ def convert(src, dest, vanilla=None, quality=QUALITY_DEFAULT,
             # CFR, so the frame count is exactly duration * fps and the port's
             # frame numbering is predictable. A variable-frame-rate mp4 would
             # make `get_movie_frame` mean something different every run.
-            '-vsync', 'cfr',
+            _cfr_flag(), 'cfr',
             # One scale filter, doing all of: even dimensions (yuv420p
             # cannot represent an odd axis), the fit to the console's drawn
             # size, and the colour matrix. See video_filter().

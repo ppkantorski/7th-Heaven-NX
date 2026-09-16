@@ -32,7 +32,9 @@ chk(A.add_imm64(A.SP, A.SP, 0x10), 'add sp, sp, #0x10'); n += 1
 chk(A.add_reg64(17, 17, 16), 'add x17, x17, x16'); n += 1
 chk(A.add_reg(16, 16, 16), 'add w16, w16, w16'); n += 1
 chk(A.add_reg(17, 17, 16), 'add w17, w17, w16'); n += 1
+chk(A.eor_reg(17, 17, 16), 'eor w17, w17, w16'); n += 1
 chk(A.mov_reg(0, 17), 'mov w0, w17'); n += 1
+chk(A.orr_lsl(8, 8, 9, 0), 'orr w8, w8, w9'); n += 1
 chk(A.cmp_reg(8, 17), 'cmp w8, w17'); n += 1
 chk(A.cmp_imm(17, 1), 'cmp w17, #1'); n += 1
 chk(A.and_mask(16, 16, 4), 'and w16, w16, #0xf'); n += 1
@@ -54,8 +56,13 @@ chk(A.bcond(0x1000, 0x1020, A.LE), 'b.le #0x1020'); n += 1
 chk(A.cbz(16, 0x1000, 0x1080), 'cbz w16, #0x1080'); n += 1
 chk(A.cbz64(0, 0x1000, 0x1080), 'cbz x0, #0x1080'); n += 1
 chk(A.cbz64(0, 0x1050, 0x1000), 'cbz x0, #0x1000', 0x1050); n += 1
+chk(A.bfi(9, 26, 0, 8), 'bfxil w9, w26, #0, #8'); n += 1
+chk(A.bfi(9, 26, 8, 8), 'bfi w9, w26, #8, #8'); n += 1
+chk(A.nop(), 'nop'); n += 1
 for rd, rn, rm in ((16, 16, 0), (0, 16, 17), (17, 0, 16)):
     chk(A.mul(rd, rn, rm), 'mul w%d, w%d, w%d' % (rd, rn, rm)); n += 1
+    chk(A.mul64(rd, rn, rm), 'mul x%d, x%d, x%d' % (rd, rn, rm)); n += 1
+    chk(A.udiv64(rd, rn, rm), 'udiv x%d, x%d, x%d' % (rd, rn, rm)); n += 1
 print('a64 encoder: %d forms checked, %d mismatch' % (n, len(fails)))
 for f in fails: print('  ' + f)
 raise SystemExit(1 if fails else 0)

@@ -45,7 +45,9 @@ into the wrong function.
 
 A window of 512 KB keeps every internal displacement under half the +/-1 MB
 limit and, measured on the stock 1.0.3 module, still offers 696 usable words
--- about six times what the largest cave here needs.
+-- about six times what the largest cave here needs. `emit_laid_out` widens
+through CAVE_SPANS only when that first window is genuinely spent, so adding
+the audio bridges does not move a single already-shipping cave.
 
 WHAT A CHAINED CAVE MAY NOT CONTAIN
 -----------------------------------
@@ -191,7 +193,27 @@ def link(runs, words):
     return out
 
 
-def emit_laid_out(pool, build, span=0x80000):
+# The window a cave with internal branches is confined to, and the widths the
+# allocator will fall back through when the first one has no room left.
+#
+# 512 KB keeps every internal displacement under half of `b.cond`/`cbz`'s
+# +/-1 MB reach and, on a fresh pool, offers ~6x what the largest cave here
+# needs. It stays the FIRST choice so a module with only the long-standing
+# caves in it lays out exactly where it always has -- the shipping layout is
+# hardware-proven and must not move because an unrelated feature was added.
+#
+# The Cosmo Memory audio bridges are what made a fallback necessary: ambient,
+# sequential shuffle, the battle character route and the two footstep bridges
+# are six more caves out of the same pool, and by the last of them the densest
+# low region is spent. Each step still sits inside the +/-1 MB limit (0xF0000
+# is 960 KB), and a64's branch encoders range-check every resolved label, so a
+# builder whose real displacement does not fit fails the build here rather
+# than emitting a wrapped branch into the middle of a function.
+CAVE_SPAN = 0x80000
+CAVE_SPANS = (0x80000, 0xA0000, 0xC0000, 0xF0000)
+
+
+def emit_laid_out(pool, build, span=None):
     """
     Place a cave that has its own internal branches.
 
@@ -203,11 +225,30 @@ def emit_laid_out(pool, build, span=0x80000):
     depends on the addresses would break that, and is caught -- the second
     call's length is checked against the first.
 
+    `span` confines the cave to one address window. Passing it pins the width
+    explicitly; leaving it None walks CAVE_SPANS, taking the first width that
+    has room. The walk only ever widens, and only for the cave that could not
+    fit -- a pool that still has room at 0x80000 allocates exactly where it
+    did before this fallback existed.
+
     Returns (entry_va, {address: word}).
     """
     probe = build(0, lambda i: 4 * i)
     n = len(probe)
-    runs = pool.take(n, span=span)
+    widths = (span,) if span else CAVE_SPANS
+    runs = None
+    for width in widths:
+        # take() mutates the pool, so a failed attempt must not leave holes
+        # marked used. It raises before recording anything only in the
+        # _window() case; snapshot and restore covers both.
+        snapshot = (list(pool.free), list(pool.used))
+        try:
+            runs = pool.take(n, span=width)
+            break
+        except NoRoom:
+            pool.free, pool.used = snapshot
+            if width is widths[-1]:
+                raise
     addrs = slots(runs, n)
     words = build(addrs[0], lambda i: addrs[i])
     if len(words) != n:

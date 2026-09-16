@@ -22,8 +22,18 @@ import exe_patch
 import iro
 import lgp
 import movies as movie_convert
+import ambientmod
 import audio_dat
 import sfxmod
+# Cosmo Memory's native audio bridges. Imported at module scope rather
+# than lazily because `_emplace_sfx` needs them on every build that has a
+# sound mod, and a missing one is a broken checkout, not a soft failure.
+import ff7nx_worldsteps
+import ff7nx_fieldsteps
+import ff7nx_fieldsteps_data
+import ff7nx_sfxshuffle
+import ff7nx_sfxbattle
+import ff7nx_ambient
 import p as pfile
 import tex
 import battle_stage_bg
@@ -770,6 +780,7 @@ class Plan:
         self.loose = {}           # (holder, name) -> (src, mod)
         self.battle_bg = {}       # (stage_num, tile_num) -> (src, mod)
         self.sfx = []             # ordered (rel, full, mod) under sfx/
+        self.ambient = []         # ordered (rel, full, mod) under Ambient/
         self.opening_dims = None  # (w, h) of the emplaced opening
         self.opening_fps = None   # frame rate of the emplaced opening, for
                                   # reporting only -- see build_exe()
@@ -802,6 +813,32 @@ class Plan:
                                      # -- FFNx's per-field widescreen table,
                                      # baked into flevel.lgp section 8 by
                                      # _build_flevel. See ff7nx_ws.py.
+        # ---------------------------------------------------------------
+        # Cosmo Memory's native audio bridges. Each of these is filled in by
+        # `_emplace_sfx`, because that is where the extra payloads are
+        # appended to audio.dat and therefore where their final offsets
+        # become known -- and the later ExeFS passes need those offsets. Any
+        # of them may stay None: a bridge that could not be prepared is
+        # reported and skipped, never half-installed.
+        self.sfx_routes = None       # {'compact': True, 'routes': {...}}
+                                     # FFNx sequential/shuffle rows, for
+                                     # ff7nx_sfxshuffle
+        self.world_footsteps = None  # terrain groups + padded payloads, for
+                                     # ff7nx_worldsteps
+        self.field_footsteps = None  # per-field CMFS routes + payloads, for
+                                     # ff7nx_fieldsteps{,_data}
+        self.world_scratch = None    # the world bridge's BSS address, passed
+                                     # to the field bridge because it SHARES
+                                     # that block -- see ff7nx_fieldsteps
+        self.ambient_runtime = None  # (field_table, battle_table) for
+                                     # ff7nx_ambient, prepared by
+                                     # _emplace_ambient once the active
+                                     # folders are resolved
+        self.battle_sfx = None       # FFNx per-actor battle routes, for
+                                     # ff7nx_sfxbattle. Their payloads go in
+                                     # reserved EMPTY archive rows, not the
+                                     # appended tail, so this is prepared
+                                     # before audio.fmt/dat are written.
 
     def total_portable(self):
         return (sum(len(v) for v in self.archive_files.values())
@@ -1073,6 +1110,16 @@ def build_plan(mods, settings_by_mod, catalogs, log=lambda *_: None,
             if sfxmod.SFX_DIR in dirs_l and (low == sfxmod.CONFIG_NAME
                                              or ext == '.ogg'):
                 plan.sfx.append((rel, full, mod))
+                continue
+
+            # The Ambient layer, collected for the same reason and resolved
+            # the same way. It does NOT go in the archive -- an ambient
+            # mapping names a PLACE, not a sound id, so folding it into a
+            # slot would give a location loop a global lifetime. See
+            # `ambientmod` and `ff7nx_ambient`.
+            if (ambientmod.AMBIENT_DIR in dirs_l
+                    and (low == ambientmod.CONFIG_NAME or ext == '.ogg')):
+                plan.ambient.append((rel, full, mod))
                 continue
 
             if ext in META_EXT:
@@ -8536,7 +8583,129 @@ def _emplace_sfx(plan, romfs, sdout, dump, log, produced):
         log('! sound mod produced no replacements -- archive left alone')
         return
 
+    # ------------------------------------------------------------------
+    # THE ARCHIVE TAIL.
+    #
+    # Everything above has finished the FIXED part: 750 records, each row
+    # either the mod's primary sound or the game's own, byte for byte. That
+    # record count is not negotiable -- every retired approach in this
+    # feature's history broke it, and `audio.fmt` is rewritten below with
+    # exactly the same number of rows it had.
+    #
+    # What follows appends EXTRA payloads after the archive's own contents in
+    # `audio.dat` and records where each bank landed. The three native bridges
+    # installed later (`ff7nx_sfxshuffle`, `ff7nx_worldsteps`,
+    # `ff7nx_fieldsteps`) point the stock loader's descriptor at one of those
+    # offsets for one call. No new `audio.fmt` row, no synthetic sound id.
+    #
+    # Order matters only in that each bank's base is the length so far, so the
+    # banks are appended once, here, and never re-derived.
+    # ------------------------------------------------------------------
+    cache_root = os.path.join(_movie_cache_dir(sdout), '..')
+
+    rotations, rotation_skips = sfxmod.prepare_rotations(
+        entries, config, oggs, res.replaced_ids,
+        cache_dir=os.path.join(cache_root, 'sfx-rotations'))
+
+    plan.world_footsteps = None
+    try:
+        plan.world_footsteps = ff7nx_worldsteps.prepare(
+            entries, files, oggs,
+            cache_dir=os.path.join(cache_root, 'sfx-worldsteps'))
+    except (ValueError, audio_dat.MissingFFmpeg) as exc:
+        log('! world footsteps: %s -- the adaptive world-map route is '
+            'skipped; nothing else is affected' % exc)
+
+    # Field footsteps share the world bridge's physical archive row and BSS
+    # block, so they are only prepared when the world bridge is present.
+    plan.field_footsteps = None
+    if plan.world_footsteps:
+        _flevel_rel, flevel_src = _find_in_dump(dump, 'flevel.lgp')
+        if not flevel_src:
+            log('! field footsteps: flevel.lgp is not in the dump, and the '
+                'route names can only be disambiguated against real field '
+                'entries -- field steps stay on the stock SFX 159 row')
+        else:
+            try:
+                plan.field_footsteps = ff7nx_fieldsteps_data.prepare(
+                    entries, configs, oggs, flevel_src,
+                    cache_dir=os.path.join(cache_root, 'sfx-fieldsteps'))
+            except (ValueError, audio_dat.MissingFFmpeg) as exc:
+                log('! field footsteps: %s -- terrain shuffle skipped' % exc)
+
+    # FFNx's per-actor battle routes. Unlike everything else in this
+    # function these do NOT go in the appended tail: each variant occupies a
+    # reserved, genuinely-empty archive row, so the selection can happen at
+    # the native player before its cache check. That is what makes them
+    # cache-safe, and it means they have to be written before the pair is
+    # dumped.
+    plan.battle_sfx = None
+    battle_overrides = sfxmod.merge_battle_overrides(configs)
+    if battle_overrides:
+        try:
+            plan.battle_sfx = ff7nx_sfxbattle.prepare(
+                entries, battle_overrides, oggs,
+                cache_dir=os.path.join(cache_root, 'sfx-battle'))
+        except (ValueError, audio_dat.MissingFFmpeg) as exc:
+            log('! battle routes: %s -- per-actor battle SFX skipped; every '
+                'id stays on its plain numeric sound' % exc)
+        if plan.battle_sfx:
+            for route in plan.battle_sfx['routes']:
+                log('               battle route %s: %d variant(s) in '
+                    'physical slot(s) %s'
+                    % (route['name'], route['variants'],
+                       ','.join(map(str, route['slots']))))
+        for key, why in ff7nx_sfxbattle.pending(battle_overrides):
+            log('               battle_%s_%0*X_%d stays on numeric SFX %d '
+                '(%s)' % (key[0], 2 if key[0] == 'char' else 4, key[1],
+                          key[2], key[2], why))
+
     fmt_bytes, dat_bytes = audio_dat.dumps(entries)
+    base_dat_bytes = len(dat_bytes)
+    expanded = bytearray(dat_bytes)
+
+    # Sequential rows: the primary variant is already in its normal slot, so
+    # only the REST are appended. Each route gets its own stride, padded to
+    # its own longest member -- one archive-wide stride let a single long
+    # effect inflate the tail to 55 MiB and push the later footstep banks
+    # toward the port's usable offset range.
+    plan.sfx_routes = None
+    if rotations:
+        routes = {}
+        for sequence in rotations:
+            extra = sequence.payloads[1:]
+            if not extra:
+                continue
+            slot = entries[sequence.sound_id - 1]
+            stride = max(map(len, extra))
+            stride = ((stride + slot.block_align - 1) // slot.block_align
+                      * slot.block_align)
+            payload_base = len(expanded)
+            for payload in extra:
+                expanded.extend(payload)
+                expanded.extend(b'\0' * (stride - len(payload)))
+            routes[sequence.sound_id] = {'count': len(sequence.payloads),
+                                         'payload_base': payload_base,
+                                         'stride': stride}
+        if routes:
+            plan.sfx_routes = {'compact': True, 'routes': routes}
+
+    if plan.world_footsteps:
+        plan.world_footsteps['payload_base'] = len(expanded)
+        expanded.extend(b''.join(plan.world_footsteps['payloads']))
+    if plan.field_footsteps:
+        plan.field_footsteps['payload_base'] = len(expanded)
+        expanded.extend(b''.join(plan.field_footsteps['payloads']))
+
+    dat_bytes = bytes(expanded)
+    # The invariant, checked rather than assumed: re-parsing the pair we are
+    # about to write must still yield exactly 750 records. If appending the
+    # tail ever damaged the archive this is where it stops, before anything
+    # reaches the SD card.
+    if len(audio_dat.loads(fmt_bytes, dat_bytes)) != audio_dat.NUM_SLOTS:
+        raise ValueError('appending the payload tail damaged the %d-slot '
+                         'archive' % audio_dat.NUM_SLOTS)
+
     for rel, blob in ((fmt_rel, fmt_bytes), (dat_rel, dat_bytes)):
         dest = os.path.join(romfs, *rel.split('/'))
         os.makedirs(os.path.dirname(dest), exist_ok=True)
@@ -8545,6 +8714,36 @@ def _emplace_sfx(plan, romfs, sdout, dump, log, produced):
         produced.append(dest)
     for line in sfxmod.describe(res):
         log(line)
+    if plan.sfx_routes:
+        variants = sum(item['count']
+                       for item in plan.sfx_routes['routes'].values())
+        log('               sequential bridge: %d route(s), %d variant(s), '
+            '%.1f MB appended after the fixed archive (route-local strides)'
+            % (len(plan.sfx_routes['routes']), variants,
+               (len(dat_bytes) - base_dat_bytes) / 1048576.0))
+    if rotation_skips:
+        log('               sequential bridge: %d route(s) left on their '
+            'primary sound (%s)'
+            % (len(rotation_skips),
+               ', '.join('#%d' % sid for sid, _why in rotation_skips[:6])))
+    if plan.world_footsteps:
+        log('               world footsteps: %d variant(s) over %d terrain '
+            'material(s), physical slot %d, %.1f MB appended'
+            % (plan.world_footsteps['variants'],
+               plan.world_footsteps['materials'],
+               ff7nx_worldsteps.PHYSICAL_SLOT,
+               sum(len(p) for p in plan.world_footsteps['payloads'])
+               / 1048576.0))
+    if plan.field_footsteps:
+        log('               field footsteps: %d route(s) -- %d triangle '
+            'override(s), %d field fallback(s) -- %d encoded variant(s)'
+            % (plan.field_footsteps['routes'],
+               plan.field_footsteps['triangles'],
+               plan.field_footsteps['fallbacks'],
+               plan.field_footsteps['variants']))
+    log('               %s stays at exactly %d records; every extra payload '
+        'lives after the archive in %s'
+        % (fmt_rel, audio_dat.NUM_SLOTS, dat_rel))
     log('               wrote %s and %s' % (fmt_rel, dat_rel))
 
 
@@ -8618,6 +8817,267 @@ def _battle_stage_vanilla_path(stage_num, dump, log):
         'background tiles for this stage cannot be converted (no native '
         'container to splice into), skipping' % (stage_num, stage_num))
     return None
+
+
+def _wrote_flevel(produced, dest):
+    """True if THIS build actually wrote `dest`, rather than keeping it."""
+    if 'flevel.lgp' in KEPT_ARCHIVES:
+        return False
+    fresh = {os.path.normpath(os.path.abspath(p)) for p in produced}
+    return os.path.normpath(os.path.abspath(dest)) in fresh
+
+
+# The normal flevel archive cache verifies that a fast-reused archive is one
+# this builder made, but CMFS runs *after* that cache point.  Without this
+# small second record, every SEVENTH_NX_REUSE_FLEVEL=1 run reopens and rewrites
+# the whole archive merely to replace the identical 31 KB of field-step
+# trailers.  The key is the exact emitted trailer bytes, not a loose config
+# timestamp, and the recorded file signature must still match before reuse.
+FIELDSTEPS_FP_CACHE = os.path.join(HERE, 'cache', '_fieldsteps_fp')
+FIELDSTEPS_FP_VERSION = b'CMFS-REUSE-V1\0'
+
+
+def _fieldsteps_fingerprint(route):
+    """Digest the exact CMFS trailers a route plan will emit."""
+    h = hashlib.sha256(FIELDSTEPS_FP_VERSION)
+    fields = route.get('fields', {}) if route else {}
+    for field in sorted(fields):
+        name = field.encode('ascii')
+        trailer = ff7nx_fieldsteps_data._trailer(fields[field])
+        h.update(struct.pack('<H', len(name)))
+        h.update(name)
+        h.update(struct.pack('<I', len(trailer)))
+        h.update(trailer)
+    return h.hexdigest()
+
+
+def _fieldsteps_cache_ok(dest, route):
+    """True only for this exact post-CMFS flevel and route plan."""
+    sig = _stat_sig(dest)
+    if sig is None:
+        return False
+    try:
+        with open(os.path.join(FIELDSTEPS_FP_CACHE, 'flevel.lgp.fp')) as f:
+            digest, size, mtime = f.read().splitlines()[:3]
+        return (digest == _fieldsteps_fingerprint(route) and
+                sig == (int(size), int(mtime)))
+    except (OSError, IndexError, ValueError):
+        return False
+
+
+def _fieldsteps_cache_store(dest, route):
+    """Record the archive just verified and written by the CMFS pass."""
+    sig = _stat_sig(dest)
+    if sig is None:
+        return
+    try:
+        os.makedirs(FIELDSTEPS_FP_CACHE, exist_ok=True)
+        with open(os.path.join(FIELDSTEPS_FP_CACHE, 'flevel.lgp.fp'), 'w') as f:
+            f.write('%s\n%d\n%d\n' % (_fieldsteps_fingerprint(route),
+                                        sig[0], sig[1]))
+    except OSError:
+        pass
+
+
+def _fieldsteps_archive_matches(dest, route):
+    """Verify every existing CMFS trailer against the current route plan.
+
+    This is the safe one-time migration path for a builder that predates the
+    small CMFS fingerprint cache.  Fast flevel reuse keeps a finished archive
+    that may already have precisely the trailers this build would emit; the
+    old path nevertheless decompressed, recompressed, and rewrote all of its
+    affected fields merely to replace those identical bytes.
+
+    Do not infer freshness from a timestamp, an archive fingerprint, or one
+    representative field.  The mutable cursor bytes are part of the trailer
+    format, and one stale route must make this return False so the normal
+    replacement path repairs it.  Decoding is read-only and materially less
+    costly than re-encoding and writing the archive, but correctness remains
+    the deciding condition.
+    """
+    fields = route.get('fields', {}) if route else {}
+    if not fields:
+        return False
+    try:
+        archive = lgp.Archive(dest)
+        for field, records in sorted(fields.items()):
+            entry = archive.index.get(field)
+            if entry is None or not archive.is_field(entry):
+                return False
+            if (ff7nx_fieldsteps_data.read_trailer(
+                    archive.decompressed(entry)) !=
+                    ff7nx_fieldsteps_data._trailer(records)):
+                return False
+    except Exception:                                           # malformed/unreadable means rewrite
+        return False
+    return True
+
+
+def _emplace_ambient(plan, romfs, log, produced):
+    """
+    Stage the ambient loops and resolve the field/battle maps.
+
+    Deliberately NOT part of `_emplace_sfx`: ambience does not touch the
+    archive at all. Its loops are loose `.ogg` under
+    `data/music_ogg/ambient/`, which is the path the port's own OGG player
+    already resolves, and the maps are consumed by the late ExeFS pass.
+
+    Which of Cosmo's FA / BA / FA+BA folders is active is decided by the
+    user's option gates and has already been applied by the time this runs --
+    `FA=1, BA=0` selects the field-only folder, and this must not assume both
+    halves exist.
+    """
+    if not plan.ambient:
+        return
+    files = [(rel, full) for rel, full, _mod in plan.ambient]
+    configs, oggs = ambientmod.collect(files)
+    if not configs:
+        log('! ambient: %d file(s) under Ambient/ but no %s to map them onto '
+            'locations -- not staged' % (len(files), ambientmod.CONFIG_NAME))
+        return
+    config = ambientmod.merge_configs(configs)
+    if not config:
+        log('! ambient: no valid field_N or bat_N mapping in %d config '
+            'file(s) -- not staged' % len(configs))
+        return
+    try:
+        field_table, battle_table = ff7nx_ambient.tables_from_config(config)
+    except ValueError as exc:
+        log('! ambient: %s -- the runtime bridge is not installed' % exc)
+        return
+    ogg_ids = set()
+    for table in (field_table, battle_table):
+        if table:
+            ogg_ids |= set(table[3])
+    # `romfs` is already .../romfs/ff7/workingdir; adding the game prefix
+    # again produces a dead LayeredFS path instead of the loader's real
+    # workingdir/data/music_ogg directory.
+    dest = os.path.join(romfs, 'data', 'music_ogg',
+                        ff7nx_ambient.AMBIENT_SUBDIR)
+    try:
+        total_bytes, total, copied_bytes, copied = ff7nx_ambient.stage_loops(
+            oggs, dest, ogg_ids)
+    except OSError as exc:
+        log('! ambient: could not stage the loops (%s)' % exc)
+        return
+    except ValueError as exc:
+        log('! ambient: %s -- the runtime bridge is not installed' % exc)
+        return
+    plan.ambient_runtime = (field_table, battle_table)
+    for ogg_id in sorted(ogg_ids):
+        produced.append(os.path.join(dest, '%04d.ogg' % ogg_id))
+    log('ambient: %d location mapping(s) -- %d field, %d battle'
+        % (len(config),
+           sum(1 for k in config if k.startswith('field_')),
+           sum(1 for k in config if k.startswith('bat_'))))
+    reused = total - copied
+    log('         %d loop file(s), %.1f MB required under data/music_ogg/%s'
+        % (total, total_bytes / 1048576.0, ff7nx_ambient.AMBIENT_SUBDIR))
+    if copied:
+        log('         staged %d changed/new file(s), %.1f MB; reused %d unchanged'
+            % (copied, copied_bytes / 1048576.0, reused))
+    else:
+        log('         reused all %d unchanged loop file(s); no ambient OGG I/O'
+            % total)
+    if field_table and not battle_table:
+        log('         battle ambience is not in this build -- the active '
+            'option set selects the field-only folder')
+    elif battle_table and not field_table:
+        log('         field ambience is not in this build -- the active '
+            'option set selects the battle-only folder')
+
+
+def _emplace_field_footstep_trailers(plan, romfs, dump, log, produced):
+    """
+    Write the resolved per-field terrain map beside the field data itself.
+
+    The routes cannot live in `exefs/main` -- 664 fallbacks and 2,040 triangle
+    overrides against a contiguous data budget of roughly 1,835 bytes for
+    every feature combined. They go in each affected field's own ignored
+    trailer instead; `ff7nx_fieldsteps_data` explains the format and why the
+    trailer is also where the per-triangle cursors live.
+
+    This runs AFTER `_emplace_sfx`, where the payload offsets become final,
+    and after the ordinary flevel rebuild, so it appends to the archive this
+    build actually produced rather than reconstructing one from vanilla.
+
+    A failure here disables only the field route: the world bridge, the
+    sequential bridge and the ordinary archive replacement are untouched, and
+    field steps fall back to the stock SFX 159 row the game already plays.
+    """
+    route = getattr(plan, 'field_footsteps', None)
+    if not route:
+        return
+    rel, vanilla = _find_in_dump(dump, 'flevel.lgp')
+    if not rel or not vanilla:
+        log('! field footsteps: flevel.lgp disappeared before the trailer '
+            'stage; the terrain shuffle is not installed')
+        plan.field_footsteps = None
+        return
+    dest = os.path.join(romfs, *rel.split('/'))
+    src = dest if os.path.exists(dest) else vanilla
+    # Does the flevel we are about to read already carry a CMFS trailer?
+    #
+    # Only a FRESHLY BUILT one is known not to. Everything else might: a
+    # leftover from an earlier run, and -- the case that actually bites --
+    # a flevel this build KEPT through SEVENTH_NX_REUSE_FLEVEL=1, which is in
+    # `produced` despite never having been written here. Testing "is it in
+    # produced" gets that exactly backwards and stacks a second trailer.
+    reused = 'flevel.lgp' in KEPT_ARCHIVES
+    same_file = (os.path.normpath(os.path.abspath(src)) ==
+                 os.path.normpath(os.path.abspath(dest)))
+    if same_file:
+        if _fieldsteps_cache_ok(dest, route):
+            log('field footsteps: CMFS terrain maps unchanged; kept flevel.lgp '
+                'without rewriting the archive')
+            return
+        # A build made before FIELDSTEPS_FP_CACHE exists has no quick record,
+        # but its flevel may still be exactly right.  On the explicit
+        # fast-reuse path, prove that rather than turning a cache migration
+        # into a 664-field recompression and 1.4 GB replacement write.
+        if reused and _fieldsteps_archive_matches(dest, route):
+            _fieldsteps_cache_store(dest, route)
+            log('field footsteps: verified %d unchanged CMFS terrain map(s); '
+                'kept flevel.lgp without rewriting the archive'
+                % len(route.get('fields', {})))
+            return
+    replace_existing = reused or (same_file and not _wrote_flevel(produced,
+                                                                  dest))
+    tmp = dest + '.fieldsteps-tmp'
+    try:
+        report = ff7nx_fieldsteps_data.apply_to_flevel(
+            src, tmp, route, replace_existing=replace_existing)
+    except Exception as exc:                                   # noqa: BLE001
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        plan.field_footsteps = None
+        log('! field footsteps: %s: %s -- the terrain shuffle is not '
+            'installed and field steps stay on stock SFX 159'
+            % (type(exc).__name__, exc))
+        return
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    os.replace(tmp, dest)
+    _fieldsteps_cache_store(dest, route)
+    if dest not in produced:
+        produced.append(dest)
+    log('field footsteps: CMFS terrain maps written into %d field(s) -- '
+        '%d triangle override(s), %d fallback(s), %d raw bytes'
+        % (report['fields'], report['triangles'], report['fallbacks'],
+           report['raw_bytes']))
+    # This pass has just rewritten flevel.lgp, seconds after the archive build
+    # recorded what it looked like before. Without re-recording it here, the
+    # file can never match its own cache entry again and every later
+    # SEVENTH_NX_REUSE_FLEVEL=1 build refuses the archive this build produced.
+    #
+    # The cached payload (the largest decompressed field) is deliberately kept
+    # rather than remeasured. The trailer does grow each field's decompressed
+    # size, but only by 9 + 3*triangles bytes -- 31,392 across 664 fields on
+    # the shipping set -- against a largest field of ~12 MB and a decompression
+    # buffer that `ff7nx_fieldbg.field_buffer_bytes` already rounds up to the
+    # next power of two above 125% of it (16.7 MB). The trailer cannot move
+    # that number, and pretending to remeasure it here would be worse: this
+    # pass never sees the uncompressed sizes.
+    _archive_restat('flevel.lgp', dest, log, 'the CMFS trailer pass')
 
 
 def _emplace_battle_bg(plan, romfs, dump, log, produced):
@@ -8784,6 +9244,21 @@ def fps_60_requested():
 # Populated by whichever path kept the file, and cleared at the start of every
 # apply_plan so a second build in the same GUI process cannot inherit it.
 ALREADY_FPS_SCALED = set()
+
+# Archives this invocation KEPT rather than wrote, by name.
+#
+# Distinct from ALREADY_FPS_SCALED, which is about an archive's CONTENT state.
+# This is about provenance: a KEPT flevel.lgp already carries whatever the
+# build that made it appended -- notably the CMFS footstep trailers -- so the
+# trailer pass must REPLACE them rather than append a second set on top. A
+# freshly built flevel has none and can take the cheap literal-append path.
+#
+# Getting this backwards does not crash: `read_trailer`'s length check rejects
+# a doubled trailer, so the runtime falls through to the stock SFX 159 row. It
+# fails silently, the archive grows every build, and field footsteps quietly
+# stop working -- which is exactly the kind of failure that is expensive to
+# find on hardware.
+KEPT_ARCHIVES = set()
 
 # The fifth line of an archive's cache record: the (size, mtime_ns) the file
 # had after apply_fps_patches rewrote it. See _archive_on_disk_is_ours.
@@ -9089,6 +9564,37 @@ def _archive_fps_restat(name, dest, log=lambda *_: None):
         'build can reuse it instead of rebuilding it)')
 
 
+def _archive_restat(name, dest, log=lambda *_: None, why=''):
+    """
+    Re-record an archive's signature after a LATER pass rewrote it in place.
+
+    Same problem `_archive_fps_restat` solves for battle.lgp, one archive
+    over. `_archive_cache_store` writes the record when the archive is built;
+    a pass that rewrites the file afterwards leaves that record stale the
+    instant it runs, and every later `SEVENTH_NX_REUSE_*` build refuses the
+    file it produced itself.
+
+    The fingerprint and the payload are KEPT: the mod inputs did not change
+    and the cached measurement (for flevel, the largest decompressed field)
+    is still the right one. Only the on-disk size and mtime moved.
+    """
+    rec = _archive_record(name)
+    sig = _stat_sig(dest)
+    if rec is None or sig is None:
+        return
+    fp, _size, _mtime, payload, fps_sig = rec
+    try:
+        os.makedirs(ARCHIVE_FP_CACHE, exist_ok=True)
+        with open(os.path.join(ARCHIVE_FP_CACHE, name + '.fp'), 'w') as f:
+            f.write('%s\n%d\n%d\n%s\n' % (fp, sig[0], sig[1], payload))
+            if fps_sig:
+                f.write('%s%d,%d\n' % (FPS_SIG_TAG, fps_sig[0], fps_sig[1]))
+    except OSError:
+        return
+    log('      (re-recorded %s\'s signature after %s, so a later '
+        'fast-reuse build can still recognise it)' % (name, why or 'this pass'))
+
+
 def _reuse_existing_flevel(sdout, log=lambda *_: None):
     """Validate and preserve sdout's current flevel.lgp for a fast build.
 
@@ -9125,6 +9631,7 @@ def _reuse_existing_flevel(sdout, log=lambda *_: None):
             'one normal build first' % REUSE_FLEVEL_ENV)
     global FIELD_BG_MAX_RAW
     FIELD_BG_MAX_RAW = payload
+    KEPT_ARCHIVES.add('flevel.lgp')
     log('flevel.lgp: FAST REUSE enabled -- kept the existing sdout archive '
         'without rebuilding it')
     log('      verified %s bytes and restored largest field %s bytes for '
@@ -9253,6 +9760,7 @@ def apply_plan(plan, archive_paths, sdout, log=lambda *_: None,
     # A second build in the same GUI process must not inherit the first one's
     # answer about which archives were already 60 FPS-scaled.
     ALREADY_FPS_SCALED.clear()
+    KEPT_ARCHIVES.clear()
 
     # Keep the archive and renderer halves of Gaia inseparable.  The archive
     # converter emits every world tile at this one scale; the later module
@@ -9412,6 +9920,12 @@ def apply_plan(plan, archive_paths, sdout, log=lambda *_: None,
     _emplace_movies(plan, romfs, sdout, dump, log, progress, produced)
     _emplace_moviecam(sdout, dump, log, produced)
     _emplace_sfx(plan, romfs, sdout, dump, log, produced)
+    # AFTER _emplace_sfx, which is where the field route table and its payload
+    # offsets become final, and after the ordinary flevel rebuild above, so
+    # Cosmos's field art, camera and section rewrites are kept rather than
+    # reconstructed from vanilla a second time.
+    _emplace_ambient(plan, romfs, log, produced)
+    _emplace_field_footstep_trailers(plan, romfs, dump, log, produced)
     _emplace_battle_bg(plan, romfs, dump, log, produced)
 
     placed = []
@@ -10357,6 +10871,329 @@ def apply_spelluv(sdout, dump, log=lambda *_: None, produced=(), needed=False):
             os.remove(tmp)
         return []
     os.replace(tmp, dest)
+    return [dest] if not built else []
+
+
+def _audio_bridge_base(sdout, dump, log, produced, what):
+    """
+    (source module, is it this build's) for an audio bridge pass, or (None, _).
+
+    Every module pass in this project follows the same rule -- whoever edits
+    `exefs/main` last has to see what everyone else wrote -- and the same
+    refusal: a module sitting in sdout that this build did NOT produce is a
+    leftover from an earlier run, and basing on the dump's stock copy instead
+    would silently throw the earlier run's patches away.
+    """
+    if dump is None or not dump.nso:
+        log('! %s: needs exefs/main from a full game dump; skipped' % what)
+        return None, False
+    dest = os.path.join(sdout, 'atmosphere', 'contents', TITLE_ID, 'exefs',
+                        'main')
+    fresh = {os.path.normpath(os.path.abspath(p)) for p in produced}
+    built = os.path.normpath(os.path.abspath(dest)) in fresh
+    if not built and os.path.exists(dest):
+        try:
+            same = (os.path.getsize(dest) == os.path.getsize(dump.nso)
+                    and open(dest, 'rb').read() == open(dump.nso, 'rb').read())
+        except OSError:
+            same = False
+        if not same:
+            log('! %s: %s already holds a module this build did not produce '
+                '-- most likely a patched one from an earlier run. Nothing '
+                'was written; delete sdout/ and rebuild.' % (what, dest))
+            return None, False
+    return (dest if built else dump.nso), built
+
+
+def _footstep_tick_hz():
+    """
+    The rate the field and world loops will really run at in THIS build.
+
+    Both footstep bridges count loop iterations to pace themselves, and FFNx's
+    rule is in SECONDS (0.5 / 0.3 walking and running, 0.3 / 0.5 on foot and
+    mounted). Converting one to the other needs the loop rate, and that is a
+    setting, not a constant:
+
+      * stock is 30 Hz -- what the bridges were originally written against;
+      * the 60 FPS group rewrites BOTH the field limiter divisor (x86
+        0x7B7840) and the world one (0x969958) from 30.0 to 60.0, so each loop
+        runs twice per original frame;
+      * `limiter_fps` raises them further still. The shipping setting is 66.
+
+    Getting this wrong does not fail the build, it just plays footsteps at the
+    wrong speed -- at 66 Hz the stock 15-tick walk cooldown is 0.227 s, which
+    is faster than FFNx's RUNNING cadence. So it is derived here, from the
+    same two settings that write the divisors, rather than assumed anywhere.
+    """
+    if not fps_60_requested():
+        return 30.0
+    return limiter_fps() or 60.0
+
+
+def _audio_bridge_budget(src, log):
+    """Log what contiguous module data is still free before a bridge claims it."""
+    try:
+        import ff7nx_tables
+        with open(src, 'rb') as handle:
+            rodata, text = ff7nx_tables.budget(handle.read())
+        log('  table budget: %d B free (.rodata tail %d, .text tail %d)'
+            % (rodata + text, rodata, text))
+    except Exception:                                          # noqa: BLE001
+        pass
+
+
+def apply_sfx_shuffle(sdout, dump, plan, log=lambda *_: None, produced=()):
+    """
+    Install the sparse sequential-SFX selector.
+
+    `_emplace_sfx` recorded routes only for successfully encoded, non-looping
+    multi-variant rows, and it already appended their extra payloads to
+    `audio.dat`, so the offsets this pass writes into the module are final.
+
+    Runs on the same finished module as every other ExeFS stage, so it cannot
+    overwrite the 60 FPS, widescreen, field or heap changes.
+    """
+    routes = getattr(plan, 'sfx_routes', None)
+    if not routes:
+        return []
+    src, built = _audio_bridge_base(sdout, dump, log, produced,
+                                    'sequential SFX')
+    if src is None:
+        return []
+    dest = os.path.join(sdout, 'atmosphere', 'contents', TITLE_ID, 'exefs',
+                        'main')
+    log('')
+    log('sequential SFX selector ...')
+    log('  base main   %s%s'
+        % (src, '   (previous patch output)' if built else '   (from dump)'))
+    _audio_bridge_budget(src, log)
+    tmp = dest + '.sfxshuffle-tmp'
+    try:
+        report = ff7nx_sfxshuffle.apply_to_nso(src, tmp, routes)
+    except Exception as exc:                                   # noqa: BLE001
+        report = None
+        log('! sequential SFX: %s: %s' % (type(exc).__name__, exc))
+    if not report:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        log('! sequential SFX selector not installed -- every archive row '
+            'keeps its safe primary variant and nothing else is affected')
+        return []
+    os.replace(tmp, dest)
+    log('  %d route(s), %d variant(s); %d-byte table at +0x%X, %d-byte BSS, '
+        'cave +0x%X (%d words)'
+        % (report['routes'], report['variants'], report['table_bytes'],
+           report['table_va'], report['bss_bytes'], report['cave_entry'],
+           report['cave_words']))
+    return [dest] if not built else []
+
+
+def apply_ambient(sdout, dump, plan, log=lambda *_: None, produced=()):
+    """
+    Install the ambient runtime: the field tick, the world and menu stops,
+    and the battle entry when the active folders provide one.
+
+    THE FIELD HOOK IS NOT THE ONE UPSTREAM USES. `analog-360` owns ARM64
+    0x947CF0 and is on in the shipping preset, so this takes the next
+    instruction (0x947CF4) instead. analog-360's cave replays its displaced
+    word and branches back there, so the two chain naturally -- see
+    `ff7nx_ambient` for the register hazard that creates and how it is
+    handled.
+    """
+    tables = getattr(plan, 'ambient_runtime', None)
+    if not tables:
+        return []
+    field_table, battle_table = tables
+    src, built = _audio_bridge_base(sdout, dump, log, produced, 'ambient')
+    if src is None:
+        return []
+    dest = os.path.join(sdout, 'atmosphere', 'contents', TITLE_ID, 'exefs',
+                        'main')
+    log('')
+    log('per-location ambience ...')
+    log('  base main   %s%s'
+        % (src, '   (previous patch output)' if built else '   (from dump)'))
+    _audio_bridge_budget(src, log)
+    tmp = dest + '.ambient-tmp'
+    try:
+        report = ff7nx_ambient.apply_to_nso(src, tmp, field_table,
+                                            battle_table)
+    except Exception as exc:                                   # noqa: BLE001
+        report = None
+        log('! ambient: %s: %s' % (type(exc).__name__, exc))
+    if not report:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        log('! the ambient runtime is not installed -- the staged loops are '
+            'inert and nothing else in the build is affected')
+        return []
+    os.replace(tmp, dest)
+    for half in ('field', 'battle'):
+        info = report[half]
+        if info:
+            log('  %-6s %d location(s), %d loop(s); %d-byte pointer/pool '
+                'data at +0x%X / +0x%X, cave +0x%X' % (
+                    half, info['locations'], info['oggs'],
+                    info['table_bytes'], info['pointer_va'], info['pool_va'],
+                    info['entry']))
+    for half, wanted, why in report.get('short', ()):
+        log('! %s ambience is NOT installed: its %d-byte map does not fit '
+            'in the module' % (half, wanted))
+        log('  %s' % why)
+        log('  the other half is unaffected; the build kept its existing '
+            'module and padding allocations intact.')
+    log('  world/menu stop caves +0x%X / +0x%X; %d-byte BSS at +0x%X'
+        % (report['world_entry'], report['menu_entry'], report['bss_bytes'],
+           report['scratch']))
+    return [dest] if not built else []
+
+
+def apply_battle_sfx(sdout, dump, plan, log=lambda *_: None, produced=()):
+    """
+    Install FFNx's per-actor battle routes at the native player boundary.
+
+    Runs at the SAME site the sequential bridge does not: `play_sfx_on_channel`
+    before its cache check, rather than `sfx_load` after it. That distinction
+    is the whole design -- see `ff7nx_sfxbattle` for the five retired
+    loader-time revisions and why none of them could work.
+    """
+    plan_routes = getattr(plan, 'battle_sfx', None)
+    if not plan_routes:
+        return []
+    src, built = _audio_bridge_base(sdout, dump, log, produced, 'battle SFX')
+    if src is None:
+        return []
+    dest = os.path.join(sdout, 'atmosphere', 'contents', TITLE_ID, 'exefs',
+                        'main')
+    log('')
+    log('per-actor battle SFX routes ...')
+    log('  base main   %s%s'
+        % (src, '   (previous patch output)' if built else '   (from dump)'))
+    tmp = dest + '.sfxbattle-tmp'
+    try:
+        report = ff7nx_sfxbattle.apply_to_nso(src, tmp, plan_routes)
+    except Exception as exc:                                   # noqa: BLE001
+        report = None
+        log('! battle SFX: %s: %s' % (type(exc).__name__, exc))
+    if not report:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        log('! per-actor battle routes not installed -- every battle id keeps '
+            'its plain numeric sound and nothing else is affected')
+        return []
+    os.replace(tmp, dest)
+    log('  %d route(s), %d variant(s) through physical slot(s) %s; %d-byte '
+        'BSS, cave +0x%X (%d words)'
+        % (report['routes'], report['variants'],
+           ','.join(map(str, report['slots'])), report['bss_bytes'],
+           report['cave_entry'], report['cave_words']))
+    return [dest] if not built else []
+
+
+def apply_world_footsteps(sdout, dump, plan, log=lambda *_: None, produced=()):
+    """
+    Install Cosmo's terrain-aware world-map footsteps.
+
+    MUST run before `apply_field_footsteps`: the field bridge shares this
+    one's BSS block and its physical archive row, and it reads the scratch
+    address this pass records on the plan rather than re-deriving it.
+    """
+    route = getattr(plan, 'world_footsteps', None)
+    if not route or route.get('payload_base') is None:
+        return []
+    src, built = _audio_bridge_base(sdout, dump, log, produced,
+                                    'world footsteps')
+    if src is None:
+        return []
+    dest = os.path.join(sdout, 'atmosphere', 'contents', TITLE_ID, 'exefs',
+                        'main')
+    log('')
+    log('adaptive world-map footsteps ...')
+    log('  base main   %s%s'
+        % (src, '   (previous patch output)' if built else '   (from dump)'))
+    tmp = dest + '.worldsteps-tmp'
+    try:
+        report = ff7nx_worldsteps.apply_to_nso(src, tmp, route,
+                                               tick_hz=_footstep_tick_hz())
+    except Exception as exc:                                   # noqa: BLE001
+        report = None
+        log('! world footsteps: %s: %s' % (type(exc).__name__, exc))
+    if not report:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        plan.world_footsteps = None
+        plan.field_footsteps = None
+        log('! world footsteps not installed; field footsteps are disabled '
+            'with them because they share its state')
+        return []
+    os.replace(tmp, dest)
+    plan.world_scratch = report['scratch']
+    log('  %d variant(s) over %d terrain material(s) through physical slot '
+        '%d; %d-byte BSS at +0x%X, cave +0x%X (%d words)'
+        % (report['variants'], report['materials'],
+           ff7nx_worldsteps.PHYSICAL_SLOT, report['bss_bytes'],
+           report['scratch'], report['cave_entry'], report['cave_words']))
+    log('  cadence: %d/%d tick(s) at %g Hz = %.2f s on foot, %.2f s mounted '
+        '(FFNx: 0.30 / 0.50)'
+        % (report['human_cooldown'], report['mount_cooldown'],
+           report['tick_hz'], report['human_cooldown'] / report['tick_hz'],
+           report['mount_cooldown'] / report['tick_hz']))
+    return [dest] if not built else []
+
+
+def apply_field_footsteps(sdout, dump, plan, log=lambda *_: None, produced=()):
+    """
+    Install the field-footstep bridge, which reads the per-field CMFS trailers
+    `_emplace_field_footstep_trailers` wrote into flevel.
+
+    Depends on `apply_world_footsteps` having run: it shares that bridge's BSS
+    block, and it is handed the address explicitly rather than deriving it, so
+    that installing the sequential bridge in between cannot silently move it.
+    """
+    route = getattr(plan, 'field_footsteps', None)
+    if not route or route.get('payload_base') is None:
+        return []
+    scratch = getattr(plan, 'world_scratch', None)
+    if not scratch:
+        log('! field footsteps: the world footstep bridge did not install, '
+            'and this one shares its state -- skipped')
+        return []
+    src, built = _audio_bridge_base(sdout, dump, log, produced,
+                                    'field footsteps')
+    if src is None:
+        return []
+    dest = os.path.join(sdout, 'atmosphere', 'contents', TITLE_ID, 'exefs',
+                        'main')
+    log('')
+    log('field footsteps ...')
+    log('  base main   %s%s'
+        % (src, '   (previous patch output)' if built else '   (from dump)'))
+    tmp = dest + '.fieldsteps-tmp'
+    terrain = {'payload_base': route['payload_base'],
+               'stride': route['stride']}
+    try:
+        report = ff7nx_fieldsteps.apply_to_nso(src, tmp, scratch,
+                                               terrain=terrain,
+                                               tick_hz=_footstep_tick_hz())
+    except Exception as exc:                                   # noqa: BLE001
+        report = None
+        log('! field footsteps: %s: %s' % (type(exc).__name__, exc))
+    if not report:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        log('! field footstep bridge not installed -- field steps keep the '
+            'stock SFX 159 row, and the world route is unaffected')
+        return []
+    os.replace(tmp, dest)
+    log('  inner cave +0x%X, outer cave +0x%X (%d words); sharing the world '
+        'bridge\'s BSS at +0x%X, no new BSS'
+        % (report['flag_entry'], report['play_entry'], report['cave_words'],
+           report['scratch']))
+    log('  cadence: %d/%d tick(s) at %g Hz = %.2f s walking, %.2f s running '
+        '(FFNx: 0.50 / 0.30)'
+        % (report['walk_cooldown'], report['run_cooldown'], report['tick_hz'],
+           report['walk_cooldown'] / report['tick_hz'],
+           report['run_cooldown'] / report['tick_hz']))
     return [dest] if not built else []
 
 

@@ -111,6 +111,62 @@ def lzs_store(data):
     return bytes(out)
 
 
+def lzs_append_literals(wrapped, suffix):
+    """Append raw decompressed bytes to an LZS-wrapped field payload.
+
+    Field files end in an ordinary LZS token stream with no terminator token.
+    Recompressing a multi-megabyte field merely to add a few private trailing
+    bytes is costly and changes unrelated compressed data.  Parse the final
+    control group, complete any unused literal bits there, then append normal
+    literal-only groups.  The original decoded bytes are untouched and the
+    result is validated by callers against :func:`lzs_decompress`.
+
+    ``wrapped`` is the LGP field payload shape ``u32 compressed_length`` plus
+    the raw LZS stream, as returned by :meth:`Archive.encode_field`.
+    """
+    if not suffix:
+        return wrapped
+    if len(wrapped) < 4:
+        raise ValueError('short LZS field payload')
+    stored, = struct.unpack('<I', wrapped[:4])
+    data = bytearray(wrapped[4:])
+    if stored != len(data):
+        raise ValueError('LZS field payload length header is inconsistent')
+    p = 0
+    last_ctrl = last_used = None
+    while p < len(data):
+        ctrl_pos = p
+        ctrl = data[p]
+        p += 1
+        used = 0
+        for bit in range(8):
+            if p >= len(data):
+                break
+            if ctrl & (1 << bit):
+                p += 1
+            else:
+                if p + 1 >= len(data):
+                    raise ValueError('truncated LZS back-reference')
+                p += 2
+            used += 1
+        last_ctrl, last_used = ctrl_pos, used
+    if p != len(data) or last_ctrl is None or not last_used:
+        raise ValueError('invalid LZS token stream')
+
+    suffix = memoryview(suffix)
+    pos = 0
+    if last_used < 8:
+        take = min(8 - last_used, len(suffix))
+        data[last_ctrl] |= ((1 << take) - 1) << last_used
+        data.extend(suffix[:take])
+        pos += take
+    while pos < len(suffix):
+        take = min(8, len(suffix) - pos)
+        data.append((1 << take) - 1)
+        data.extend(suffix[pos:pos + take])
+        pos += take
+    return struct.pack('<I', len(data)) + data
+
 # Reference encoding, derived from lzs_decompress() above rather than from a
 # spec, so the two cannot drift apart:
 #

@@ -1406,6 +1406,41 @@ def run_build(mods, enabled, settings_by_mod, log, progress,
     # the others left. Does nothing at all unless `ff7nx_dynweapon` put the
     # per-weapon variants in the archives. See FINDINGS-412.
     produced += build.apply_dynweapon(SDOUT_DIR, DUMP, log, produced)
+    # ------------------------------------------------------------------
+    # Cosmo Memory's native audio bridges.
+    #
+    # These go here, after every visual and input patch, for the ordinary
+    # reason: whoever edits `exefs/main` last has to see what everyone else
+    # wrote. Their caves come out of ff7nx_cave's padding pool, which
+    # re-checks that each hole is still zero in the module being patched, so
+    # taking them last costs the earlier features nothing.
+    #
+    # THE ORDER AMONG THEM IS NOT ARBITRARY. `apply_field_footsteps`
+    # shares the world bridge's BSS block and its physical archive row, and
+    # takes the address from the report `apply_world_footsteps` records on
+    # the plan -- so world must come first, and the sequential bridge (which
+    # grows BSS by its own 232 bytes) must not be able to come between them
+    # in a way that moves what the field bridge reads. Passing the address
+    # explicitly is what makes that safe rather than merely conventional.
+    #
+    # `apply_ambient` goes last of the five. It is the only one that needs
+    # contiguous module data (a 918-byte field map on the shipping option
+    # set), so taking it last means it sees exactly what the others left and
+    # reports a real shortfall instead of pre-empting them. Its field hook is
+    # 0x947CF4, one instruction AFTER analog-360's -- the two chain, they do
+    # not contend; see ff7nx_ambient.
+    #
+    # Each one fails closed on its own: a bridge that cannot be installed is
+    # reported and skipped, and everything else -- including the ordinary
+    # 718-row archive replacement, which needs no module patch at all --
+    # still works.
+    produced += build.apply_sfx_shuffle(SDOUT_DIR, DUMP, plan, log, produced)
+    produced += build.apply_battle_sfx(SDOUT_DIR, DUMP, plan, log, produced)
+    produced += build.apply_world_footsteps(SDOUT_DIR, DUMP, plan, log,
+                                            produced)
+    produced += build.apply_field_footsteps(SDOUT_DIR, DUMP, plan, log,
+                                            produced)
+    produced += build.apply_ambient(SDOUT_DIR, DUMP, plan, log, produced)
     # The custom PIXEL shader sets (background scaler, FXAA). These touch no
     # module at all, so they can go anywhere -- but they must go BEFORE
     # prune_stale, because that is what deletes them again when the setting

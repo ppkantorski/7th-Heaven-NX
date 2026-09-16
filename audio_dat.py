@@ -54,6 +54,7 @@ worth of the game depends on it.
 """
 import io
 import os
+import re
 import struct
 import subprocess
 
@@ -65,6 +66,7 @@ FMT_EMPTY = 18                         # WAVEFORMATEX only
 EMPTY_FILL = b'\xCD' * FMT_EMPTY       # what the original packer writes
 
 WAVE_FORMAT_ADPCM = 2
+FFMPEG_ENV = 'SEVENTH_NX_FFMPEG'
 
 
 class BadArchive(Exception):
@@ -268,13 +270,121 @@ def decoded_bytes(fmt, data_len):
     return total * channels * 2
 
 
+def canonical_adpcm_fmt(fmt):
+    """Return an MS-ADPCM format block with geometry-derived byte rate.
+
+    FFmpeg versions disagree about ``nAvgBytesPerSec`` even when they emit
+    byte-identical ADPCM blocks.  FF7's hardware-stable slot 744 build used
+    the standard value derived from sample rate, block alignment, and samples
+    per block.  Normalize only that advisory field while preserving the codec
+    coefficients and every other byte from the encoder.
+    """
+    if not fmt or len(fmt) != FMT_FULL:
+        raise BadArchive('MS ADPCM format block is %d bytes, expected %d' %
+                         (len(fmt or b''), FMT_FULL))
+    tag, = struct.unpack_from('<H', fmt, 0)
+    rate, = struct.unpack_from('<I', fmt, 4)
+    block_align, = struct.unpack_from('<H', fmt, 12)
+    samples_per_block, = struct.unpack_from('<H', fmt, 18)
+    if tag != WAVE_FORMAT_ADPCM or not rate or not block_align or \
+            not samples_per_block:
+        raise BadArchive('invalid MS ADPCM geometry in format block')
+    out = bytearray(fmt)
+    struct.pack_into('<I', out, 8,
+                     rate * block_align // samples_per_block)
+    return bytes(out)
+
+
 # ------------------------------------------------------------- encoding
+
+_LOOPSTART = re.compile(br'LOOPSTART\s*=\s*([0-9]+)', re.IGNORECASE)
+_LOOPEND = re.compile(br'LOOPEND\s*=\s*([0-9]+)', re.IGNORECASE)
+_LOOPLENGTH = re.compile(br'LOOPLENGTH\s*=\s*([0-9]+)', re.IGNORECASE)
+
+
+def source_loop_metadata(src):
+    """Return ``(start, end, sample_rate)`` from an OGG's loop comments.
+
+    FFNx/Cosmo Memory expresses loop positions as decoded PCM sample frames
+    in Vorbis comments.  ``end`` is ``None`` when the file supplies only a
+    LOOPSTART marker, which conventionally means loop through EOF.
+    """
+    try:
+        with open(src, 'rb') as f:
+            blob = f.read()
+    except OSError:
+        return None
+    start_match = _LOOPSTART.search(blob)
+    if not start_match:
+        return None
+    ident = blob.find(b'\x01vorbis')
+    if ident < 0 or ident + 16 > len(blob):
+        return None
+    sample_rate = struct.unpack_from('<I', blob, ident + 12)[0]
+    if not sample_rate:
+        return None
+    start = int(start_match.group(1))
+    end_match = _LOOPEND.search(blob)
+    length_match = _LOOPLENGTH.search(blob)
+    if end_match:
+        end = int(end_match.group(1))
+    elif length_match:
+        end = start + int(length_match.group(1))
+    else:
+        end = None
+    return start, end, sample_rate
+
+
+def with_source_loop(wav, metadata):
+    """Insert the archive packer's ``fflp`` loop chunk in an encoded WAV.
+
+    FFmpeg writes ``0xffffffff`` as the data size when WAV goes to stdout.
+    Consequently a chunk appended after ``data`` is swallowed as sample data;
+    place our marker immediately before that final data chunk instead.
+    """
+    if not metadata:
+        return wav
+    fmt, data, _old_start, _old_end = parse_wav(wav)
+    channels = struct.unpack_from('<H', fmt, 2)[0]
+    output_rate = struct.unpack_from('<I', fmt, 4)[0]
+    total_bytes = decoded_bytes(fmt, len(data))
+    frame_bytes = channels * 2
+    total_frames = total_bytes // frame_bytes if frame_bytes else 0
+    if not channels or not output_rate or total_frames < 2:
+        raise BadArchive('encoded WAV has no usable decoded loop range')
+
+    source_start, source_end, source_rate = metadata
+
+    def scale(value):
+        return (value * output_rate + source_rate // 2) // source_rate
+
+    start = max(0, min(scale(source_start), total_frames - 1))
+    end = total_frames if source_end is None else scale(source_end)
+    end = max(start + 1, min(end, total_frames))
+    chunk = b'fflp' + struct.pack('<I2I', 8,
+                                  start * frame_bytes,
+                                  end * frame_bytes)
+    pos = 12
+    data_pos = None
+    while pos + 8 <= len(wav):
+        cid = wav[pos:pos + 4]
+        if cid == b'data':
+            data_pos = pos
+            break
+        size = struct.unpack_from('<I', wav, pos + 4)[0]
+        pos += 8 + size + (size & 1)
+    if data_pos is None:
+        raise BadArchive('encoded WAV has no data chunk for loop marker')
+    out = bytearray(wav[:data_pos] + chunk + wav[data_pos:])
+    struct.pack_into('<I', out, 4, len(out) - 8)
+    return bytes(out)
 
 class MissingFFmpeg(Exception):
     pass
 
 
-def encode(src, rate=None, block_align=None, log=lambda *_: None):
+def encode(src, rate=None, block_align=None, preserve_loop=False,
+           log=lambda *_: None):
     """
     Encode any audio file ffmpeg can read into mono 4-bit MS ADPCM.
 
@@ -284,13 +394,17 @@ def encode(src, rate=None, block_align=None, log=lambda *_: None):
     resampling to the original's rate is not cosmetic.
     """
     import shutil as _sh
-    if not _sh.which('ffmpeg'):
+    ffmpeg = os.environ.get(FFMPEG_ENV) or _sh.which('ffmpeg')
+    if not ffmpeg:
         raise MissingFFmpeg('ffmpeg is required to convert sound effects')
-    cmd = ['ffmpeg', '-y', '-nostdin', '-loglevel', 'error', '-i', src,
+    cmd = [ffmpeg, '-y', '-nostdin', '-loglevel', 'error', '-i', src,
            '-ac', '1', '-acodec', 'adpcm_ms']
     if rate:
         cmd += ['-ar', str(rate)]
-    if block_align and 32 <= block_align <= 8192:
+    # The bundled encoder supports an explicit ADPCM block size. Matching the
+    # displaced slot is important because the native loader retains format
+    # geometry at several call sites.
+    if block_align:
         cmd += ['-block_size', str(block_align)]
     cmd += ['-f', 'wav', '-']
     p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -298,7 +412,20 @@ def encode(src, rate=None, block_align=None, log=lambda *_: None):
         raise BadArchive('ffmpeg failed on %s: %s'
                          % (os.path.basename(src),
                             p.stderr.decode('utf8', 'replace').strip()[-300:]))
-    return p.stdout
+    wav = p.stdout
+    if preserve_loop:
+        metadata = source_loop_metadata(src)
+        if metadata:
+            wav = with_source_loop(wav, metadata)
+    if block_align:
+        produced_fmt, _data, _start, _end = parse_wav(wav)
+        produced_align = struct.unpack_from('<H', produced_fmt, 12)[0]
+        if produced_align != block_align:
+            raise BadArchive('ffmpeg encoded %s with %d-byte ADPCM blocks; '
+                             'slot requires %d' %
+                             (os.path.basename(src), produced_align,
+                              block_align))
+    return wav
 
 
 if __name__ == '__main__':

@@ -326,4 +326,54 @@ def csel64(rd, rn, rm, cond):
     return 0x9A800000 | (rm << 16) | (cond << 12) | (rn << 5) | rd
 
 
+# ---------------------------------------------------------------- additions
+# Added for the Cosmo Memory audio bridges (ambient, sequential SFX shuffle,
+# world/field footsteps, battle character routes). Every form below is
+# round-tripped through capstone by test_a64.py alongside everything above --
+# these four were the only encodings the audio caves needed that this file did
+# not already carry.
+def nop():
+    """NOP -- architectural no-operation.
+
+    Used where a cave must keep its word count stable across the two
+    emit_laid_out passes (see ff7nx_cave.emit_laid_out) while a branch it
+    would otherwise emit resolves to the next word.
+    """
+    return 0xD503201F
+
+
+def mul64(rd, rn, rm):
+    """MUL Xd, Xn, Xm -- the 64-bit MADD alias with Ra = XZR.
+
+    The audio bridges need this for host-tick durations, which are a 64-bit
+    quantity: the 32-bit `mul` above silently truncates a tick count that has
+    been running since boot.
+    """
+    return 0x9B007C00 | (rm << 16) | (rn << 5) | rd
+
+
+def udiv64(rd, rn, rm):
+    """UDIV Xd, Xn, Xm -- unsigned 64-bit quotient.
+
+    Division by zero yields 0 rather than trapping. Every caller here rejects
+    a zero divisor first: the tick frequency is read from the system register
+    and a zero reading means the cadence must not run at all, not that the
+    interval is zero.
+    """
+    return 0x9AC00800 | (rm << 16) | (rn << 5) | rd
+
+
+def bfi(rd, rn, lsb, width):
+    """BFI Wd, Wn, #lsb, #width -- insert Wn's low `width` bits at `lsb`.
+
+    Assembles as BFM; `bfxil` is the same encoding with lsb == 0. Used to pack
+    the (slot, count, stride) route words the sequential-SFX table holds.
+    """
+    if not 0 <= lsb < 32 or not 1 <= width <= 32 - lsb:
+        raise ValueError('bfi lsb=%d width=%d is out of range' % (lsb, width))
+    immr = (-lsb) % 32
+    imms = width - 1
+    return 0x33000000 | (immr << 16) | (imms << 10) | (rn << 5) | rd
+
+
 EQ = 0
