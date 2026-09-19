@@ -1441,6 +1441,29 @@ def run_build(mods, enabled, settings_by_mod, log, progress,
     produced += build.apply_field_footsteps(SDOUT_DIR, DUMP, plan, log,
                                             produced)
     produced += build.apply_ambient(SDOUT_DIR, DUMP, plan, log, produced)
+    # ------------------------------------------------------------------
+    # Echo-S. Its field scripts are FFNx-authored, so the two unconditional
+    # music-compatibility patches FFNx applies to the PC exe have to exist
+    # here too or the merged scripts come up with no field BGM and the wrong
+    # battle music. Nothing to do with voice; it runs whenever the scripts
+    # were taken, and unlike the Cosmo bridges it stops the build rather than
+    # shipping an flevel whose other half is missing. Neither of its two
+    # sites is touched by anything else this project installs -- both were
+    # read out of the real shipping module; see ff7nx_echomusic.
+    produced += build.apply_echo_music(SDOUT_DIR, DUMP, plan, log, produced)
+    # The dialogue runtime, LAST of the module passes and after apply_ambient
+    # specifically. Three of its sixteen sites are already owned -- analog-360
+    # at 0x947CF0 and the ambient battle/world services at 0x8FB20 and
+    # 0xF1E0EC -- and it chains in front of them rather than displacing them.
+    # It can only do that because it runs second: `ff7nx_ambient` verifies the
+    # STOCK word at its sites and refuses to install over a branch, so the
+    # reverse order stops the build with the site named instead of composing
+    # something subtly wrong. See ff7nx_voice.
+    produced += build.apply_echo_voice(SDOUT_DIR, DUMP, plan, log, produced)
+    # Echo-S's first field script invokes a PC runtime-selected tutorial
+    # movie. This preserves the real materia tutorial and redirects only
+    # that field to an otherwise unused movie slot.
+    produced += build.apply_echo_tutorial(SDOUT_DIR, DUMP, plan, log, produced)
     # The custom PIXEL shader sets (background scaler, FXAA). These touch no
     # module at all, so they can go anywhere -- but they must go BEFORE
     # prune_stale, because that is what deletes them again when the setting

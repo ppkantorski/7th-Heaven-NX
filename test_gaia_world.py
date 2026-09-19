@@ -109,6 +109,7 @@ def main():
                'GUI world cap %d selects uniform %dx native scale'
                % (selected_cap, factor))
 
+        os.environ[build.WORLD_TEX_CAP_ENV] = '512'
         sky_in = {
             'wm_kumo.tex': (os.path.join(GAIA, 'wm_kumo_00.dds'), fake_mod),
             'meteo.tex': (os.path.join(GAIA, 'meteo_00.dds'), fake_mod),
@@ -116,8 +117,28 @@ def main():
         sky_out = build._convert_world_dds(
             sky_in,
             {n: os.path.join(VAN, n) for n in sky_in}, logs.append)
-        ok(not sky_out,
-           'Gaia cloud and meteor stay native without their glTF UVs')
+        cloud = tex.parse(open(sky_out['wm_kumo.tex'][0], 'rb').read())
+        meteor = tex.parse(open(sky_out['meteo.tex'][0], 'rb').read())
+        ok((cloud['width'], cloud['height']) == (512, 128),
+           'Gaia clouds retain their authored aspect at the 512 cap')
+        ok((meteor['width'], meteor['height']) == (512, 256),
+           'Gaia meteor retains its authored aspect at the 512 cap')
+        sky_scales = ff7nx_gaia.special_scales()
+        ok(sky_scales['wm_kumo'] == (2.0, 2.0)
+           and sky_scales['meteo'] == (2.0, 4.0),
+           'archive publishes independent cloud/meteor X/Y UV factors')
+
+        os.environ[build.WORLD_TEX_CAP_ENV] = '768'
+        sky_768 = build._convert_world_dds(
+            sky_in,
+            {n: os.path.join(VAN, n) for n in sky_in}, logs.append)
+        meteor_768 = tex.parse(open(
+            sky_768['meteo.tex'][0], 'rb').read())
+        ok((meteor_768['width'], meteor_768['height']) == (768, 384),
+           'active 768 cap gives Gaia meteor 768x384 detail')
+        ok(ff7nx_gaia.special_scales()['meteo'] == (3.0, 6.0),
+           '768 meteor publishes its nonuniform 3x/6x native UV factors')
+        os.environ[build.WORLD_TEX_CAP_ENV] = '512'
 
         multi_out = build._convert_world_dds(
             {'dfx.tex': (os.path.join(GAIA, 'dfx_00.dds'), fake_mod)},
@@ -125,10 +146,9 @@ def main():
         ok(not multi_out,
            'multi-palette runtime effect stays native from frame-zero DDS')
 
-        # The Highwind shadow exposed the larger renderer-role boundary in
-        # build 181. These are sprites/effects, not terrain mesh textures;
-        # their independent UV/blend/palette state must stay native until a
-        # matching external renderer exists on Switch.
+        # Sprite/UI content uses renderer-aware conversion. The shadow is the
+        # important boundary: Gaia stores the falloff in alpha, while the
+        # native renderer expects transparent index zero plus blended greys.
         runtime_names = {
             'map.tex', 'midlmap.tex', 'midlmap2.tex', 'radar.tex',
             'shadow.tex', 'snow4.tex', 'snow5.tex',
@@ -137,12 +157,45 @@ def main():
             {n: (os.path.join(GAIA, n[:-4] + '_00.dds'), fake_mod)
              for n in runtime_names},
             {n: os.path.join(VAN, n) for n in runtime_names}, logs.append)
-        ok(not runtime_out,
-           'non-terrain world sprites/effects stay on their native renderer')
+        ok(set(runtime_out) == runtime_names,
+           'Gaia map UI and soft shadow are converted, not held vanilla')
+        shadow = tex.parse(open(runtime_out['shadow.tex'][0], 'rb').read())
+        ok((shadow['width'], shadow['height']) == (256, 256),
+           'Gaia shadow keeps its available 256px detail')
+        ok(0 in shadow['pixels'] and len(set(shadow['pixels'])) > 2,
+           'Gaia shadow has transparent pixels and a soft indexed falloff')
+        shadow_pal = shadow['palette']
+        visible_greys = {
+            shadow_pal[i * 4] for i in set(shadow['pixels']) if i
+        }
+        ok(min(visible_greys) >= 41 and max(visible_greys) <= 115,
+           'Gaia alpha was mapped to the native shadow grey range')
+
+        # THE HALO. The native shadow is colour-KEYED, so there is no partial
+        # coverage: every pixel that is not index zero is drawn solid. Keying
+        # at alpha >= 1 therefore turned Gaia's long faint tail into a ring of
+        # opaque light grey -- 21,575 pixels against vanilla's 16,352-pixel
+        # equivalent, +32% area, and very visible over dark ground.
+        #
+        # Pin the coverage to vanilla's own, which is the criterion
+        # build._shadow_alpha_cutoff solves for.
+        native = tex.parse(open(os.path.join(VAN, 'shadow.tex'), 'rb').read())
+        native_frac = (sum(1 for x in native['pixels'] if x)
+                       / float(native['width'] * native['height']))
+        drawn = sum(1 for i in shadow['pixels'] if i)
+        frac = drawn / float(shadow['width'] * shadow['height'])
+        ok(abs(frac - native_frac) < 0.02,
+           'Gaia shadow covers vanilla\'s area (%.1f%% vs %.1f%%) -- no halo'
+           % (100 * frac, 100 * native_frac))
+        ok(frac < 0.30,
+           'the faint alpha tail is keyed out rather than drawn solid')
+        snow = tex.parse(open(runtime_out['snow4.tex'][0], 'rb').read())
+        ok((snow['width'], snow['height']) == (512, 512),
+           'Gaia snow overlay obeys the world cap with normalized UVs')
 
         # Exact six-site renderer correction: each hook must be emitted only
         # for a Gaia scale, with a fully indexed/capped archive alongside it.
-        main_path = os.path.join(HERE, 'exefs', 'main')
+        main_path = os.path.join(HERE, 'dump', 'exefs', 'main')
         if os.path.isfile(main_path):
             old_scale = os.environ.get(ff7nx_gaia.SCALE_ENV)
             try:
@@ -151,9 +204,12 @@ def main():
                 words = ff7nx_gaia.patch_words(nxmap.Main(main_path))
                 ok(all(va in words for va, _, _ in ff7nx_gaia.SITES),
                    'all six terrain U/V normalisations receive Gaia hooks')
+                ok(ff7nx_gaia.SPECIAL_HOOK in words,
+                   'sprite inverse-size correction is paired with archive')
                 os.environ[ff7nx_gaia.SCALE_ENV] = '1'
+                os.environ.pop(ff7nx_gaia.SPECIAL_ENV, None)
                 ok(not ff7nx_gaia.patch_words(nxmap.Main(main_path)),
-                   'native 1x plan emits no module correction')
+                   'fully native plan emits no module correction')
             finally:
                 if old_scale is None:
                     os.environ.pop(ff7nx_gaia.SCALE_ENV, None)
@@ -179,7 +235,8 @@ def main():
             f.write('fingerprint\n%d\n%d\n123456\n'
                     % (stat.st_size, stat.st_mtime_ns))
         try:
-            reused = build._reuse_existing_flevel(reuse_root, logs.append)
+            reused = build._reuse_existing_flevel(reuse_root, 'fingerprint',
+                                                  logs.append)
             ok(reused == flevel and build.FIELD_BG_MAX_RAW == 123456,
                'fast mode verifies flevel and restores its buffer metadata')
             before_mtime = os.stat(flevel).st_mtime_ns
@@ -193,7 +250,8 @@ def main():
             with open(flevel, 'ab') as f:
                 f.write(b'changed')
             try:
-                build._reuse_existing_flevel(reuse_root, logs.append)
+                build._reuse_existing_flevel(reuse_root, 'fingerprint',
+                                             logs.append)
             except RuntimeError:
                 refused = True
             else:

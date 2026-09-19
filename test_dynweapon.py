@@ -188,17 +188,26 @@ def test_repoint(tmp):
         with open(p, 'wb') as f:
             f.write(blob)
         van[nm] = p
+    hrc_on = D.hrc_rewrite_enabled()
     out, n = D.repoint('char.lgp', {}, van, man, os.path.join(tmp, 'c'))
-    check('only the referrers that name a dynamic part are rewritten', n == 2)
+    check('only the referrers that name a dynamic part are rewritten',
+          n == (2 if hrc_on else 1))
     got = open(out['aaad1.rsd'][0], 'rb').read()
     check('PLY is repointed at the range base', b'PLY=Z00A00F00.PLY' in got)
     check('MAT and GRP are left alone -- the loader does not read them',
           b'MAT=AAAE1.MAT' in got and b'GRP=AAAE1.GRP' in got)
     check('the rsd keeps its CRLFs', got.count(b'\r\n') == rsd.count(b'\r\n'))
-    got = open(out['acgd.hrc'][0], 'rb').read()
-    check('the bone token is replaced', b'2 Z01A20F20 ACGE' in got)
-    check('the hrc keeps its CRLFs and its other tokens',
-          got.count(b'\r\n') == hrc.count(b'\r\n') and b'1 ZZZZ' in got)
+    if hrc_on:
+        got = open(out['acgd.hrc'][0], 'rb').read()
+        check('the bone token is replaced', b'2 Z01A20F20 ACGE' in got)
+        check('the hrc keeps its CRLFs and its other tokens',
+              got.count(b'\r\n') == hrc.count(b'\r\n') and b'1 ZZZZ' in got)
+    else:
+        # SEVENTH_NX_DW_HRC=static: the .hrc must come through BYTE-IDENTICAL,
+        # so Barret's field model keeps naming the four-character ACJF that
+        # vanilla and every working character use.
+        check('static mode leaves the hrc completely untouched',
+              'acgd.hrc' not in out or out['acgd.hrc'][0] == van['acgd.hrc'])
     check('an hrc that names nothing dynamic is not touched at all',
           'other.hrc' not in out or out['other.hrc'][0] == van['other.hrc'])
 

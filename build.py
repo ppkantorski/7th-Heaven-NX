@@ -21,6 +21,7 @@ from collections import Counter
 import exe_patch
 import iro
 import lgp
+import pyff7_path
 import movies as movie_convert
 import ambientmod
 import audio_dat
@@ -34,6 +35,14 @@ import ff7nx_fieldsteps_data
 import ff7nx_sfxshuffle
 import ff7nx_sfxbattle
 import ff7nx_ambient
+import echo_s_flevel
+import echo_s_tutorial
+import ff7nx_echomusic
+import ff7nx_voice
+import voicemod
+import echo_s_battletext
+import echo_s_battlevo
+import voice_ogg
 import p as pfile
 import tex
 import battle_stage_bg
@@ -176,8 +185,18 @@ def ensure_pyff7(log=lambda *_: None):
                 'PyFF7 is required to build model archives but could not be '
                 f'downloaded. Clone https://github.com/niemasd/PyFF7 into '
                 f'{PYFF7_DIR} and retry. ({exc})')
-    if PYFF7_DIR not in sys.path:
-        sys.path.insert(0, PYFF7_DIR)
+    # BELT AND BRACES. Putting the clone root on sys.path only works if
+    # nothing has already resolved the name `PyFF7` -- and the clone root is
+    # itself importable as a PEP 420 namespace package, so anything that
+    # imported `PyFF7.<anything>` before this point has cached the wrong
+    # object and this import becomes a no-op that cannot find `lgp`.
+    #
+    # That is not hypothetical: `echo_s_flevel` did exactly this at module
+    # scope, and because build.py imports it at the top, every model archive
+    # died with "No module named 'PyFF7.lgp'" while the file sat on disk.
+    # `pyff7_path.ensure` evicts a cached namespace before fixing the path, so
+    # the next module to make the same mistake cannot take the build down.
+    pyff7_path.ensure(HERE)
     from PyFF7.lgp import pack_lgp
     return pack_lgp
 
@@ -239,7 +258,18 @@ ROMFS = 'romfs/ff7/workingdir'
 #
 # So the destination is found by looking the vanilla file up in the dump and
 # mirroring wherever it actually lives. See _loose_destination.
-LOOSE_DIRS = {'kernel': 'data/kernel'}
+# Directories whose `.bin` files the port opens by path rather than out of an
+# archive. `_loose_destination` finds the vanilla copy by name inside the dump
+# and mirrors its location, so the value here is only the fallback.
+#
+# `battle` is here for `scene.bin`, which carries every battle's enemy data,
+# AI and -- the reason Echo-S ships one -- the in-battle dialogue. Without it
+# the mod's rewritten battle lines never arrive: the first boss still says
+# "Attack while his tail is up" instead of Echo-S's "Don't attack while his
+# tail is up". The `.bin` test at the routing site is what keeps this from
+# catching a mod's enemy MODELS, which live under `battle/` too but are
+# .hrc/.rsd/.p/.tex.
+LOOSE_DIRS = {'kernel': 'data/kernel', 'battle': 'data/battle'}
 
 ARCHIVES = {
     'char.lgp': 'data/field/char.lgp',
@@ -415,6 +445,13 @@ FFNX_AUDIO_DIRS = {'sfx', 'ambient', 'voice', 'movies'}
 # Cosmo Memory cannot work on Switch at all (no external-SFX path, see the
 # note above) and is not a case worth breaking every soundtrack mod for.
 VGMSTREAM_DIR = 'vgmstream'
+
+# Echo-S is the one field-script package for which we have a Switch-specific,
+# structurally checked section-1 importer.  Keep this an exact manifest ID,
+# not a filename/display-name guess: a renamed .iro must still work, while an
+# unrelated PC field mod must continue through the conservative section 4/9
+# path below.
+ECHO_S_MOD_ID = '09e81530-3f09-46b9-831b-df431b8f319c'
 
 
 def _sig(path):
@@ -775,12 +812,26 @@ class Plan:
     def __init__(self):
         self.archive_files = {}   # archive -> {lowername: (src, mod)}
         self.chunks = {}          # field -> {section: (src, mod)}
+        self.echo_fields = {}     # field -> (src, mod), Echo-S section-1
+                                  # imports only; see `_build_flevel`
+        self.echo_tutorial = False # mds7pb_1 PMVIE redirect + fship2n movie
+        self.echo_kernel = {}     # 'kernel.bin'/'kernel2.bin' -> (src, mod),
+                                     # Echo-S only; structurally merged rather
+                                     # than copied -- see _emplace_echo_kernel
+        self.echo_kernel_skipped = []  # rel paths of Echo-S's alternate
+                                       # kernel packages, reported not taken
+        self.whole_archives = []   # (rel, mod filename) for a mod file that
+                                   # IS an archive rather than an entry in one
         self.music = {}           # basename -> (src, mod)
         self.movies = {}          # lowercase stem -> (src, mod)
         self.loose = {}           # (holder, name) -> (src, mod)
         self.battle_bg = {}       # (stage_num, tile_num) -> (src, mod)
         self.sfx = []             # ordered (rel, full, mod) under sfx/
         self.ambient = []         # ordered (rel, full, mod) under Ambient/
+        self.voice = []           # ordered (rel, full, mod) under voice/,
+                                  # already recognised by voicemod
+        self.echo_options = {}    # Echo-S's own ConfigOption values, for the
+                                  # settings its RUNTIME needs (Auto, BVoice)
         self.opening_dims = None  # (w, h) of the emplaced opening
         self.opening_fps = None   # frame rate of the emplaced opening, for
                                   # reporting only -- see build_exe()
@@ -843,8 +894,64 @@ class Plan:
     def total_portable(self):
         return (sum(len(v) for v in self.archive_files.values())
                 + sum(len(v) for v in self.chunks.values())
+                + len(self.echo_fields) + len(self.echo_kernel)
                 + len(self.music) + len(self.loose) + len(self.battle_bg)
                 + (1 if self.sfx else 0))
+
+
+def _echo_s_field_name(mod, rel, catalogs):
+    """Return an Echo-S field basename, or ``None`` for every other file.
+
+    Echo-S stores 705 complete PC fields under ``flevel.lgp/<field>``.  They
+    cannot travel through the normal PC-field path: that deliberately imports
+    only palette/background sections 4 and 9.  Conversely, treating *every*
+    directory called flevel.lgp as Echo would make arbitrary gameplay mods
+    replace Switch scripts.  The upstream manifest GUID plus an exact field
+    name from the user's own flevel catalog is the narrow, stable boundary.
+    """
+    manifest = getattr(mod, 'manifest', None)
+    if getattr(manifest, 'mod_id', '').lower() != ECHO_S_MOD_ID:
+        return None
+    parts = [p for p in rel.replace('\\', '/').split('/') if p]
+    if len(parts) < 2 or parts[-2].lower() != 'flevel.lgp':
+        return None
+    name = parts[-1].lower()
+    if not name or '.' in name:
+        return None
+    if name not in catalogs.get('flevel.lgp', set()):
+        return None
+    return name
+
+
+# The only two Echo-S kernel records this build takes, and they are MERGED,
+# never copied -- see `_emplace_echo_kernel`.
+ECHO_S_KERNEL_FILES = {'kernel.bin': 'KERNEL.BIN', 'kernel2.bin': 'kernel2.bin'}
+
+
+def _echo_s_kernel_name(mod, rel):
+    """
+    Return `kernel.bin`/`kernel2.bin` for Echo-S's own kernel pair, else None.
+
+    Echo-S's `Echo-S/kernel/` folder holds far more than the pair the mod
+    actually installs: `Vanilla/`, `Legionz/` and `OldSpellNames_*` are
+    alternate packages its PC installer never selects unless you ask for them,
+    and `window.bin` is PC font/width data that makes the Switch text renderer
+    advance wrongly (visibly so after a capital W).
+
+    None of that is described in mod.xml -- the manifest simply takes the whole
+    `Echo-S` folder -- so without this the generic loose-file router would see
+    four different KERNEL.BINs under a directory called `kernel`, key three of
+    them on the same name, and let the last one off the filesystem win. This
+    keeps the exact two files at the exact top of the folder and nothing else.
+    """
+    if getattr(getattr(mod, 'manifest', None), 'mod_id', '').lower() != \
+            ECHO_S_MOD_ID:
+        return None
+    parts = [p for p in rel.replace('\\', '/').split('/') if p]
+    if len(parts) < 2 or parts[-2].lower() != 'kernel':
+        return None
+    low = parts[-1].lower()
+    return low if low in ECHO_S_KERNEL_FILES else None
 
 
 def build_plan(mods, settings_by_mod, catalogs, log=lambda *_: None,
@@ -1035,6 +1142,16 @@ def build_plan(mods, settings_by_mod, catalogs, log=lambda *_: None,
         picked = mod.files_for(settings, read=runtime_read, log=log)
         log(f'{mod.display_name}: {len(picked)} candidate files')
 
+        # Echo-S is the one mod whose options reach an ARM64 pass rather than
+        # only deciding which folders are collected. `Auto` is FFNx's
+        # auto-text-advance, which on this port is a hook of its own on the
+        # input refresh, and `BVoice` is the battle-bark probability the
+        # producer cave bakes in as an immediate. Both are needed long after
+        # the plan is built, so they are carried on it.
+        if getattr(getattr(mod, 'manifest', None), 'mod_id', '').lower() == \
+                ECHO_S_MOD_ID:
+            plan.echo_options = dict(settings)
+
         # Decide, ONCE PER MOD, whether this mod's `vgmstream/` files are a
         # soundtrack or FFNx aliases -- see the VGMSTREAM_DIR note above.
         #
@@ -1120,6 +1237,45 @@ def build_plan(mods, settings_by_mod, catalogs, log=lambda *_: None,
             if (ambientmod.AMBIENT_DIR in dirs_l
                     and (low == ambientmod.CONFIG_NAME or ext == '.ogg')):
                 plan.ambient.append((rel, full, mod))
+                continue
+
+            # Echo-S is a dialogue/script mod, not an ordinary PC field-art
+            # replacement.  Its complete field files need the specialised
+            # section-1 merge below; do this before the generic archive
+            # router sees their matching basenames.  Assignment is deliberately
+            # last-write-wins because `files_for()` is already in 7th Heaven
+            # precedence order (base Echo-S first, selected UI variant last).
+            echo_field = _echo_s_field_name(mod, rel, catalogs)
+            if echo_field is not None:
+                plan.echo_fields[echo_field] = (full, mod)
+                continue
+
+            # This PC-only RuntimeVar payload is not a general mkup
+            # replacement. Give it an unused Switch slot and use the
+            # field-scoped module redirect below; the normal movie path still
+            # converts/caches it using this build's 15/30 FPS policy.
+            rel_parts = [p.lower() for p in rel.replace('\\', '/').split('/')]
+            if (getattr(getattr(mod, 'manifest', None), 'mod_id', '').lower()
+                    == ECHO_S_MOD_ID
+                    and rel_parts == ['materia tutorial', 'movies', 'mkup.avi']):
+                plan.movies[echo_s_tutorial.REDIRECT_STEM] = (full, mod)
+                plan.echo_tutorial = True
+                continue
+
+            # Echo-S's kernel folder, in full. The pair it really installs is
+            # merged section by section against the Switch container; the
+            # alternate packages beside it (and its PC window.bin) are dropped
+            # here rather than left for a generic router to guess at.
+            if (getattr(getattr(mod, 'manifest', None), 'mod_id', '').lower()
+                    == ECHO_S_MOD_ID
+                    and 'kernel' in [p.lower() for p in
+                                     os.path.dirname(rel)
+                                     .replace('\\', '/').split('/')]):
+                echo_kernel = _echo_s_kernel_name(mod, rel)
+                if echo_kernel is not None:
+                    plan.echo_kernel[echo_kernel] = (full, mod)
+                else:
+                    plan.echo_kernel_skipped.append(rel)
                 continue
 
             if ext in META_EXT:
@@ -1254,6 +1410,28 @@ def build_plan(mods, settings_by_mod, catalogs, log=lambda *_: None,
                 parts = [p.lower() for p in
                          os.path.dirname(rel).replace('\\', '/').split('/')]
                 holder = next((p for p in parts if p in FFNX_AUDIO_DIRS), None)
+                if holder == 'voice':
+                    # THE ONE FFNX AUDIO DIRECTORY THAT NOW HAS SOMEWHERE TO
+                    # GO. `voice/` was collected and discarded for as long as
+                    # the port had no way to play a loose clip by name; it
+                    # does -- `MusicStream` formats
+                    # "%s/data/music_ogg/%s.ogg" and hands it to vgmstream,
+                    # and it takes a NAME, not a slot. So Echo-S's layout can
+                    # be staged as-is and the runtime rebuilds the filename
+                    # from live game state, with no table in the module at
+                    # all.
+                    #
+                    # `classify_voice_path` decides WHAT KIND (field line,
+                    # ASK option, world, a party-leader overlay, a battle
+                    # bark); anything under `voice/` that is not one of those
+                    # shapes keeps skipping exactly as before, so an
+                    # unrelated FFNx voice mod cannot be half-ingested.
+                    if voicemod.classify_voice_path(rel):
+                        plan.voice.append((rel, full, mod))
+                    else:
+                        plan.skipped_ffnx_audio[holder] = \
+                            plan.skipped_ffnx_audio.get(holder, 0) + 1
+                    continue
                 if holder:
                     plan.skipped_ffnx_audio[holder] = \
                         plan.skipped_ffnx_audio.get(holder, 0) + 1
@@ -1281,6 +1459,21 @@ def build_plan(mods, settings_by_mod, catalogs, log=lambda *_: None,
                     plan.unmatched.append(rel)
                     continue
                 plan.chunks.setdefault(field, {})[idx] = (full, mod)
+                continue
+
+            # A WHOLE PC ARCHIVE IS NOT AN ENTRY. Echo-S ships
+            # `Echo-S/world/world_us.lgp`, a complete 3 MB PC world archive,
+            # which on the PC means "use this instead of the game's". This
+            # port composes every archive from the dump plus the enabled mods,
+            # so there is nothing here that can honour that -- and the
+            # ordinary router, seeing a file inside a folder that votes
+            # world_us.lgp, would add it AS AN ENTRY CALLED `world_us.lgp`:
+            # three megabytes the game never reads, inside the archive it was
+            # meant to replace. Its sibling `mes` IS a real entry name and
+            # still goes through normally, so the world-map text arrives; only
+            # the container is refused, and it says so.
+            if low in ARCHIVES:
+                plan.whole_archives.append((rel, mod.filename))
                 continue
 
             hits = [a for a, names in catalogs.items() if low in names]
@@ -1358,6 +1551,10 @@ def build_plan(mods, settings_by_mod, catalogs, log=lambda *_: None,
             versions.setdefault(target, {}).setdefault(low, []).append(
                 (_model_subfolder('Dynamic Weapons', src[1]), src[0], src[1]))
 
+    # AFTER the weapon set is in place, so its own .rsd entries are counted
+    # among the models whose textures have to exist.
+    _rescue_dangling_model_textures(plan, catalogs, mods, log)
+
     # A Dynamic Weapons mesh is only useful through the matching RSD branch.
     # A companion add-on can intentionally replace a texture or the emitted
     # mesh, yet also offer a *static* HRC for the same character.  Selecting
@@ -1402,6 +1599,36 @@ def build_plan(mods, settings_by_mod, catalogs, log=lambda *_: None,
         log('  world textures: %d frame-zero DDS file(s) mapped to exact '
             'world_us.lgp TEX entries; conversion runs during archive build'
             % len(plan.world_dds_native_names))
+    if plan.echo_fields:
+        if getattr(echo_s_flevel, 'BUTTON_GLYPHS_RETARGETED', 0):
+            log('  Echo-S: %d PC button glyph(s) retargeted -- Echo-S writes '
+                'a button as <PC glyph>(NAME) and those glyph bytes are not '
+                'in this font, so each becomes this port\'s own icon '
+                '(CANCEL -> X, CONFIRM -> O, MENU -> triangle, SWITCH -> '
+                'square) or, where no icon is established, the bare name'
+                % echo_s_flevel.BUTTON_GLYPHS_RETARGETED)
+        log('  Echo-S: %d field script(s) selected for validated section-1 '
+            'merge' % len(plan.echo_fields))
+    if plan.voice:
+        kinds = Counter((voicemod.classify_voice_path(rel) or ('?',))[0]
+                        for rel, _f, _m in plan.voice)
+        log('  Echo-S voice: %d clip(s) under voice/ (%s)'
+            % (len(plan.voice),
+               ', '.join('%d %s' % (n, k) for k, n in sorted(kinds.items()))))
+    for rel, who in plan.whole_archives:
+        log('  %s: %s is a complete PC archive, not an entry -- refused. '
+            'This port composes its archives from the dump, so a wholesale '
+            'replacement cannot be honoured; any of its contents that ship '
+            'as loose files alongside it are still taken normally.'
+            % (who, rel))
+    if plan.echo_kernel or plan.echo_kernel_skipped:
+        log('  Echo-S: %s selected for section-level kernel merge; %d '
+            'alternate/PC kernel file(s) not taken (%s)'
+            % (', '.join(sorted(plan.echo_kernel)) or 'nothing',
+               len(plan.echo_kernel_skipped),
+               ', '.join(sorted(os.path.basename(r)
+                                for r in plan.echo_kernel_skipped)[:6])
+               or 'none'))
     _warn_frankenstein(plan, log)
     return plan
 
@@ -2828,7 +3055,8 @@ def _warn_frankenstein(plan, log):
                 return c
         return None
 
-    broken = []
+    mixed = []
+    incomplete = []
     pair_counts = Counter()
     for low in list(files):
         if not low.endswith('.hrc'):
@@ -2838,30 +3066,63 @@ def _warn_frankenstein(plan, log):
             text = open(files[low][0], 'rb').read().decode('latin1')
         except OSError:
             continue
+        gone = []
+        split = None
         for m in _HRC_PIECE.finditer(text):
             for tok in m.group(1).split():
-                e = resolve(tok.strip())
-                if e and folder_of.get(e) and folder_of[e] != hrc_folder:
-                    broken.append(low)
-                    pair_counts[frozenset((hrc_folder, folder_of[e]))] += 1
-                    break
-            else:
-                continue
-            break
+                tok = tok.strip()
+                entry = resolve(tok)
+                if entry is None:
+                    gone.append(tok)
+                    continue
+                other = folder_of.get(entry)
+                if other and other != hrc_folder and split is None:
+                    split = other
+        if gone:
+            incomplete.append((low, hrc_folder, gone))
+        if split is not None:
+            mixed.append(low)
+            pair_counts[frozenset((hrc_folder, split))] += 1
 
-    if not broken:
+    # A BONE THIS SKELETON NAMES AND NOBODY SUPPLIES.
+    # This is the one that actually renders wrong, and it used to be silent:
+    # the old check only looked at which OPTION supplied a piece and skipped
+    # an unresolved one entirely.
+    if incomplete:
+        log(f'! {len(incomplete)} model(s) name a part no enabled option '
+            'supplies -- these will be missing geometry in game:')
+        for low, folder, gone in incomplete[:8]:
+            log(f'    {low} ("{folder or "(base)"}") wants '
+                f'{", ".join(sorted(set(gone))[:4])}')
+        if len(incomplete) > 8:
+            log(f'    ... and {len(incomplete) - 8} more')
+
+    if not mixed:
         return
     plan.folder_conflicts = [(sorted(p)[0], sorted(p)[1], n)
                              for p, n in pair_counts.most_common()]
-    log(f'NOTE: {len(broken)} model(s) draw pieces from two different enabled '
-        'options and may look wrong:')
-    for low in broken[:8]:
+    # MIXING IS USUALLY THE POINT, SO DO NOT CALL IT A CONFLICT.
+    # 7th Heaven has no concept of a model as a unit: `Wrap.cs:173-201`
+    # registers each option's files, `VFile.cs:292` returns the first active
+    # candidate PER FILENAME, and an .hrc and its pieces are resolved
+    # independently. Mods rely on that -- Ninostyle's Cloud takes his chibi
+    # skeleton from `Efryt/fb`, which declares the `AAAD1` bone, and the mesh
+    # hanging off that bone from a Dynamic Weapons <Conditional>. Both options
+    # are meant to be on, and PC composes the same two-source model.
+    #
+    # So this is reported as information. What it cannot tell apart is an
+    # intended split from an accidental one; the list above is the one that
+    # says something is actually broken.
+    log(f'note: {len(mixed)} model(s) take their skeleton from one enabled '
+        'option and some geometry from another:')
+    for low in mixed[:8]:
         log(f'    {low}')
     for a, b, n in plan.folder_conflicts:
-        log(f'  conflict between options "{a or "(base)"}" and '
-            f'"{b or "(base)"}"')
-    log('  This is a conflict inside the mod, not a packing error. If one of '
-        'these models looks wrong, turn one of those two options off.')
+        log(f'  "{a or "(base)"}" + "{b or "(base)"}" -- {n} model(s)')
+    log('  That is how 7th Heaven resolves files too (per filename, first '
+        'active option wins -- AppWrapper/VFile.cs:292), and mods depend on '
+        'it, so this is not by itself a fault. It is worth reading only if a '
+        'specific model looks wrong in game.')
 
 
 # --------------------------------------------------------------------------
@@ -6376,6 +6637,148 @@ def _provisional_target(c, route_target):
     }.get(leaf)
 
 
+# The mod-side folder each model archive is fed from, for the texture repair
+# below. Same mapping `_model_target_of` falls back on.
+MODEL_SOURCE_DIR = {
+    'char.lgp': 'char', 'world_us.lgp': 'world', 'high-us.lgp': 'high',
+    'battle.lgp': 'battle', 'magic.lgp': 'magic', 'menu_us.lgp': 'menu',
+}
+
+# Distinct from `_RE_RSD_TEX` further down (which this once shadowed): that
+# one is used by the model-assembly pass and accepts only [A-Za-z0-9_] stems,
+# so it silently misses the mod's `JESS (2).TIM` spellings. This one is for
+# the completeness check and has to see every name a loader would.
+_RE_RSD_TEX_REF = re.compile(
+    rb'TEX\[\d+\]\s*=\s*([A-Za-z0-9_ ()\-]+?)\s*\.\s*\w+', re.I)
+
+
+def _rsd_texture_names(blob):
+    """Lowercase `<stem>.tex` for every texture an .rsd names."""
+    return {m.group(1).decode('ascii', 'replace').strip().lower() + '.tex'
+            for m in _RE_RSD_TEX_REF.finditer(blob)}
+
+
+def _rescue_dangling_model_textures(plan, catalogs, mods, log):
+    """
+    A model we ship must not name a texture that is not in the archive.
+
+    AN INACTIVE FOLDER CAN STILL OWN AN ACTIVE MODEL'S TEXTURE.
+    ==========================================================
+    `DEFAULT_OVERRIDES` turns Ninostyle's `fb` option off, deliberately: on,
+    it pulls 878 MB of re-eyed models built for Shinra Archaeology Cut's
+    Advanced Facial Animation, which buys nothing without SAC in the load
+    order. That is still the right default -- but `fb/char/` is also the only
+    ACTIVE-by-default source of two textures that models from other, active
+    folders reference:
+
+        sbad.tex    named by 15 of Barret's 16 Dynamic Weapons arms
+        npc92.tex   named by 13 rsd(s)
+
+    Measured over the whole built char.lgp, those two are the ONLY dangling
+    references out of 424 textures named by 4,180 `.rsd` entries, so this
+    repairs exactly what is broken and touches nothing else.
+
+    Barret is how it surfaced: every weapon but the Gatling Gun renders with
+    parts of its texture missing, and the field framerate collapses. The
+    Gatling Gun is the one arm that names `br.tex`, which does ship.
+
+    Only a texture an `.rsd` we are actually shipping asks for is rescued, and
+    only by exact filename out of the same archive's source folder, so this
+    cannot quietly drag an inactive folder's models in behind it.
+    """
+    rescued = 0
+    for target, source_dir in sorted(MODEL_SOURCE_DIR.items()):
+        bucket = plan.archive_files.get(target) or {}
+        # `catalogs[target]` is the vanilla archive's set of entry NAMES, not
+        # a path map -- so it says what is present, which is all this needs.
+        present = set(bucket) | set(catalogs.get(target) or ())
+        wanted = set()
+        # Only the .rsd entries THIS BUILD adds or replaces can dangle: a
+        # vanilla .rsd names a vanilla texture, and the vanilla archive ships
+        # both. That also keeps this to a few hundred small reads instead of
+        # 4,180.
+        for low in sorted(bucket):
+            if not low.endswith('.rsd'):
+                continue
+            src = bucket[low]
+            path = src[0] if isinstance(src, (tuple, list)) else src
+            if not path or not isinstance(path, str):
+                continue
+            try:
+                with open(path, 'rb') as handle:
+                    wanted |= _rsd_texture_names(handle.read(4096))
+            except OSError:
+                continue
+        missing = sorted(t for t in wanted if t not in present)
+        if not missing:
+            continue
+        found_all = _find_in_mod_trees(mods, set(missing), source_dir)
+        for low in missing:
+            found = found_all.get(low)
+            if not found:
+                log('  ! %s: %s is named by a shipped model and is in no mod '
+                    'folder at all -- that model will render untextured'
+                    % (target, low))
+                continue
+            path, where = found
+            bucket[low] = (path, None)
+            plan.archive_files[target] = bucket
+            rescued += 1
+            log('  %s: %s was named by a shipped model but no ACTIVE folder '
+                'supplies it -- taken from %s' % (target, low, where))
+    return rescued
+
+
+def _find_in_mod_trees(mods, lows, source_dir):
+    """
+    {name: (path, description)} for each of `lows` under a `<source_dir>/`.
+
+    Takes the whole set and walks the mod trees ONCE. The trees are large and
+    this runs at plan time, so a walk per missing name would be paid on every
+    build for a repair that is usually two files.
+
+    Deliberately walks the mod tree rather than the resolved candidate list:
+    the whole point is to reach a folder the option vote switched off.
+
+    SHALLOWEST WINS, and that matters. Ninostyle ships `sbad.tex` four times:
+
+        fb/char/SBAD.TEX                                  <- the plain one
+        Alt Outfits/Advent Children Barret/char/SBAD.TEX
+        Alt Outfits/RE Barret/char/SBAD.TEX
+        Alt Outfits/Vanilla Barret/char/SBAD.TEX
+
+    The three under `Alt Outfits` are alternate SKINS, gated on `Barret = 1|2|3`;
+    this build runs `Barret = 0`. Plain path order would have picked Advent
+    Children's and given him the wrong Barret. Depth separates a mod's base
+    set from its variants, and ties break on the path so a build is
+    reproducible.
+    """
+    if isinstance(lows, str):
+        lows = {lows}
+    lows = {n.lower() for n in lows}
+    hits = {}
+    for mod in mods or ():
+        # `Mod.cache` is the unpacked tree; `Mod.path` is the .iro archive,
+        # which is not walkable.
+        root = getattr(mod, 'cache', None)
+        if not root or not os.path.isdir(root):
+            continue
+        for base, _dirs, names in os.walk(root):
+            parts = [p.lower() for p in base.replace('\\', '/').split('/')]
+            if source_dir not in parts:
+                continue
+            for name in names:
+                low = name.lower()
+                if low in lows:
+                    full = os.path.join(base, name)
+                    rel = os.path.relpath(full, root).replace('\\', '/')
+                    hits.setdefault(low, []).append(
+                        (rel.count('/'), rel, full,
+                         '%s/%s' % (os.path.basename(root), rel)))
+    return {low: (sorted(v)[0][2], sorted(v)[0][3])
+            for low, v in hits.items() if v}
+
+
 def _reroute_by_folder(candidates, route_target, route_pure=None):
     """
     Make a model's parts follow the model, when they were split across
@@ -7302,7 +7705,7 @@ def _bake_widescreen_ranges(archive, payloads, widescreen, log):
 
 
 def _build_flevel(archive_path, chunks, field_files, romfs, log,
-                  dds_sources=(), widescreen=None):
+                  dds_sources=(), widescreen=None, echo_fields=None):
     """
     Patch flevel.lgp. Three replacement shapes, decided per entry by
     comparing the mod file with how the VANILLA entry is stored:
@@ -7317,12 +7720,27 @@ def _build_flevel(archive_path, chunks, field_files, romfs, log,
     - vanilla entry is LZS-wrapped but not a field (tut files...): re-wrap
       the mod data.
 
-    Plus the existing explicit .chunk.<n> section patches.
+    Plus the existing explicit .chunk.<n> section patches.  Echo-S is a
+    separate, explicit input: it imports only its normalized script section
+    through ``echo_s_flevel`` while retaining the already-composed Switch
+    palette/background and all other non-script sections.
     """
     archive = lgp.Archive(archive_path)
     van_size = os.path.getsize(archive_path)
     payloads = {}
-
+    # The DECOMPRESSED bytes behind `payloads`, for the fields an earlier pass
+    # in this same function already rebuilt.
+    #
+    # THIS IS WHAT LETS THE CHUNK PASS COMPOSE INSTEAD OF REPLACE. That pass
+    # used to start from `archive.decompressed(entry)` unconditionally --
+    # vanilla -- which was harmless while it was the only writer of a given
+    # field. It stopped being harmless the moment Echo-S arrived: Cosmos Limit
+    # Break ships a `.chunk.9` for 683 fields and Echo-S ships a script for
+    # 703, and 682 of those are THE SAME FIELD. Rebuilding from vanilla there
+    # silently discards the section 1 the Echo-S pass just merged, so the mod
+    # would have been inert in all but twenty-one fields -- with no warning
+    # anywhere, because both passes individually reported success.
+    raws = {}
     cap = _field_bg_cap()
     if cap and chunks:
         chunks = _cap_field_backgrounds(chunks, log, cap)
@@ -7391,12 +7809,64 @@ def _build_flevel(archive_path, chunks, field_files, romfs, log,
             log(f'  {name}: field skipped -- it only changes unsafe '
                 f'sections {held} (kept Switch vanilla)')
             continue
-        payloads[name] = _encode_field_cached(
-            archive, lgp.join_sections(van_secs))
+        raws[name] = lgp.join_sections(van_secs)
+        payloads[name] = _encode_field_cached(archive, raws[name])
         msg = f'  {name}: spliced sections {took} from mod'
         if held:
             msg += f', kept Switch-vanilla sections {held}'
         log(msg)
+
+    # Echo-S's field package contains PC field files.  Unlike a generic PC
+    # replacement, section 1 is its actual content (dialogue/event scripts),
+    # so its strictly checked importer is the sole exception to
+    # SAFE_MOD_SECTIONS.  Apply it after ordinary per-file replacements: that
+    # preserves any selected Switch-safe art from lower-priority mods.  The
+    # later explicit chunk pass keeps its long-standing final ownership of
+    # section-specific field-art edits.
+    echo_imported = 0
+    for name, (src, _mod) in sorted((echo_fields or {}).items()):
+        entry = archive.index.get(name)
+        if entry is None or not archive.is_field(entry):
+            raise RuntimeError('Echo-S field %s is not a Switch field entry' %
+                               name)
+        try:
+            with open(src, 'rb') as handle:
+                echo_payload = handle.read()
+            # A prior generic field replacement may already have supplied
+            # section 4/9.  That staged payload—not vanilla—is the base, so
+            # this cannot erase selected Cosmos Limit Break data.
+            base_payload = payloads.get(name, entry['payload'])
+            raw, imported = echo_s_flevel.merge_field_payload(
+                base_payload, echo_payload, field_name=name)
+        except (OSError, ValueError, echo_s_flevel.EchoFlevelError) as exc:
+            raise RuntimeError('Echo-S field %s rejected: %s' %
+                               (name, exc)) from exc
+        if imported:
+            # Archive.encode_field verifies decompression exactly.  Keeping
+            # Echo in the established content-addressed field cache avoids
+            # re-running the compressor for 705 scripts on every build.
+            raws[name] = raw
+            payloads[name] = _encode_field_cached(archive, raw)
+            echo_imported += 1
+    if echo_fields:
+        log('  Echo-S: section 1 merged into %d/%d selected field(s) '
+            '(all non-script Switch sections preserved)'
+            % (echo_imported, len(echo_fields)))
+        # An entity binds to a model by INDEX into section 3, so wherever
+        # Echo-S edited that list its script and the Switch's loader disagree
+        # and every model above the edit is off by one. mds7pb_1 is the case
+        # that surfaced it: the bar's pinball machine rendered as a man.
+        unportable = echo_s_flevel.UNPORTABLE_MODEL_LOADERS
+        log('  Echo-S: model loader taken with the script wherever it '
+            'changed -- an entity binds to a model by index, so section 1 '
+            'and section 3 are one unit')
+        if unportable:
+            log('  ! Echo-S edits the model loader in %d field(s) in a way '
+                'this port cannot follow: it names a model belonging to '
+                'ANOTHER field, and this port keys models per field '
+                '(mds7pb_1fieldbg_pinbl.char). Those keep the Switch loader '
+                'and their models may be mismapped: %s'
+                % (len(unportable), ', '.join(sorted(unportable))))
 
     # Fields whose recomposed bytes match vanilla exactly are LEFT ALONE
     # rather than re-encoded. A section-9 mod is not obliged to change every
@@ -7411,14 +7881,27 @@ def _build_flevel(archive_path, chunks, field_files, romfs, log,
         if entry is None or not archive.is_field(entry):
             log(f'  ! no such field: {field}')
             continue
-        parts = lgp.split_sections(archive.decompressed(entry))
-        # Compared against the RECOMPOSED vanilla field, not the decompressed
-        # one. Vanilla fields carry ~14 bytes past the last section that
-        # join_sections does not reproduce (it lays the sections out
-        # contiguously from the header it writes), so comparing with the
-        # original bytes finds a difference in every single field and the
-        # test never fires.
-        van_raw = lgp.join_sections(parts)
+        # START FROM WHAT THIS BUILD ALREADY COMPOSED, not from vanilla.
+        # `raws` holds the decompressed bytes of any field an earlier pass in
+        # this function rebuilt -- a generic section splice, or Echo-S's
+        # section-1 import. Cosmos Limit Break chunks 683 fields and Echo-S
+        # scripts 703, overlapping in 682, so re-deriving from vanilla here
+        # would drop Echo-S's dialogue in all but twenty-one of them.
+        base_raw = raws.get(field)
+        if base_raw is None:
+            parts = lgp.split_sections(archive.decompressed(entry))
+            # Compared against the RECOMPOSED vanilla field, not the
+            # decompressed one. Vanilla fields carry ~14 bytes past the last
+            # section that join_sections does not reproduce (it lays the
+            # sections out contiguously from the header it writes), so
+            # comparing with the original bytes finds a difference in every
+            # single field and the test never fires.
+            van_raw = lgp.join_sections(parts)
+        else:
+            # Same test, against the composed base: "this chunk adds nothing
+            # to what we already have" keeps the payload already recorded.
+            parts = lgp.split_sections(base_raw)
+            van_raw = base_raw
         for idx, (src, _) in sorted(sections.items()):
             if not 1 <= idx <= 9:
                 continue
@@ -7428,6 +7911,7 @@ def _build_flevel(archive_path, chunks, field_files, romfs, log,
         if raw == van_raw:
             identical += 1
             continue
+        raws[field] = raw
         payloads[field] = _encode_field_cached(archive, raw)
         patched += 1
         if len(chunks) > 100 and (n_done + 1) % 100 == 0:
@@ -8801,6 +9285,417 @@ def _loose_destination(holder, name, dump, log):
     return matches[0].replace(os.sep, '/'), matches[0]
 
 
+def _voice_disabled():
+    """
+    SEVENTH_NX_NO_VOICE=1 -- the whole voice half off, both halves of it.
+
+    Echo-S's data and its voice arrive in the same build, and they fail in
+    completely different ways: a bad script merge is wrong text or missing
+    BGM, a bad runtime is a crash or silence. One flag that turns off the
+    staging AND the runtime together makes that a two-minute ExeFS-only
+    rebuild to tell apart, instead of a bisect that rebuilds a 1.4 GB archive
+    to answer a question about ARM64.
+    """
+    return os.environ.get('SEVENTH_NX_NO_VOICE', '').strip() not in ('', '0')
+
+
+ECHO_BVOICE_OPTION = 'BVoice'
+# Echo-S's `Battle Lines` list, in its own order. The runtime takes the
+# percentage as an immediate, so this is the whole mapping.
+ECHO_BVOICE_PERCENT = {'0': 0, '1': 25, '2': 50, '3': 75, '4': 100}
+
+
+def _echo_battle_percent(plan):
+    """Echo-S's `BVoice` as a percentage, defaulting to its own default (25)."""
+    raw = plan.echo_options.get(ECHO_BVOICE_OPTION,
+                                plan.echo_options.get('bvoice', 1))
+    return ECHO_BVOICE_PERCENT.get(str(raw).strip(), 25)
+
+
+def _battle_vo_entries(plan, triples, log):
+    """
+    Echo-S's battle barks as staging entries, or ([], why not).
+
+    The index is the mod's own `voice/config.toml`, not the clip filenames --
+    see `echo_s_battlevo`. This is a separate staging pass from field voice
+    because it is a separate key scheme: `battle/bc<char><cmd><action><v>`
+    rather than `<field>/<dialog><page>`, and `voice_ogg.stage` takes one
+    naming function per call.
+    """
+    percent = _echo_battle_percent(plan)
+    if not percent:
+        return [], ('Echo-S battle lines: BVoice is Off -- no barks staged '
+                    'and the battle producer is not installed')
+    # The mod root, from any voice file: `full` ends with `rel`, so what is
+    # left is where the .iro was extracted. Derived rather than carried on the
+    # plan, because the only thing that could make it wrong -- a voice file
+    # from somewhere else -- would already have broken the field pass.
+    root = None
+    for rel, full, _mod in plan.voice:
+        rel = rel.replace('\\', '/')
+        full_slash = full.replace(os.sep, '/')
+        if full_slash.endswith(rel):
+            root = full[:len(full) - len(rel)].rstrip('/' + os.sep)
+            break
+    config = echo_s_battlevo.config_path(root) if root else None
+    if not config:
+        return [], ('! Echo-S battle lines: BVoice is %d%% but %s is not in '
+                    'the extracted mod, so the keys the runtime asks for '
+                    'cannot be resolved; no barks staged'
+                    % (percent, echo_s_battlevo.CONFIG_REL))
+    with open(config, encoding='utf-8', errors='replace') as handle:
+        pools = echo_s_battlevo.parse_config(handle.read())
+    sources = echo_s_battlevo.sources_from_files(triples)
+    notes = []
+    entries, missing = echo_s_battlevo.entries(
+        pools, sources, lambda key, path: voicemod.Entry(key,
+                                                         source_path=path),
+        log=notes.append)
+    log('')
+    log('Echo-S battle lines: %d%% -- %d action key(s) (%d exact, %d '
+        'command-only fallbacks) x %d variant(s) = %d name(s) over %d clip(s)'
+        % (percent, len(pools),
+           sum(1 for k in pools if k[2] != 0xFFFF),
+           sum(1 for k in pools if k[2] == 0xFFFF),
+           echo_s_battlevo.VARIANTS, len(entries),
+           len({e.source_path for e in entries})))
+    if missing:
+        log('  %d clip(s) the config names and the mod does not ship (%s%s) '
+            '-- those pools stage their remaining clips'
+            % (len(missing), ', '.join(m.split("/")[-1] for m in missing[:3]),
+               ' ...' if len(missing) > 3 else ''))
+    log('  the pool is shuffled by the action counter\'s low %d bit(s); the '
+        'percentage is the counter itself, so Echo-S\'s silent placeholder '
+        'files are not staged at all'
+        % ff7nx_voice.BATTLE_VARIANT_BITS)
+    return entries, None
+
+
+def echo_scene_bin(plan):
+    """Echo-S's replacement `scene.bin`, or None."""
+    entry = plan.loose.get(('battle', 'scene.bin'))
+    return entry[0] if entry else None
+
+
+def _battle_text_entries(plan, log):
+    """
+    Echo-S's in-battle conversations, or ([], why not).
+
+    A third voice system: field lines are addressed by script state, barks by
+    the action the actor is running, and these by THE LINE ITSELF -- the cave
+    hashes the string the battle text queue is showing. So this needs the
+    actual battle text, which is why it can only run once Echo-S's `scene.bin`
+    is being taken. See `echo_s_battletext`.
+    """
+    scene_bin = echo_scene_bin(plan)
+    if not scene_bin:
+        return [], ('Echo-S battle conversations: the mod ships no scene.bin, '
+                    'so there is no battle text to match clips against')
+    clips = echo_s_battletext.shipped_clips(
+        [(rel, full) for rel, full, _mod in plan.voice])
+    if not clips:
+        return [], ('Echo-S battle conversations: no _battle/<actor>/<line>'
+                    ' clips under voice/, nothing to stage')
+    notes = []
+    made, matched, unmatched = echo_s_battletext.entries(
+        scene_bin, clips,
+        lambda key, path: voicemod.Entry(key, source_path=path),
+        log=notes.append)
+    log('')
+    if not made:
+        # NOT AN ORDINARY ZERO. Both halves are present -- the mod's
+        # scene.bin and its clips -- so every line failing to match means the
+        # two are being read against each other wrongly, and the only symptom
+        # in game is silence. This reported a bare "0 matched" for two builds
+        # while the clip list was being taken from the silent tree.
+        log('! Echo-S battle conversations: scene.bin and %d clip(s) are both '
+            'present and NOT ONE line matched. Nothing is staged, so battle '
+            'conversations will be silent. Expect 32 matches on the Echo-S '
+            'release; a zero here means the clips and the battle text are '
+            'being read against each other wrongly, not that there is '
+            'nothing to say.' % len(clips))
+        return [], None
+    log('Echo-S battle conversations: %d clip(s) matched to battle text, '
+        '%d staged name(s)' % (len(matched), len(made)))
+    log('  the runtime hashes the line it is displaying, and the strings sit '
+        'INLINE in each scene\'s AI script rather than in a pool with an '
+        'offset table -- so every start position whose name matches the clip '
+        'is staged. They are hard links to one encode; the wrong ones are '
+        'never opened.')
+    # Barks are in `clips` too and will never match a sentence, so only the
+    # sentence-shaped leftovers are worth naming.
+    orphans = sorted(n for n in unmatched
+                     if not echo_s_battletext.looks_like_a_bark(n))
+    if orphans:
+        log('  %d clip(s) match no line under FFNx\'s own naming rules '
+            '(decode_ff7_text + tokenize_text): %s. Those carry a character-'
+            'name byte the tokenizer turns into a newline, so the name Echo-S '
+            'gave them is not one the game would ask for.'
+            % (len(orphans), ', '.join(orphans)))
+    return made, None
+
+
+def _emplace_voice(plan, romfs, log, produced, progress=None):
+    """
+    Stage Echo-S's dialogue clips under data/music_ogg, in native form.
+
+    WHY THIS IS NOT `plan.music`
+    ============================
+    They land in the same directory the soundtrack does, because that is the
+    only directory the port will open an .ogg from. They are not music: the
+    music pass is keyed on BASENAME and would collapse 15,505 clips onto a few
+    hundred names, and none of them is a track the game asks for by itself.
+    These are addressed by the RUNTIME, which rebuilds `<field>/<dialog><page>`
+    from live game state, so their subdirectory layout is the index and has to
+    survive intact.
+
+    THE COST, STATED PLAINLY
+    ========================
+    Echo-S's clips are arbitrary PC Vorbis and the native player is only safe
+    at 48 kHz stereo with LOOPSTART=0 and a 100 ms lead-in, so every one is
+    re-encoded. That is a one-time cost: `voice_ogg` content-addresses the
+    result, so the second build over the same mod does no audio work at all
+    and the staged files are hard links to the cache rather than a second
+    copy on disk.
+    """
+    if not plan.voice:
+        return
+    if _voice_disabled():
+        log('')
+        log('Echo-S voice: SEVENTH_NX_NO_VOICE=1 -- %d clip(s) not staged and '
+            'the dialogue runtime will not be installed. Everything else '
+            'about Echo-S (its field scripts, its kernel, the FFNx music '
+            'patches) is unaffected, so this isolates the voice half without '
+            'rebuilding an archive.' % len(plan.voice))
+        return
+    if not voice_ogg.have_ffmpeg():
+        log('! Echo-S voice: ffmpeg is required to re-encode %d clip(s) into '
+            'the shape the native player accepts (set SEVENTH_NX_FFMPEG or '
+            'put ffmpeg on PATH). No voice staged; nothing else is affected.'
+            % len(plan.voice))
+        return
+
+    triples = [(rel, full) for rel, full, _mod in plan.voice]
+
+    # SEVENTH_NX_VOICE_FIELDS: stage only these field folders.
+    #
+    # The full set is 15,505 clips, about nine minutes of encoding on a first
+    # build and 2.8 GB onto the SD card. That is the right thing to ship and
+    # the wrong thing to spend on finding out whether the runtime works at
+    # all, so the first hardware test can name a handful of fields and be a
+    # two-minute build with forty megabytes to copy. `_world` and `nocloud`
+    # come along whenever anything is selected, because the world-map and
+    # party-leader hooks are separate caves worth exercising and cost almost
+    # nothing.
+    wanted = os.environ.get('SEVENTH_NX_VOICE_FIELDS', '').strip()
+    if wanted:
+        keep = {f.strip().lower() for f in wanted.split(',') if f.strip()}
+        keep |= {'_world', 'nocloud'}
+        before = len(triples)
+        triples = [(rel, full) for rel, full in triples
+                   if any(p.lower() in keep
+                          for p in rel.replace('\\', '/').split('/'))]
+        log('')
+        log('Echo-S voice: SEVENTH_NX_VOICE_FIELDS is set -- staging %d of '
+            '%d clip(s), for %s (plus _world and the NoCloud overlays). '
+            'Unset it for the full set.'
+            % (len(triples), before, ', '.join(sorted(keep - {'_world',
+                                                              'nocloud'}))))
+
+    notes = []
+    entries = []
+    entries += voicemod.ingest_field_vo_from_files(triples, log=notes.append)
+    entries += voicemod.ingest_world_vo_from_files(triples, log=notes.append)
+    entries += voicemod.ingest_nocloud_vo_from_files(triples, log=notes.append)
+    if not entries:
+        log('! Echo-S voice: %d file(s) under voice/ but none of them matched '
+            'a dialogue line; nothing staged' % len(plan.voice))
+        return
+
+    log('')
+    log('Echo-S voice: %d clip(s) from %d file(s) under voice/'
+        % (len(entries), len(plan.voice)))
+    battle_entries, battle_note = _battle_vo_entries(plan, triples, log)
+    text_entries, text_note = _battle_text_entries(plan, log)
+    # `notes` carries ingestion's running commentary as well as its refusals.
+    # Only the refusals are worth a build-log line, and counting the lot would
+    # have reported four times as many skipped files as there were.
+    notes = [n for n in notes if n.startswith('skip')]
+    if notes:
+        # Named, not just counted. These are authoring leftovers whose names
+        # do not match FFNx's own <dialog><page> convention, so there is no
+        # line they could be attached to -- but "unrecognised" is also what a
+        # genuinely mis-ingested file looks like, and the only way to tell the
+        # two apart is to be able to read the names.
+        shown = []
+        for note in notes[:4]:
+            path = note.rsplit(': ', 1)[-1]
+            shown.append('/'.join(path.replace('\\', '/').split('/')[-2:]))
+        log('  %d file(s) skipped as unrecognised -- names that match no '
+            'dialogue line: %s%s'
+            % (len(notes), ', '.join(shown),
+               ' ...' if len(notes) > len(shown) else ''))
+
+    out = os.path.join(romfs, MUSIC_DIR)
+    tick = None
+    if progress is not None:
+        def tick(done, total):
+            progress(done, total, 'Echo-S voice')
+    try:
+        report = voice_ogg.stage(entries, out, log=log, progress=tick)
+    except (voicemod.BadArchive, voice_ogg.VoiceEncodeError) as exc:
+        log('! Echo-S voice: %s -- nothing staged, and nothing else in the '
+            'build is affected' % exc)
+        return
+    produced.extend(report['produced'])
+    log('  %d encoded, %d taken from the cache; %d linked into sdout, %d '
+        'already in place' % (report['encoded'], report['cached'],
+                              report['linked'], report['kept']))
+    if battle_note:
+        log('  %s' % battle_note)
+    elif battle_entries:
+        # A second pass, not a second list: these keys are named by a
+        # different function, and `stage` takes one per call.
+        try:
+            battle = voice_ogg.stage(battle_entries, out,
+                                     filename=echo_s_battlevo.filename,
+                                     log=log, progress=tick)
+        except (voicemod.BadArchive, voice_ogg.VoiceEncodeError) as exc:
+            log('! Echo-S battle lines: %s -- no barks staged; field voice '
+                'and everything else are unaffected' % exc)
+        else:
+            produced.extend(battle['produced'])
+            report['bytes'] += battle['bytes']
+            report['ms'] += battle['ms']
+            log('  battle: %d encoded, %d from the cache; %d name(s) linked '
+                'into sdout%s'
+                % (battle['encoded'], battle['cached'], battle['linked'],
+                   ', %d could not be encoded' % len(battle['failed'])
+                   if battle['failed'] else ''))
+    if text_note:
+        log('  %s' % text_note)
+    elif text_entries:
+        try:
+            spoken = voice_ogg.stage(text_entries, out,
+                                     filename=echo_s_battletext.filename,
+                                     log=log, progress=tick)
+        except (voicemod.BadArchive, voice_ogg.VoiceEncodeError) as exc:
+            log('! Echo-S battle conversations: %s -- none staged; nothing '
+                'else in the build is affected' % exc)
+        else:
+            produced.extend(spoken['produced'])
+            report['bytes'] += spoken['bytes']
+            report['ms'] += spoken['ms']
+            log('  battle text: %d encoded, %d from the cache; %d name(s) '
+                'linked into sdout' % (spoken['encoded'], spoken['cached'],
+                                       spoken['linked']))
+    log('  encoder: %s' % voice_ogg.encoder_detail())
+    warning = voice_ogg.encoder_warning()
+    if warning:
+        log('! Echo-S voice: %s' % warning)
+    if report.get('failed'):
+        # Named, and never silent. Each of these is one line of dialogue that
+        # will be mute in game, and the name is what makes it possible to say
+        # which line and to tell a broken source file from a broken encoder.
+        log('! %d of %d clip(s) could not be encoded and are NOT staged -- '
+            'those lines will be silent; everything else is unaffected:'
+            % (len(report['failed']), report['clips']))
+        for name, source, why in report['failed'][:6]:
+            log('    %s  <- %s' % (name, os.path.basename(source or '?')))
+        if len(report['failed']) > 6:
+            log('    ... and %d more' % (len(report['failed']) - 6))
+        log('    first reason: %s' % report['failed'][0][2])
+    log('  %.1f MB of dialogue, %.0f minutes of speech, under %s/  (%s)'
+        % (report['bytes'] / 1048576.0, report['ms'] / 60000.0, MUSIC_DIR,
+           report['bitrate']))
+    log('    Echo-S\'s own clips run 127-517 kbps (median 375), so the 500k '
+        'default is chosen to lose nothing in the transcode rather than to '
+        'save space -- it is not a reduced-quality setting. '
+        'SEVENTH_NX_VOICE_BITRATE=256k roughly halves the SD card cost and is '
+        'still at or above most of the sources; 128k is genuinely below them.')
+    log('  48 kHz stereo Vorbis, LOOPSTART=0, %d ms lead-in -- the only shape '
+        'the native player is safe with; every clip was verified against the '
+        'decoder invariants before it was cached'
+        % voice_ogg.LEAD_IN_MS)
+
+
+def _emplace_echo_kernel(plan, romfs, dump, log, produced):
+    """
+    Merge Echo-S's kernel records into the Switch containers, section by
+    section.
+
+    WHY NOT JUST COPY THEM
+    ======================
+    Both files are compressed containers, and the PC and Switch builds do not
+    frame them the same way. KERNEL.BIN is a stream of counted gzip records;
+    kernel2.bin is an LZS blob with its own eighteen-section table. Dropping
+    Echo-S's PC file on top of the Switch one replaces the Switch framing as
+    well as the content, which is how you get a kernel the port cannot read at
+    all rather than one with different text in it.
+
+    `echo_s_kernel` decodes both sides, takes only the logical sections Echo-S
+    actually changed, and re-frames the result the way the Switch file was
+    framed. One section is deliberately held back: KERNEL.BIN's 128-entry
+    weapon table carries a normal-hit SFX id per weapon, and Echo-S rewrites
+    Barret's and Vincent's so FFNx can route them through numeric SFX
+    replacements. This port routes those through Cosmo Memory's
+    character-aware `battle_char` bridges instead, which read the STOCK ids --
+    so importing Echo's would make exactly those two characters silent.
+
+    THE BASE IS WHAT THIS BUILD ALREADY STAGED, NOT THE DUMP
+    ========================================================
+    Modern Spell Names and Enhanced Stock UI both ship a kernel2.bin, and the
+    ordinary loose-file pass has already resolved between them and written its
+    winner. Starting from that file rather than from the dump means Echo-S
+    merges ON TOP of the selected spell-name table instead of discarding it,
+    and only for the sections Echo-S itself changed. The changed-section list
+    is logged both ways round so an actual clash is visible rather than silent.
+    """
+    if not plan.echo_kernel:
+        return
+    import echo_s_kernel
+    if plan.echo_kernel_skipped:
+        log('Echo-S kernel: %d alternate/PC file(s) deliberately not taken '
+            '(Vanilla/Legionz/OldSpellNames packages and the PC window.bin, '
+            'which is font-width data the Switch renderer does not share)'
+            % len(plan.echo_kernel_skipped))
+    for name in sorted(plan.echo_kernel):
+        src, _mod = plan.echo_kernel[name]
+        rel, found = _loose_destination('kernel', name, dump, log)
+        dest = os.path.join(romfs, *rel.split('/'))
+        if os.path.isfile(dest) and os.path.normpath(os.path.abspath(dest)) \
+                in {os.path.normpath(os.path.abspath(p)) for p in produced}:
+            base_path, base_why = dest, "this build's own"
+        elif found is not None:
+            base_path, base_why = os.path.join(dump.workingdir, found), "the dump's"
+        else:
+            log('! Echo-S kernel: no Switch %s to merge against -- skipped '
+                '(Echo-S text will not appear)' % name)
+            continue
+        with open(base_path, 'rb') as handle:
+            base = handle.read()
+        with open(src, 'rb') as handle:
+            echo = handle.read()
+        try:
+            if name == 'kernel2.bin':
+                merged, changed = echo_s_kernel.merge_kernel2(base, echo)
+            else:
+                merged, changed = echo_s_kernel.merge_gzip_container(
+                    base, echo, preserve_weapon_sfx=True)
+        except (echo_s_kernel.EchoKernelError, ValueError) as exc:
+            log('! Echo-S kernel: %s rejected: %s -- keeping %s unchanged'
+                % (name, exc, name))
+            continue
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        with open(dest, 'wb') as handle:
+            handle.write(merged)
+        if dest not in produced:
+            produced.append(dest)
+        log('Echo-S kernel: %s <- %d changed section(s) %s, merged onto %s '
+            'copy' % (rel, len(changed),
+                      list(changed) if changed else '[]', base_why))
+
+
 def _battle_stage_vanilla_path(stage_num, dump, log):
     """Find data/battle/stage<NN>.dat in the dump, mirroring
     _loose_destination's found-not-assumed approach."""
@@ -9176,6 +10071,13 @@ NO_ARCHIVE_CACHE_ENV = 'SEVENTH_NX_NO_ARCHIVE_CACHE'
 # exactly the one recorded by this packer's cache and restores its measured
 # maximum field size before any module patch runs.
 REUSE_FLEVEL_ENV = 'SEVENTH_NX_REUSE_FLEVEL'
+# One-shot recovery for a cache record whose fingerprint was stranded even
+# though the archive itself is still byte-for-byte the file it recorded.  It
+# is deliberately opt-in: a normal fast build must continue to reject changed
+# sources rather than guess.  `_reuse_existing_flevel` still requires the
+# existing archive's recorded size, mtime and decompression-buffer payload to
+# be intact before it will rebaseline its metadata.
+REBASE_FLEVEL_ENV = 'SEVENTH_NX_REBASE_FLEVEL_CACHE'
 
 # BUILD 324. `_archive_fingerprint` hashes every .py in this folder that is
 # not in MAIN_ONLY_MODULES -- **build.py included** -- so editing the build
@@ -9212,7 +10114,8 @@ def _reuse_requested(name):
 # Every name that only changes build SCHEDULING, never archive bytes. Putting
 # them in the fingerprint would make asking to skip battle.lgp invalidate
 # magic.lgp, which is the opposite of the point.
-SCHEDULING_ENV = frozenset([REUSE_FLEVEL_ENV, REUSE_ALL_ENV]
+SCHEDULING_ENV = frozenset([REUSE_FLEVEL_ENV, REUSE_ALL_ENV,
+                            REBASE_FLEVEL_ENV]
                            + list(REUSE_ARCHIVE_ENV.values()))
 
 # BUILD 326. The 60 FPS setting. It is a GUI/CLI setting, not an environment
@@ -9225,9 +10128,24 @@ SCHEDULING_ENV = frozenset([REUSE_FLEVEL_ENV, REUSE_ALL_ENV]
 # 60 FPS must not invalidate flevel.lgp (1.4 GB) to no purpose.
 FPS_ENV = 'SEVENTH_NX_60FPS'
 
+# BUILD 439. `SEVENTH_NX_DW_HRC` decides whether `.hrc` bone tokens are
+# rewritten, which changes the bytes of the model archives Dynamic Weapons
+# writes into -- char.lgp -- and NOTHING else. Left in the generic
+# environment sweep it invalidated every archive including flevel.lgp, so
+# asking for a one-archive experiment demanded the 1.4 GB rebuild the
+# experiment exists to avoid. Same treatment as FPS_ENV: out of the sweep,
+# folded into the `extra` of the archives it can actually reach.
+DW_HRC_ENV = ff7nx_dynweapon.HRC_MODE_ENV
+
 
 def fps_60_requested():
     return _truthy(FPS_ENV)
+
+
+def _dynweapon_targets(plan):
+    """Archive names the dynamic-weapons pass writes into, or ()."""
+    return frozenset(item['archive']
+                     for item in getattr(plan, 'dynweapon', ()) or ())
 
 
 # Archives this invocation KEPT rather than built, by name. Two later passes
@@ -9311,6 +10229,24 @@ MAIN_ONLY_ENV = frozenset((
     'SEVENTH_NX_SWIRL_GPU',      # ff7nx_swirlgpu   its capture path
     'SEVENTH_NX_GPU_CAP',        # ff7nx_gpucap     the GPU target's size
     'SEVENTH_NX_SUMMON_REACH',   # ff7nx_summonreach
+    # Echo-S voice. None of these four can change an archive's bytes: the
+    # first three decide which loose .ogg files are staged under music_ogg and
+    # how they are encoded, the fourth turns the module pass off. Leaving them
+    # in the generic sweep would mean scoping a voice test to six fields --
+    # the whole point of which is a two-minute rebuild -- invalidated
+    # flevel.lgp and cost forty minutes instead.
+    'SEVENTH_NX_VOICE_FIELDS',   # voicemod   which fields to stage
+    'SEVENTH_NX_VOICE_BITRATE',  # voice_ogg  encode quality (its own cache)
+    'SEVENTH_NX_VOICE_WORKERS',  # voice_ogg  encoder parallelism
+    'SEVENTH_NX_NO_VOICE',       # ff7nx_voice   the whole half, off
+    'SEVENTH_NX_VOICE_LEVEL',    # ff7nx_voice   which layers to install
+    'SEVENTH_NX_VOICE_FORCED_NAME',  # ff7nx_voice  bisect: skip the key builder
+    'SEVENTH_NX_VOICE_MESSAGE_PHASE',  # ff7nx_voice  which MESSAGE site
+    'SEVENTH_NX_VOICE_MESSAGE_STUB',   # ff7nx_voice  diagnostic empty cave
+    'SEVENTH_NX_VOICE_DUCK',     # ff7nx_voice   BGM level under speech
+    'SEVENTH_NX_VOICE_FOREIGN',  # ff7nx_voice   second-window line: defer/drop
+    'SEVENTH_NX_VOICE_CLOSE',    # ff7nx_voice   window close: play/stop
+    'SEVENTH_NX_VOICE_TRIGGER',  # ff7nx_voice   publish on dialog/state
 ))
 
 # The modules those settings reach, by the same rule: each writes into
@@ -9326,6 +10262,22 @@ MAIN_ONLY_MODULES = frozenset((
     'ff7nx_ifritsrc.py',
     'ff7nx_swirlgpu.py', 'ff7nx_gpucap.py',
     'ff7nx_summonreach.py',
+    # Echo-S. `ff7nx_voice` and `ff7nx_echomusic` are module patches by the
+    # same rule as everything above: caves and hook words, nothing else.
+    # `voicemod` and `voice_ogg` write LOOSE .ogg files under music_ogg, which
+    # is not an archive and is not covered by an archive fingerprint at all.
+    #
+    # This matters more than it looks. All the remaining Echo-S work is in
+    # `ff7nx_voice.py` -- battle barks, ducking, whatever the hardware says
+    # next -- and without this line every edit to it would invalidate
+    # flevel.lgp and cost a 1.4 GB rebuild to answer a question about ARM64.
+    #
+    # `echo_s_flevel.py` is deliberately NOT here: it decides what goes into
+    # the field archive, so editing it must rebuild it. Nor is
+    # `echo_s_kernel.py`, which is cheap to be conservative about.
+    'ff7nx_voice.py', 'ff7nx_echomusic.py',
+    'voicemod.py', 'voice_ogg.py', 'echo_s_battlevo.py',
+    'echo_s_battletext.py',
 ))
 
 
@@ -9336,6 +10288,18 @@ def _stat_sig(path):
         return (st.st_size, st.st_ns if hasattr(st, 'st_ns') else st.st_mtime_ns)
     except OSError:
         return None
+
+
+def _field_dds_fingerprint(sources):
+    """Stable cache representation of field IRO paths and folder filters.
+
+    The filters are sets. Their repr order varies with Python's hash seed,
+    so sorting only the outer list caused unchanged flevel inputs to miss
+    the cache between launches. Keep None (all folders) distinct from an
+    empty filter, and sort the folder names before hashing.
+    """
+    return sorted((path, None if allowed is None else tuple(sorted(allowed)))
+                  for path, allowed in (sources or ()))
 
 
 def _ws_fingerprint(widescreen):
@@ -9409,7 +10373,8 @@ def _archive_fingerprint(name, archive_path, files, extra):
         # instead: it is the only archive whose bytes it changes, and a
         # 1.4 GB flevel rebuild on every 60 FPS toggle is pure waste.
         if (k.startswith('SEVENTH_NX') and k not in SCHEDULING_ENV
-                and k != FPS_ENV and k not in MAIN_ONLY_ENV):
+                and k != FPS_ENV and k != DW_HRC_ENV
+                and k not in MAIN_ONLY_ENV):
             h.update(('%s=%s\0' % (k, os.environ[k])).encode())
     for fn in sorted(os.listdir(HERE)):
         # Same rule as MAIN_ONLY_ENV: these modules only ever write into
@@ -9418,6 +10383,55 @@ def _archive_fingerprint(name, archive_path, files, extra):
         # build.py included.
         if fn.endswith('.py') and fn not in MAIN_ONLY_MODULES:
             h.update(('%s|%r' % (fn, _stat_sig(os.path.join(HERE, fn)))).encode())
+    h.update(repr(extra).encode())
+    return h.hexdigest()
+
+
+INPUTS_FP_TAG = 'inputs='
+
+
+def _archive_inputs_fingerprint(name, archive_path, files, extra):
+    """
+    The half of `_archive_fingerprint` that is about the MOD DATA, not us.
+
+    WHY THIS EXISTS
+    ---------------
+    The combined key hashes every .py in this folder, build.py included, so
+    editing the packer at all invalidates flevel -- correct by default, since
+    build.py really can change an archive's bytes. But during a debugging
+    cycle that is the wrong trade: every edit to an ExeFS-only feature costs
+    either a 40-minute flevel rebuild or a blanket `SEVENTH_NX_REBASE_FLEVEL_
+    CACHE=1`, and that blanket flag also waves through a genuine INPUT change,
+    which is the one thing the guard exists to catch.
+
+    Splitting the key lets `_reuse_existing_flevel` tell the two apart: if the
+    mods, their files, the settings and the widescreen data are all unchanged
+    and only our code moved, the existing archive is still exactly what this
+    build would produce, so it is kept and the record is refreshed. If any
+    INPUT changed, it still refuses, flag or no flag.
+
+    Deliberately a second pass rather than a refactor of the combined key: the
+    combined value must stay byte-identical or every archive in the cache
+    invalidates once, which is the cost this is trying to avoid.
+    """
+    h = hashlib.sha1()
+    h.update(b'ARCHIVE-INPUTS-V1\0' + name.encode())
+    h.update(repr(_stat_sig(archive_path)).encode())
+    for low in sorted(files):
+        v = files[low]
+        src = v[0] if isinstance(v, (tuple, list)) else v
+        if isinstance(src, dict):
+            for k in sorted(src):
+                q = src[k]
+                q = q[0] if isinstance(q, (tuple, list)) else q
+                h.update(('%s|%s|%r' % (low, k, _stat_sig(q))).encode())
+            continue
+        h.update(('%s|%r' % (low, _stat_sig(src))).encode())
+    for k in sorted(os.environ):
+        if (k.startswith('SEVENTH_NX') and k not in SCHEDULING_ENV
+                and k != FPS_ENV and k != DW_HRC_ENV
+                and k not in MAIN_ONLY_ENV):
+            h.update(('%s=%s\0' % (k, os.environ[k])).encode())
     h.update(repr(extra).encode())
     return h.hexdigest()
 
@@ -9445,6 +10459,19 @@ def _archive_record(name):
             except ValueError:
                 fps_sig = None
     return fp, size, mtime, payload, fps_sig
+
+
+def _archive_stored_inputs_fp(name):
+    """The inputs-only fingerprint in a record, or None for an old one."""
+    try:
+        with open(os.path.join(ARCHIVE_FP_CACHE, name + '.fp')) as f:
+            parts = f.read().split('\n')
+    except OSError:
+        return None
+    for line in parts[4:]:
+        if line.startswith(INPUTS_FP_TAG):
+            return line[len(INPUTS_FP_TAG):].strip() or None
+    return None
 
 
 def _archive_on_disk_is_ours(dest, size, mtime, fps_sig):
@@ -9529,7 +10556,7 @@ def _accept_fps_state(name, state, log):
     return True
 
 
-def _archive_cache_store(name, dest, fp, payload=''):
+def _archive_cache_store(name, dest, fp, payload='', inputs_fp=None):
     try:
         os.makedirs(ARCHIVE_FP_CACHE, exist_ok=True)
         sig = _stat_sig(dest)
@@ -9537,6 +10564,8 @@ def _archive_cache_store(name, dest, fp, payload=''):
             return
         with open(os.path.join(ARCHIVE_FP_CACHE, name + '.fp'), 'w') as f:
             f.write('%s\n%d\n%d\n%s\n' % (fp, sig[0], sig[1], payload))
+            if inputs_fp:
+                f.write('%s%s\n' % (INPUTS_FP_TAG, inputs_fp))
     except OSError:
         pass
 
@@ -9595,14 +10624,17 @@ def _archive_restat(name, dest, log=lambda *_: None, why=''):
         'fast-reuse build can still recognise it)' % (name, why or 'this pass'))
 
 
-def _reuse_existing_flevel(sdout, log=lambda *_: None):
+def _reuse_existing_flevel(sdout, expected_fp, log=lambda *_: None,
+                           expected_inputs_fp=None):
     """Validate and preserve sdout's current flevel.lgp for a fast build.
 
     Returns its absolute path and restores ``FIELD_BG_MAX_RAW`` from the
-    metadata written when that exact file was built.  Refusing on a missing
-    or externally changed file is deliberate: without the cached measurement,
-    later exefs/main passes could size the field decompression buffer for a
-    different archive and turn a time-saving option into a crash.
+    metadata written when that exact file was built.  Refusing on a missing,
+    externally changed, *or differently sourced* file is deliberate: without
+    the cached measurement, later ExeFS passes could size the field
+    decompression buffer for a different archive and turn a time-saving
+    option into a crash.  The source fingerprint check also prevents a
+    requested fast build from silently retaining stale Echo-S scripts.
     """
     dest = os.path.join(sdout, 'atmosphere', 'contents', TITLE_ID, ROMFS,
                         ARCHIVES['flevel.lgp'])
@@ -9615,6 +10647,7 @@ def _reuse_existing_flevel(sdout, log=lambda *_: None):
     try:
         with open(rec) as f:
             parts = f.read().split('\n')
+        stored_fp = parts[0]
         size, mtime, payload = int(parts[1]), int(parts[2]), int(parts[3])
     except (OSError, IndexError, TypeError, ValueError):
         raise RuntimeError(
@@ -9629,6 +10662,63 @@ def _reuse_existing_flevel(sdout, log=lambda *_: None):
         raise RuntimeError(
             '%s=1 refused: cached flevel decompression size is invalid; run '
             'one normal build first' % REUSE_FLEVEL_ENV)
+    if not expected_fp or stored_fp != expected_fp:
+        # ONLY OUR CODE MOVED -> KEEP IT. The combined key hashes every .py in
+        # this folder, so any packer edit lands here even when nothing that
+        # reaches flevel changed. The inputs-only key answers the question the
+        # guard actually cares about: are the mods, their files, the settings
+        # and the widescreen data still the ones this archive was built from?
+        # If they are, this archive is exactly what a rebuild would produce.
+        #
+        # A genuine input change still refuses below, with or without the
+        # rebase flag -- that is the case that would silently ship stale
+        # Echo-S scripts, which is why the guard exists at all.
+        stored_inputs = _archive_stored_inputs_fp('flevel.lgp')
+        if (expected_inputs_fp and stored_inputs
+                and stored_inputs == expected_inputs_fp):
+            log('flevel.lgp: the packer changed but every flevel INPUT is '
+                'unchanged -- keeping the existing archive and refreshing its '
+                'record (no rebuild, no %s needed)' % REBASE_FLEVEL_ENV)
+            _archive_cache_store('flevel.lgp', dest, expected_fp,
+                                 str(payload), expected_inputs_fp)
+        elif not _truthy(REBASE_FLEVEL_ENV):
+            what = ('build code' if stored_inputs
+                    and expected_inputs_fp == stored_inputs
+                    else 'flevel inputs or build code')
+            raise RuntimeError(
+                '%s=1 refused: %s changed; run one normal build first'
+                % (REUSE_FLEVEL_ENV, what))
+        # This is intentionally not an automatic migration. The caller has
+        # explicitly audited the inputs and asked to retain this exact archive;
+        # we only repair the metadata after proving it is still the precise
+        # file the old record described. No archive bytes are read, changed or
+        # regenerated here.
+        try:
+            with open(rec, 'w') as f:
+                f.write('%s\n%d\n%d\n%d\n' %
+                        (expected_fp, size, mtime, payload))
+                # Plant the inputs-only key while we are here. Without it the
+                # next packer edit lands in the same chicken-and-egg: the
+                # cheap path needs a stored inputs key to compare against, and
+                # only a rebase or a full rebuild ever wrote one.
+                if expected_inputs_fp:
+                    f.write('%s%s\n' % (INPUTS_FP_TAG, expected_inputs_fp))
+        except OSError as exc:
+            raise RuntimeError(
+                '%s=1 could not refresh flevel cache metadata: %s'
+                % (REBASE_FLEVEL_ENV, exc))
+        log('flevel.lgp: cache fingerprint rebaselined for the verified '
+            'existing archive; no flevel bytes were rebuilt or changed')
+    # SELF-HEAL. A record written before the inputs key existed cannot answer
+    # "did only our code change?", so the first packer edit after it still
+    # costs a rebase. Writing the key now, on a build where the combined key
+    # DID match and the inputs are therefore known-good, means that happens
+    # once per cache rather than once per edit.
+    if expected_inputs_fp and _archive_stored_inputs_fp('flevel.lgp') is None:
+        _archive_cache_store('flevel.lgp', dest, expected_fp, str(payload),
+                             expected_inputs_fp)
+        log('flevel.lgp: recorded the inputs-only cache key for this archive '
+            '(later packer edits will not need a rebuild or a rebase)')
     global FIELD_BG_MAX_RAW
     FIELD_BG_MAX_RAW = payload
     KEPT_ARCHIVES.add('flevel.lgp')
@@ -9778,13 +10868,42 @@ def apply_plan(plan, archive_paths, sdout, log=lambda *_: None,
 
     model_targets = sorted(a for a in plan.archive_files if a != 'flevel.lgp')
     flevel_fields = plan.archive_files.get('flevel.lgp', {})
-    do_flevel = bool(plan.chunks) or bool(flevel_fields)
+    do_flevel = bool(plan.chunks) or bool(flevel_fields) or bool(plan.echo_fields)
+    ffp = None
+    ffp_inputs = None
+    if 'flevel.lgp' in archive_paths:
+        # Echo fields do not enter `archive_files`: they have a dedicated,
+        # section-1-only path.  Include their source signatures explicitly or
+        # an archive-cache hit could retain the prior dialogue scripts after
+        # an Echo option/UI variant changed.
+        ffp = _archive_fingerprint(
+            'flevel.lgp', archive_paths['flevel.lgp'], dict(flevel_fields),
+            (sorted((k, sorted(v)) for k, v in plan.chunks.items()),
+             sorted((name, _stat_sig(src))
+                    for name, (src, _mod) in plan.echo_fields.items()),
+             _field_dds_fingerprint(plan.field_dds_sources),
+             # the widescreen config decides 41 fields' camera ranges,
+             # and it lives outside `flevel_fields`, so it has to be in
+             # the key by hand or swapping mods would reuse a stale
+             # archive built against the previous one
+             _ws_fingerprint(plan.widescreen)))
+        # The same key minus the packer's own .py files -- see
+        # `_archive_inputs_fingerprint`. Built from identical arguments so the
+        # two can only disagree about our code.
+        ffp_inputs = _archive_inputs_fingerprint(
+            'flevel.lgp', archive_paths['flevel.lgp'], dict(flevel_fields),
+            (sorted((k, sorted(v)) for k, v in plan.chunks.items()),
+             sorted((name, _stat_sig(src))
+                    for name, (src, _mod) in plan.echo_fields.items()),
+             _field_dds_fingerprint(plan.field_dds_sources),
+             _ws_fingerprint(plan.widescreen)))
     reuse_flevel = _truthy(REUSE_FLEVEL_ENV) or _truthy(REUSE_ALL_ENV)
     if reuse_flevel:
         # Add it to `produced` even though this invocation did not write it.
         # prune_stale() only knows that list; omitting the reused archive here
         # would make the fast mode delete the very file it promised to keep.
-        produced.append(_reuse_existing_flevel(sdout, log))
+        produced.append(_reuse_existing_flevel(
+            sdout, ffp, log, expected_inputs_fp=ffp_inputs))
     total = len(model_targets) + (1 if do_flevel and not reuse_flevel else 0)
     step = 0
 
@@ -9833,7 +10952,11 @@ def apply_plan(plan, archive_paths, sdout, log=lambda *_: None,
              # really does change this ONE archive's bytes and has to be in
              # its key. It is excluded from the generic environment sweep so
              # it cannot invalidate the other four.
-             fps_60_requested() if name == 'battle.lgp' else 0))
+             fps_60_requested() if name == 'battle.lgp' else 0,
+             # BUILD 439, same rule: only the archives dynamic weapons
+             # actually writes into can change when this flips.
+             (ff7nx_dynweapon.hrc_rewrite_enabled()
+              if name in _dynweapon_targets(plan) else 0)))
         hit, payload = _archive_cache_ok(name, dest_path, fp, log)
         if hit:
             produced.append(dest_path)
@@ -9880,20 +11003,29 @@ def apply_plan(plan, archive_paths, sdout, log=lambda *_: None,
         step += 1
         if 'flevel.lgp' in archive_paths:
             fdest = os.path.join(romfs, ARCHIVES['flevel.lgp'])
-            ffp = _archive_fingerprint(
-                'flevel.lgp', archive_paths['flevel.lgp'],
-                dict(flevel_fields),
-                (sorted((k, sorted(v)) for k, v in plan.chunks.items()),
-                 sorted(plan.field_dds_sources or ()),
-                 # the widescreen config decides 41 fields' camera ranges,
-                 # and it lives outside `flevel_fields`, so it has to be in
-                 # the key by hand or swapping mods would reuse a stale
-                 # archive built against the previous one
-                 _ws_fingerprint(plan.widescreen)))
+            # `ffp` was deliberately calculated before the optional fast
+            # reuse check.  The same input identity is now required for a
+            # cache hit and for an explicit reuse request.
             hit, payload = _archive_cache_ok('flevel.lgp', fdest, ffp, log)
             if hit:
                 produced.append(fdest)
                 dest = None
+                # ARM THE CHEAP PATH ON A HIT, NOT ONLY ON A REBUILD.
+                # The inputs-only key used to be written in one place: the
+                # branch below, which runs only when flevel is actually
+                # rebuilt. A build that CONFIRMS the archive is current left
+                # the record exactly as it found it -- so a record with no
+                # inputs key kept not having one, and the next packer edit hit
+                # "flevel inputs or build code changed" with no way out but a
+                # 40-minute rebuild or a blanket rebase. Which is the loop
+                # this whole split was meant to end.
+                #
+                # A hit means the combined key matched, so the inputs matched
+                # too, and the file is byte-identical to the one the record
+                # already describes. Writing the key here states something
+                # already proven.
+                _archive_cache_store('flevel.lgp', fdest, ffp,
+                                     payload if payload else '', ffp_inputs)
                 # restore the side effect the skipped build would have set
                 global FIELD_BG_MAX_RAW
                 try:
@@ -9908,10 +11040,10 @@ def apply_plan(plan, archive_paths, sdout, log=lambda *_: None,
                 dest = _build_flevel(archive_paths['flevel.lgp'], plan.chunks,
                                      flevel_fields, romfs, log,
                                      plan.field_dds_sources,
-                                     plan.widescreen)
+                                     plan.widescreen, plan.echo_fields)
                 if dest:
                     _archive_cache_store('flevel.lgp', dest, ffp,
-                                         str(FIELD_BG_MAX_RAW))
+                                         str(FIELD_BG_MAX_RAW), ffp_inputs)
             if dest:
                 produced.append(dest)
         else:
@@ -9940,6 +11072,8 @@ def apply_plan(plan, archive_paths, sdout, log=lambda *_: None,
         log('loose data file: %s%s'
             % (rel, '' if found else '   (assumed -- no vanilla copy found)'))
 
+    _emplace_echo_kernel(plan, romfs, dump, log, produced)
+
     for low, (src, _) in plan.music.items():
         dest = os.path.join(romfs, MUSIC_DIR, low)
         os.makedirs(os.path.dirname(dest), exist_ok=True)
@@ -9947,6 +11081,14 @@ def apply_plan(plan, archive_paths, sdout, log=lambda *_: None,
         produced.append(dest)
     if plan.music:
         log(f'copied {len(plan.music)} music files')
+
+    # AFTER the music copy, and into the same directory. The two cannot
+    # collide -- a track is `<name>.ogg` at the top of music_ogg and a
+    # dialogue clip is always at least one directory down -- but the ordering
+    # is still deliberate: if a soundtrack mod ever did ship a top-level name
+    # that matched, the track the player asks for by name should win over a
+    # voice clip nothing would look for there.
+    _emplace_voice(plan, romfs, log, produced, progress)
 
     # Executable channel: a base x86 ff7 exe (optionally with HEXT baked in)
     # routed to the romfs exe path via LayeredFS. The base exe is found from
@@ -11045,6 +12187,374 @@ def apply_ambient(sdout, dump, plan, log=lambda *_: None, produced=()):
     log('  world/menu stop caves +0x%X / +0x%X; %d-byte BSS at +0x%X'
         % (report['world_entry'], report['menu_entry'], report['bss_bytes'],
            report['scratch']))
+    return [dest] if not built else []
+
+
+def apply_echo_music(sdout, dump, plan, log=lambda *_: None, produced=()):
+    """
+    Install the two FFNx music-compatibility patches Echo-S's scripts assume.
+
+    THIS IS NOT A VOICE PASS. It runs whenever Echo-S's field scripts were
+    taken into flevel, with or without any voice layer, because the scripts
+    themselves are what depend on it: FFNx clears the music lock on every
+    field load and masks the AKAO command byte, and a field script written
+    against that behaviour comes up silent on a build that does neither.
+
+    Unlike the Cosmo bridges this one does NOT fail quietly. If it cannot be
+    installed, the flevel in this same build already contains Echo-S's scripts,
+    so skipping it would ship a game whose towns have no music -- a failure
+    that looks like a field-art bug and would cost a hardware round trip to
+    find. The build stops instead, with the site named.
+    """
+    if not plan.echo_fields:
+        return []
+    src, built = _audio_bridge_base(sdout, dump, log, produced,
+                                    'Echo-S music compatibility')
+    if src is None:
+        raise RuntimeError(
+            'Echo-S field scripts were merged into flevel.lgp but the music '
+            'compatibility patches could not be based on a module this build '
+            'produced; the two halves must ship together')
+    dest = os.path.join(sdout, 'atmosphere', 'contents', TITLE_ID, 'exefs',
+                        'main')
+    log('')
+    log('Echo-S music compatibility ...')
+    log('  base main   %s%s'
+        % (src, '   (previous patch output)' if built else '   (from dump)'))
+    tmp = dest + '.echomusic-tmp'
+    try:
+        report = ff7nx_echomusic.apply_to_nso(src, tmp)
+    except Exception:                                          # noqa: BLE001
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        raise
+    os.replace(tmp, dest)
+    log('  field-load music lock cleared at guest +0x%X (site +0x%X, cave '
+        '+0x%X, %d words)'
+        % (report['guest_lock'], report['lock']['site'],
+           report['lock']['cave_entry'], report['lock']['cave_words']))
+    log('  AKAO command byte sanitised at the field music call (site +0x%X, '
+        'cave +0x%X, %d words); 0xDA folded onto the stock stop'
+        % (report['sound']['site'], report['sound']['cave_entry'],
+           report['sound']['cave_words']))
+    log('  no BSS, no table -- the contiguous budget is untouched')
+    return [dest] if not built else []
+
+
+# FFNx's `enable_voice_auto_text`, which Echo-S's own mod.xml sets from its
+# `Auto` option. On this port it is a hook on the post-refresh input read, so
+# it is a runtime argument rather than a config file.
+ECHO_AUTO_OPTION = 'auto'
+
+# HOW LOUD THE MUSIC IS WHILE SOMEBODY IS TALKING.
+# ================================================
+# This is FFNx's `external_voice_music_fade_volume`, and 25 is FFNx's own
+# default -- the number every PC player of Echo-S hears. It is a MULTIPLIER on
+# the MusicManager's master volume, so it composes with the in-game Config
+# music slider instead of replacing it: Config at 60% with this at 25% means
+# the OST sits at 15% of full under a line and returns to 60% after it. Voice
+# players are not MusicManager slots, so their own gain is never touched.
+#
+# Ducking was pinned at 100 (off) from build 313 to build 325 because a User
+# Break in the field dispatcher had not been explained yet. It has been: the
+# release ramp loaded the duck state into W8, which zero-extended over X8 --
+# the live MusicManager pointer -- and wrote the final ramp value through
+# `state + 0x448`. That is fixed in `_emit_bgm_release_step`, and the reason
+# to keep ducking off went with it. `SEVENTH_NX_VOICE_DUCK=100` turns it off
+# again without editing this file, and it is an ExeFS-only rebuild.
+ECHO_DUCK_PERCENT = 25
+ECHO_DUCK_ATTACK_FRAMES = 12          # 0.2s at 60 FPS
+ECHO_DUCK_RELEASE_FRAMES = 45         # 0.75s at 60 FPS
+
+
+def _echo_duck_percent(log):
+    raw = os.environ.get('SEVENTH_NX_VOICE_DUCK', '').strip()
+    if not raw:
+        return ECHO_DUCK_PERCENT
+    try:
+        value = int(raw)
+    except ValueError:
+        value = -1
+    if not 0 <= value <= 100:
+        log('! SEVENTH_NX_VOICE_DUCK=%r is not 0..100 -- using %d'
+            % (raw, ECHO_DUCK_PERCENT))
+        return ECHO_DUCK_PERCENT
+    return value
+
+
+def _echo_battle_text(plan):
+    """
+    Install the battle-conversation producer?
+
+    Only when there is something for it to say. It hashes the line the battle
+    text queue is displaying, so it needs Echo-S's `scene.bin` (the text) AND
+    its `_battle/<actor>/<line>.ogg` clips; with either missing every hash
+    would miss its preflight and the hook would be pure cost.
+    """
+    return bool(echo_scene_bin(plan) and echo_s_battletext.shipped_clips(
+        [(rel, full) for rel, full, _mod in plan.voice]))
+
+
+def apply_echo_voice(sdout, dump, plan, log=lambda *_: None, produced=()):
+    """
+    Install Echo-S's dialogue runtime.
+
+    RUNS AFTER `apply_ambient`, AND THAT IS NOT A CONVENTION
+    =======================================================
+    Three of its sixteen hook sites are already owned when this runs:
+
+        0x947CF0   analog-360's field hook
+        0x8FB20    the ambient battle entry
+        0xF1E0EC   the ambient world stop
+
+    All three are per-frame services, so they chain -- the voice cave takes
+    the site and ends by branching to whoever held it, instead of replaying a
+    displaced instruction. But `ff7nx_ambient` installs with `expect_word` and
+    refuses anything but the stock word at its sites, so the order is forced:
+    ambient first, this second. Reverse them and the ambient pass fails with
+    the site named, which is the correct outcome and the reason it is safe to
+    state the dependency rather than defend against it.
+
+    The 60 FPS preset, widescreen and analog-360 are not touched at all: the
+    only words this writes outside its own hook sites are padding holes that
+    `ff7nx_cave` re-verified as still zero in THIS module.
+    """
+    if not plan.voice or _voice_disabled():
+        return []
+    src, built = _audio_bridge_base(sdout, dump, log, produced, 'Echo-S voice')
+    if src is None:
+        return []
+    dest = os.path.join(sdout, 'atmosphere', 'contents', TITLE_ID, 'exefs',
+                        'main')
+    auto = str(plan.echo_options.get(ECHO_AUTO_OPTION,
+                                     plan.echo_options.get('Auto', 1)))
+    auto_advance = auto not in ('0', 'False', 'false')
+    log('')
+    log('Echo-S dialogue runtime ...')
+    log('  base main   %s%s'
+        % (src, '   (previous patch output)' if built else '   (from dump)'))
+    _audio_bridge_budget(src, log)
+    level = (os.environ.get('SEVENTH_NX_VOICE_LEVEL', '').strip().lower()
+             or 'full')
+    if level not in ff7nx_voice.VOICE_LEVELS:
+        log('! SEVENTH_NX_VOICE_LEVEL=%r is not one of %s -- using full'
+            % (level, ', '.join(ff7nx_voice.VOICE_LEVELS)))
+        level = 'full'
+    forced = os.environ.get('SEVENTH_NX_VOICE_FORCED_NAME', '').strip() or None
+    # 'pre' hooks the BL at 0x970394, before the native message-window
+    # updater runs; 'post' hooks 0x970398, after it. The author chose 'pre'
+    # so the producer sees the page transition before the updater consumes
+    # it -- but 'pre' is also the only point at which our cave reads
+    # MESSAGE_STATE before the game itself has, and that is the one guest
+    # access it makes that the handler has not already validated.
+    #
+    # 'post' IS THE DEFAULT, AND NOT BECAUSE IT IS TIDIER.
+    # Every build that has survived hardware since 317 used 'post'; 'pre' has
+    # never completed a new game. Leaving the author's 'pre' as the default
+    # would mean a plain `python3 7th_heaven_nx.py` shipped the one setting
+    # nothing has ever proved, which is the opposite of what a default is for.
+    phase = os.environ.get('SEVENTH_NX_VOICE_MESSAGE_PHASE', '').strip().lower()
+    if phase not in ('pre', 'post'):
+        phase = 'post'
+    # Narrow diagnostics replace the producer with progressively larger safe
+    # subsets: hook only, save/restore, guest reads, table accesses, transition
+    # logic, close-path-only or selected scalar request publication without a
+    # key, or an all-NOP body with the full producer's physical footprint.
+    # None reaches playback.
+    # What happens to a line whose window is not the one currently speaking.
+    # 'defer' holds the request and plays it when the current clip ends;
+    # 'drop' is the historical behaviour, which discarded it. 342 of 544
+    # fields have voiced lines on more than one window, so this is not a rare
+    # path -- see FINDINGS-425.
+    foreign = os.environ.get('SEVENTH_NX_VOICE_FOREIGN', '').strip().lower()
+    if foreign not in ('replace', 'defer', 'drop'):
+        foreign = 'replace'
+    # What a closing dialogue window does to the line it was showing.
+    # 'stop' is the default and the natural one: dismiss a box and its voice
+    # stops. It cannot cut off a line that outlasts a script-timed window,
+    # because the producer only ever observes the close of a BLOCKING
+    # message -- see the note at `closing` in ff7nx_voice. 'play' lets a
+    # dismissed line run on into the next conversation.
+    close = os.environ.get('SEVENTH_NX_VOICE_CLOSE', '').strip().lower()
+    if close not in ('play', 'stop'):
+        close = 'stop'
+    # What counts as "a new line has appeared on this window". 'dialog' also
+    # accepts a changed dialog id, which is what a non-blocking MESSAGE needs
+    # -- its opcode handler runs once, so there is no frame in which this
+    # cave can observe the state going from zero. 'state' is the historical
+    # transition-only rule.
+    trigger = os.environ.get('SEVENTH_NX_VOICE_TRIGGER', '').strip().lower()
+    if trigger not in ('dialog', 'state'):
+        trigger = 'dialog'
+    stub = os.environ.get('SEVENTH_NX_VOICE_MESSAGE_STUB', '').strip().lower()
+    if stub not in ('passthrough', 'saveonly', 'reads', 'tables',
+                    'transitions', 'closing', 'pubowner', 'pubauto',
+                    'pubcmd', 'publication',
+                    'footprint'):
+        stub = None
+    tmp = dest + '.echovoice-tmp'
+    try:
+        report = ff7nx_voice.apply_to_nso(
+            src, tmp, auto_advance=auto_advance, level=level,
+            forced_name=forced, message_phase=phase,
+            message_stub=stub,
+            battle_probability=_echo_battle_percent(plan),
+            battle_text=_echo_battle_text(plan),
+            allow_foreign_field_replace=(foreign == 'replace'),
+            defer_foreign_play=(foreign == 'defer'),
+            stop_on_close=(close == 'stop'),
+            publish_on_dialog_change=(trigger == 'dialog'),
+            duck_percent=_echo_duck_percent(log),
+            duck_attack_frames=ECHO_DUCK_ATTACK_FRAMES,
+            duck_release_frames=ECHO_DUCK_RELEASE_FRAMES)
+    except Exception as exc:                                   # noqa: BLE001
+        report = None
+        log('! Echo-S voice runtime: %s: %s' % (type(exc).__name__, exc))
+    if not report:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        log('! the dialogue runtime is not installed -- the staged clips are '
+            'inert and nothing else in the build is affected')
+        return []
+    os.replace(tmp, dest)
+    words = sum(v for k, v in report.items() if k.endswith('_words') and v)
+    installed = [n for n in ('message', 'ask', 'name_change', 'field',
+                             'world_message', 'world_ask', 'world_service',
+                             'input') if report.get(n + '_entry')]
+    log('  level %s -- %s%s' % (report['level'], ', '.join(installed),
+        '   [FORCED NAME %r -- the live key builder is NOT installed]'
+        % report['forced_name'] if report.get('forced_name') else ''))
+    if report.get('message_stub'):
+        stub_detail = {
+            'passthrough': 'only returns control',
+            'saveonly': 'only saves/restores the translated registers',
+            'reads': 'performs the producer guest reads only',
+            'tables': 'also accesses the per-window bookkeeping tables',
+            'transitions': ('also runs transition/page state logic, but stops '
+                            'before request publication'),
+            'closing': ('runs the production close-path reads and branches, '
+                        'but writes no request fields'),
+            'pubowner': ('also writes only the pending request owner field'),
+            'pubauto': ('also writes only the pending auto-advance field'),
+            'pubcmd': ('also writes only the pending command field'),
+            'publication': ('runs the exact transition and request-mailbox '
+                            'paths, but does not touch the voice key buffer'),
+            'footprint': ('executes NOPs through every padding run used by '
+                          'the full producer'),
+        }[report['message_stub']]
+        log('  *** DIAGNOSTIC: the MESSAGE cave is a %s STUB -- %s. '
+            '%s ***'
+            % (report['message_stub'].upper(), stub_detail,
+               'No key, no command, no playback.'
+               if report['message_stub'] not in
+               ('pubowner', 'pubauto', 'pubcmd', 'publication')
+               else 'No key and no playback.'))
+    log('  MESSAGE hooked %s the native window updater (phase %s)'
+        % ('before' if report.get('message_phase') == 'pre' else 'after',
+           report.get('message_phase')))
+    log('  %d cave word(s) (%s KB) from the padding pool, %d-byte BSS at '
+        '+0x%X%s' % (words, format(words * 4 / 1024.0, '.1f'),
+                     report['bss_bytes'], report['scratch'],
+                     '  (+%d aligning the block to 16)'
+                     % report['scratch_align_pad']
+                     if report['scratch_align_pad'] else ''))
+    for site, who, entry in report['chained']:
+        log('  +0x%X chained in front of %s (its cave at +0x%X is unchanged)'
+            % (site, who, entry))
+    if report['duck_percent'] < 100:
+        log('  BGM ducks to %d%% under speech over %d frame(s), releases '
+            'over %d' % (report['duck_percent'],
+                         report['duck_attack_frames'],
+                         report['duck_release_frames']))
+    else:
+        log('  BGM ducking: OFF (SEVENTH_NX_VOICE_DUCK=100) -- no '
+            'MusicManager access from the voice service')
+    log('  auto text advance: %s   (Echo-S option "Auto", default on)'
+        % ('on' if auto_advance else 'off'))
+    if report.get('publish_on_dialog_change'):
+        log('  a line is requested when the window\'s dialog id changes, not '
+            'only on a state transition -- a non-blocking MESSAGE (WINDOW; '
+            'MESSAGE; WAIT; WCLS) runs its handler once and has no transition '
+            'to observe. SEVENTH_NX_VOICE_TRIGGER=state restores the old rule')
+    if report.get('stop_on_close'):
+        log('  dismissing a dialogue box stops its line. Only a BLOCKING '
+            'message\'s close reaches the producer, so a line written to '
+            'outlast a script-timed window (md8_1\'s 7.3s Wedge scream '
+            'behind a 39-frame window) is unaffected. '
+            'SEVENTH_NX_VOICE_CLOSE=play lets a dismissed line run on')
+    else:
+        log('  SEVENTH_NX_VOICE_CLOSE=play -- a dismissed line keeps '
+            'playing into whatever comes next')
+    if report.get('allow_foreign_field_replace'):
+        log('  a line opened on a second window takes over from one that is '
+            'still playing. Echo-S clips outlast their box and scenes mix '
+            'window ids (fship_25 drops to window 0 for one line mid-'
+            'conversation), so holding it made you read one speaker and hear '
+            'the previous one. SEVENTH_NX_VOICE_FOREIGN=defer holds it '
+            'instead, =drop discards it')
+    elif report.get('defer_foreign_play'):
+        log('  SEVENTH_NX_VOICE_FOREIGN=defer -- a line opened on a second '
+            'window while one is speaking is HELD until the first ends')
+    else:
+        log('  SEVENTH_NX_VOICE_FOREIGN=drop -- a line opened on a second '
+            'window while one is speaking is discarded')
+    if report.get('battle_probability'):
+        log('  battle lines: %d%% (Echo-S option "Battle Lines"/BVoice) -- '
+            'the action producer at +0x%X publishes '
+            'battle/bc<char><cmd><action><variant>; battle RESULT text '
+            '("stole", "couldn\'t steal", "nothing happened") is a separate '
+            'hook and is not installed'
+            % (report['battle_probability'], ff7nx_voice.BATTLE_ACTION_HOOK))
+    else:
+        log('  battle lines: off (Echo-S option "Battle Lines"/BVoice = 0) -- '
+            'no battle producer, no barks staged')
+    log('  battle grunts: Echo-S\'s "Battle Grunts" option picks between its '
+        'NV_Attacks and V_Attacks folders, and both are sfx/*.ogg for FFNx\'s '
+        'external SFX layer. This port has no external SFX loader at all, so '
+        'that option cannot do anything here and it is not a missing hook.')
+    log('  no table -- the contiguous budget is exactly what it was')
+    return [dest] if not built else []
+
+
+def apply_echo_tutorial(sdout, dump, plan, log=lambda *_: None, produced=()):
+    """Install Echo-S's mds7pb_1-only tutorial movie redirect."""
+    if not getattr(plan, 'echo_tutorial', False):
+        return []
+    src, built = _audio_bridge_base(sdout, dump, log, produced,
+                                    'Echo-S tutorial redirect')
+    if src is None:
+        return []
+    dest = os.path.join(sdout, 'atmosphere', 'contents', TITLE_ID, 'exefs',
+                        'main')
+    tmp = dest + '.echotutorial-tmp'
+    try:
+        report = echo_s_tutorial.patch_main(src, tmp)
+    except Exception as exc:  # noqa: BLE001
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        log('! Echo-S tutorial redirect: %s: %s'
+            % (type(exc).__name__, exc))
+        return []
+    os.replace(tmp, dest)
+    log('Echo-S tutorial movie: PMVIE slot %d (%s) -> slot %d (%s) only in '
+        '%s (field id 0x%03X), cave +0x%X (%d words)'
+        % (report['requested_index'], report['requested'],
+           report['redirect_index'], report['redirect'], report['field'],
+           report['field_id'], report['entry'], report['words']))
+    # The redirect is only half of this. Slot 1 carries no file in the stock
+    # game -- that is exactly why it was safe to claim -- so if the movie pass
+    # did not produce one, the module now sends mds7pb_1 at a movie that is
+    # not there. That is silent in the build log and confusing on hardware,
+    # and it has already cost one test cycle.
+    movie = os.path.join(sdout, 'atmosphere', 'contents', TITLE_ID, ROMFS,
+                         'data', 'movies', report['redirect'] + '.mp4')
+    if not os.path.exists(movie):
+        log('! Echo-S tutorial movie: the redirect is installed but '
+            '%s.mp4 is NOT in the output. Slot %d has no file in the stock '
+            'game, so mds7pb_1 will now ask for a movie that does not exist. '
+            'Either the movie pass did not run (ffmpeg missing?) or the '
+            'movies directory was not copied to the SD card.'
+            % (report['redirect'], report['redirect_index']))
     return [dest] if not built else []
 
 

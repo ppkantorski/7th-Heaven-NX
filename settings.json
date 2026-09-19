@@ -63,14 +63,14 @@
   }
  },
  "Echo-s.iro": {
-  "enabled": false,
+  "enabled": true,
   "options": {
    "Echo-S": 1,
    "Time": 1,
    "Music": 1,
    "BVoice": 1,
    "Grunts": 1,
-   "Auto": 1,
+   "Auto": 0,
    "NV_Attacks": 1,
    "V_Attacks": 1,
    "EchoeS Of The Planet": 1,

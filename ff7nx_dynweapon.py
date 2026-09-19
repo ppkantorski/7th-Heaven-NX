@@ -97,6 +97,33 @@ MARKER = 'z0'
 MAX_SLOTS = 26          # 'a'..'z' part slots per character
 MAX_RANGE = 16          # count-1 has to fit in one hex digit
 
+# BARRET IS THE ONLY CHARACTER WHOSE .HRC HAS TO BE REWRITTEN.
+# ===========================================================
+# For everyone else the varying part is a `.p`, named by a `.rsd` that does
+# NOT vary, so the only rewrite is a `PLY=` line and the cave sees a `.p`
+# open. Measured in the built char.lgp:
+#
+#   Cloud  AAAA.HRC   16 bone tokens, longest 5, no z0 token
+#   Barret ACGD.HRC   15 bone tokens, longest 9, token Z01A20F20
+#
+# Barret's `ACJF.RSD` differs between folders -- only in `TEX[0]`, BR.TIM for
+# the Gatling Gun and SBAD.TIM for the other fifteen -- so the RSD itself
+# became a variant, and his field model's bone token had to become a
+# nine-character name. Vanilla char.lgp has 4,195 bone tokens and every one
+# of them is four characters. Cloud, who works, never exercises this.
+#
+# `SEVENTH_NX_DW_HRC=static` leaves bone tokens alone: the `.hrc` keeps
+# naming `ACJF`, that one static `.rsd` is still repointed at the `.p` range,
+# and Barret then uses exactly the path Cloud's weapons already prove. The
+# cost is that one texture serves all sixteen. It is a diagnostic first --
+# if Barret's weapons change under it, the bone token was the fault.
+HRC_MODE_ENV = 'SEVENTH_NX_DW_HRC'
+
+
+def hrc_rewrite_enabled():
+    """False when the build is asked to leave .hrc bone tokens alone."""
+    return os.environ.get(HRC_MODE_ENV, '').strip().lower() != 'static'
+
 _RE_PLY = re.compile(rb'(PLY\s*=\s*)([A-Za-z0-9_.]+)(\.\w+)', re.I)
 # An .hrc bone line: "<n parts> TOKEN [TOKEN ...]", possibly with a trailing
 # \r. The three groups keep the line's own spacing intact so a rewrite can
@@ -402,7 +429,7 @@ def repoint(target, bucket, vanilla, manifest, cache_dir,
             continue
         if e['ext'] == 'p':
             want_p[e['stem']] = e['base_stem']
-        elif e['ext'] == 'rsd':
+        elif e['ext'] == 'rsd' and hrc_rewrite_enabled():
             want_rsd[e['stem']] = e['base_stem']
     if not (want_p or want_rsd):
         return bucket, 0
@@ -476,6 +503,29 @@ def repoint(target, bucket, vanilla, manifest, cache_dir,
     return bucket, done
 
 
+def _majority_variant(variants):
+    """
+    (source, mod) of the content the most members of a range share.
+
+    Ties break on the lowest value in the range, so a build is reproducible
+    and a genuine 8/8 split still picks the range's first member.
+    """
+    counts = {}
+    for value, _name, src, mod in variants:
+        try:
+            with open(src, 'rb') as handle:
+                digest = handle.read()
+        except OSError:
+            continue
+        entry = counts.setdefault(digest, [0, value, src, mod])
+        entry[0] += 1
+        entry[1] = min(entry[1], value)
+    if not counts:
+        return variants[0][2], variants[0][3]
+    best = max(counts.values(), key=lambda e: (e[0], -e[1]))
+    return best[2], best[3]
+
+
 def emplace(plan, groups, catalogs, log=lambda *_: None):
     """
     Add every variant to its archive under its `z0...` name.
@@ -488,6 +538,12 @@ def emplace(plan, groups, catalogs, log=lambda *_: None):
     if not placed:
         return []
 
+    if not hrc_rewrite_enabled():
+        log('  dynamic weapons: %s=static -- .hrc bone tokens are left alone. '
+            'Any part whose .rsd varies keeps ONE static .rsd (so one texture '
+            'serves the whole range) and only its .p follows the equipped '
+            'weapon. This is the path every other character already uses.'
+            % HRC_MODE_ENV)
     per_archive = {}
     manifest = []
     for g in placed:
@@ -530,6 +586,14 @@ def emplace(plan, groups, catalogs, log=lambda *_: None):
             # the module patch turned off still renders a sensible weapon
             # rather than whichever folder happened to be emplaced last.
             bucket[g.low] = (variants[0][2], variants[0][3])
+            if not hrc_rewrite_enabled() and g.ext == 'rsd':
+                # In static mode this ONE .rsd serves the whole range, so the
+                # range's first member is the wrong choice: for Barret it is
+                # the Gatling Gun, the only arm of sixteen that names
+                # `BR.TIM`, and the other fifteen then render with a texture
+                # meant for something else. Take whichever content the most
+                # weapons agree on -- fifteen right instead of one.
+                bucket[g.low] = _majority_variant(variants)
         # CLOSURE. The cave can ask for any value in [base, base+count); a
         # name it asks for and the archive does not hold is a model part that
         # fails to load, with nothing on screen to say why. Every one of them
