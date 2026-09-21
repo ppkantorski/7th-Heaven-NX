@@ -1909,6 +1909,13 @@ def apply_to_nso(src, dest, bitmap, space=None, fps=60,
     # own config documents for frames_per_minute = 20.
     frames = max(1, int(round(FRAMES_PER_MINUTE * 2 * (fps / 30.0))))
 
+    # KNOWN, DELIBERATELY NOT FIXED IN THIS BUILD -- see FINDINGS-484.
+    # `cave_space.find_holes_in` rejects a run of zeros that a word in
+    # `.rodata`/`.data` points at; passing `text` alone makes that scan's input
+    # empty, so on this main it admits 128 extra runs (288 words) and 88 of
+    # this module's 387 runs sit in them. `ff7nx_voice._verified_hole_pool` is
+    # the correct construction. Changing it here moves every day/night cave,
+    # and this build is carrying one variable, not two.
     pool = ff7nx_cave.HolePool(text, starts=set(nxmap.Main(src).arm_starts))
     entries, placed, outdoor_at, phase_at, gamma_at, sky_at = build_all(
         pool, space, bss, bitmap, frames, force_on=force_on,

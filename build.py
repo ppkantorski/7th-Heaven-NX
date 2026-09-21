@@ -9743,6 +9743,11 @@ def _emplace_voice(plan, romfs, log, produced, progress=None):
     log('  %d encoded, %d taken from the cache; %d linked into sdout, %d '
         'already in place' % (report['encoded'], report['cached'],
                               report['linked'], report['kept']))
+    log('  loudness: %s' % voice_ogg.normalization_detail())
+    if voice_ogg.unmeasured():
+        log('! %d clip(s) could not be measured and were encoded at the '
+            'level the mod shipped them at, rather than dropped'
+            % voice_ogg.unmeasured())
     if battle_note:
         log('  %s' % battle_note)
     elif battle_entries:
@@ -9805,10 +9810,17 @@ def _emplace_voice(plan, romfs, log, produced, progress=None):
         'save space -- it is not a reduced-quality setting. '
         'SEVENTH_NX_VOICE_BITRATE=256k roughly halves the SD card cost and is '
         'still at or above most of the sources; 128k is genuinely below them.')
-    log('  48 kHz stereo Vorbis, %d ms lead-in, one-sample loop at the exact '
-        'file tail -- the native decoder keeps its required loop route without '
-        'wrapping back to spoken audio; every clip was verified before caching'
-        % voice_ogg.LEAD_IN_MS)
+    if voice_ogg.LOOP_TAG_MODE == voice_ogg.LOOP_TAG_ZERO:
+        log('  48 kHz stereo Vorbis, LOOPSTART=0, %d ms lead-in -- the only '
+            'shape the native player is safe with; every clip was verified '
+            'against the decoder invariants before it was cached'
+            % voice_ogg.LEAD_IN_MS)
+    else:
+        log('  48 kHz stereo Vorbis, %d ms lead-in, one-sample loop at the '
+            'exact file tail (%s=tail) -- THIS IS THE WITHDRAWN BUILD 458 '
+            'SHAPE; it asks the player to seek into the final Ogg page and is '
+            'here only so it can be compared against LOOPSTART=0'
+            % (voice_ogg.LEAD_IN_MS, voice_ogg.LOOP_TAG_ENV))
 
 
 def _emplace_echo_kernel(plan, romfs, dump, log, produced):
@@ -10429,6 +10441,8 @@ MAIN_ONLY_ENV = frozenset((
     # flevel.lgp and cost forty minutes instead.
     'SEVENTH_NX_VOICE_FIELDS',   # voicemod   which fields to stage
     'SEVENTH_NX_VOICE_BITRATE',  # voice_ogg  encode quality (its own cache)
+    'SEVENTH_NX_VOICE_NORMALIZE',  # voice_ogg  dialogue loudness, ditto
+    'SEVENTH_NX_VOICE_LOOPTAG',  # voice_ogg  where the loop tag points, ditto
     'SEVENTH_NX_VOICE_WORKERS',  # voice_ogg  encoder parallelism
     'SEVENTH_NX_NO_VOICE',       # ff7nx_voice   the whole half, off
     'SEVENTH_NX_VOICE_LEVEL',    # ff7nx_voice   which layers to install

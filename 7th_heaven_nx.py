@@ -843,6 +843,18 @@ TEX_CACHE_BY_LABEL = {v: k for k, v in TEX_CACHE_CHOICES}
 # The background scaler and the full-screen AA. Both are PIXEL shaders the
 # port already loads from romfs; these are drop-in replacements that used to
 # have to be copied onto the card by hand. See ff7nx_shaders.py.
+VOICE_NORM_CHOICES = [
+    ('loudness:-15.3', 'Match “My hero!” — −15.3 LUFS (recommended)'),
+    ('loudness:-17', 'Quieter — −17 LUFS'),
+    ('loudness:-16', 'A little quieter — −16 LUFS'),
+    ('loudness:-14', 'A little louder — −14 LUFS'),
+    ('loudness:-13', 'Louder — −13 LUFS'),
+    ('peak:-1.1', 'Equal peaks only — −1.1 dBFS'),
+    ('off', 'Off — as the mod shipped'),
+]
+VOICE_NORM_LABELS = dict(VOICE_NORM_CHOICES)
+VOICE_NORM_BY_LABEL = {v: k for k, v in VOICE_NORM_CHOICES}
+
 SCALER_CHOICES = [
     ('', 'Stock \u2014 the port\u2019s own 2xSaI / HQ4x'),
     ('hd', 'HD \u2014 Catmull-Rom + sharpen (recommended)'),
@@ -1496,6 +1508,21 @@ def run_build(mods, enabled, settings_by_mod, log, progress,
     if produced:
         log(f'done. {len(produced)} files in sdout/')
         log('copy the contents of sdout/ onto the root of your SD card.')
+        # Atmosphere's fs.mitm caches the BUILT romfs layout -- every file's
+        # offset and length -- in atmosphere/contents/<title>/romfs_metadata.bin
+        # on the card. Nothing in this build writes that file and nothing here
+        # can invalidate it. Change any file under romfs/ and leave it in
+        # place, and the game is handed the old layout for the new bytes: a
+        # clip, an audio.dat record or an archive entry read at the wrong
+        # length. It is one file, deleting it costs a few seconds of boot, and
+        # skipping it costs a day of bisecting the mod instead.
+        log('then DELETE atmosphere/contents/0100A5B00BDC6000/'
+            'romfs_metadata.bin from the card. Atmosphere caches the romfs '
+            'layout there and does not notice that you changed the files; a '
+            'stale one feeds the game the wrong bytes. It rebuilds by itself '
+            'on the next boot.')
+        log('  (copying only exefs/main does not need this -- exefs is not '
+            'part of that cache, which is why a main-only test never had to.)')
     else:
         log('nothing was written.')
     return _finish(bool(produced))
@@ -2094,6 +2121,16 @@ def launch_ui():
 
     def current_gfx_pool():
         return GFX_POOL_BY_LABEL.get(gfx_var.get(), _gfxpool.DEFAULT_MB)
+
+    voice_norm_saved = global_saved.get(
+        'voice_normalize', build.voice_ogg.NORMALIZE_DEFAULT)
+    if voice_norm_saved not in VOICE_NORM_LABELS:
+        voice_norm_saved = build.voice_ogg.NORMALIZE_DEFAULT
+    voice_norm_var = tk.StringVar(value=VOICE_NORM_LABELS[voice_norm_saved])
+
+    def current_voice_normalize():
+        return VOICE_NORM_BY_LABEL.get(voice_norm_var.get(),
+                                       build.voice_ogg.NORMALIZE_DEFAULT)
 
     scaler_saved = global_saved.get('scaler', '')
     if scaler_saved not in SCALER_LABELS:
@@ -2702,6 +2739,33 @@ def launch_ui():
              'from FF7\u2019s standard-definition originals are BT.601, so '
              'without this their colour is slightly desaturated.', False),
         ]),
+        ('Voice', [
+            ('combo', 'Dialogue loudness', voice_norm_var,
+             [l for _, l in VOICE_NORM_CHOICES],
+             'Echo-S’s lines come from many people, many microphones and '
+             'many years, and they arrive at very different levels. Measured '
+             'over 160 random clips of the set you have installed:\n\n'
+             '    peak       −12.0 … −0.0 dBFS     spread 12 dB\n'
+             '    loudness   −28.4 … −9.2 LUFS     spread 19 dB\n\n'
+             'and the second row is the one you hear. This measures every '
+             'clip and applies ONE gain to it — not compression, not a '
+             'per-frame filter, so nothing pumps and no timbre changes. On '
+             'the same sample it takes the loudness spread from 19 dB to '
+             '3.6 dB with nothing clipping.\n\n'
+             'THE DEFAULT IS NOT INVENTED. −15.3 LUFS is the measured '
+             'loudness of Jessie’s “My hero!” in the first reactor '
+             '(nmkin_3, line 6). Pick a neighbouring level if you want it '
+             'louder or quieter against the music.\n\n'
+             '“Equal peaks only” does what it says — every clip’s '
+             'loudest sample becomes identical. It is here because it is the '
+             'obvious reading of the request, but on your own files it still '
+             'leaves a 16.4 dB loudness spread, because a line with one '
+             'sharp consonant peaks high while sounding quiet.\n\n'
+             'COST: changing this re-encodes all 15,505 clips once, which is '
+             'the long part of a build. Changing it back is free — the '
+             'cache is keyed by the setting, so every level you have already '
+             'built is still there.', False),
+        ]),
     ]
 
     def open_settings():
@@ -2987,7 +3051,9 @@ def launch_ui():
                                  'gfx_pool_mb': current_gfx_pool(),
                                  'scaler': current_scaler(),
                                  'fxaa': current_fxaa(),
-                                 'video_shader': current_video_shader()}
+                                 'video_shader': current_video_shader(),
+                                 'voice_normalize':
+                                     current_voice_normalize()}
         return persist
 
     def save_settings_now(*_args):
@@ -3861,6 +3927,7 @@ def launch_ui():
         # path uses. test_gfxpool.py asserts it matches
         # ff7nx_gfxpool.POOL_MB_ENV.
         os.environ[_HEADLESS_GFX_ENV] = str(current_gfx_pool())
+        os.environ[build.voice_ogg.NORMALIZE_ENV] = current_voice_normalize()
         os.environ[build.ff7nx_shaders.SCALER_ENV] = current_scaler()
         os.environ[build.ff7nx_shaders.FXAA_ENV] = current_fxaa()
         os.environ[build.ff7nx_shaders.VIDEO_ENV] = \
@@ -4102,6 +4169,10 @@ def main():
             except (TypeError, ValueError):
                 _fb = build.ff7nx_fieldbuf.DEFAULT_SCALE
             os.environ[build.ff7nx_fieldbuf.SCALE_ENV] = str(_fb)
+        if build.voice_ogg.NORMALIZE_ENV not in os.environ:
+            os.environ[build.voice_ogg.NORMALIZE_ENV] = str(
+                saved.get('__global__', {}).get(
+                    'voice_normalize', build.voice_ogg.NORMALIZE_DEFAULT))
         if build.ff7nx_shaders.SCALER_ENV not in os.environ:
             os.environ[build.ff7nx_shaders.SCALER_ENV] = str(
                 saved.get('__global__', {}).get('scaler', '') or '')

@@ -34,6 +34,14 @@ the recipe. Change `RECIPE` and every clip re-encodes; leave it and none do.
 Staging then hard-links out of the cache, so a second copy of 2.5 GB never
 exists on disk. The link falls back to a copy across filesystems.
 
+AND SINCE BUILD 482, THE LEVEL
+==============================
+Echo-S's lines come from many people, many microphones and many years, and
+they arrive at very different levels. `_measure` gives each clip ONE gain,
+measured from the clip itself, so the whole set lands where the setting says.
+See the block above `NORMALIZE_ENV` for the measurements, why the default is
+EBU R128 loudness rather than equal peaks, and where -15.3 LUFS comes from.
+
 WHAT IS VERIFIED, AND WHEN
 ==========================
 Every encode is checked against the decoder invariants before it is allowed
@@ -47,6 +55,7 @@ half-written clip cannot be observed at all.
 """
 import hashlib
 import os
+import re
 import shutil
 import struct
 import subprocess
@@ -58,12 +67,215 @@ import movies
 import voicemod
 
 
+class VoiceEncodeError(Exception):
+    pass
+
+
+# ------------------------------------------------------- loudness, BUILD 482
+# Echo-S's clips come from many people, many microphones and many years, and
+# they arrive at wildly different levels. Measured over 160 random clips of
+# the shipped set:
+#
+#     peak      min -12.0   median  -2.1   max  -0.0 dBFS    spread 12.0 dB
+#     loudness  min -28.4   median -16.1   max  -9.2 LUFS    spread 19.1 dB
+#
+# and that second row is the one you hear. Equalising the PEAKS -- which is
+# the obvious reading of "make them all the same volume" -- leaves 16.4 dB of
+# that loudness spread standing, because a line with one sharp consonant
+# peaks high while sounding quiet. So the default measures the way ears
+# hear, EBU R128 integrated loudness, and `peak` remains available for
+# anyone who wants literally equal maxima.
+#
+# THE TARGET IS NOT INVENTED. -15.3 LUFS is the measured integrated loudness
+# of Jessie's "My hero!" in `nmkin_3` (dialogue id 6), which is the line the
+# level was chosen against.
+#
+# WHAT IS APPLIED IS ONE NUMBER PER CLIP. Not `dynaudnorm`, not `speechnorm`,
+# not single-pass `loudnorm` -- all three vary the gain THROUGH the clip and
+# audibly pump on speech. This measures the whole clip, computes one scalar
+# gain, and applies it with `volume`. A pure gain cannot change timbre,
+# cannot pump, and cannot clip, because the gain is capped by the clip's own
+# true peak against `TRUE_PEAK_CEILING` before it is used.
+NORMALIZE_ENV = 'SEVENTH_NX_VOICE_NORMALIZE'
+NORMALIZE_DEFAULT = 'loudness:-15.3'
+REFERENCE_LINE = 'nmkin_3 dialogue 6, Jessie "My hero!"'
+TRUE_PEAK_CEILING = -1.0      # dBTP, so a gained clip still cannot clip
+SILENCE_FLOOR = -60.0         # below this a clip is silence, not a quiet line
+MAX_GAIN_DB = 20.0            # a noise floor lifted 20 dB is loud enough
+
+
+def _normalization():
+    """`(mode, target_db)` -- mode is 'off', 'loudness' or 'peak'."""
+    raw = os.environ.get(NORMALIZE_ENV, NORMALIZE_DEFAULT).strip()
+    if not raw or raw.lower() in ('off', '0', 'none', 'false'):
+        return 'off', 0.0
+    mode, _, target = raw.partition(':')
+    mode = mode.strip().lower()
+    if mode not in ('loudness', 'peak'):
+        raise VoiceEncodeError('%s=%r: the mode must be off, loudness or peak'
+                               % (NORMALIZE_ENV, raw))
+    try:
+        value = float(target)
+    except ValueError:
+        raise VoiceEncodeError('%s=%r: %r is not a level in dB'
+                               % (NORMALIZE_ENV, raw, target))
+    limit = 0.0 if mode == 'peak' else -1.0
+    if not -40.0 <= value <= limit:
+        raise VoiceEncodeError('%s=%r: %g is outside the sane range'
+                               % (NORMALIZE_ENV, raw, value))
+    return mode, value
+
+
+NORMALIZE_MODE, NORMALIZE_TARGET = _normalization()
+
+
+def normalization_detail():
+    """One line for the build log."""
+    if NORMALIZE_MODE == 'off':
+        return 'off -- every clip keeps the level the mod shipped it at'
+    if NORMALIZE_MODE == 'peak':
+        return ('peak, %g dBFS -- every clip\'s loudest sample is made equal'
+                % NORMALIZE_TARGET)
+    return ('loudness (EBU R128), %g LUFS -- the measured loudness of %s'
+            % (NORMALIZE_TARGET, REFERENCE_LINE))
+
+
+_MAX_VOLUME = re.compile(r'max_volume:\s*(-?[0-9.]+) dB')
+_INPUT_I = re.compile(r'"input_i"\s*:\s*"(-?[0-9.a-zA-Z]+)"')
+_INPUT_TP = re.compile(r'"input_tp"\s*:\s*"(-?[0-9.a-zA-Z]+)"')
+
+
+def _float_or_none(match):
+    """
+    The number, or None when there is not one.
+
+    `-inf` IS a number here and must survive: `loudnorm` prints it for pure
+    digital silence, and Echo-S ships silent placeholders. Rejecting it would
+    file every one of them as "could not measure", which is a different thing
+    from "there is nothing to measure" and would put a misleading count in
+    the build log. The caller's silence floor catches it, because -inf is
+    below every floor.
+    """
+    if not match:
+        return None
+    try:
+        value = float(match.group(1))
+    except ValueError:
+        return None
+    if value != value:                        # NaN
+        return None
+    return value
+
+
+def _measure(ffmpeg, source):
+    """
+    The gain this clip needs, in dB, measured rather than assumed.
+
+    Returns `(gain, reason)`; `reason` is None when the measurement was used
+    and a short string when it was not, so the build can say how many clips
+    it could not measure instead of silently shipping them at a level nobody
+    chose. A clip that cannot be measured is shipped UNCHANGED -- a line at
+    the wrong volume is better than a line that is missing.
+    """
+    if NORMALIZE_MODE == 'off':
+        return 0.0, None
+    if NORMALIZE_MODE == 'peak':
+        chain = 'volumedetect'
+    else:
+        chain = 'loudnorm=print_format=json'
+    probe = subprocess.run(
+        [ffmpeg, '-hide_banner', '-nostdin', '-i', source,
+         '-af', chain, '-f', 'null', '-'],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if probe.returncode:
+        return 0.0, 'ffmpeg could not measure it'
+    text = probe.stderr
+    if NORMALIZE_MODE == 'peak':
+        peak = _float_or_none(_MAX_VOLUME.search(text))
+        if peak is None:
+            return 0.0, 'no max_volume in the probe'
+        if peak <= SILENCE_FLOOR:
+            return 0.0, 'silence'
+        gain = NORMALIZE_TARGET - peak
+    else:
+        loudness = _float_or_none(_INPUT_I.search(text))
+        true_peak = _float_or_none(_INPUT_TP.search(text))
+        if loudness is None:
+            return 0.0, 'no integrated loudness in the probe'
+        if loudness <= SILENCE_FLOOR:
+            return 0.0, 'silence'
+        gain = NORMALIZE_TARGET - loudness
+        if true_peak is not None:
+            # Never let the gain push the clip into the ceiling. This is what
+            # makes a pure gain safe: the result cannot clip, it just lands
+            # short of the target for a clip with no headroom.
+            gain = min(gain, TRUE_PEAK_CEILING - true_peak)
+    return max(-MAX_GAIN_DB, min(MAX_GAIN_DB, gain)), None
+
+
+_unmeasured = 0
+
+
+def unmeasured():
+    """How many clips this build could not measure."""
+    return _unmeasured
+
+
 # The hardware-proven stream shape. LEAD_IN_MS is the decoder's own discard,
 # measured; the sample rate and channel count are what the native player
 # accepts and are NOT settings -- get either wrong and the line is silent.
 LEAD_IN_MS = 100
 TARGET_SAMPLE_RATE = 48000
 TARGET_CHANNELS = 2
+
+# WHERE THE LOOP POINT GOES, AND WHY IT IS BACK AT ZERO.
+# ======================================================
+# The native player needs loop metadata at all -- without a LOOPSTART comment
+# it does not take the decoder route these clips are staged for. Every build up
+# to log 333 shipped `LOOPSTART=0` and the log called it, in those words, "the
+# only shape the native player is safe with".
+#
+# Build 458 moved it to the final sample (`LOOPSTART=<granule-1>`,
+# `LOOPLENGTH=1`) so that a player left alive across a field transition would
+# loop one inaudible sample instead of replaying the sentence. **That build is
+# marked WITHDRAWN in its own document.** On hardware the line still restarted,
+# the conclusion drawn was that NativeOggPlayer treats the tag as a loop
+# boolean, and build 459 solved the transition properly in `ff7nx_voice` by
+# latching the player at MAPJUMP.
+#
+# What build 459 did not do was put the tag back. It changed only
+# `ff7nx_voice.py` and `build.py` and said "no voice re-encoding is required",
+# so the withdrawn tag stayed in this file and has been on every clip since log
+# 334. That is the whole of the difference between the voice set that worked
+# and the voice set that does not.
+#
+# The tail tag is not inert. A loop point at the LAST decoded sample asks the
+# player to seek into the final Ogg page, and whether that lands inside a
+# packet or past the end of the stream depends on where that clip's pages
+# happen to fall -- which is why the failure is per-clip rather than total:
+# some lines play, some replay from the beginning, some wedge the stream
+# thread. Zero is the one loop target that is a valid seek in every stream.
+#
+# `SEVENTH_NX_VOICE_LOOPTAG=tail` restores the withdrawn shape for A/B use. It
+# is part of the cache key, so switching costs one re-encode and switching back
+# costs none.
+LOOP_TAG_ENV = 'SEVENTH_NX_VOICE_LOOPTAG'
+LOOP_TAG_ZERO = 'zero'
+LOOP_TAG_TAIL = 'tail'
+
+
+def _loop_tag_mode():
+    raw = (os.environ.get(LOOP_TAG_ENV, '') or '').strip().lower()
+    if not raw:
+        return LOOP_TAG_ZERO
+    if raw not in (LOOP_TAG_ZERO, LOOP_TAG_TAIL):
+        raise VoiceEncodeError('%s=%r is not %r or %r'
+                               % (LOOP_TAG_ENV, raw, LOOP_TAG_ZERO,
+                                  LOOP_TAG_TAIL))
+    return raw
+
+
+LOOP_TAG_MODE = _loop_tag_mode()
 
 
 def _bitrate():
@@ -101,16 +313,47 @@ TARGET_BITRATE = _bitrate()
 LEGACY_RECIPE = ('ECHO-VOICE-V3 adelay=%d ar=%d ac=%d vorbis %s LOOPSTART=0'
                  % (LEAD_IN_MS, TARGET_SAMPLE_RATE, TARGET_CHANNELS,
                     TARGET_BITRATE))
-RECIPE = ('ECHO-VOICE-V4 adelay=%d ar=%d ac=%d vorbis %s '
-          'LOOPSTART=final-1 LOOPLENGTH=1'
-          % (LEAD_IN_MS, TARGET_SAMPLE_RATE, TARGET_CHANNELS, TARGET_BITRATE))
+# V5 adds the NORMALISATION to the key. The gain itself is per clip and
+# measured from the source, and the source bytes are already in the key, so
+# the mode and the target are all that need to be here -- change either and
+# every clip re-encodes exactly once; change it back and none do.
+# V6 puts the LOOP TAG in the key. V4 and V5 both shipped the withdrawn
+# build-458 tail loop, and a cache holding those must not answer a build that
+# wants the proven `LOOPSTART=0` back -- which is exactly how the withdrawn
+# shape survived build 459 in the first place.
+RECIPE = ('ECHO-VOICE-V6 adelay=%d ar=%d ac=%d vorbis %s loop=%s norm=%s'
+          % (LEAD_IN_MS, TARGET_SAMPLE_RATE, TARGET_CHANNELS, TARGET_BITRATE,
+             LOOP_TAG_MODE,
+             'off' if NORMALIZE_MODE == 'off'
+             else '%s:%g:tp%g' % (NORMALIZE_MODE, NORMALIZE_TARGET,
+                                  TRUE_PEAK_CEILING)))
+
+
+# THE LEGACY MIGRATION IS A RETAG, SO IT IS ONLY VALID FOR A TAG CHANGE.
+#
+# `LEGACY_RECIPE` is V3. V3 -> V4 changed the loop COMMENTS and nothing else,
+# so lifting a V3 entry into the new path with `_publish_final_sample_loop`
+# -- rewriting its tags, keeping its audio -- was exactly right, and it saved
+# 15,505 re-encodes.
+#
+# V5 changes the AUDIO: it applies a measured per-clip gain. Taking the same
+# shortcut then publishes V3 audio under a V5 key, and the feature silently
+# does nothing. That is precisely what build 482 shipped:
+#
+#     0 encoded, 15505 taken from the cache; 15505 linked into sdout
+#     loudness: loudness (EBU R128), -15.3 LUFS ...
+#
+# -- a loudness line over a set of clips that had not been touched. Measured
+# afterwards: every V5 cache entry was byte-for-byte its V4 entry.
+#
+# So the shortcut is allowed only while the current recipe is audio-identical
+# to the legacy one, which is exactly when normalisation is off. `RECIPE`
+# carries `norm=off` then, so the two differ in tags alone and the retag is
+# sound again.
+LEGACY_IS_AUDIO_IDENTICAL = (NORMALIZE_MODE == 'off')
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CACHE = os.path.join(HERE, 'cache', '_voice_ogg')
-
-
-class VoiceEncodeError(Exception):
-    pass
 
 
 # The runtime is meaningful only if this build successfully staged its clips.
@@ -336,18 +579,26 @@ def _vorbis_comments(data):
     return comments
 
 
-def _with_final_sample_loop(data):
-    """Move the required Ogg loop to one inaudible sample at the file tail.
+def loop_comments(data, mode=None):
+    """The LOOP* comments this build ships, for a finished stream."""
+    mode = LOOP_TAG_MODE if mode is None else mode
+    if mode == LOOP_TAG_TAIL:
+        return [b'LOOPSTART=' + str(_last_granule(data) - 1).encode('ascii'),
+                b'LOOPLENGTH=1']
+    return [b'LOOPSTART=0']
 
-    The Switch decoder needs loop metadata. Hardware later established that
-    its NativeOggPlayer treats the tag as a loop boolean and still rewinds the
-    sentence, so this standards-correct range is not the transition fix;
-    ff7nx_voice owns that at MAPJUMP. Keeping the narrow range remains useful
-    for players which honor the comments. Only the Vorbis comment packet and
-    its Ogg CRC change; audio packets are byte-for-byte preserved.
+
+def _with_final_sample_loop(data, mode=None):
+    """Put the required Ogg loop tag where this build wants it.
+
+    The Switch decoder needs loop metadata to take the route these clips are
+    staged for; WHERE the loop points is the question, and `LOOP_TAG_ENV`
+    above is the record of why it points at zero. Only the Vorbis comment
+    packet and its Ogg CRC change; audio packets are byte-for-byte preserved,
+    so this converts a finished clip either way without re-encoding.
     """
     data = bytearray(data)
-    last = _last_granule(data)
+    wanted = loop_comments(bytes(data), mode)
     marker = data.find(b'\x03vorbis')
     page = data.rfind(b'OggS', 0, marker + 1)
     if page < 0 or page + 27 > len(data):
@@ -385,8 +636,7 @@ def _with_final_sample_loop(data):
         raise VoiceEncodeError('expected exactly one LOOPSTART comment, got %d'
                                % loopstart_count)
 
-    comments.extend((b'LOOPSTART=' + str(last - 1).encode('ascii'),
-                     b'LOOPLENGTH=1'))
+    comments.extend(wanted)
     replacement = (struct.pack('<I', len(comments)) +
                    b''.join(struct.pack('<I', len(value)) + value
                             for value in comments))
@@ -487,17 +737,26 @@ def _verify(path, legacy=False):
             raise VoiceEncodeError('%s has no legacy LOOPSTART=0 comment'
                                    % path)
     else:
-        last = _last_granule(data)
-        expected = b'LOOPSTART=' + str(last - 1).encode('ascii')
-        if expected not in comments or b'LOOPLENGTH=1' not in comments:
+        wanted = loop_comments(data)
+        missing = [value for value in wanted if value not in comments]
+        if missing:
             raise VoiceEncodeError(
-                '%s does not loop only its final sample (expected %r and '
-                'LOOPLENGTH=1)' % (path, expected))
+                '%s does not carry this build\'s loop tag (%s missing %r)'
+                % (path, LOOP_TAG_MODE, missing))
+        if LOOP_TAG_MODE == LOOP_TAG_ZERO:
+            # A stale tail tag left behind by a build 458-era cache entry is
+            # the exact thing this shape exists to remove, so a leftover
+            # LOOPLENGTH is a failure, not something to tolerate.
+            for value in comments:
+                if value.upper().startswith(b'LOOPLENGTH='):
+                    raise VoiceEncodeError(
+                        '%s still carries %r from the withdrawn tail-loop '
+                        'shape' % (path, value))
     return len(data), voicemod._ogg_duration_ms(data)
 
 
 def verify(path):
-    """Verify the production one-sample-tail loop shape."""
+    """Verify this build's loop shape."""
     return _verify(path, legacy=False)
 
 
@@ -585,9 +844,21 @@ def encode(source, target):
         prefix='.%s.' % os.path.basename(target), suffix='.tmp.ogg',
         dir=os.path.dirname(target) or '.')
     os.close(handle)
+    # Measure first, then apply ONE gain. The measurement is of the source,
+    # before the lead-in silence exists, so the padding cannot drag the
+    # loudness down; the filters then run gain-then-delay for the same
+    # reason. A clip that cannot be measured is encoded unchanged and
+    # counted, never dropped.
+    gain, unmeasurable = _measure(ffmpeg, source)
+    if unmeasurable and unmeasurable != 'silence':
+        global _unmeasured
+        _unmeasured += 1
+    chain = 'adelay=%d:all=1' % LEAD_IN_MS
+    if gain:
+        chain = 'volume=%.2fdB,%s' % (gain, chain)
     common = [ffmpeg, '-hide_banner', '-nostdin', '-loglevel', 'error', '-y',
               '-i', source,
-              '-af', 'adelay=%d:all=1' % LEAD_IN_MS,
+              '-af', chain,
               '-ar', str(TARGET_SAMPLE_RATE),
               '-ac', str(TARGET_CHANNELS)]
     try:
@@ -747,7 +1018,7 @@ def stage(entries, output_dir, filename=voicemod.folder_voice_key_to_filename,
         cached, legacy = _cache_paths(source)
         made = False
         if not os.path.isfile(cached):
-            if os.path.isfile(legacy):
+            if LEGACY_IS_AUDIO_IDENTICAL and os.path.isfile(legacy):
                 try:
                     _verify(legacy, legacy=True)
                     _publish_final_sample_loop(legacy, cached)

@@ -286,6 +286,7 @@
   "gfx_pool_mb": 256,
   "scaler": "hd",
   "fxaa": "hd",
-  "video_shader": "hd"
+  "video_shader": "hd",
+  "voice_normalize": "loudness:-15.3"
  }
 }
