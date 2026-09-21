@@ -1488,6 +1488,12 @@ def run_build(mods, enabled, settings_by_mod, log, progress,
     # cannot run before the archives. Does nothing unless Echo-S is in the
     # load order with its "Day Night" option on. See ff7nx_daynight.
     produced += build.apply_daynight(SDOUT_DIR, DUMP, plan, log, produced)
+    # ... and the half of it that is a PC executable patch rather than FFNx:
+    # the date and the mod's own clock in the main menu, which Echo-S's own
+    # Time Keeper tutorial tells you to go and look at. Same option, same
+    # pool, and it goes after the cycle so a shortfall lands on the newest
+    # thing. See ff7nx_calendar.
+    produced += build.apply_calendar(SDOUT_DIR, DUMP, plan, log, produced)
     # Echo-S's first field script invokes a PC runtime-selected tutorial
     # movie. This preserves the real materia tutorial and redirects only
     # that field to an otherwise unused movie slot.

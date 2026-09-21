@@ -38,6 +38,7 @@ import ff7nx_ambient
 import echo_s_flevel
 import echo_s_tutorial
 import ff7nx_echomusic
+import ff7nx_calendar
 import ff7nx_daynight
 import ff7nx_facial
 import ff7nx_voice
@@ -10443,6 +10444,8 @@ MAIN_ONLY_ENV = frozenset((
     'SEVENTH_NX_VOICE_BITRATE',  # voice_ogg  encode quality (its own cache)
     'SEVENTH_NX_VOICE_NORMALIZE',  # voice_ogg  dialogue loudness, ditto
     'SEVENTH_NX_VOICE_LOOPTAG',  # voice_ogg  where the loop tag points, ditto
+    ff7nx_calendar.ENV,          # ff7nx_calendar  the menu date row
+    ff7nx_calendar.LAYOUT_ENV,   # ff7nx_calendar  ... and its columns
     'SEVENTH_NX_VOICE_WORKERS',  # voice_ogg  encoder parallelism
     'SEVENTH_NX_NO_VOICE',       # ff7nx_voice   the whole half, off
     'SEVENTH_NX_VOICE_LEVEL',    # ff7nx_voice   which layers to install
@@ -10497,6 +10500,7 @@ MAIN_ONLY_MODULES = frozenset((
     # outdoor bitmap, but it writes nothing to either, so editing it cannot
     # change an archive's bytes -- and this feature has taken enough builds
     # without each one also costing a 1.4 GB flevel rebuild.
+    'ff7nx_calendar.py',
     'ff7nx_daynight.py',
 ))
 
@@ -13011,6 +13015,62 @@ def apply_daynight(sdout, dump, plan, log=lambda *_: None, produced=()):
     log('  %d-byte BSS at +0x%X, %d cave word(s), %d table byte(s)'
         % (report['bss_bytes'], report['bss_base'], report['cave_words'],
            report['table_bytes']))
+    return [dest] if not built else []
+
+
+def apply_calendar(sdout, dump, plan, log=lambda *_: None, produced=()):
+    """
+    Install the date and clock in the main menu.
+
+    The other half of Echo-S's Day/Night, and the half nobody noticed was
+    missing: its Time Keeper tutorial says "you can check the date/time in
+    your menu", and on PC that sentence is delivered by
+    `DayNight/hext/03 - Calendar.txt` patching `ff7.exe`. A Hext file has
+    nothing to patch in an ARM64 recompilation, so it never arrived here.
+
+    Gated on the same option as the cycle itself, because a menu that shows a
+    clock which never advances would be worse than no clock. Runs after it for
+    the usual padding-pool reason, and fails closed: the menu keeps its stock
+    Time/Gil box and the rest of the build is untouched. See FINDINGS-489 for
+    every site and how each was identified.
+    """
+    if not plan.echo_fields:
+        return []
+    if not _echo_daynight_requested(plan):
+        return []
+    if not ff7nx_calendar.enabled():
+        log('')
+        log('menu calendar: %s=0 -- the Time box keeps the play timer'
+            % ff7nx_calendar.ENV)
+        return []
+    src, built = _audio_bridge_base(sdout, dump, log, produced, 'menu calendar')
+    if src is None:
+        return []
+    dest = os.path.join(sdout, 'atmosphere', 'contents', TITLE_ID, 'exefs',
+                        'main')
+    log('')
+    log('Echo-S menu calendar ...')
+    log('  base main   %s%s'
+        % (src, '   (previous patch output)' if built else '   (from dump)'))
+    tmp = dest + '.calendar-tmp'
+    # ROMFS is the working directory inside romfs; the guest image sits
+    # beside it under resources, not in it.
+    guest = os.path.join(sdout, 'atmosphere', 'contents', TITLE_ID,
+                         *ff7nx_calendar.GUEST_IMAGE.split(os.sep))
+    if not os.path.isfile(guest):
+        guest = None
+    try:
+        report = ff7nx_calendar.apply_to_nso(src, tmp, log=log, guest=guest)
+    except Exception as exc:                                   # noqa: BLE001
+        report = None
+        log('! menu calendar: %s: %s' % (type(exc).__name__, exc))
+    if not report:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        log('! the menu calendar is not installed -- the day/night cycle '
+            'itself is unaffected and the menu looks exactly as it did')
+        return []
+    os.replace(tmp, dest)
     return [dest] if not built else []
 
 
