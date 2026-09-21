@@ -656,6 +656,22 @@ EXPECTED_MOVEMENT = frozenset({'dense repack', 'page cap', 'field background',
                                'palette clamp'})
 
 COUNTERS = (
+    # BUILD 346. A Cosmo Memory sfx folder lost its .ogg files between two
+    # builds. Every line below stayed internally consistent -- 721 mappings,
+    # 750 slots, an audio.dat that was written and verified -- so nothing
+    # said a word, and the only visible symptom was battle sounds turning to
+    # crackle on the console because `main`'s route table no longer described
+    # the `audio.dat` on the card. These four are what moved, and naming them
+    # is how the next one gets caught in the log instead of in a battle.
+    ('sfx source oggs',
+     r'sound effects: [\d,]+ mapping\(s\) from \d+ config file\(s\), '
+     r'([\d,]+) \.ogg', 'sound effects'),
+    ('sfx config files',
+     r'sound effects: [\d,]+ mapping\(s\) from (\d+) config file', 'sound effects'),
+    ('sfx slots replaced',
+     r'sound effects: ([\d,]+) of [\d,]+ slots replaced', 'sound effects'),
+    ('sfx sequential routes',
+     r'sequential bridge: ([\d,]+) route\(s\), [\d,]+ variant', 'sound effects'),
     # FINDINGS-158. Tiles naming a palette past the end of section 3. This
     # must NEVER be silently zero because the line vanished -- if the regex
     # stops matching, the counter reads None and the guard says "moved",

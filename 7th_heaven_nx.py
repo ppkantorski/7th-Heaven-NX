@@ -1137,6 +1137,44 @@ def _compatibility_profile(mods, enabled, settings_by_mod, log):
     return active, effective
 
 
+# THE SFX TABLES LIVE IN `main` AND THEIR SAMPLES LIVE IN `audio.dat`.
+#
+# `ff7nx_sfxshuffle`'s route table and `sfxmod`'s appended payload region are
+# one thing in two files: the table says "route 12's third variant is at this
+# offset past the fixed archive", and the offset is only true of the exact
+# `audio.dat` the same build wrote. Copy one without the other and every
+# variant read lands somewhere else in a 79 MB file, which sounds like the
+# samples have been corrupted -- attacks play correctly the first time and
+# turn to crackle as the sequential selector advances into the appended
+# region.
+#
+# Build 346 did exactly that: a Cosmo Memory sfx folder lost its .ogg files,
+# the bridge fell from 58 routes and 13.1 MB to 21 and 3.3 MB, and a
+# `main`-only copy left the console reading the old layout through the new
+# table. Nothing in the build said a word, because each half was internally
+# consistent. This is that word.
+AUDIO_PAIR = (os.path.join('data', 'sound', 'audio.dat'),
+              os.path.join('data', 'sound', 'audio.fmt'))
+
+
+def _audio_fingerprint():
+    """(size, sha256) per file of the SFX archive `main` is indexed against."""
+    import hashlib
+    out = {}
+    for name in AUDIO_PAIR:
+        path = os.path.join(SDOUT_DIR, 'atmosphere', 'contents',
+                            build.TITLE_ID, build.ROMFS, name)
+        try:
+            with open(path, 'rb') as handle:
+                digest = hashlib.sha256()
+                for block in iter(lambda: handle.read(1 << 20), b''):
+                    digest.update(block)
+                out[name] = (os.path.getsize(path), digest.hexdigest())
+        except OSError:
+            out[name] = None
+    return out
+
+
 def run_build(mods, enabled, settings_by_mod, log, progress,
               fps_60=False):
     # BUILD 326. Publish the 60 FPS setting so the ARCHIVE CACHE can see it.
@@ -1147,6 +1185,8 @@ def run_build(mods, enabled, settings_by_mod, log, progress,
     # animation wait scaled x4. build.py folds this into battle.lgp's key
     # only, so toggling it cannot invalidate the other four archives.
     os.environ[build.FPS_ENV] = '1' if fps_60 else '0'
+
+    audio_before = _audio_fingerprint()
 
     # COUNTER GUARD (HANDOFF-121 3.6). Tee the log, and at the end name every
     # counter that moved outside the pass this build was meant to change. It
@@ -1514,6 +1554,15 @@ def run_build(mods, enabled, settings_by_mod, log, progress,
     if produced:
         log(f'done. {len(produced)} files in sdout/')
         log('copy the contents of sdout/ onto the root of your SD card.')
+        moved = [name for name, was in audio_before.items()
+                 if was != _audio_fingerprint().get(name)]
+        if moved:
+            log('')
+            log('!! data/sound CHANGED THIS BUILD (%s). exefs/main carries '
+                'the SFX route table that indexes it, so the two are one '
+                'thing in two files -- copy data/sound as well, or the game '
+                'reads every appended sound variant at the wrong offset and '
+                'they come out as crackle.' % ', '.join(sorted(moved)))
         # Atmosphere's fs.mitm caches the BUILT romfs layout -- every file's
         # offset and length -- in atmosphere/contents/<title>/romfs_metadata.bin
         # on the card. Nothing in this build writes that file and nothing here

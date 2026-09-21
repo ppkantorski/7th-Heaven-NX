@@ -13134,6 +13134,9 @@ def apply_facial(sdout, dump, plan, log=lambda *_: None, produced=()):
     log('  mouth: KAWAI EYETX\'s third parameter, which the stock handler '
         'writes a literal 0 over, is latched and drives '
         'hundred_data_group_array[3]')
+    log('  NPC mouth safety: eye-set 9 borrows Cloud\'s eyes but probes '
+        '`npc_mouth_<n>`, never Cloud\'s `c_mouth_<n>`; this keeps a generic '
+        'mouth texture off NPC heads whose group 3 is the full face material')
     if report['lip_flap']:
         log('  lip flap: ON -- while ff7nx_voice has a player sounding for '
             'the model that opened the window, the mouth opens and closes '

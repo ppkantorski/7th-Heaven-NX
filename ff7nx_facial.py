@@ -246,7 +246,7 @@ SL_ART_R = 0x14
 SL_MOUTH_TEX = 0x18
 SL_ART_IDX = 0x1C                     # u8, index loaded in art_l/art_r
 SL_MOUTH_IDX = 0x1D                   # u8, index loaded in mouth_tex
-SL_FLAGS = 0x1E                       # u8, bit0 = stock pointers + name taken
+SL_FLAGS = 0x1E                       # u8, FLAG_* below
 SL_MISS_EYE = 0x1F                    # u8, bit n = index n probed and absent
 SL_EXPR = 0x20                        # u8, latched expression, 0 = none
 SL_MOUTH_REQ = 0x21                   # u8, latched mouth index, 0 = none
@@ -258,6 +258,7 @@ SL_MOUTH_SCRIPT = 0x34                # u8, what KAWAI EYETX asked for
 SL_NAME_MAX = 8
 
 FLAG_STOCK = 1
+FLAG_NPC = 2                          # eye-set 9; use npc_* fallbacks
 
 # The highest index a name is built for. The shipped set tops out at
 # Y_EYE2_6, so 7 is one past everything that exists and 8 bits of
@@ -669,12 +670,20 @@ def build_blink_cave(cave, addr, bss, load_entry, mload_entry,
     a.bcond('out', HS)
     _slot(a, 23)
 
-    # which of the nine eye sets this model uses.  9 is the NPC marker and
-    # resolves to Cloud's set exactly as FFNx does; 8 is the entry whose
-    # has_eyes is 0 in the module, so there is nothing to fall back to.
+    # Which of the nine eye sets this model uses.  9 is the NPC marker. FFNx
+    # borrows Cloud's generic EYES for it, but deliberately uses npc_mouth_N
+    # rather than Cloud's c_mouth_N.  Keep that distinction in the slot before
+    # mapping the eye set to zero.  Missing it made every voiced NPC eligible
+    # for Cloud's mouth texture; on oldm3, group 3 is the entire NPC20-textured
+    # head, so the lip flap replaced the whole face and made it flash pink.
+    # Entry 8 has has_eyes == 0 in the module and has no fallback.
     _gld8(a, 21, A_EYE_IDX, 25)
     a.emit(A.cmp_imm(25, 9))
     a.bcond('eye_set', NE)
+    a.emit(A.ldrb(9, 20, SL_FLAGS))
+    a.emit(A.movz(10, FLAG_NPC))
+    a.emit(orr_reg(9, 9, 10))
+    a.emit(A.strb(9, 20, SL_FLAGS))
     a.emit(A.movz(25, 0))
     a.label('eye_set')
     a.emit(A.cmp_imm(25, 8))
@@ -717,7 +726,9 @@ def build_blink_cave(cave, addr, bss, load_entry, mload_entry,
     a.emit(A.sub_imm(9, 9, SL_NAME))
     a.emit(A.str_(9, 20, SL_NAMELEN))
     a.cbz(9, 'out')
-    a.emit(A.movz(9, FLAG_STOCK))
+    a.emit(A.ldrb(9, 20, SL_FLAGS))
+    a.emit(A.movz(10, FLAG_STOCK))
+    a.emit(orr_reg(9, 9, 10))
     a.emit(A.strb(9, 20, SL_FLAGS))
     a.label('have_stock')
 
@@ -1030,6 +1041,19 @@ def build_mload_cave(cave, addr, bss, gen_entry):
                 ('lit', b'.tim')])
     a.b('named')
     a.label('cand1')
+    # Eye-set 9 is an NPC marker, not another name for Cloud.  FFNx first
+    # probes mouth_<model>_N and then npc_mouth_N for this case.  In
+    # particular it must never fall through to c_mouth_N: many NPC heads have
+    # a fourth material group that covers the whole face rather than a mouth
+    # quad, and feeding Cloud's tiny mouth texture to it recolours the head.
+    a.emit(A.ldrb(9, 20, SL_FLAGS))
+    a.emit(A.lsr(9, 9, 1))
+    a.emit(A.and_mask(9, 9, 1))
+    a.cbz(9, 'cand1_generic')
+    _emit_name(a, 'm1npc', 28, GS_NAME_M, 24, 20,
+               [('lit', b'npc_mouth_'), ('digit',), ('lit', b'.tim')])
+    a.b('named')
+    a.label('cand1_generic')
     a.emit(A.ldr(9, 24, HDR_GENR_LEN))
     a.cbz(9, 'settle')
     _emit_name(a, 'm1', 28, GS_NAME_M, 24, 20,
