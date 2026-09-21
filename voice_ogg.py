@@ -8,7 +8,7 @@ The port plays a loose .ogg through `MusicStream` -> vgmstream. That path was
 built for background music, and the author established on hardware -- not by
 reading, by running it -- that it only behaves for one specific stream shape:
 
-    48 kHz, 2 channels, Vorbis, with a LOOPSTART=0 comment
+    48 kHz, 2 channels, Vorbis, with a one-sample final loop
 
 and that selecting that route costs roughly the first 100 ms of the clip,
 which the decoder discards on overlap. The fix for that is a 100 ms of silence
@@ -75,7 +75,8 @@ def _bitrate():
     knowing what it costs: Echo-S's 15,505 clips arrive as 2.2 GB of PC Vorbis
     and come out at roughly 2.8 GB, so the "normalisation" step makes the mod
     BIGGER. Nothing about 500k was proven on hardware -- the invariants that
-    were are 48 kHz, stereo and LOOPSTART=0. For speech, 128k is transparent
+    were are 48 kHz, stereo and a valid loop-tagged decoder route. For speech,
+    128k is transparent
     and lands the whole set near 700 MB.
 
     It participates in the cache key, so changing it re-encodes everything
@@ -97,7 +98,11 @@ TARGET_BITRATE = _bitrate()
 # 400 of Echo-S's own clips, the native encoder aborts on roughly one in two
 # hundred with `vorbisenc.c: Assertion l != csub failed`, and at equal
 # bitrates it is audibly worse. See `_encoder`.
-RECIPE = ('ECHO-VOICE-V3 adelay=%d ar=%d ac=%d vorbis %s LOOPSTART=0'
+LEGACY_RECIPE = ('ECHO-VOICE-V3 adelay=%d ar=%d ac=%d vorbis %s LOOPSTART=0'
+                 % (LEAD_IN_MS, TARGET_SAMPLE_RATE, TARGET_CHANNELS,
+                    TARGET_BITRATE))
+RECIPE = ('ECHO-VOICE-V4 adelay=%d ar=%d ac=%d vorbis %s '
+          'LOOPSTART=final-1 LOOPLENGTH=1'
           % (LEAD_IN_MS, TARGET_SAMPLE_RATE, TARGET_CHANNELS, TARGET_BITRATE))
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -285,7 +290,142 @@ def encoder_warning():
             'encoder is part of the cache key.')
 
 
-def verify(path):
+def _last_granule(data):
+    """Return the exact decoded sample count from the final Ogg page."""
+    offset, last = 0, None
+    while offset < len(data):
+        if data[offset:offset + 4] != b'OggS' or offset + 27 > len(data):
+            raise VoiceEncodeError('invalid Ogg page at %d' % offset)
+        segments = data[offset + 26]
+        lacing_end = offset + 27 + segments
+        if lacing_end > len(data):
+            raise VoiceEncodeError('truncated Ogg lacing table')
+        page_end = lacing_end + sum(data[offset + 27:lacing_end])
+        if page_end > len(data):
+            raise VoiceEncodeError('truncated Ogg page body')
+        granule, = struct.unpack_from('<q', data, offset + 6)
+        if granule >= 0:
+            last = granule
+        offset = page_end
+    if last is None or last < 2:
+        raise VoiceEncodeError('Ogg stream has no usable final granule')
+    return last
+
+
+def _vorbis_comments(data):
+    """Return the complete user-comment byte strings from a Vorbis stream."""
+    marker = data.find(b'\x03vorbis')
+    if marker < 0 or marker + 11 > len(data):
+        raise VoiceEncodeError('no Vorbis comment header')
+    vendor_len, = struct.unpack_from('<I', data, marker + 7)
+    count_at = marker + 11 + vendor_len
+    if count_at + 4 > len(data):
+        raise VoiceEncodeError('truncated Vorbis comment header')
+    count, = struct.unpack_from('<I', data, count_at)
+    cursor = count_at + 4
+    comments = []
+    for _ in range(count):
+        if cursor + 4 > len(data):
+            raise VoiceEncodeError('truncated Vorbis comment length')
+        length, = struct.unpack_from('<I', data, cursor)
+        cursor += 4
+        if cursor + length > len(data):
+            raise VoiceEncodeError('truncated Vorbis comment body')
+        comments.append(bytes(data[cursor:cursor + length]))
+        cursor += length
+    return comments
+
+
+def _with_final_sample_loop(data):
+    """Move the required Ogg loop to one inaudible sample at the file tail.
+
+    The Switch decoder needs loop metadata. Hardware later established that
+    its NativeOggPlayer treats the tag as a loop boolean and still rewinds the
+    sentence, so this standards-correct range is not the transition fix;
+    ff7nx_voice owns that at MAPJUMP. Keeping the narrow range remains useful
+    for players which honor the comments. Only the Vorbis comment packet and
+    its Ogg CRC change; audio packets are byte-for-byte preserved.
+    """
+    data = bytearray(data)
+    last = _last_granule(data)
+    marker = data.find(b'\x03vorbis')
+    page = data.rfind(b'OggS', 0, marker + 1)
+    if page < 0 or page + 27 > len(data):
+        raise VoiceEncodeError('Vorbis comment is not in an Ogg page')
+    segments = data[page + 26]
+    lacing = page + 27
+    body = lacing + segments
+    page_end = body + sum(data[lacing:body])
+    if not body <= marker < page_end:
+        raise VoiceEncodeError('Vorbis comment crosses an Ogg page')
+
+    vendor_len, = struct.unpack_from('<I', data, marker + 7)
+    count_at = marker + 11 + vendor_len
+    count, = struct.unpack_from('<I', data, count_at)
+    cursor = count_at + 4
+    comments = []
+    loopstart_count = 0
+    for _ in range(count):
+        if cursor + 4 > page_end:
+            raise VoiceEncodeError('truncated Vorbis comment length')
+        length, = struct.unpack_from('<I', data, cursor)
+        cursor += 4
+        value = bytes(data[cursor:cursor + length])
+        cursor += length
+        if cursor > page_end:
+            raise VoiceEncodeError('truncated Vorbis comment body')
+        upper = value.upper()
+        if upper.startswith(b'LOOPSTART='):
+            loopstart_count += 1
+            continue
+        if upper.startswith(b'LOOPLENGTH='):
+            continue
+        comments.append(value)
+    if loopstart_count != 1:
+        raise VoiceEncodeError('expected exactly one LOOPSTART comment, got %d'
+                               % loopstart_count)
+
+    comments.extend((b'LOOPSTART=' + str(last - 1).encode('ascii'),
+                     b'LOOPLENGTH=1'))
+    replacement = (struct.pack('<I', len(comments)) +
+                   b''.join(struct.pack('<I', len(value)) + value
+                            for value in comments))
+    old_start, old_end = count_at, cursor
+    delta = len(replacement) - (old_end - old_start)
+
+    # `cursor` points at the Vorbis comment framing bit. Find the lacing entry
+    # which terminates that packet; growing it moves the following setup packet
+    # without changing any audio packet or page boundary after this one.
+    needed = cursor + 1 - body
+    walked = 0
+    packet_end_segment = None
+    for index in range(segments):
+        walked += data[lacing + index]
+        if walked >= needed:
+            for final in range(index, segments):
+                if data[lacing + final] < 255:
+                    packet_end_segment = final
+                    break
+            break
+    if (packet_end_segment is None or
+            not 0 <= data[lacing + packet_end_segment] + delta <= 255):
+        raise VoiceEncodeError('final loop tags need an Ogg lacing rewrite')
+    data[lacing + packet_end_segment] += delta
+    data[old_start:old_end] = replacement
+    page_end += delta
+
+    crc = 0
+    for where in range(page, page_end):
+        byte = 0 if page + 22 <= where < page + 26 else data[where]
+        crc ^= byte << 24
+        for _ in range(8):
+            crc = ((crc << 1) ^
+                   (0x04C11DB7 if crc & 0x80000000 else 0)) & 0xFFFFFFFF
+    struct.pack_into('<I', data, page + 22, crc)
+    return bytes(data)
+
+
+def _verify(path, legacy=False):
     """
     Check the decoder invariants on a finished file. Returns (bytes, ms).
 
@@ -341,10 +481,24 @@ def verify(path):
                                'is only safe at %d / %d'
                                % (path, rate, channels, TARGET_SAMPLE_RATE,
                                   TARGET_CHANNELS))
-    if b'LOOPSTART=0' not in data[:0x4000]:
-        raise VoiceEncodeError('%s has no LOOPSTART=0 comment; without it the '
-                               'player takes the other decoder route' % path)
+    comments = _vorbis_comments(data)
+    if legacy:
+        if b'LOOPSTART=0' not in comments:
+            raise VoiceEncodeError('%s has no legacy LOOPSTART=0 comment'
+                                   % path)
+    else:
+        last = _last_granule(data)
+        expected = b'LOOPSTART=' + str(last - 1).encode('ascii')
+        if expected not in comments or b'LOOPLENGTH=1' not in comments:
+            raise VoiceEncodeError(
+                '%s does not loop only its final sample (expected %r and '
+                'LOOPLENGTH=1)' % (path, expected))
     return len(data), voicemod._ogg_duration_ms(data)
+
+
+def verify(path):
+    """Verify the production one-sample-tail loop shape."""
+    return _verify(path, legacy=False)
 
 
 def _identification(data):
@@ -361,7 +515,7 @@ def _identification(data):
     raise VoiceEncodeError('no Vorbis identification header')
 
 
-def cache_path(source):
+def _cache_paths(source):
     """
     Where this exact source, under this exact recipe, is kept.
 
@@ -369,18 +523,46 @@ def cache_path(source):
     cache exists for: the same clip reached through a re-extracted .iro, or a
     line that ships audio byte-identical to another line's.
     """
-    digest = hashlib.sha256()
-    digest.update(RECIPE.encode('ascii'))
-    digest.update(b'\0')
+    digests = []
+    for recipe in (RECIPE, LEGACY_RECIPE):
+        digest = hashlib.sha256()
+        digest.update(recipe.encode('ascii'))
+        digest.update(b'\0')
+        digest.update((encoder_id() or 'none').encode('ascii'))
+        digest.update(b'\0')
+        digests.append(digest)
     # The encoder is part of the recipe, not part of the environment. Without
     # this, a cache built by FFmpeg's native encoder is reused verbatim after
     # libvorbis is installed and the quality problem is permanent.
-    digest.update((encoder_id() or 'none').encode('ascii'))
-    digest.update(b'\0')
     with open(source, 'rb') as handle:
         for block in iter(lambda: handle.read(1 << 20), b''):
-            digest.update(block)
-    return os.path.join(CACHE, digest.hexdigest() + '.ogg')
+            for digest in digests:
+                digest.update(block)
+    return tuple(os.path.join(CACHE, digest.hexdigest() + '.ogg')
+                 for digest in digests)
+
+
+def cache_path(source):
+    return _cache_paths(source)[0]
+
+
+def _publish_final_sample_loop(source, target):
+    """Retag one legacy cache entry atomically, without re-encoding audio."""
+    with open(source, 'rb') as handle:
+        converted = _with_final_sample_loop(handle.read())
+    os.makedirs(os.path.dirname(target) or '.', exist_ok=True)
+    handle, temporary = tempfile.mkstemp(
+        prefix='.%s.' % os.path.basename(target), suffix='.tmp.ogg',
+        dir=os.path.dirname(target) or '.')
+    try:
+        with os.fdopen(handle, 'wb') as output:
+            output.write(converted)
+        verify(temporary)
+        os.replace(temporary, target)
+        temporary = None
+    finally:
+        if temporary and os.path.exists(temporary):
+            os.unlink(temporary)
 
 
 def encode(source, target):
@@ -442,6 +624,10 @@ def encode(source, target):
                 raise VoiceEncodeError(
                     'ffmpeg could not normalise %s with the %s encoder: %s'
                     % (source, encoder, result.stderr.strip() or 'no stderr'))
+        with open(temporary, 'rb') as handle:
+            converted = _with_final_sample_loop(handle.read())
+        with open(temporary, 'wb') as handle:
+            handle.write(converted)
         measured = verify(temporary)
         os.replace(temporary, target)
         temporary = None
@@ -558,11 +744,19 @@ def stage(entries, output_dir, filename=voicemod.folder_voice_key_to_filename,
                                    % filename(entry.key))
 
     def prepare(source):
-        cached = cache_path(source)
+        cached, legacy = _cache_paths(source)
         made = False
         if not os.path.isfile(cached):
-            encode(source, cached)
-            made = True
+            if os.path.isfile(legacy):
+                try:
+                    _verify(legacy, legacy=True)
+                    _publish_final_sample_loop(legacy, cached)
+                except VoiceEncodeError:
+                    encode(source, cached)
+                    made = True
+            else:
+                encode(source, cached)
+                made = True
         try:
             measured = verify(cached)
         except VoiceEncodeError:

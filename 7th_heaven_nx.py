@@ -1460,6 +1460,22 @@ def run_build(mods, enabled, settings_by_mod, log, progress,
     # reverse order stops the build with the site named instead of composing
     # something subtly wrong. See ff7nx_voice.
     produced += build.apply_echo_voice(SDOUT_DIR, DUMP, plan, log, produced)
+    # The facial runtime, after the voice one and for two reasons. Its lip
+    # flap reads `ff7nx_voice`'s live-player pointer, so it needs that pass's
+    # BSS address, which `apply_echo_voice` records on the plan. And it is the
+    # largest remaining consumer of the padding pool -- about 1,450 of the
+    # 1,763 usable words left after everything else -- so it goes last of the
+    # two and reports what it took rather than pre-empting anyone. It does
+    # nothing at all unless SEVENTH_NX_FACIAL shipped the art. See
+    # ff7nx_facial.
+    produced += build.apply_facial(SDOUT_DIR, DUMP, plan, log, produced)
+    # Echo-S's Day/Night cycle, after the facial runtime and for the same
+    # padding-pool reason: whoever goes last is the one that reports a
+    # shortfall. It also needs the built flevel on disk for `maplist`, which
+    # is the field id -> name table its outdoor bitmap is keyed by, so it
+    # cannot run before the archives. Does nothing unless Echo-S is in the
+    # load order with its "Day Night" option on. See ff7nx_daynight.
+    produced += build.apply_daynight(SDOUT_DIR, DUMP, plan, log, produced)
     # Echo-S's first field script invokes a PC runtime-selected tutorial
     # movie. This preserves the real materia tutorial and redirects only
     # that field to an otherwise unused movie slot.

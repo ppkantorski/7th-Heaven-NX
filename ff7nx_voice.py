@@ -250,13 +250,25 @@ MUSIC_THREAD_NAME_FORMAT = 0x11A9ABC
 MUSIC_THREAD_NAME_FORMAT_STOCK = b"music stream thread '%s'\0"
 
 # NativeOggPlayer's worker checks this branch before deciding whether a
-# decoder-owned LOOPSTART stream may pass its real end.  A voice must use the
-# stable LOOPSTART=0 loader route, but only the voice player is redirected to
-# the worker's existing end-of-stream branch.
+# decoder-owned LOOPSTART stream may pass its real end.  The Switch decoder
+# treats LOOPSTART as a boolean and rewinds to the beginning even when the Ogg
+# names a final-sample loop.  Normal playback keeps this branch's exact two
+# routes; only a MAPJUMP-latched field voice is diverted to the worker's own
+# renderer-stop path.
 WORKER_LOOP_HOOK = 0x34B4
 WORKER_LOOP_ORIG = 0x3500020A          # cbnz w10, 0x34f4
 WORKER_ENDCHECK = WORKER_LOOP_HOOK + 4
 WORKER_LOOP_CONTINUE = 0x34F4
+WORKER_STOP_UNLOCK = 0x3568
+
+# Opcode 0x60 from the original execute_opcode_table resolves through the
+# recompilation map to this exact ARM64 function entry.  chrin_1b proves why
+# the event matters: Reno executes MAPJUMP while MESSAGE 75, owned by another
+# entity, is intentionally still open.  Window-close and field-frame service
+# callbacks therefore cannot own this boundary.
+MAPJUMP_HOOK = 0x95B8B0
+MAPJUMP_ORIG = 0xF81B0FF9              # str x25, [sp, #-0x50]!
+MAPJUMP_RESUME = MAPJUMP_HOOK + 4
 
 # This is reached after the worker has released the native renderer at +0x80,
 # but while it still owns the player's mutex.  It is the only point at which
@@ -268,13 +280,6 @@ WORKER_RELOAD_ORIG = 0xF9402E60         # ldr x0, [x19, #0x58]
 WORKER_RELOAD_STOCK = WORKER_RELOAD_HOOK + 4
 WORKER_REENTER = 0x3358                 # worker initialization, with x0=P
 
-# The decoder constructor saves a 0xC8-byte reset image at ``decoder+0xB0``.
-# OGG_PLAY(loopish=0) restores that image in its worker before decoding.
-# Therefore a tagged source can be made a true one-shot only by clearing the
-# loop flag in *both* the live decoder and its saved reset image before start.
-# Changing only the live word after OGG_PLAY is too late (the old v16 result).
-DECODER_LOOP_FLAG_OFF = 0x18
-DECODER_RESET_IMAGE_OFF = 0xB0
 RENDERER_PLAY_CURSOR_VTBL_OFF = 0x68
 
 # Guest globals, derived from FFNx's field data chain and cross-checked in
@@ -492,6 +497,46 @@ BATTLE_TEXT_SAVE_OFF = 0x400            # x24..x28, then translated LR
 BATTLE_TEXT_LR_OFF = BATTLE_TEXT_SAVE_OFF + 5 * 8
 BATTLE_TEXT_LAST_OFF = 0x430            # u32 buffer/character signature
 # `WORLD_DIALOG` is the highest 256-byte record and ends exactly at 0x990.
+# THE REPLAY GUARD, AT THE DRAIN.
+# ==============================
+# Four builds guarded the PUBLISH side -- per-window records, per-window key
+# hashes, a global last-key slot -- and the recording of the scene falsifies
+# all of them at once. Measured from `repeated_dialogue.mp4` by matched filter
+# against the staged clip:
+#
+#     chrin_1b/74.ogg  (Reno)    -0.67s .. 2.24s   natural end
+#     chrin_1b/75.ogg  (grunts)   2.49s .. 5.35s   natural end, complete
+#     chrin_1b/75.ogg  AGAIN      5.44s ..         cut off by the map change
+#
+# 0.09 SECONDS. The clip restarts five or six frames after it ends, which is
+# the length of `completed` -> `commands` -> `create`. So whatever published
+# it, the fact that matters is the one this can act on: AT THE MOMENT A PLAYER
+# RETIRES, THE REQUEST SITTING IN THE MAILBOX IS THE LINE THAT JUST PLAYED.
+#
+# So the identity kept is the key the LIVE PLAYER was built from, and a
+# request matching it is refused for a short window after that player is
+# retired. It cannot be clobbered by the other speakers in a burst (there is
+# one player, not one per window), it does not care which window or which code
+# path published the duplicate, and the key carries the field name so a new
+# scene is never confused with a repeat.
+#
+# The comparison is against the last key a player was BUILT from, and the
+# counter is what makes it a guard rather than a permanent ban: while that
+# player is still speaking the counter is zero, so a same-window re-request
+# still replaces it, exactly as before.
+#
+# Both live in `VOICE_PAGE`'s dead tail -- a u8[256] indexed by window id,
+# and `audit_voice_windows.py` walked every MESSAGE and ASK site in all 702
+# Echo-S fields to establish that the ids used are 0, 1, 2 and 3. Byte 64 up is
+# unreachable, so this costs NO new BSS; the block has 8 bytes of page slack.
+VOICE_ACTIVE_KEY_HASH_OFF = VOICE_PAGE_OFF + 64    # u32, last key constructed
+VOICE_REPLAY_GUARD_OFF = VOICE_PAGE_OFF + 68       # u32, frames still guarded
+VOICE_MAPJUMP_OFF = VOICE_PAGE_OFF + 72             # u32, worker stop latch
+# Frames after a retirement during which that same line will not be rebuilt.
+# The measured gap is 5-6 frames; a map transition is about 60. Half a second
+# is comfortably outside the time it takes to close a box and talk to an NPC
+# again, which is the only thing this can wrongly refuse.
+VOICE_REPLAY_GUARD_FRAMES = 30
 VOICE_SCRATCH_BYTES = 0x990
 VOICE_CMD_NONE = 0
 VOICE_CMD_PLAY = 1
@@ -715,6 +760,26 @@ def _emit_bss_key_copy(a, bss, source_off, target_off):
         a.emit(A.str64(8, bss, target_off + off))
 
 
+def _emit_key_hash(a, bss, dest, label_prefix, cursor=11, counter=10, word=8):
+    """Fold ``VOICE_KEY`` into a u32 in ``dest``.
+
+    A loop, not 32 unrolled words: build 449 put the unrolled form in the
+    SHARED service builder, took world_service to 689 words against a 696-word
+    window, and the allocator could not place it -- which silenced the entire
+    runtime on hardware.  Eight words, whatever the key length.
+    """
+    a.emit(A.add_imm64(cursor, bss, VOICE_KEY_OFF))
+    a.emit(A.movz(dest, 0))
+    a.emit(A.movz(counter, VOICE_KEY_BYTES // 4))
+    label = label_prefix + '_key_hash_word'
+    a.label(label)
+    a.emit(A.ldr_post(word, cursor, 4))
+    a.emit(A.eor_reg(dest, dest, word))
+    a.emit(A.sub_imm(counter, counter, 1))
+    a.emit(A.cmp_imm(counter, 0))
+    a.bcond(label, A.NE)
+
+
 def _emit_ogg_preflight(a, bss, miss_label):
     """Open and release the exact native Ogg path before player construction.
 
@@ -805,6 +870,54 @@ def _emit_native_task_join(a, player):
     a.emit(A.ldr64(8, 0, 0x00))
     a.emit(A.ldr64(8, 8, 0x18))
     a.emit(0xD63F0100)                  # blr x8
+
+
+def _build_mapjump_voice_latch(cave, addr, scratch):
+    """Latch a field transition without calling audio from the script VM."""
+    a = Asm(cave, addr)
+    _bss_ptr(a, 8, scratch)
+    a.emit(A.ldr64(9, 8, VOICE_PLAYER_OFF))
+    a.cbz64(9, 'resume')
+    a.emit(A.movz(9, 1))
+    a.emit(A.str_(9, 8, VOICE_MAPJUMP_OFF))
+    a.label('resume')
+    a.emit(MAPJUMP_ORIG)
+    a.emit(A.b(a.pc(), MAPJUMP_RESUME))
+    return a.resolve()
+
+
+def _build_mapjump_worker_stop(cave, addr, scratch):
+    """Stop only our field voice, inside its worker, after MAPJUMP.
+
+    This hook does not infer EOF and does not alter decoder state.  With no
+    transition latch it reproduces the stock CBNZ exactly.  Once MAPJUMP has
+    latched a live field voice, it clears the one-shot latch and enters the
+    worker's existing externally-stopped cleanup path before another loop
+    buffer can be submitted.
+    """
+    a = Asm(cave, addr)
+    _bss_ptr(a, 11, scratch)
+    a.emit(A.ldr(12, 11, VOICE_MAPJUMP_OFF))
+    a.cbz(12, 'stock')
+    a.emit(A.ldr64(12, 11, VOICE_PLAYER_OFF))
+    a.emit(A.cmp_reg64(19, 12))
+    a.bcond('stock', A.NE)
+    a.emit(A.str_(A.WZR, 11, VOICE_MAPJUMP_OFF))
+    # We are already inside the player's locked worker section. Reproduce the
+    # state written by OGG_STOP's nonblocking half, then join the worker's
+    # existing unlock/cleanup route. Do not branch to +0x34D8: that EOF path
+    # still submits a final buffer and expects X22 to hold a computed clamp,
+    # which is not live at this hook.
+    a.emit(A.strb(A.WZR, 19, 0x50))
+    a.emit(A.movz(12, 8))
+    a.emit(A.str_(12, 19, 0x98))
+    a.emit(A.b(a.pc(), WORKER_STOP_UNLOCK))
+    a.label('stock')
+    a.cbnz(10, 'loop_continue')
+    a.emit(A.b(a.pc(), WORKER_ENDCHECK))
+    a.label('loop_continue')
+    a.emit(A.b(a.pc(), WORKER_LOOP_CONTINUE))
+    return a.resolve()
 
 
 def _emit_host_deadline(a, player, bss, deadline_off=CLOCK_DEADLINE_OFF):
@@ -1359,6 +1472,7 @@ def _build_message_command_cave(cave, addr, scratch, forced_name=None,
                                 construct_key=True,
                                 stop_on_close=True,
                                 publish_on_dialog_change=True,
+                                first_in_burst_wins=True,
                                 publication_mask=VOICE_PUBLISH_ALL,
                                 window_param_offset=1,
                                 dialog_param_offset=2,
@@ -1471,31 +1585,31 @@ def _build_message_command_cave(cave, addr, scratch, forced_name=None,
 
     a.emit(A.cmp_imm(27, 0))
     a.bcond('opening', A.EQ)
+    # A RECORDED STATE OF 0 STILL MEANS "THIS WINDOW IS FRESH".
+    # ========================================================
+    # Build 448 narrowed this to a virgin record, to stop a window that
+    # closes and reopens from requesting the same line twice. That cured the
+    # duplicate and caused a worse bug, which the emulator caught before it
+    # shipped: the per-window record is NOT cleared between fields, so
+    #
+    #     chrin_1b w1/d75 plays, closes   -> record <75, 0>
+    #     the next field uses w1 for d75  -> dialog "unchanged" -> SILENT
+    #
+    # Those are two sides of one missing fact. Nothing here can tell "the same
+    # window reopening the same line" from "a new scene's line that happens to
+    # match", because the record does not know which field wrote it. Guessing
+    # either way trades a repeat for a missing line, and a missing line is the
+    # bug this whole runtime exists to avoid.
+    #
+    # So the publish rule is back as it was, and the duplicate is stopped
+    # where it can be identified without that fact -- see `completed`, which
+    # refuses to drain a pending request for the line that just finished.
     a.emit(A.cmp_imm(8, 0))
     a.bcond('starting', A.EQ)
     if publish_on_dialog_change:
-        # A DIFFERENT LINE ON THIS WINDOW IS A NEW LINE, WHATEVER THE STATE
-        # SAID.
-        # ==================================================================
-        # Publishing only on an observed 0 -> nonzero state transition
-        # assumes this cave runs on consecutive frames, and that assumption
-        # holds only for a MESSAGE that blocks its script until dismissed.
-        # Echo-S also uses the non-blocking idiom, and md8_1 is the measured
-        # case:
-        #
-        #     WMODE 3,0,0 ; WINDOW 3 ; MESSAGE 3,9 ; WAIT 39 ; WCLS 3
-        #
-        # The script does not wait, so the opcode handler -- and this cave
-        # with it -- runs ONCE. There is no earlier frame in which the state
-        # was zero to be recorded, so `starting` never fires and Wedge's line
-        # is never requested. Worse, that single pass stores a nonzero state
-        # which is then never cleared, because the close is never observed
-        # either: window 3 stays poisoned for every later non-blocking line.
-        #
-        # The dialog id is the thing that actually identifies the line, so
-        # compare it. It costs no new BSS -- it rides in the high byte of the
-        # entry that already exists -- and it is what the world producer has
-        # always done with VOICE_WORLD_DIALOG.
+        # The dialog id is the thing that identifies the line, and it is what
+        # makes a non-blocking MESSAGE audible: the handler runs once, so
+        # there is no earlier frame in which the state was zero.
         a.emit(A.cmp_reg(9, 28))
         a.bcond('starting', A.NE)
     a.emit(A.cmp_imm(8, 14))
@@ -1625,6 +1739,42 @@ def _build_message_command_cave(cave, addr, scratch, forced_name=None,
         a.b('update')
 
     a.label('queue_play')
+    if first_in_burst_wins:
+        # THREE ENTITIES, ONE SCRIPT TICK, ONE SLOT.
+        # =========================================
+        # `chrin_1b` is the measured case -- Reno tells the grunts not to step
+        # on the flowers and all three answer at once. Each grunt is its own
+        # ENTITY and its whole routine is three opcodes:
+        #
+        #     WINDOW 1 ; MESSAGE 1,75 ; RET      <- 75a.ogg, 2.85s, all three
+        #     WINDOW 2 ; MESSAGE 2,76 ; RET         voices in one recording
+        #     WINDOW 3 ; MESSAGE 3,77 ; RET
+        #
+        # Echo-S voices only 75, because that clip IS the overlap. All three
+        # routines run in the same tick, so this cave published three times
+        # before the service built anything: 75's key was overwritten by 76's
+        # and then 77's, the last one has no clip, its preflight failed, and
+        # the scene was silent.
+        #
+        # `SEVENTH_NX_VOICE_FOREIGN` could not help. Every setting there
+        # decides what a foreign window does to an AUDIBLE line, and there was
+        # never an audible line to protect -- which is exactly why `defer`
+        # changed nothing on hardware.
+        #
+        # So: while a PLAY is pending and UNCONSUMED, a publish from a
+        # DIFFERENT window leaves it alone. Same window still overwrites,
+        # because that is a page advance and the newest line is the right one.
+        # The guard is live only inside one burst -- the service clears
+        # PENDING_CMD the moment it takes the request -- so ordinary
+        # conversation is untouched.
+        a.emit(A.ldr(8, 24, VOICE_PENDING_CMD_OFF))
+        a.emit(A.cmp_imm(8, VOICE_CMD_PLAY))
+        a.bcond('burst_clear', A.NE)
+        a.emit(A.ldr(8, 24, VOICE_PENDING_OWNER_OFF))
+        a.emit(A.cmp_reg(8, 26))
+        a.bcond('burst_clear', A.EQ)
+        a.b('update')
+        a.label('burst_clear')
     if construct_key and (forced_name is None or build_key_then_forced):
         if key_mode == 'folder':
             _emit_field_folder_key(a, scratch,
@@ -1693,6 +1843,16 @@ def _build_message_command_cave(cave, addr, scratch, forced_name=None,
         a.emit(A.strb(A.WZR, 1, 0))
     elif construct_key:
         a.emit(A.strb(A.WZR, 1, forced_name_length))
+    # NO REPLAY GUARD LIVES HERE ANY MORE, AND THAT IS DELIBERATE.
+    # ============================================================
+    # Builds 448, 451 and 452 each refused the duplicate on this side, and the
+    # recording of the scene shows why none of them could work: the clip
+    # restarts SIX FRAMES after it ends, which is the service's retirement
+    # path, not a publish. Worse, a refusal here is not free -- the key buffer
+    # has already been rewritten by the time any test on it can run, so
+    # refusing leaves the shared mailbox describing a request nobody made.
+    # The guard now lives at the drain, in `_build_field_clocked_voice_service`,
+    # where the request and the line that just played can be compared directly.
     if publication_mask & VOICE_PUBLISH_OWNER:
         a.emit(A.str_(26, 24, VOICE_PENDING_OWNER_OFF))
     if publication_mask & VOICE_PUBLISH_AUTO:
@@ -2246,7 +2406,9 @@ def _build_field_clocked_voice_service(cave, addr, scratch,
                                        battle_mode=False,
                                        resume_target=None,
                                        allow_foreign_replace=False,
-                                       defer_foreign_play=True):
+                                       defer_foreign_play=True,
+                                       replay_guard=False,
+                                       stream_once=True):
     """Consume MESSAGE commands through the v49-proven voice lifecycle.
 
     The MESSAGE cave only writes a compact filename and command.  This native
@@ -2255,6 +2417,15 @@ def _build_field_clocked_voice_service(cave, addr, scratch,
     after the worker reaches state 1, and is then deleted by its own native
     destructor before the next queued source is constructed.
     """
+    # Build 449's lesson, enforced here rather than trusted to every caller:
+    # the duplicate is a FIELD dialogue defect, and the world and battle
+    # services are built from this same function. Asking for the guard in
+    # either of those is refused silently, so no future call site can repeat
+    # the change that took world_service to 689 words and silenced the game.
+    if replay_guard not in (False, 'window', 'always'):
+        raise ValueError('replay_guard must be False, "window" or "always"')
+    if world_mode or battle_mode:
+        replay_guard = False
     a = Asm(cave, addr)
     a.emit(A.stp64_pre(29, 30, 31, -0x30))
     a.emit(_stp_off(19, 20, 0x10))
@@ -2268,6 +2439,14 @@ def _build_field_clocked_voice_service(cave, addr, scratch,
     # a disabled mix cannot dereference MusicManager on any service path.
     if duck_percent < 100:
         _emit_bgm_release_step(a, 19, 'release_step')
+    if replay_guard == 'window':
+        # One tick of the retirement guard. It runs before anything else so a
+        # frame in which nothing happens still expires it.
+        a.emit(A.ldr(8, 19, VOICE_REPLAY_GUARD_OFF))
+        a.cbz(8, 'replay_guard_idle')
+        a.emit(A.sub_imm(8, 8, 1))
+        a.emit(A.str_(8, 19, VOICE_REPLAY_GUARD_OFF))
+        a.label('replay_guard_idle')
     a.emit(A.ldr64(20, 19, VOICE_PLAYER_OFF))
     a.cbz64(20, 'idle')
     a.emit(A.ldr(8, 20, 0x98))
@@ -2384,6 +2563,24 @@ def _build_field_clocked_voice_service(cave, addr, scratch,
 
     a.label('completed')
     _emit_native_task_join(a, 20)
+    if replay_guard == 'window':
+        # ARM THE GUARD AT RETIREMENT, FROM BSS -- NOT FROM THE PLAYER.
+        # ============================================================
+        # Build 449 compared the pending request against the retiring player's
+        # own filename, which lives in the tail of its allocation. That object
+        # is about to be freed a few instructions below, and the comparison
+        # only ever worked while it was alive. The hash was taken at `create`
+        # instead, so this is a BSS-to-BSS copy that outlives the player and
+        # is unaffected by when the destructor runs.
+        a.emit(A.movz(8, VOICE_REPLAY_GUARD_FRAMES))
+        a.emit(A.str_(8, 19, VOICE_REPLAY_GUARD_OFF))
+    # The 449 guard that lived here -- comparing the pending key against the
+    # retiring player's own filename -- is GONE, and its removal is the point.
+    # It only ran when a player existed, so it could not see the replay that
+    # actually happens: dismissal DELETES the player, and the stale request is
+    # then constructed from `idle`. The replay debounce at the top of this
+    # callback covers this drain as well, because every construction goes
+    # through `create`.
     if not retain_completed:
         a.emit(_mov64(0, 20))
         a.emit(A.bl(a.pc(), OGG_DELETE))
@@ -2491,6 +2688,40 @@ def _build_field_clocked_voice_service(cave, addr, scratch,
         a.emit(A.str_(A.WZR, 19, VOICE_AUTO_OK_PENDING_OFF))
         a.emit(A.str_(A.WZR, 19, VOICE_OWNER_OFF))
     a.label('create_preflight')
+    if replay_guard:
+        # THE LINE THAT JUST FINISHED IS NOT REBUILT.
+        # ===========================================
+        # Every construction in this runtime passes through here, which is why
+        # the guard is here and not on the publish side: it does not matter
+        # whether the duplicate arrived as a deferred foreign request drained
+        # by `completed`, as a late publish picked up from `idle`, or as a key
+        # left in the mailbox by a refused publish. All three end at `create`
+        # asking for the clip that was playing a moment ago, and all three are
+        # refused by one comparison.
+        #
+        # The hash is taken on this side of the preflight so the ASK option
+        # fallbacks, which rewrite the key and branch back here, are measured
+        # as the clip they end up playing. W21 is one of the two registers
+        # this cave saves for itself and nothing else in the body uses it, so
+        # it carries the value through malloc and the constructor to the
+        # single store at `create_keep_variant_fallback` -- one hash, not two.
+        #
+        # It is a debounce and worth saying so plainly: it is armed for
+        # VOICE_REPLAY_GUARD_FRAMES service ticks after a retirement and says
+        # nothing about anything older. What it gives up is a script that
+        # deliberately plays the SAME line twice inside half a second with
+        # nothing in between. convil_2 repeats dialog 49 nine times and every
+        # pair has another line between them, so it is unaffected -- an
+        # intervening line retires with its own hash and disarms this one.
+        _emit_key_hash(a, 19, 21, 'create_guard')
+        if replay_guard == 'window':
+            a.emit(A.ldr(8, 19, VOICE_REPLAY_GUARD_OFF))
+            a.cbz(8, 'create_unguarded')
+        a.emit(A.ldr(8, 19, VOICE_ACTIVE_KEY_HASH_OFF))
+        a.emit(A.cmp_reg(8, 21))
+        a.bcond('clear_command', A.EQ)
+        if replay_guard == 'window':
+            a.label('create_unguarded')
     _emit_ogg_preflight(a, 19, 'initial_option_fallback')
     a.emit(A.movz(0, PLAYER_ALLOC_BYTES))
     a.emit(A.bl(a.pc(), MALLOC))
@@ -2506,6 +2737,10 @@ def _build_field_clocked_voice_service(cave, addr, scratch,
     a.emit(A.str_(8, 19, VOICE_OWNER_OFF))
     a.emit(A.ldr(8, 19, VOICE_PENDING_AUTO_OFF))
     a.emit(A.str_(8, 19, VOICE_ACTIVE_AUTO_OFF))
+    # Defensive reset for the next field.  A MAPJUMP latch is normally
+    # consumed by the retiring player's worker; it must never be inherited by
+    # a later player if a transition occurred with no worker refill pending.
+    a.emit(A.str_(A.WZR, 19, VOICE_MAPJUMP_OFF))
     a.emit(_mov64(0, 20))
     a.emit(A.movz(1, 0))
     a.emit(A.bl(a.pc(), OGG_PLAY))
@@ -2516,6 +2751,10 @@ def _build_field_clocked_voice_service(cave, addr, scratch,
     a.bcond('create_keep_variant_fallback', A.NE)
     a.emit(A.str_(A.WZR, 19, VOICE_VARIANT_FALLBACK_OFF))
     a.label('create_keep_variant_fallback')
+    if replay_guard:
+        # The hash computed at `create_preflight`, stored only now that this
+        # key really is the one a player was built from.
+        a.emit(A.str_(21, 19, VOICE_ACTIVE_KEY_HASH_OFF))
     _emit_host_deadline(a, 20, 19, VOICE_DEADLINE_OFF)
     a.emit(0x1E2E1000)                  # fmov s0, #1.0
     a.emit(_mov64(0, 20))
@@ -2763,9 +3002,12 @@ def _build_message_stub_cave(cave, addr, scratch, save=False, reads=False,
 
 def patch_main_clocked_dialogue(src, dest, forced_name=None,
                                 defer_foreign_play=True,
-                                allow_foreign_field_replace=True,
+                                allow_foreign_field_replace=False,
                                 stop_on_close=True,
                                 publish_on_dialog_change=True,
+                                first_in_burst_wins=True,
+                                replay_guard=False,
+                                stream_once=True,
                                 forced_alt_name=None,
                                 retain_completed=False,
                                 build_key_then_forced=False,
@@ -2821,6 +3063,15 @@ def patch_main_clocked_dialogue(src, dest, forced_name=None,
     field_word, = struct.unpack_from('<I', text, FIELD_HOOK)
     field_chain = (_direct_branch_target(FIELD_HOOK, field_word)
                    if field_word != FIELD_ORIG else None)
+    worker_loop_word, = struct.unpack_from('<I', text, WORKER_LOOP_HOOK)
+    if worker_loop_word != WORKER_LOOP_ORIG:
+        raise ValueError('voice worker loop site +0x%X is %08X, expected '
+                         '%08X' % (WORKER_LOOP_HOOK, worker_loop_word,
+                                   WORKER_LOOP_ORIG))
+    mapjump_word, = struct.unpack_from('<I', text, MAPJUMP_HOOK)
+    if hook_field and mapjump_word != MAPJUMP_ORIG:
+        raise ValueError('field MAPJUMP hook +0x%X is %08X, expected %08X'
+                         % (MAPJUMP_HOOK, mapjump_word, MAPJUMP_ORIG))
     input_word, = struct.unpack_from('<I', text, INPUT_POST_REFRESH_HOOK)
     if hook_ask:
         ask_setup = struct.unpack_from('<II', text, ASK_PRE_HOOK - 8)
@@ -2933,6 +3184,16 @@ def patch_main_clocked_dialogue(src, dest, forced_name=None,
                VOICE_SCRATCH_BYTES))
     bss_growth = align_pad + VOICE_SCRATCH_BYTES
     pool = _verified_hole_pool(src, text)
+    mapjump_entry, mapjump_placed = (None, {})
+    transition_worker_entry, transition_worker_placed = (None, {})
+    if hook_field:
+        mapjump_entry, mapjump_placed = ff7nx_cave.emit_laid_out(
+            pool, lambda cave, address: _build_mapjump_voice_latch(
+                cave, address, scratch))
+        transition_worker_entry, transition_worker_placed = \
+            ff7nx_cave.emit_laid_out(
+                pool, lambda cave, address: _build_mapjump_worker_stop(
+                    cave, address, scratch))
     message_entry, message_placed = (None, {})
     def build_message(cave, address):
         return _build_message_command_cave(
@@ -2946,6 +3207,7 @@ def patch_main_clocked_dialogue(src, dest, forced_name=None,
             hold_until_window_close=auto_advance,
             stop_on_close=stop_on_close,
             publish_on_dialog_change=publish_on_dialog_change,
+            first_in_burst_wins=first_in_burst_wins,
             resume_instruction=message_orig,
             resume_address=message_resume,
             resume_call_target=message_call_target)
@@ -3012,6 +3274,7 @@ def patch_main_clocked_dialogue(src, dest, forced_name=None,
                 folder_forced_suffix=folder_forced_suffix,
                 stop_on_close=stop_on_close,
                 publish_on_dialog_change=publish_on_dialog_change,
+                first_in_burst_wins=first_in_burst_wins,
                 window_param_offset=2, dialog_param_offset=3,
                 # The live highlighted option is read from ASK's fifth guest
                 # argument before the stock updater, matching FFNx's wrapper.
@@ -3038,7 +3301,14 @@ def patch_main_clocked_dialogue(src, dest, forced_name=None,
                 duck_release_frames=duck_release_frames,
                 auto_advance=auto_advance, resume_target=field_chain,
                 allow_foreign_replace=allow_foreign_field_replace,
-                defer_foreign_play=defer_foreign_play))
+                defer_foreign_play=defer_foreign_play,
+                # FIELD ONLY. The default is off and this is the one caller
+                # that turns it on: build 449 put a duplicate guard in this
+                # SHARED builder, world_service went 625 -> 689 words against
+                # a 696-word window, the allocator failed and the whole
+                # runtime went silent. The repeat is a field-dialogue defect.
+                replay_guard=replay_guard,
+                stream_once=stream_once))
     battle_action_entry = None
     battle_action_placed = {}
     battle_text_entry = None
@@ -3061,7 +3331,8 @@ def patch_main_clocked_dialogue(src, dest, forced_name=None,
                 duck_attack_frames=duck_attack_frames,
                 duck_release_frames=duck_release_frames,
                 auto_advance=False, battle_mode=True,
-                resume_target=battle_chain, allow_foreign_replace=True))
+                resume_target=battle_chain, allow_foreign_replace=True,
+                stream_once=stream_once))
     world_message_entry = None
     world_message_placed = {}
     world_ask_entry = None
@@ -3087,7 +3358,8 @@ def patch_main_clocked_dialogue(src, dest, forced_name=None,
                     auto_advance=auto_advance, world_mode=True,
                     resume_target=world_service_chain,
                     allow_foreign_replace=allow_foreign_field_replace,
-                    defer_foreign_play=defer_foreign_play))
+                    defer_foreign_play=defer_foreign_play,
+                    stream_once=stream_once))
     input_entry = None
     input_placed = {}
     if auto_advance:
@@ -3095,6 +3367,8 @@ def patch_main_clocked_dialogue(src, dest, forced_name=None,
             pool, lambda cave, address: _build_auto_ok_input_cave(
                 cave, address, scratch))
     placed = {}
+    placed.update(mapjump_placed)
+    placed.update(transition_worker_placed)
     placed.update(message_placed)
     placed.update(ask_placed)
     placed.update(name_placed)
@@ -3108,6 +3382,10 @@ def patch_main_clocked_dialogue(src, dest, forced_name=None,
     placed.update(input_placed)
     if hook_message:
         placed[message_hook] = A.b(message_hook, message_entry)
+    if hook_field:
+        placed[MAPJUMP_HOOK] = A.b(MAPJUMP_HOOK, mapjump_entry)
+        placed[WORKER_LOOP_HOOK] = A.b(
+            WORKER_LOOP_HOOK, transition_worker_entry)
     if hook_ask:
         placed[ASK_PRE_HOOK] = A.b(ASK_PRE_HOOK, ask_entry)
     if disable_name_change:
@@ -3142,6 +3420,12 @@ def patch_main_clocked_dialogue(src, dest, forced_name=None,
     if hook_message:
         assert struct.unpack_from('<I', check_raw[0], message_hook)[0] == \
             A.b(message_hook, message_entry)
+    if hook_field:
+        assert struct.unpack_from('<I', check_raw[0], MAPJUMP_HOOK)[0] == \
+            A.b(MAPJUMP_HOOK, mapjump_entry)
+        assert struct.unpack_from('<I', check_raw[0],
+                                  WORKER_LOOP_HOOK)[0] == \
+            A.b(WORKER_LOOP_HOOK, transition_worker_entry)
     # Native MESSAGE/ASK updates are PC-relative BLs.  Their original words
     # cannot be copied into caves; prove every emitted replacement reaches
     # the same native routine from its new PC.
@@ -3191,8 +3475,9 @@ def patch_main_clocked_dialogue(src, dest, forced_name=None,
         assert struct.unpack_from('<I', check_raw[0],
                                   INPUT_POST_REFRESH_HOOK)[0] == \
             A.b(INPUT_POST_REFRESH_HOOK, input_entry)
-    assert struct.unpack_from('<I', check_raw[0], WORKER_LOOP_HOOK)[0] == \
-        WORKER_LOOP_ORIG
+    if not hook_field:
+        assert struct.unpack_from('<I', check_raw[0],
+                                  WORKER_LOOP_HOOK)[0] == WORKER_LOOP_ORIG
     assert struct.unpack_from('<I', out, 0x3C)[0] == \
         old_bss + bss_growth
     os.makedirs(os.path.dirname(dest), exist_ok=True)
@@ -3209,6 +3494,10 @@ def patch_main_clocked_dialogue(src, dest, forced_name=None,
             'world_ask_entry': world_ask_entry,
             'world_service_entry': world_service_entry,
             'input_entry': input_entry,
+            'mapjump_entry': mapjump_entry,
+            'transition_worker_entry': transition_worker_entry,
+            'mapjump_words': len(mapjump_placed),
+            'transition_worker_words': len(transition_worker_placed),
             'message_words': len(message_placed), 'ask_words': len(ask_placed),
             'name_change_words': len(name_placed), 'field_words': len(field_placed),
             'battle_action_words': len(battle_action_placed),
@@ -3293,8 +3582,11 @@ def apply_to_nso(src, dest, auto_advance=True, duck_percent=85,
                  battle_probability=0, battle_text=False, level='full',
                  forced_name=None, message_phase='pre',
                  message_stub=None, defer_foreign_play=True,
-                 allow_foreign_field_replace=True,
-                 stop_on_close=True, publish_on_dialog_change=True):
+                 allow_foreign_field_replace=False,
+                 stop_on_close=True, publish_on_dialog_change=True,
+                 first_in_burst_wins=True,
+                 replay_guard=False,
+                 stream_once=True):
     """
     Install the production dialogue runtime, `src` -> `dest`, in this
     project's idiom.
@@ -3363,6 +3655,9 @@ def apply_to_nso(src, dest, auto_advance=True, duck_percent=85,
         stop_on_close=stop_on_close,
         allow_foreign_field_replace=allow_foreign_field_replace,
         publish_on_dialog_change=publish_on_dialog_change,
+        first_in_burst_wins=first_in_burst_wins,
+        replay_guard=replay_guard,
+        stream_once=stream_once,
         **flags)
     report['level'] = level
     report['defer_foreign_play'] = (defer_foreign_play
@@ -3370,6 +3665,9 @@ def apply_to_nso(src, dest, auto_advance=True, duck_percent=85,
     report['allow_foreign_field_replace'] = allow_foreign_field_replace
     report['stop_on_close'] = stop_on_close
     report['publish_on_dialog_change'] = publish_on_dialog_change
+    report['first_in_burst_wins'] = first_in_burst_wins
+    report['replay_guard'] = replay_guard
+    report['stream_once'] = stream_once
     report['forced_name'] = forced_name
     report['message_phase'] = message_phase
     report['message_stub'] = message_stub

@@ -104,7 +104,7 @@
  "Ninostyle Chibi Fixes and Additions v2.5.iro": {
   "enabled": true,
   "options": {
-   "fb": 1,
+   "fb": 0,
    "dwaeris": 1,
    "dwbarret": 1,
    "dwcid": 1,
@@ -250,7 +250,7 @@
   ],
   "field_tex_cap": 512,
   "world_tex_cap": 768,
-  "battle_bg_tex_cap": 1024,
+  "battle_bg_tex_cap": 768,
   "spell_tex_cap": 768,
   "spell_fx_cap": 768,
   "field_bg_page_px": 768,

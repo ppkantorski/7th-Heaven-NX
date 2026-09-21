@@ -711,6 +711,107 @@ def model_loader_names(section3: bytes):
 # recorded for the build log. See `_model_loader_is_portable`.
 UNPORTABLE_MODEL_LOADERS = []
 
+# Fields whose loader was taken in Echo-S's ORDER using this port's own asset
+# records, matched by HRC id. See `remap_model_loader`.
+REMAPPED_MODEL_LOADERS = []
+
+# Fields where Echo-S's loader names different things but every index already
+# means the same asset here, so keeping ours is correct rather than a
+# compromise. A sentinel, not bytes, so a caller cannot mistake it for one.
+EQUIVALENT_MODEL_LOADER = object()
+EQUIVALENT_MODEL_LOADERS = []
+
+
+def model_loader_records(section3: bytes):
+    """
+    [(name, hrc id, byte range)] for a field's model loader, in index order.
+
+    Layout per `kujata`'s `flevel-loader.js`: name, u16, 8-byte HRC id,
+    4-byte scale, u16 animation count, three 9-byte lights and a 3-byte
+    global light, then the animation names.
+    """
+    _blank, count, _scale = struct.unpack_from('<hhh', section3, 0)
+    cursor = 6
+    out = []
+    for _ in range(count):
+        start = cursor
+        length, = struct.unpack_from('<H', section3, cursor)
+        cursor += 2
+        name = bytes(section3[cursor:cursor + length]).rstrip(b'\0') \
+            .decode('ascii', 'replace')
+        cursor += length + 2
+        hrc = bytes(section3[cursor:cursor + 8]).rstrip(b'\0 ').upper()
+        cursor += 8 + 4
+        animations, = struct.unpack_from('<H', section3, cursor)
+        cursor += 2 + 30
+        for _animation in range(animations):
+            length, = struct.unpack_from('<H', section3, cursor)
+            cursor += 2 + length + 2
+        out.append((name, hrc, (start, cursor)))
+    return out
+
+
+def remap_model_loader(echo_section3: bytes, stock_section3: bytes):
+    """
+    The Switch's own model records, reordered into ECHO-S's index order.
+
+    THE PINBALL MACHINE IS A MAN, THE SEQUEL.
+    =========================================
+    `_model_loader_is_portable` compares model NAMES, and this port keys them
+    per field (`mds7pb_2fieldbg_pinbl.char`). Echo-S does not always keep those
+    names -- in `mds7pb_2`, the lower floor of the bar, its loader reads:
+
+        0..6  the same seven names the Switch has
+        7     Pinball      <- was mds7pb_2fieldbg_pinbl.char (index 9)
+        8     Shake        <- was mds7pb_2nible_camera.char   (index 7)
+
+    and it drops `fieldbg_mtra8` entirely. Name comparison sees two assets
+    this field does not have, refuses the loader, and keeps the Switch's --
+    so Echo-S's script asks for model 7 and gets `nible_camera`, a person.
+    Exactly the `mds7pb_1` bug, one floor down, and immune to the fix that
+    solved it because there the names still matched.
+
+    THE 8-BYTE HRC ID IS THE MATCH, NOT THE NAME. Every record carries the
+    skeleton it loads, and Echo-S keeps it: `Pinball` carries `CZED.HRC`,
+    which IS `mds7pb_2fieldbg_pinbl.char`; `Shake` carries `CYIF.HRC`, which
+    is `nible_camera`. So the port can honour Echo-S's ORDER while keeping its
+    own asset records -- names, scale and animation names complete with the
+    extensions Echo-S strips (`CZFF.tor` against its `CZFF`).
+
+    Returns the rebuilt section 3, or None when any Echo-S record's HRC is
+    absent from the Switch loader or appears in it twice. A guess here renders
+    the wrong model and says nothing, so an unmatched field keeps today's
+    behaviour and is reported.
+    """
+    try:
+        echo = model_loader_records(echo_section3)
+        stock = model_loader_records(stock_section3)
+    except (struct.error, IndexError):
+        return None
+    if not echo or not stock:
+        return None
+    by_hrc = {}
+    for record in stock:
+        by_hrc.setdefault(record[1], []).append(record)
+    chosen = []
+    for _name, hrc, _span in echo:
+        candidates = by_hrc.get(hrc) or []
+        if len(candidates) != 1:
+            return None
+        chosen.append(candidates[0])
+    if [r[2] for r in chosen] == [r[2] for r in stock[:len(chosen)]]:
+        # SAME ORDER, SAME COUNT OF LEADING RECORDS: every index Echo-S's
+        # script can name already means the same asset here, so the Switch
+        # loader is EQUIVALENT and keeping it is correct. Say so with a
+        # distinct answer -- calling this "unportable" sent me looking for a
+        # model bug in `blin67_2` that does not exist.
+        return EQUIVALENT_MODEL_LOADER
+    out = bytearray(stock_section3[:6])
+    struct.pack_into('<h', out, 2, len(chosen))
+    for _name, _hrc, (start, end) in chosen:
+        out += stock_section3[start:end]
+    return bytes(out)
+
 
 def _model_loader_is_portable(echo_section3: bytes, stock_section3: bytes):
     """
@@ -786,8 +887,22 @@ def merge_field_payload(stock_payload: bytes, echo_payload: bytes,
     if 1 in sections and bytes(echo_sections[2]) != bytes(stock_sections[2]):
         if _model_loader_is_portable(echo_sections[2], stock_sections[2]):
             sections.add(3)
-        elif field_name and field_name not in UNPORTABLE_MODEL_LOADERS:
-            UNPORTABLE_MODEL_LOADERS.append(field_name)
+        else:
+            # The names are not ones this field has -- but the 8-byte HRC ids
+            # still are, so Echo-S's ORDER can be honoured with the Switch's
+            # own records. This is what makes `mds7pb_2`'s pinball a pinball.
+            remapped = remap_model_loader(echo_sections[2],
+                                          stock_sections[2])
+            if remapped is EQUIVALENT_MODEL_LOADER:
+                if field_name and field_name not in EQUIVALENT_MODEL_LOADERS:
+                    EQUIVALENT_MODEL_LOADERS.append(field_name)
+            elif remapped is not None:
+                echo_sections[2] = remapped
+                sections.add(3)
+                if field_name and field_name not in REMAPPED_MODEL_LOADERS:
+                    REMAPPED_MODEL_LOADERS.append(field_name)
+            elif field_name and field_name not in UNPORTABLE_MODEL_LOADERS:
+                UNPORTABLE_MODEL_LOADERS.append(field_name)
     imported = []
     for section in sections:
         index = section - 1

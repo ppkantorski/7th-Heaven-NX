@@ -231,12 +231,70 @@ class Option:
 DEFAULT_OVERRIDES = {
     # Ninostyle Chibi Fixes and Additions
     '3b25060c-c60e-426e-ac46-f85479e983e5': {
-        # 'Facial Animation' On pulls in 878 MB of re-eyed models built for
-        # Shinra Archaeology Cut's Advanced Facial Animation. Without SAC in
-        # the load order they are 878 MB that buys nothing.
+        # 'Facial Animation' Off. STILL THE RIGHT DEFAULT, BUT THE REASON THIS
+        # ONCE GAVE WAS WRONG and it is worth correcting rather than leaving a
+        # plausible story in place.
+        #
+        # It said the 851 MB of re-eyed models need Shinra Archaeology Cut,
+        # which is not in this load order, so they "buy nothing". The mod's
+        # own description does say "Compatibility with Shinra Archaeology
+        # Cut" -- but SAC is not what supplies the art. This mod ships its own
+        # complete set, restyled for chibi:
+        #
+        #   fb/flevel/   1,004 files, 137 MB -- 929 `eye_<MODEL>[r]_<n>.TEX`
+        #                plus `mouth_<MODEL>_<n>` and `<char>_mouth_<n>`
+        #   fb/char/     2,634 re-eyed models
+        #   fb/high, fb/world, fb/chocobo
+        #
+        # What used to be missing was the RUNTIME. Those textures are read by
+        # FFNx's `ff7_advanced_blinking` (`FFNx/src/ff7/field/model.cpp` and
+        # `src/field.cpp`), which hooks the KAWAI opcode's EYETX subcode to
+        # capture a mouth index and then rewrites
+        # `polygon_set->hundred_data_group_array[1..3]` with textures it loads
+        # by name. That is FFNx code, not game code, so for a long time an
+        # index above 2 did nothing here at all.
+        #
+        # `ff7nx_facial` is that runtime, since build 461, and the two ship
+        # together: the runtime is installed under this same flag because
+        # without the art every name it builds is absent and it resolves to
+        # the stock blink. This default stays 1 -- off -- because the art is
+        # 851 MB and about 2,500 changed model entries, which is not something
+        # to turn on for somebody by surprise. `SEVENTH_NX_FACIAL=1` flips it
+        # to 0 (the mod's own default, "On"). See BUILD-461 and FINDINGS-441.
         'fb': 1,
     },
 }
+
+# Ninostyle Fixes' GUID, spelled once. The base Ninostyle Chibi mod uses the
+# SAME option id `fb` for something completely different -- "Chibi Field and
+# World Models", where 1 means On -- so anything touching this option has to
+# be keyed on the mod, never on the id alone.
+NINOSTYLE_FIXES_ID = '3b25060c-c60e-426e-ac46-f85479e983e5'
+FACIAL_ENV = 'SEVENTH_NX_FACIAL'
+
+
+def facial_animation_requested():
+    """Has the build been asked to ship Ninostyle's facial-animation set?"""
+    return os.environ.get(FACIAL_ENV, '').strip().lower() in (
+        '1', 'true', 'yes', 'on')
+
+
+def _overrides_for(mod_id):
+    """
+    DEFAULT_OVERRIDES for `mod_id`, with the facial-animation switch applied.
+
+    Kept as a function rather than mutating the table at import time so the
+    environment can change between builds in one process -- the GUI runs
+    several -- and so a test can set it without leaving the module dirty.
+    """
+    out = dict(DEFAULT_OVERRIDES.get(mod_id, {}))
+    if mod_id == NINOSTYLE_FIXES_ID and facial_animation_requested():
+        # 0 is "On" for THIS mod's option. Dropping the override entirely
+        # would also work today, since the mod's own default is 0 -- but
+        # saying it explicitly means a future upstream default cannot quietly
+        # change what this flag does.
+        out['fb'] = 0
+    return out
 
 
 class Manifest:
@@ -431,7 +489,7 @@ class Manifest:
 
     def defaults(self):
         d = {o.id: o.default for o in self.options}
-        d.update(DEFAULT_OVERRIDES.get(self.mod_id, {}))
+        d.update(_overrides_for(self.mod_id))
         return d
 
 

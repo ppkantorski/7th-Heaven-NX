@@ -38,6 +38,8 @@ import ff7nx_ambient
 import echo_s_flevel
 import echo_s_tutorial
 import ff7nx_echomusic
+import ff7nx_daynight
+import ff7nx_facial
 import ff7nx_voice
 import voicemod
 import echo_s_battletext
@@ -1554,6 +1556,12 @@ def build_plan(mods, settings_by_mod, catalogs, log=lambda *_: None,
     # AFTER the weapon set is in place, so its own .rsd entries are counted
     # among the models whose textures have to exist.
     _rescue_dangling_model_textures(plan, catalogs, mods, log)
+    # Resolve the facial question ONCE, here, where the mods and the catalogs
+    # are. Three places need the answer -- the warning below, flevel's cache
+    # key, and `apply_facial` -- and having each work it out for itself is how
+    # the environment variable ended up being three different questions.
+    plan.facial_art = facial_art_is_shipping(catalogs, mods)
+    _warn_facial_animation_is_not_installable(catalogs, mods, log)
 
     # A Dynamic Weapons mesh is only useful through the matching RSD branch.
     # A companion add-on can intentionally replace a texture or the emitted
@@ -6729,6 +6737,106 @@ def _rescue_dangling_model_textures(plan, catalogs, mods, log):
     return rescued
 
 
+_FACIAL_ART_RE = re.compile(r'^eye_[a-z0-9]+r?_[1-9]\.tex$')
+
+
+def facial_art_is_shipping(catalogs, mods, plan=None):
+    """
+    Is the facial-animation art actually going into this build?
+
+    BUILD 461 GATED THE RUNTIME ON THE ENVIRONMENT VARIABLE, AND THAT WAS
+    WRONG. `SEVENTH_NX_FACIAL=1` only moves a DEFAULT: `iro._overrides_for`
+    applies it to Ninostyle Fixes' `fb`, and `_mod_options_from_saved` then
+    does `merged.update(stored)` -- so a value the user saved in settings.json
+    WINS over it. Somebody who has turned Facial Animation on in the GUI ships
+    all 1,013 textures and, before this function existed, got no runtime and no
+    explanation, because the pass was asking the environment instead of asking
+    the build.
+
+    So ask the build. The question is whether the indexed eye set is in the
+    plan, and the plan knows: `plan.archive_files['flevel.lgp']` is every entry
+    that archive is about to be written with. The environment variable still
+    forces it on, which is what makes it useful for a test build on a load
+    order that does not carry the art at all.
+    """
+    if iro.facial_animation_requested():
+        return True
+    if plan is not None:
+        bucket = plan.archive_files.get('flevel.lgp') or {}
+        if any(_FACIAL_ART_RE.match(name) for name in bucket):
+            return True
+        return False
+    # Plan-time: the mod trees are what there is to look at, and `fb/flevel`
+    # is the folder Ninostyle Fixes keeps the set in.
+    for mod in mods or ():
+        root = getattr(mod, 'cache', None)
+        if not root or not os.path.isdir(root):
+            continue
+        for base, _dirs, names in os.walk(root):
+            parts = [p.lower() for p in base.replace('\\', '/').split('/')]
+            if 'flevel' not in parts or 'fb' not in parts:
+                continue
+            if any(_FACIAL_ART_RE.match(n.lower()) for n in names):
+                return True
+    return False
+
+
+def _warn_facial_animation_is_not_installable(catalogs, mods, log):
+    """
+    Say loudly what `SEVENTH_NX_FACIAL=1` cannot do yet.
+
+    TWO THINGS ARE MISSING, AND NEITHER FAILS LOUDLY ON ITS OWN.
+    ===========================================================
+    1. The art. Ninostyle's facial set is ~1,000 textures under `fb/flevel`,
+       and all but ten are names vanilla flevel.lgp does not have. flevel is
+       written through `lgp.Archive.replace`, which refuses new entries
+       because the 3,600-byte name LOOKUP TABLE inside `middle` indexes the
+       TOC and would have to be regenerated. So they are dropped, silently,
+       and the option looks applied.
+
+    2. The runtime. Those textures are read by FFNx's `ff7_advanced_blinking`
+       -- not by the game. The port has the stock two-frame blink, so an eye
+       index above 2 and every mouth index do nothing whatever is shipped.
+
+    The flag exists so the art side can be worked on and measured; it is not
+    a feature switch yet, and a build that sets it must say so rather than
+    produce something that looks enabled.
+    """
+    if not facial_art_is_shipping(catalogs, mods, plan=None):
+        return
+    flevel = catalogs.get('flevel.lgp') or set()
+    new = have = 0
+    for mod in mods or ():
+        root = getattr(mod, 'cache', None)
+        if not root or not os.path.isdir(root):
+            continue
+        for base, _dirs, names in os.walk(root):
+            parts = [p.lower() for p in base.replace('\\', '/').split('/')]
+            if 'flevel' not in parts or 'fb' not in parts:
+                continue
+            for name in names:
+                if name.lower() in flevel:
+                    have += 1
+                else:
+                    new += 1
+    if not (new or have):
+        return
+    log('%s=1: shipping the facial-animation set -- %d flevel texture(s), %d '
+        'of them names flevel.lgp did not have (addable since build 443).'
+        % (iro.FACIAL_ENV, new + have, new))
+    log('! %s=1: THIS IS NOT ONLY NEW ART. Turning the option on also makes '
+        'Ninostyle Fixes\' `fb/char` win over the base Chibi mod\'s, which is '
+        'about 2,500 changed model entries -- re-eyed .p/.rsd/.hrc for every '
+        'field character. They should render and blink on the stock path; '
+        'that they do is exactly what this build is for testing.'
+        % iro.FACIAL_ENV)
+    log('%s=1: the RUNTIME is installed as well since build 461 -- the blink '
+        'index names a texture, KAWAI EYETX\'s mouth parameter is no longer '
+        'thrown away, and an eye index above 2 is latched instead of dropped. '
+        'What it actually installed is reported later, under "advanced '
+        'facial animation". See ff7nx_facial.' % iro.FACIAL_ENV)
+
+
 def _find_in_mod_trees(mods, lows, source_dir):
     """
     {name: (path, description)} for each of `lows` under a `<source_dir>/`.
@@ -7748,10 +7856,47 @@ def _build_flevel(archive_path, chunks, field_files, romfs, log,
     if chunks:
         chunks = _hold_back_heap_tight(chunks, log)
 
+    added_raw = []
     for name, (src, _) in field_files.items():
         entry = archive.index.get(name)
         if entry is None:
-            log(f'  ! flevel: no such entry {name}, skipped')
+            # A NAME FLEVEL DOES NOT HAVE YET. Until build 443 this was the
+            # end of the road -- `! no such entry, skipped` -- because the
+            # archive's name lookup table could not grow. It can now
+            # (`lgp.Archive.add`), so a new LOOSE asset is stored, raw.
+            #
+            # Raw is not a guess. Every storage decision below is made by
+            # looking at how VANILLA stores the same name, and a new name has
+            # no vanilla counterpart -- but the things that arrive here are
+            # textures (Ninostyle's eye and mouth set), and the one thing
+            # this function's own docstring warns about is that LZS-wrapping
+            # a texture crashes the game the moment it is used. A new FIELD
+            # would need the opposite, and is refused instead: nothing routes
+            # to a field flevel did not already have, so one appearing here
+            # is a routing bug, not an asset.
+            if '.' not in name:
+                log('  ! flevel: %s is a new FIELD, not an asset -- refused '
+                    '(nothing can route to a field flevel did not have)'
+                    % name)
+                continue
+            try:
+                with open(src, 'rb') as handle:
+                    data = handle.read()
+            except OSError as exc:
+                log('  ! flevel: cannot read %s: %s' % (name, exc))
+                continue
+            raw_mod = (lgp.lzs_decompress(data[4:])
+                       if _is_lzs_wrapped(data) else data)
+            cap = _field_tex_cap()
+            if cap:
+                try:
+                    capped, _note = tex.cap_dimensions(raw_mod, cap)
+                except Exception:                              # noqa: BLE001
+                    capped = None
+                if capped is not None:
+                    raw_mod = capped
+            payloads[name] = raw_mod
+            added_raw.append((name, len(raw_mod)))
             continue
         with open(src, 'rb') as f:
             data = f.read()
@@ -7860,6 +8005,22 @@ def _build_flevel(archive_path, chunks, field_files, romfs, log,
         log('  Echo-S: model loader taken with the script wherever it '
             'changed -- an entity binds to a model by index, so section 1 '
             'and section 3 are one unit')
+        # mds7pb_2, the floor below, needed more: Echo-S RENAMES the models
+        # there (`Pinball`, `Shake`) so name comparison finds nothing this
+        # field owns -- but every record still carries the 8-byte HRC id, so
+        # the port can honour Echo-S's ORDER using its own asset records.
+        remapped = echo_s_flevel.REMAPPED_MODEL_LOADERS
+        if remapped:
+            log('  Echo-S: %d field(s) had the loader rebuilt in Echo-S\'s '
+                'ORDER from this port\'s own records, matched by HRC id -- '
+                'Echo-S renames the models there so nothing matched by name: '
+                '%s' % (len(remapped), ', '.join(sorted(remapped))))
+        equivalent = echo_s_flevel.EQUIVALENT_MODEL_LOADERS
+        if equivalent:
+            log('  Echo-S: %d field(s) name their models differently but '
+                'every index already means the same asset here, so the Switch '
+                'loader is correct rather than a compromise: %s'
+                % (len(equivalent), ', '.join(sorted(equivalent))))
         if unportable:
             log('  ! Echo-S edits the model loader in %d field(s) in a way '
                 'this port cannot follow: it names a model belonging to '
@@ -8398,6 +8559,36 @@ def _build_flevel(archive_path, chunks, field_files, romfs, log,
     # content-keyed encode cache, so ordering costs nothing but correctness.
     ws_stats = _bake_widescreen_ranges(archive, payloads, widescreen, log)
 
+    # A NAME FLEVEL DOES NOT ALREADY HAVE IS NOW ADDED, NOT REFUSED.
+    # ==============================================================
+    # `replace()` still handles everything that exists, because that path
+    # keeps the table verbatim and is what every field goes through. Only
+    # genuinely new names take `add()`, which rebuilds the 3,600-byte name
+    # lookup table -- the thing that made this refuse before.
+    #
+    # A new FIELD would be a mistake and is still refused: a field the model
+    # loader and the chunk passes know nothing about cannot be reached, and
+    # silently adding one would hide a routing bug. Loose entries -- eye and
+    # mouth textures, which is what this exists for -- are added.
+    added = [low for low in sorted(payloads) if low not in archive.index]
+    fields_wanted = [low for low in added if '.' not in low]
+    if fields_wanted:
+        log('  ! flevel: %d new FIELD(s) cannot be added (e.g. %s); a field '
+            'nothing routes to is a routing bug, not an asset'
+            % (len(fields_wanted), fields_wanted[0]))
+        return None
+    for low in added:
+        try:
+            archive.add(low, payloads.pop(low))
+        except (ValueError, lgp.ConflictTableInTheWay) as exc:
+            log('  ! flevel: cannot add %s: %s' % (low, exc))
+            return None
+    if added:
+        log('  flevel: %d new entr(y|ies) added raw (%.0f MB) and the name '
+            'lookup table rebuilt; %d existing entr(y|ies) untouched'
+            % (len(added), sum(n for _f, n in added_raw) / 1e6,
+               len(archive.entries) - len(added)))
+        log('    e.g. %s' % ', '.join(sorted(added)[:4]))
     try:
         archive.replace(payloads)
     except lgp.NewEntriesRequired as exc:
@@ -9452,11 +9643,12 @@ def _emplace_voice(plan, romfs, log, produced, progress=None):
     THE COST, STATED PLAINLY
     ========================
     Echo-S's clips are arbitrary PC Vorbis and the native player is only safe
-    at 48 kHz stereo with LOOPSTART=0 and a 100 ms lead-in, so every one is
-    re-encoded. That is a one-time cost: `voice_ogg` content-addresses the
-    result, so the second build over the same mod does no audio work at all
-    and the staged files are hard links to the cache rather than a second
-    copy on disk.
+    at 48 kHz stereo with a one-sample final loop and a 100 ms lead-in. The
+    normalization is a one-time cost: `voice_ogg` content-addresses the
+    result, so later builds over the same mod do no audio work at all. Older
+    LOOPSTART=0 cache entries are upgraded by changing only their metadata,
+    without re-encoding. Staged files are hard links to the cache rather than
+    a second copy on disk.
     """
     if not plan.voice:
         return
@@ -9613,9 +9805,9 @@ def _emplace_voice(plan, romfs, log, produced, progress=None):
         'save space -- it is not a reduced-quality setting. '
         'SEVENTH_NX_VOICE_BITRATE=256k roughly halves the SD card cost and is '
         'still at or above most of the sources; 128k is genuinely below them.')
-    log('  48 kHz stereo Vorbis, LOOPSTART=0, %d ms lead-in -- the only shape '
-        'the native player is safe with; every clip was verified against the '
-        'decoder invariants before it was cached'
+    log('  48 kHz stereo Vorbis, %d ms lead-in, one-sample loop at the exact '
+        'file tail -- the native decoder keeps its required loop route without '
+        'wrapping back to spoken audio; every clip was verified before caching'
         % voice_ogg.LEAD_IN_MS)
 
 
@@ -10245,8 +10437,16 @@ MAIN_ONLY_ENV = frozenset((
     'SEVENTH_NX_VOICE_MESSAGE_STUB',   # ff7nx_voice  diagnostic empty cave
     'SEVENTH_NX_VOICE_DUCK',     # ff7nx_voice   BGM level under speech
     'SEVENTH_NX_VOICE_FOREIGN',  # ff7nx_voice   second-window line: defer/drop
+    'SEVENTH_NX_VOICE_BURST',    # ff7nx_voice   same-tick burst: first/last
     'SEVENTH_NX_VOICE_CLOSE',    # ff7nx_voice   window close: play/stop
     'SEVENTH_NX_VOICE_TRIGGER',  # ff7nx_voice   publish on dialog/state
+    'SEVENTH_NX_VOICE_REPLAY',   # ff7nx_voice   retirement guard: guard/off
+    # BUILD 475. Pins the day/night clock to one hour so "does night look
+    # right" is one build and ten seconds instead of a wait in a field. Same
+    # rule as everything above: `ff7nx_daynight` writes into exefs/main and
+    # nowhere else, so this cannot change an archive byte.
+    ff7nx_daynight.FREEZE_ENV,
+    ff7nx_daynight.STRENGTH_ENV,   # how hard the tint lands; module-only too
 ))
 
 # The modules those settings reach, by the same rule: each writes into
@@ -10278,7 +10478,42 @@ MAIN_ONLY_MODULES = frozenset((
     'ff7nx_voice.py', 'ff7nx_echomusic.py',
     'voicemod.py', 'voice_ogg.py', 'echo_s_battlevo.py',
     'echo_s_battletext.py',
+    # BUILD 475. Caves, hook words and three rodata tables, into exefs/main.
+    # It READS flevel's maplist and Echo-S's loose field files to build the
+    # outdoor bitmap, but it writes nothing to either, so editing it cannot
+    # change an archive's bytes -- and this feature has taken enough builds
+    # without each one also costing a 1.4 GB flevel rebuild.
+    'ff7nx_daynight.py',
 ))
+
+# The shader half of the same rule.
+#
+# `ff7nx_shaders.apply` writes .glsl files into `romfs/ff7/shaders` and
+# nothing else -- it cannot change a byte of any archive. Leaving its three
+# settings in the generic `SEVENTH_NX*` sweep made changing the anti-aliasing
+# setting alter flevel.lgp's INPUTS fingerprint, which is the half the reuse
+# guard treats as a genuine mod/settings change and refuses outright:
+#
+#     ERROR: SEVENTH_NX_REUSE_FLEVEL=1 refused: flevel inputs or build code
+#            changed; run one normal build first
+#
+# A 40-minute 1.4 GB rebuild to answer "is FXAA costing me frames", which is
+# exactly the question a shaders-only rebuild exists to answer cheaply. Taken
+# from the module's own constants rather than spelled again here, so renaming
+# a setting cannot silently put it back in the sweep -- tests/test_reuse_
+# archives.py asserts the two agree.
+SHADER_ONLY_ENV = frozenset((
+    ff7nx_shaders.SCALER_ENV,
+    ff7nx_shaders.FXAA_ENV,
+    ff7nx_shaders.VIDEO_ENV,
+))
+SHADER_ONLY_MODULES = frozenset(('ff7nx_shaders.py',))
+
+# What the archive fingerprints actually exclude: everything that provably
+# writes somewhere no archive lives. One name for the rule, two lists for the
+# two places it applies.
+ARCHIVE_NEUTRAL_ENV = MAIN_ONLY_ENV | SHADER_ONLY_ENV
+ARCHIVE_NEUTRAL_MODULES = MAIN_ONLY_MODULES | SHADER_ONLY_MODULES
 
 
 def _stat_sig(path):
@@ -10374,14 +10609,19 @@ def _archive_fingerprint(name, archive_path, files, extra):
         # 1.4 GB flevel rebuild on every 60 FPS toggle is pure waste.
         if (k.startswith('SEVENTH_NX') and k not in SCHEDULING_ENV
                 and k != FPS_ENV and k != DW_HRC_ENV
-                and k not in MAIN_ONLY_ENV):
+                # BUILD 467: the same rule as FPS_ENV. This one only moves a
+                # DEFAULT that a saved setting overrides, so the variable is
+                # not the state; the RESOLVED answer is folded into
+                # flevel.lgp's `extra` at the call site instead.
+                and k != iro.FACIAL_ENV
+                and k not in ARCHIVE_NEUTRAL_ENV):
             h.update(('%s=%s\0' % (k, os.environ[k])).encode())
     for fn in sorted(os.listdir(HERE)):
         # Same rule as MAIN_ONLY_ENV: these modules only ever write into
         # `exefs/main`, so editing one cannot change an archive's bytes and
         # must not invalidate an archive cache. Everything else still does,
         # build.py included.
-        if fn.endswith('.py') and fn not in MAIN_ONLY_MODULES:
+        if fn.endswith('.py') and fn not in ARCHIVE_NEUTRAL_MODULES:
             h.update(('%s|%r' % (fn, _stat_sig(os.path.join(HERE, fn)))).encode())
     h.update(repr(extra).encode())
     return h.hexdigest()
@@ -10430,7 +10670,12 @@ def _archive_inputs_fingerprint(name, archive_path, files, extra):
     for k in sorted(os.environ):
         if (k.startswith('SEVENTH_NX') and k not in SCHEDULING_ENV
                 and k != FPS_ENV and k != DW_HRC_ENV
-                and k not in MAIN_ONLY_ENV):
+                # BUILD 467: the same rule as FPS_ENV. This one only moves a
+                # DEFAULT that a saved setting overrides, so the variable is
+                # not the state; the RESOLVED answer is folded into
+                # flevel.lgp's `extra` at the call site instead.
+                and k != iro.FACIAL_ENV
+                and k not in ARCHIVE_NEUTRAL_ENV):
             h.update(('%s=%s\0' % (k, os.environ[k])).encode())
     h.update(repr(extra).encode())
     return h.hexdigest()
@@ -10583,10 +10828,16 @@ def _archive_fps_restat(name, dest, log=lambda *_: None):
     if rec is None or sig is None:
         return
     fp, size, mtime, payload, _old = rec
+    # Keep the inputs key -- see `_archive_restat`. Same hole, same archive
+    # class of bug: battle.lgp would refuse its own output on the next
+    # fast build.
+    inputs_fp = _archive_stored_inputs_fp(name)
     try:
         with open(os.path.join(ARCHIVE_FP_CACHE, name + '.fp'), 'w') as f:
             f.write('%s\n%s\n%s\n%s\n%s%d,%d\n'
                     % (fp, size, mtime, payload, FPS_SIG_TAG, sig[0], sig[1]))
+            if inputs_fp:
+                f.write('%s%s\n' % (INPUTS_FP_TAG, inputs_fp))
     except OSError:
         return
     log('      (recorded this archive\'s post-60-FPS signature, so the next '
@@ -10612,12 +10863,24 @@ def _archive_restat(name, dest, log=lambda *_: None, why=''):
     if rec is None or sig is None:
         return
     fp, _size, _mtime, payload, fps_sig = rec
+    # AND THE INPUTS KEY, WHICH THIS USED TO THROW AWAY.
+    # =================================================
+    # `_archive_record` does not return it, so re-recording a signature
+    # silently deleted the `inputs=` line. That is the whole reason
+    # `SEVENTH_NX_REUSE_FLEVEL=1` kept refusing with "flevel inputs or build
+    # code changed" after a perfectly good full build: the full build DID
+    # write the key, and then this function rewrote the record without it, so
+    # the cheap "the packer changed but every input is unchanged" path had
+    # nothing to compare against and fell through to the refusal.
+    inputs_fp = _archive_stored_inputs_fp(name)
     try:
         os.makedirs(ARCHIVE_FP_CACHE, exist_ok=True)
         with open(os.path.join(ARCHIVE_FP_CACHE, name + '.fp'), 'w') as f:
             f.write('%s\n%d\n%d\n%s\n' % (fp, sig[0], sig[1], payload))
             if fps_sig:
                 f.write('%s%d,%d\n' % (FPS_SIG_TAG, fps_sig[0], fps_sig[1]))
+            if inputs_fp:
+                f.write('%s%s\n' % (INPUTS_FP_TAG, inputs_fp))
     except OSError:
         return
     log('      (re-recorded %s\'s signature after %s, so a later '
@@ -10876,27 +11139,36 @@ def apply_plan(plan, archive_paths, sdout, log=lambda *_: None,
         # section-1-only path.  Include their source signatures explicitly or
         # an archive-cache hit could retain the prior dialogue scripts after
         # an Echo option/UI variant changed.
+        # ONE tuple, passed to both. The comment that used to sit between
+        # these two calls said they were "built from identical arguments so
+        # the two can only disagree about our code" -- which was true, and
+        # was maintained by hand across two copies. Now it is true by
+        # construction.
+        flevel_extra = (
+            sorted((k, sorted(v)) for k, v in plan.chunks.items()),
+            sorted((name, _stat_sig(src))
+                   for name, (src, _mod) in plan.echo_fields.items()),
+            _field_dds_fingerprint(plan.field_dds_sources),
+            # the widescreen config decides 41 fields' camera ranges, and it
+            # lives outside `flevel_fields`, so it has to be in the key by
+            # hand or swapping mods would reuse a stale archive built against
+            # the previous one
+            _ws_fingerprint(plan.widescreen),
+            # BUILD 467, and the same rule FPS_ENV follows. `SEVENTH_NX_FACIAL`
+            # only moves a DEFAULT, and a value saved in settings.json beats
+            # it -- so the variable is not the state. Keying on the variable
+            # meant merely DROPPING a flag whose effect was already overridden
+            # invalidated a 1.5 GB archive whose bytes had not moved. What
+            # changes flevel is whether the art ships, so that is the key.
+            bool(getattr(plan, 'facial_art', False)))
         ffp = _archive_fingerprint(
             'flevel.lgp', archive_paths['flevel.lgp'], dict(flevel_fields),
-            (sorted((k, sorted(v)) for k, v in plan.chunks.items()),
-             sorted((name, _stat_sig(src))
-                    for name, (src, _mod) in plan.echo_fields.items()),
-             _field_dds_fingerprint(plan.field_dds_sources),
-             # the widescreen config decides 41 fields' camera ranges,
-             # and it lives outside `flevel_fields`, so it has to be in
-             # the key by hand or swapping mods would reuse a stale
-             # archive built against the previous one
-             _ws_fingerprint(plan.widescreen)))
+            flevel_extra)
         # The same key minus the packer's own .py files -- see
-        # `_archive_inputs_fingerprint`. Built from identical arguments so the
-        # two can only disagree about our code.
+        # `_archive_inputs_fingerprint`.
         ffp_inputs = _archive_inputs_fingerprint(
             'flevel.lgp', archive_paths['flevel.lgp'], dict(flevel_fields),
-            (sorted((k, sorted(v)) for k, v in plan.chunks.items()),
-             sorted((name, _stat_sig(src))
-                    for name, (src, _mod) in plan.echo_fields.items()),
-             _field_dds_fingerprint(plan.field_dds_sources),
-             _ws_fingerprint(plan.widescreen)))
+            flevel_extra)
     reuse_flevel = _truthy(REUSE_FLEVEL_ENV) or _truthy(REUSE_ALL_ENV)
     if reuse_flevel:
         # Add it to `produced` even though this invocation did not write it.
@@ -12363,12 +12635,50 @@ def apply_echo_voice(sdout, dump, plan, log=lambda *_: None, produced=()):
     # None reaches playback.
     # What happens to a line whose window is not the one currently speaking.
     # 'defer' holds the request and plays it when the current clip ends;
-    # 'drop' is the historical behaviour, which discarded it. 342 of 544
-    # fields have voiced lines on more than one window, so this is not a rare
-    # path -- see FINDINGS-425.
+    # 'replace' lets it take the slot immediately; 'drop' is the historical
+    # behaviour, which discarded it. 342 of 544 fields have voiced lines on
+    # more than one window, so this is not a rare path -- see FINDINGS-425.
+    #
+    # DEFER IS THE DEFAULT, AND IT IS THE ONE THAT HAS BEEN PLAYED.
+    # ============================================================
+    # `replace` was the default for historical reasons and nobody has shipped
+    # a build on it since builds 446-459: every test of the Echo-S runtime
+    # through the church, the train and the Highwind was run with
+    # SEVENTH_NX_VOICE_FOREIGN=defer on the command line. It is also the
+    # better behaviour on its own merits -- it was what stopped a train
+    # conversation cutting itself off -- and leaving the default at a setting
+    # that has not been played is how a regression hides. The other two remain
+    # one ExeFS-only rebuild away.
     foreign = os.environ.get('SEVENTH_NX_VOICE_FOREIGN', '').strip().lower()
     if foreign not in ('replace', 'defer', 'drop'):
-        foreign = 'replace'
+        foreign = 'defer'
+    # Which line wins when several windows publish in ONE script tick, before
+    # the service has built anything. `first` is the default: chrin_1b's three
+    # grunts answer Reno simultaneously from three entities, only the first is
+    # voiced (that clip holds all three voices), and `last` loses it to a
+    # window with no clip at all. `SEVENTH_NX_VOICE_BURST=last` restores the
+    # old behaviour in an ExeFS-only rebuild.
+    burst = os.environ.get('SEVENTH_NX_VOICE_BURST', '').strip().lower()
+    if burst not in ('first', 'last'):
+        burst = 'first'
+    # Whether the field service refuses to rebuild the line that has just
+    # finished. chrin_1b's three grunts repeated themselves into the map
+    # transition, and the recording of the scene put the second play SIX
+    # FRAMES after the first ended -- the retirement path, not a second
+    # request. `off` restores the old behaviour and takes the field cave back
+    # to exactly the 570 words it shipped at, in one ExeFS-only rebuild.
+    # How hard the field service refuses to rebuild a line it has just built.
+    #   always  the same key is never built twice in a row -- no timer, no
+    #           arming, nothing the transition can skip past. This is the only
+    #           form that can be trusted while the mechanism is unknown, and
+    #           it is what BUILD 455 ships.
+    #   window  armed for VOICE_REPLAY_GUARD_FRAMES ticks after a retirement.
+    #           Build 453. It depends on the service OBSERVING the retirement,
+    #           and across a map change the field callback may not run at all.
+    #   off     no guard.
+    replay = os.environ.get('SEVENTH_NX_VOICE_REPLAY', '').strip().lower()
+    if replay not in ('always', 'window', 'off'):
+        replay = 'off'
     # What a closing dialogue window does to the line it was showing.
     # 'stop' is the default and the natural one: dismiss a box and its voice
     # stops. It cannot cut off a line that outlasts a script-timed window,
@@ -12404,6 +12714,11 @@ def apply_echo_voice(sdout, dump, plan, log=lambda *_: None, produced=()):
             defer_foreign_play=(foreign == 'defer'),
             stop_on_close=(close == 'stop'),
             publish_on_dialog_change=(trigger == 'dialog'),
+            first_in_burst_wins=(burst == 'first'),
+            replay_guard=(False if replay == 'off' else replay),
+            # The staged Ogg loops only its final sample. Decoder state and
+            # the shared music worker remain stock.
+            stream_once=False,
             duck_percent=_echo_duck_percent(log),
             duck_attack_frames=ECHO_DUCK_ATTACK_FRAMES,
             duck_release_frames=ECHO_DUCK_RELEASE_FRAMES)
@@ -12486,18 +12801,35 @@ def apply_echo_voice(sdout, dump, plan, log=lambda *_: None, produced=()):
         log('  SEVENTH_NX_VOICE_CLOSE=play -- a dismissed line keeps '
             'playing into whatever comes next')
     if report.get('allow_foreign_field_replace'):
-        log('  a line opened on a second window takes over from one that is '
-            'still playing. Echo-S clips outlast their box and scenes mix '
-            'window ids (fship_25 drops to window 0 for one line mid-'
-            'conversation), so holding it made you read one speaker and hear '
-            'the previous one. SEVENTH_NX_VOICE_FOREIGN=defer holds it '
-            'instead, =drop discards it')
+        log('  SEVENTH_NX_VOICE_FOREIGN=replace -- a line opened on a second '
+            'window takes over from one that is still playing. This was the '
+            'default until build 460 and is no longer the tested path')
     elif report.get('defer_foreign_play'):
-        log('  SEVENTH_NX_VOICE_FOREIGN=defer -- a line opened on a second '
-            'window while one is speaking is HELD until the first ends')
+        log('  a line opened on a second window while one is speaking is HELD '
+            'until the first ends. This is the default: it is what every '
+            'Echo-S build since 446 was tested on, and it is what stopped the '
+            'train conversation cutting itself off. =replace lets the second '
+            'window take the slot immediately, =drop discards it')
     else:
         log('  SEVENTH_NX_VOICE_FOREIGN=drop -- a line opened on a second '
             'window while one is speaking is discarded')
+    log('  field-transition voice stop: MAPJUMP latches only the private '
+        'dialogue player; its native worker takes the existing renderer-stop '
+        'path before the transition can expose a buffered loop. Ordinary '
+        'dialogue EOF and every music player keep their stock routes')
+    if report.get('replay_guard') == 'always':
+        log('  a line is NEVER built twice in a row: every construction goes '
+            'through one place, and a request whose key matches the last key a '
+            'player was built from is dropped there. No timer and no arming, '
+            'so nothing a map change skips can get past it. The cost is real '
+            'and worth watching for: the same line asked for twice with no '
+            'other line between -- talking to one NPC twice -- is silent the '
+            'second time. SEVENTH_NX_VOICE_REPLAY=window restores the timed '
+            'form, =off removes it')
+    elif report.get('replay_guard'):
+        log('  SEVENTH_NX_VOICE_REPLAY=window -- a line is not rebuilt for %d '
+            'frame(s) after its player retires'
+            % ff7nx_voice.VOICE_REPLAY_GUARD_FRAMES)
     if report.get('battle_probability'):
         log('  battle lines: %d%% (Echo-S option "Battle Lines"/BVoice) -- '
             'the action producer at +0x%X publishes '
@@ -12513,6 +12845,239 @@ def apply_echo_voice(sdout, dump, plan, log=lambda *_: None, produced=()):
         'external SFX layer. This port has no external SFX loader at all, so '
         'that option cannot do anything here and it is not a missing hook.')
     log('  no table -- the contiguous budget is exactly what it was')
+    plan.voice_scratch = report.get('scratch')
+    return [dest] if not built else []
+
+
+ECHO_TIME_OPTION = 'Time'
+
+
+def _echo_daynight_requested(plan):
+    """Echo-S's `Time` option -- its Day/Night add-on. Default 1, as the
+    mod declares."""
+    raw = plan.echo_options.get(ECHO_TIME_OPTION,
+                                plan.echo_options.get('time', 1))
+    return str(raw).strip() not in ('', '0', 'off', 'false')
+
+
+def apply_daynight(sdout, dump, plan, log=lambda *_: None, produced=()):
+    """
+    Install Echo-S's Day/Night cycle -- the half FFNx supplies.
+
+    The mod's own contribution is one instruction per field marking it
+    outdoor; the clock and the colour filter are FFNx code that this port does
+    not have. `ff7nx_daynight` is that code. See FINDINGS-465 for the
+    addresses and why the flag comes from a build-time bitmap rather than from
+    the `Time` actor `echo_s_flevel` strips.
+
+    Runs after `apply_facial` for one reason: both take from the same padding
+    pool, and whoever goes last should be the one that reports a shortfall.
+
+    Fails closed. A module whose sites are already owned, a pool with no room,
+    or an Echo-S without the Day/Night folder is reported and skipped, and
+    nothing else in the build is affected.
+    """
+    if not plan.echo_fields:
+        return []
+    if not _echo_daynight_requested(plan):
+        log('')
+        log('day/night: Echo-S\'s "Day Night" option is Off -- not installed')
+        return []
+    src, built = _audio_bridge_base(sdout, dump, log, produced, 'day/night')
+    if src is None:
+        return []
+    dest = os.path.join(sdout, 'atmosphere', 'contents', TITLE_ID, 'exefs',
+                        'main')
+    log('')
+    log('Echo-S day/night cycle ...')
+    log('  base main   %s%s'
+        % (src, '   (previous patch output)' if built else '   (from dump)'))
+    flevel = os.path.join(sdout, 'atmosphere', 'contents', TITLE_ID, ROMFS,
+                          ARCHIVES['flevel.lgp'])
+    if not os.path.exists(flevel):
+        flevel = os.path.join(HERE, 'game_data_files', 'field', 'flevel.lgp')
+    tmp = dest + '.daynight-tmp'
+    try:
+        maplist = ff7nx_daynight.read_maplist(flevel)
+        bitmap = ff7nx_daynight.outdoor_bitmap(maplist, plan.echo_fields, log)
+        try:
+            sky_rows = ff7nx_daynight.sky_plan(flevel, maplist, log=log)
+        except Exception as exc:                               # noqa: BLE001
+            # Fails closed: no Highwind sky rather than a tinted hull.
+            log('! day/night sky: %s: %s -- the window sky is off, the rest '
+                'of the cycle is unaffected' % (type(exc).__name__, exc))
+            sky_rows = []
+        report = ff7nx_daynight.apply_to_nso(
+            src, tmp, bitmap, fps=_footstep_tick_hz(),
+            freeze_hour=ff7nx_daynight.freeze_hour_from_env(),
+            strength=ff7nx_daynight.strength_from_env(),
+            sky_rows=sky_rows)
+    except Exception as exc:                                   # noqa: BLE001
+        report = None
+        log('! day/night: %s: %s' % (type(exc).__name__, exc))
+    if not report:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        log('! the day/night cycle is not installed -- nothing else in the '
+            'build is affected and the game looks exactly as it did')
+        return []
+    os.replace(tmp, dest)
+    log('  clock: minutes/hours/days/months in field variable bank 1 at '
+        '+0x0A..+0x0F, the same bytes the mod\'s own config names -- savemap '
+        '+0x0BAE, inside the script variable banks, so the TIME OF DAY IS '
+        'PART OF YOUR SAVE and Echo-S\'s own scripts can set it: every inn\'s '
+        '`Sleep` actor does hours += 8, and a dozen story fields assign the '
+        'hour outright')
+    log('  a save made before this feature existed has whatever the game left '
+        'in those five bytes, so a date outside its own ranges (day 0 or '
+        '>31, month >11, hour >23, minute >59) is treated as never '
+        'initialised and seeded to 08:00 day 1 rather than run from nonsense')
+    log('  %d frame(s) per minute at %g Hz -- a full day is %.0f real '
+        'minutes, which is what frames_per_minute=%d means on PC'
+        % (report['frames_per_minute'], report['fps'], report['day_minutes'],
+           ff7nx_daynight.FRAMES_PER_MINUTE))
+    log('  %d of %d field ids are marked outdoor; the rest are never tinted'
+        % (report['outdoor_fields'], len(maplist)))
+    log('  colour: FFNx multiplies its tint in LINEAR light and re-encodes '
+        '(FFNx.frag:162), this port\'s shaders multiply in gamma, so the '
+        'phase colour goes through a gamma %g table first -- night is a 0.42 '
+        'multiply on red and green, not 0.15' % report['gamma'])
+    log('  clock: ticks once a frame in driver modes %d..%d (field, battle, '
+        'world map), the same three FFNx ticks in -- so the time of day keeps '
+        'up with a PC build instead of stopping whenever you leave a field'
+        % (ff7nx_daynight.DRIVER_FIELD, ff7nx_daynight.DRIVER_WORLD))
+    if report['sky_rows']:
+        log('  Highwind window sky: %d field(s) tint their layer-3 parallax '
+            'from the same clock, and ONLY that -- the hull, the deck, the '
+            'window frame, the actors and the UI are outside the bracket '
+            'because they are on other pages. This is not something FFNx '
+            'does; it is a deliberate extra.'
+            % len(report['sky_rows']))
+    else:
+        log('  Highwind window sky: not installed')
+    log('  scenes: all three are tinted. Battle honours the outdoor bit the '
+        'last field set and the world map ignores it, as FFNx does, and each '
+        'one\'s UI is turned off at FFNx\'s own six call sites -- the '
+        '8th/11th/15th engine_draw_graphics_object call in the world draw '
+        '(x86 +0x175/+0x1BE/+0x208) and the battle main loop\'s text, box '
+        'and menu calls (x86 +0x289/+0x2CF/+0x32A), every one of them counted '
+        'out of the binary at install time')
+    _dn_night = ff7nx_daynight.as_the_shader_multiplies(
+        ff7nx_daynight.NIGHT_RGB, report['strength'])
+    log('  strength: %d%%%s -- night multiplies by %s (FFNx\'s own 100%% is '
+        '%s). White stays white at every setting, so midday, interiors and '
+        'every untinted draw in the game are identical whatever it is'
+        % (report['strength'],
+           ' (the shipped default)'
+           if report['strength'] == ff7nx_daynight.DEFAULT_STRENGTH
+           else ' from %s, NOT the shipped %d%%'
+           % (ff7nx_daynight.STRENGTH_ENV,
+              ff7nx_daynight.DEFAULT_STRENGTH),
+           _dn_night,
+           ff7nx_daynight.as_the_shader_multiplies(
+               ff7nx_daynight.NIGHT_RGB, ff7nx_daynight.FULL_STRENGTH)))
+    if report['freeze_hour'] is not None:
+        log('! day/night: %s=%d -- THE CLOCK IS PINNED at %02d:00 and does '
+            'not advance or reach the savemap. This is a diagnostic; drop the '
+            'variable and rebuild for a real cycle'
+            % (ff7nx_daynight.FREEZE_ENV, report['freeze_hour'],
+               report['freeze_hour']))
+    if ff7nx_daynight.shaders_carry_the_tint(sdout, TITLE_ID):
+        log('  tint: written into the BlockVertex block where the port\'s one '
+            'draw helper assembles it on its own stack (+0x10DA260), in '
+            'blendMode.y/.z -- two ivec4 lanes the shaders never read -- and '
+            'lmain_vv/tlmain_vv multiply it into vColor. Turned off again '
+            'before the UI is drawn, so dialogue boxes stay unshaded')
+    else:
+        log('! day/night: the module half is installed but the SHADER half '
+            'is not. `lmain_vv.glsl`/`tlmain_vv.glsl` on the card do not '
+            'carry the tint, so the clock will run and nothing will change '
+            'colour. Those two come from the 16:9 pass -- turn widescreen on, '
+            'or copy them from custom_shaders/wide_screen')
+    log('  %d-byte BSS at +0x%X, %d cave word(s), %d table byte(s)'
+        % (report['bss_bytes'], report['bss_base'], report['cave_words'],
+           report['table_bytes']))
+    return [dest] if not built else []
+
+
+def apply_facial(sdout, dump, plan, log=lambda *_: None, produced=()):
+    """
+    Install the advanced facial-animation runtime.
+
+    Builds 443 and 444 taught flevel.lgp to take new entries and shipped the
+    art; this is the half that makes an index mean something. It is gated on
+    the same `SEVENTH_NX_FACIAL` flag, because without the art every name it
+    asks for is absent and the whole thing is 1,400 words that resolve to the
+    stock blink.
+
+    MUST run after `apply_echo_voice`. Two reasons, and both are checked
+    rather than trusted: the lip flap reads the voice runtime's live-player
+    pointer, which means it needs that pass's BSS address and therefore that
+    pass to have chosen one; and the padding pool re-verifies every hole, so
+    running last means this one sees what everybody else took instead of the
+    other way round.
+
+    Fails closed. A module whose sites are already owned, or a pool with no
+    room left, is reported and skipped -- the art still ships and the game
+    still blinks on the stock two-frame path.
+    """
+    if not getattr(plan, 'facial_art', False):
+        return []
+    src, built = _audio_bridge_base(sdout, dump, log, produced,
+                                    'facial animation')
+    if src is None:
+        return []
+    dest = os.path.join(sdout, 'atmosphere', 'contents', TITLE_ID, 'exefs',
+                        'main')
+    log('')
+    log('advanced facial animation ...')
+    log('  base main   %s%s'
+        % (src, '   (previous patch output)' if built else '   (from dump)'))
+    voice_bss = getattr(plan, 'voice_scratch', None)
+    fps = _footstep_tick_hz()
+    tmp = dest + '.facial-tmp'
+    try:
+        report = ff7nx_facial.apply_to_nso(src, tmp, voice_bss=voice_bss,
+                                           fps=fps)
+    except Exception as exc:                                   # noqa: BLE001
+        report = None
+        log('! facial runtime: %s: %s' % (type(exc).__name__, exc))
+    if not report:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        log('! the facial runtime is not installed -- the art still ships and '
+            'every model blinks on the stock two-frame path, exactly as it '
+            'did before this pass existed')
+        return []
+    os.replace(tmp, dest)
+    log('  eyes: the blink index now names a texture. `eye_<model>_<n>` '
+        'first, then the eye set\'s own `<name>_<n>` -- 164 of the 388 HRC '
+        'models the shipped fields load have their own pair, and the cast '
+        'uses the generic names the mod replaces in place.')
+    log('  a name flevel.lgp does not have is asked for ONCE per model per '
+        'index and then remembered, so a load order without the Ninostyle '
+        'set costs one probe per model and nothing after it')
+    log('  mouth: KAWAI EYETX\'s third parameter, which the stock handler '
+        'writes a literal 0 over, is latched and drives '
+        'hundred_data_group_array[3]')
+    if report['lip_flap']:
+        log('  lip flap: ON -- while ff7nx_voice has a player sounding for '
+            'the model that opened the window, the mouth opens and closes '
+            'every %d frame(s) at %g Hz (%.1f openings a second). The 703 '
+            'shipped fields set a mouth index SIX times in total, so without '
+            'this the ten mouth sets would be inert.'
+            % (1 << report['flap_shift'], fps,
+               fps / (2 << report['flap_shift'])))
+    else:
+        log('  lip flap: off -- no voice runtime in this build, so the mouth '
+            'moves only where a KAWAI EYETX asks for it (six sites)')
+    log('  expressions: an eye index above 2 is latched instead of being '
+        'dropped by the stock 1..2 guard, and re-asserted every frame so the '
+        'per-frame blink loop cannot overwrite it after one frame. No stock '
+        'opcode behaviour changes.')
+    log('  %d-byte BSS at +0x%X, %d cave word(s) from the padding pool, no '
+        'contiguous table' % (report['bss_bytes'], report['bss_base'],
+                              report['cave_words']))
     return [dest] if not built else []
 
 

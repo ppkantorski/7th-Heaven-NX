@@ -521,6 +521,20 @@ class Cpu:
             self._wr64(rn, a + imm9)
             return None
 
+        # ---- 64-bit LDR, post-indexed. The same form one register wider.
+        # `battle_draw_call_42908C` ends `ldr x23, [sp], #0x40` and the
+        # day/night cave that puts the tint back after a battle UI draw
+        # displaces exactly that word, so it has to be executable here or the
+        # cave is only ever read rather than run.
+        if (w & 0xFFE00C00) == 0xF8400400:                    # ldr Xt,[Xn],#i
+            imm9 = (w >> 12) & 0x1FF
+            if imm9 & 0x100:
+                imm9 -= 0x200
+            a = self._rd64(rn)
+            self._wr64(rd, self.mem.u(a, 8))
+            self._wr64(rn, a + imm9)
+            return None
+
         # ---- add / sub immediate ----------------------------------------
         imm12 = (w >> 10) & 0xFFF
         sh = (w >> 22) & 1
@@ -866,6 +880,54 @@ class Cpu:
             else:
                 self.x[rn] = addr
             return None
+        if (w & 0xFFE00C00) == 0xF8000C00:                    # str Xt,[Xn,#i]!
+            # The single-register pre-index form. `ff7nx_facial`'s KAWAI hook
+            # displaces one (`str x25, [sp, #-0x50]!`) and has to replay it,
+            # so the interpreter has to execute it rather than refuse it.
+            imm = (w >> 12) & 0x1FF
+            if imm & 0x100:
+                imm -= 0x200
+            addr = ((self.sp if rn == 31 else self.x[rn]) + imm) & M64
+            self.mem.setu(addr, self.x[rd] & M64, 8)
+            if rn == 31:
+                self.sp = addr
+            else:
+                self.x[rn] = addr
+            return None
+        if (w & 0xFFE0FC00) == 0x38604800:                    # ldrb Wt,[Xn,Wm,UXTW]
+            # The byte-indexed table form `ff7nx_audio_cave.ldrb_uxtw` emits;
+            # `ff7nx_daynight` indexes its outdoor bitmap with it.
+            rm = (w >> 16) & 0x1F
+            return s(rd, self.mem.u((self._rd64(rn) + (self.x[rm] & M32))
+                                    & M64, 1), True)
+        if (w & 0xFFE0FC00) == 0xB8607800:                    # ldr Wt,[Xn,Xm,LSL#2]
+            # Replays the stock uniform-buffer selector displaced by the
+            # day/night transport hook.
+            rm = (w >> 16) & 0x1F
+            addr = (self._rd64(rn) + ((self.x[rm] & M64) << 2)) & M64
+            return s(rd, self.mem.u(addr, 4), True)
+        if (w & 0xFFE0FC00) == 0x2A200000:                    # orn Wd,Wn,Wm
+            # `mvn Wd, Wm` is `orn Wd, WZR, Wm`. `ff7nx_daynight` keeps its
+            # tint complemented in BSS so that an all-zero BSS reads as white,
+            # and this is what un-complements it on the way out.
+            # zero-aware on Rn: `mvn Wd, Wm` is `orn Wd, WZR, Wm`, and
+            # reading wzr as the stack pointer would turn it into garbage.
+            rm = (w >> 16) & 0x1F
+            src = 0 if rn == 31 else g(rn, True)
+            return s(rd, (src | (~g(rm, True) & M32)) & M32, True)
+        if (w & 0xFFE0FC00) == 0x0A200000:                    # bic Wd,Wn,Wm
+            rm = (w >> 16) & 0x1F
+            return s(rd, g(rn, True) & (~g(rm, True) & M32), True)
+        if (w & 0xFFE0FC00) == 0x1AC02000:                    # lslv Wd,Wn,Wm
+            rm = (w >> 16) & 0x1F
+            return s(rd, (g(rn, True) << (g(rm, True) & 31)) & M32, True)
+        if (w & 0xFFE0FC00) == 0x1AC02400:                    # lsrv Wd,Wn,Wm
+            rm = (w >> 16) & 0x1F
+            return s(rd, (g(rn, True) >> (g(rm, True) & 31)) & M32, True)
+        if (w & 0xFFE0FC00) == 0x8B204000:                    # add Xd,Xn,Wm,UXTW
+            # The descriptor-index form `ff7nx_audio_cave.add_x_uxtw` emits.
+            rm = (w >> 16) & 0x1F
+            return self._wr64(rd, (self._rd64(rn) + (self.x[rm] & M32)) & M64)
         if (w & 0xFFC00000) == 0xA8C00000:                    # ldp post-index
             imm = (w >> 15) & 0x7F
             if imm & 0x40:

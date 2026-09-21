@@ -72,6 +72,8 @@ HI = 0x8        # unsigned higher (C set and Z clear) -- used by the field-wait
 def mov_reg(rd, rm):  return 0x2A0003E0 | (rm << 16) | rd      # ORR Wd, WZR, Wm
 def mov_reg64(rd, rm): return 0xAA0003E0 | (rm << 16) | rd      # ORR Xd, XZR, Xm
 def eor_reg(rd, rn, rm): return 0x4A000000 | (rm << 16) | (rn << 5) | rd
+def orn_reg(rd, rn, rm): return 0x2A200000 | (rm << 16) | (rn << 5) | rd
+def mvn_reg(rd, rm):     return orn_reg(rd, WZR, rm)            # ORN Wd, WZR, Wm
 
 
 def mrs_nzcv(rt):

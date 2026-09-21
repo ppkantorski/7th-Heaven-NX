@@ -34,6 +34,68 @@ class NewEntriesRequired(Exception):
         super().__init__(f'{len(names)} new entries required')
 
 
+class ConflictTableInTheWay(Exception):
+    """Raised when adding entries to an archive whose names collide."""
+
+
+# ---------------------------------------------------- the name lookup table
+#
+# The 3,600 bytes at the head of `middle` are NOT padding. They are a
+# 30x30 table of {u16 first TOC index (1-based), u16 count}, bucketed by the
+# first two characters of the name, and the TOC is sorted so each bucket is
+# one contiguous run. Add an entry and every index after it shifts, so the
+# table has to be rebuilt -- which is why `replace()` refuses new names.
+#
+# DERIVED FROM THE SHIPPED ARCHIVES, NOT FROM A SPEC. `build_lookup_table`
+# reproduces the existing table BYTE FOR BYTE for flevel.lgp (741), char.lgp
+# (12,649), battle.lgp (11,119), magic.lgp (5,252) and menu_us.lgp (50).
+# `test_lgp_add.py` runs that check, so a wrong mapping cannot pass quietly.
+#
+# Digits share buckets with letters ('0' with 'a', '1' with 'b', ...) and '_'
+# shares with 'k'. That is what the shipped tables do; it is a hint table, not
+# a hash, and a bucket only has to bracket the run the game then scans.
+
+def _lookup_first(char):
+    """Bucket row for a name's first character, or None if it has no row."""
+    char = char.lower()
+    if 'a' <= char <= 'z':
+        return ord(char) - ord('a')
+    if '0' <= char <= '9':
+        return ord(char) - ord('0')
+    return None
+
+
+def _lookup_second(char):
+    """Bucket column for a name's second character. One-based; 0 if absent."""
+    if not char:
+        return 0
+    char = char.lower()
+    if 'a' <= char <= 'z':
+        return ord(char) - ord('a') + 1
+    if '0' <= char <= '9':
+        return ord(char) - ord('0') + 1
+    if char == '_':
+        return 11
+    return 0
+
+
+def build_lookup_table(names):
+    """The 3,600-byte table for `names`, which must be in TOC order."""
+    table = [[0, 0] for _ in range(900)]
+    for index, name in enumerate(names):
+        row = _lookup_first(name[0])
+        if row is None:
+            continue
+        bucket = row * 30 + _lookup_second(name[1] if len(name) > 1 else '')
+        if table[bucket][1] == 0:
+            table[bucket][0] = index + 1
+        table[bucket][1] += 1
+    out = bytearray()
+    for first, count in table:
+        out += struct.pack('<HH', first, count)
+    return bytes(out)
+
+
 # ------------------------------------------------------------------ LZS
 
 def lzs_decompress(data):
@@ -418,6 +480,64 @@ class Archive:
             raise NewEntriesRequired(missing)
         for name, data in payloads.items():
             self.index[name]['payload'] = data
+
+    def add(self, name, payload):
+        """
+        Append a NEW entry, keeping the TOC sorted and rebuilding the lookup
+        table. `replace()` still refuses new names; this is the deliberate
+        path for adding them.
+
+        REFUSED when the archive has a conflict table. Those entries index the
+        TOC by position to tell duplicate names apart (magic.lgp: 652 of
+        them), so re-sorting would silently point them at the wrong files.
+        Nothing this build adds to goes anywhere near one -- flevel, char,
+        battle and menu all have zero -- and refusing is better than carrying
+        an untested rewrite of a table we have no failing case for.
+        """
+        low = name.lower()
+        if low in self.index:
+            raise ValueError('%s is already in %s' % (low, self.path))
+        if len(low.encode('ascii', 'replace')) > 19:
+            raise ValueError('%s does not fit an LGP name field' % low)
+        if len(self.middle) > LOOKUP_LEN + 2:
+            raise ConflictTableInTheWay(
+                '%s has a conflict table (%d bytes past the lookup table); '
+                'entries cannot be added to it'
+                % (self.path, len(self.middle) - LOOKUP_LEN - 2))
+        entry = {
+            'name': low,
+            'raw_name': low.encode('ascii', 'replace').ljust(20, b'\0'),
+            # 14 in every entry of every shipped archive measured: flevel,
+            # char, battle and menu_us, 24,559 entries, no other value.
+            'check': 14,
+            'conflict': 0,
+            'payload': payload,
+        }
+        # THE INVARIANT IS BUCKET CONTIGUITY, NOT SORT ORDER. Measured on the
+        # shipped archives: flevel, battle, menu_us and magic are NOT sorted
+        # by name at all, and char.lgp only happens to be -- but in all five,
+        # every bucket occupies ONE unbroken run, which is what an
+        # {index, count} table can describe. So a new entry goes at the end
+        # of its own bucket's run and every existing entry keeps its exact
+        # position. Sorting the whole TOC would "look" tidier and would
+        # reorder 12,649 entries for no reason.
+        bucket = self._bucket_of(low)
+        at = len(self.entries)
+        for index, existing in enumerate(self.entries):
+            if self._bucket_of(existing['name']) == bucket:
+                at = index + 1
+        self.entries.insert(at, entry)
+        self.index[low] = entry
+        self.middle = (build_lookup_table([e['name'] for e in self.entries])
+                       + self.middle[LOOKUP_LEN:])
+        return entry
+
+    @staticmethod
+    def _bucket_of(name):
+        row = _lookup_first(name[0])
+        if row is None:
+            return None
+        return row * 30 + _lookup_second(name[1] if len(name) > 1 else '')
 
     def write(self, dest):
         count = len(self.entries)
