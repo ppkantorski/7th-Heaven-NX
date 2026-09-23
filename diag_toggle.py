@@ -70,6 +70,7 @@ if _HERE not in sys.path:
 
 import ff7nx_camclamp as C                                      # noqa: E402
 import ff7nx_facial as F                                        # noqa: E402
+import ff7nx_daynight as D                                      # noqa: E402
 
 NOP = 0xD503201F
 
@@ -96,6 +97,28 @@ SWITCHES = {
         'off_says': 'the facial runtime is OFF (stock blink/mouth). Faces '
                     'lose the advanced animation; nothing else changes. If '
                     'the corruption goes with it, this is the leak.',
+    },
+    'daynight': {
+        # The Echo-S day/night cycle, at its two per-frame hooks.
+        #
+        # THIS FEATURE ONLY STARTED INSTALLING IN BUILD 355. It had been
+        # failing with `NoRoom` for many builds -- the padding pool was full
+        # -- and the facial leak fix freed 46 words, which was enough to let
+        # it in. So a whole feature came back to life in the same build as
+        # the newly reported camera jumps and the bugin1c black-screen hang.
+        #
+        # That is FINDINGS-304 s6 exactly: when a new symptom appears in the
+        # same build as another change, revert the change first. It is one
+        # word each and it cannot be the wrong thing to check.
+        #
+        # TICK is the per-frame tint driver on `field_draw_everything`;
+        # CLEAR is the word after the gray-quad draw. Off means no tinting
+        # and no clock, and nothing else in the build changes.
+        'words': {D.TICK_HOOK: D.TICK_ORIG,
+                  D.CLEAR_HOOK: D.CLEAR_ORIG},
+        'on_says': 'the day/night cycle is active again.',
+        'off_says': 'day/night is OFF -- no tint, no clock. If the camera '
+                    'jumps or the hang go with it, that is the cause.',
     },
     'facial-blink': {
         # The blink/eye hook (x86 0x649B50 field_blink_3d_model). This is the

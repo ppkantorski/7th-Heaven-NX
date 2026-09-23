@@ -155,7 +155,32 @@ LIT_FLOOR = 10.0
 LIT_COVER = os.environ.get('SEVENTH_NX_LITCOVER') == '1'
 
 # Below this much camera travel, pin instead. See `fit`.
-PIN_SLACK = 24
+#
+# 24 WAS TOO WIDE, AND `bugin2` IS THE MEASUREMENT -- 2026-09-23.
+#
+# This rule exists for `md8_1`, whose lit art is 432 units against a 427
+# window: FIVE units of slack, imperceptible as motion and very perceptible
+# as the picture sliding off its own edge. Pinning it was right.
+#
+# `bugin2` (Cosmo Canyon, the observatory) has TWENTY, and 20 <= 24, so it
+# was pinned too. That is not a sliver -- it is exactly the travel FFNx
+# gives it:
+#
+#     bugin2 vanilla -224..224
+#       FFNx  half_width = 160 + min(53, 446/2 - 160) = 213 -> [-10, 10]
+#       ours  clamped_range() -> -170..170             -> [-10, 10]   SAME
+#       camfit pinned it to -160..160                  -> [  0,  0]
+#
+# And a pinned range is not merely a still camera: `ff7nx_camclamp` clamps
+# the SCRIPTED camera to it, so a script that pans the observatory gets
+# yanked to dead centre and snapped back when it ends. That is the abrupt
+# x jump reported on hardware when the planet cries start, and it is the
+# same shape as the 7th Heaven bar snap. FFNx has no camfit, which is
+# exactly why FFNx does not do it.
+#
+# 8 keeps md8_1's five units pinned and gives bugin2 its twenty back.
+# SEVENTH_NX_PIN_SLACK overrides it for an A/B without editing this file.
+PIN_SLACK = int(os.environ.get('SEVENTH_NX_PIN_SLACK') or 8)
 
 
 INTERIOR = 160          # inside this is the 4:3 picture; it is always art

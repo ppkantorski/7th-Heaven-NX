@@ -212,6 +212,22 @@ def link(runs, words):
 CAVE_SPAN = 0x80000
 CAVE_SPANS = (0x80000, 0xA0000, 0xC0000, 0xF0000)
 
+# A cave with NO short-range branch does not need a window at all.
+#
+# The window exists for `b.cond`, `cbz` and `adr`, which reach +/-1 MB. A
+# cave built only from `bl`, `b` and `ret` reaches +/-128 MB, so confining it
+# to 960 KB is a restriction it never earned -- and by the time the late
+# passes run it is the difference between installing and not. MEASURED on
+# the shipped module after every other pass: 2884 free words in 2689 runs,
+# of which 2534 are single words; 195 usable, but no 960 KB window holds the
+# 105 the menu calendar needs. Unconstrained, those 195 are reachable.
+#
+# a64's branch encoders range-check every resolved label, so passing this
+# for a cave that DOES contain a short branch fails the build rather than
+# encoding into the wrong function. That check is the safety net, not this
+# constant.
+ANY_SPAN = 'any'
+
 
 def emit_laid_out(pool, build, span=None):
     """
@@ -235,7 +251,10 @@ def emit_laid_out(pool, build, span=None):
     """
     probe = build(0, lambda i: 4 * i)
     n = len(probe)
-    widths = (span,) if span else CAVE_SPANS
+    if span == ANY_SPAN:
+        widths = (None,)                 # no window; see ANY_SPAN
+    else:
+        widths = (span,) if span else CAVE_SPANS
     runs = None
     for width in widths:
         # take() mutates the pool, so a failed attempt must not leave holes

@@ -568,8 +568,17 @@ def apply_to_nso(src, dest, space=None, log=lambda *_: None, guest=None):
     pool = ff7nx_cave.HolePool(text, starts=set(nxmap.Main(src).arm_starts))
 
     placed = {}
+    # ANY_SPAN: none of this module's caves contains a short-range branch --
+    # `build_date_cave` emits only bl/b/ret, and the clock and separator
+    # caves only ret -- so none of them needs the 960 KB window that exists
+    # for b.cond/cbz/adr. Requiring one is what made this pass fail with
+    # `NoRoom: no 983040-byte window holds 105 usable word(s)` once the
+    # day/night cycle started installing and took the dense low runs.
+    # a64 range-checks every resolved label, so if a short branch is ever
+    # added here the build fails rather than encoding into another function.
     entry, words = ff7nx_cave.emit_laid_out(
-        pool, lambda cave, at: build_date_cave(cave, at, table_at, layout))
+        pool, lambda cave, at: build_date_cave(cave, at, table_at, layout),
+        span=ff7nx_cave.ANY_SPAN)
     placed.update(words)
     # what the window had to hold, which is the number that matters -- the
     # map also carries the `b` at the end of each run it was chained through
@@ -580,12 +589,13 @@ def apply_to_nso(src, dest, space=None, log=lambda *_: None, guest=None):
     for site, _want, reg, guest, what in CLOCK_SITES:
         where, words = ff7nx_cave.emit_laid_out(
             pool, lambda cave, at, _g=guest, _r=reg:
-            build_clock_cave(cave, at, _g, _r))
+            build_clock_cave(cave, at, _g, _r), span=ff7nx_cave.ANY_SPAN)
         placed.update(words)
         clock_entries[what] = where
         placed[site] = A.bl(site, where)
 
-    where, words = ff7nx_cave.emit_laid_out(pool, build_separator_cave)
+    where, words = ff7nx_cave.emit_laid_out(pool, build_separator_cave,
+                                            span=ff7nx_cave.ANY_SPAN)
     placed.update(words)
     clock_entries['separator'] = where
     placed[SEPARATOR_SITE] = A.bl(SEPARATOR_SITE, where)
