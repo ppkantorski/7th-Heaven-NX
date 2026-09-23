@@ -10,7 +10,7 @@
    "FMV": 1,
    "Footsteps": 1,
    "WM": 1,
-   "Base": 0,
+   "Base": 1,
    "Ambience": 1,
    "WM 1": 1,
    "FA+BA": 1,
@@ -287,6 +287,6 @@
   "scaler": "hd",
   "fxaa": "hd",
   "video_shader": "hd",
-  "voice_normalize": "loudness:-15.3"
+  "voice_normalize": "speech:-16.2"
  }
 }

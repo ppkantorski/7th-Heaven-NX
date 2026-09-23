@@ -109,6 +109,53 @@ MENU_HOOK = 0xD0C3D4
 MENU_ORIG = 0xD0002E16                  # adrp x22, #0x12CE000
 MENU_RESUME = MENU_HOOK + 4
 
+# THE STOP THAT COVERS EVERY OTHER MODULE  (BUILD 506)
+# ====================================================
+# The world and menu stops above enumerate the two places ambience was known
+# to survive into. That is the wrong shape, and GAME OVER is what proved it:
+#
+#   * ambience kept playing over the game-over music and screen, because game
+#     over is neither field, battle, world nor menu, so nothing stopped it;
+#   * dismissing the game-over screen then hung the game on a black screen
+#     with the loop still running -- the exact hazard the MENU hook's comment
+#     already names, "its worker can outlive the field and hold the menu
+#     exit", happening at a transition that had no stop.
+#
+# FFNx does not enumerate. `ff7_handle_ambient_playback` (ff7/misc.cpp:760)
+# runs once per frame off the global loop and switches on the driver mode:
+# FIELD and BATTLE play, and `default:` -- EVERY other mode -- stops. So the
+# correct rule is "stop unless we are in a mode that plays", and the correct
+# place for it is the one entry point every module change goes through.
+#
+# `set_driver_mode(w0)` is that entry point, already mapped and already
+# hardware-proven by ff7nx_daynight, which hooks its `stp x29, x30` at
+# +0x10F3D04. This takes the NEXT instruction:
+#
+#   +10F3D00  stp  x20, x19, [sp, #-0x20]!
+#   +10F3D04  stp  x29, x30, [sp, #0x10]   <- ff7nx_daynight
+#   +10F3D08  add  x29, sp, #0x10
+#   +10F3D0C  mov  w19, w0                 <- THIS
+#   +10F3D10  bl   #0x10fb0a0
+#
+# The two chain the same way analog-360 and the field hook do: day/night's
+# cave replays its `stp` and returns to +0x10F3D08, +0x10F3D08 runs, then
+# this one. `mov w19, w0` is position-independent, the frame is fully
+# established by then, and x19/x20 are already saved by the function's own
+# prologue -- so the cave may use them, as the other stop caves do.
+#
+# Being on the SETTER rather than a frame loop means it runs once per
+# transition instead of once per frame, and it runs BEFORE the new module's
+# loop starts, which is what actually closes the hang: the worker is disposed
+# while the old module's thread is still the one running.
+MODE_HOOK = 0x10F3D0C
+MODE_ORIG = 0x2A0003F3                  # mov w19, w0
+MODE_RESUME = MODE_HOOK + 4
+# `set_driver_mode`'s numbering, shared with ff7nx_daynight: FF7's own
+# `ff7_game_modes` plus one. Only these two play ambience.
+MODE_DRIVER_FIELD = 2
+MODE_DRIVER_BATTLE = 3
+MODE_SAVE_W0 = 0x20
+
 ADRP_PAGE = 0x12CE000                   # the page all three ADRPs name
 
 # ------------------------------------------------------------ port routines
@@ -117,6 +164,23 @@ OGG_CTOR = 0x2EB0                       # (NativeOggPlayer *, char *name)
 OGG_PLAY = 0x36D0                       # (NativeOggPlayer *, bool loopish)
 OGG_VOLUME = 0x3810                     # (NativeOggPlayer *, float gain)
 OGG_DELETE = 0x3310                     # stop, dispose and free
+# PAUSE AND RESUME  (BUILD 507)
+#
+# A symmetric pair, found by reading the player's own state transitions.
+# Both take only `this`, both take the object's lock through the vtable at
+# [this+0x58] (+0x10 acquire, +0x18 release on the tail branch), both call one
+# method on the decoder at [this+0x80] and then write a state code to
+# [this+0x98]:
+#
+#   0x3750   decoder vtable +0x48   state <- 2      RESUME
+#   0x37B0   decoder vtable +0x50   state <- 4      PAUSE
+#
+# State 2 is what OGG_PLAY itself writes at 0x370C ("playing"), which is what
+# identifies 0x3750 as the resume of the pair and 4 as paused. Using the real
+# pause matters: muting with OGG_VOLUME would leave the decoder running, so
+# the loop would be somewhere else when the battle unpaused.
+OGG_RESUME = 0x3750
+OGG_PAUSE = 0x37B0
 PLAYER_BYTES = 0xA0
 # NativeOggPlayer's worker keeps the supplied name and uses it later while it
 # creates/names its Horizon thread.  A stack stem is therefore invalid as
@@ -143,8 +207,18 @@ FIELD_ID_GUEST = 0xCFF468
 # FFNx calls this `modules_global_object->battle_id`. On the original game it
 # is a direct guest global, not a pointer, so one translation is all it needs.
 BATTLE_ID_GUEST = 0xCC0D8A
+# `g_is_battle_paused`. FFNx derives it as
+# `get_absolute_value(run_animation_script, 0xA)` and names the result in its
+# own symbol, `g_is_battle_paused_DC0E6C`; ff7nx_locate resolves the same
+# address independently and ff7nx_summonhold already reads it.
+PAUSED_GUEST = 0xDC0E6C
 
 SCRATCH_BYTES = 24
+# The state block: +0 player pointer (8), +8 location id, +12 ogg id,
+# +16 mode, +20 whether WE have the player paused. The last one is the whole
+# reason a flag is needed at all -- pause and resume must be called on the
+# TRANSITION, not once per battle frame.
+PAUSE_OFF = 20
 FIELD_MODE = 1
 BATTLE_MODE = 2
 AMBIENT_SUBDIR = 'ambient'
@@ -493,10 +567,61 @@ def build_field_cave(cave, addr, scratch, pointer_va, pool_va, lo, hi):
     return a.resolve()
 
 
+def _emit_battle_pause(a):
+    """Follow `g_is_battle_paused` with the player's own pause/resume.
+
+    FFNx does this by polling every frame
+    (`ff7_handle_ambient_playback`, ff7/misc.cpp):
+
+        if ( *is_battle_paused && isAmbientPlaying())  pauseAmbient();
+        else if (!*is_battle_paused && !isAmbientPlaying()) resumeAmbient();
+
+    which is a TRANSITION, expressed as a comparison against what the engine
+    is already doing. We have no `isAmbientPlaying`, so the transition is
+    remembered in the state block instead -- and it has to be a transition:
+    calling pause on every paused frame would take the player's lock sixty
+    times a second for nothing.
+
+    This runs FIRST, before the location lookup, so it happens on every
+    battle frame whatever the lookup decides -- including the frames where
+    there is no track for this battle and the lookup leaves early.
+    """
+    AC.mov32(a, 0, PAUSED_GUEST)
+    a.emit(A.bl(a.pc(), AC.GUEST_TRANSLATE))
+    a.emit(A.ldrb(23, 0, 0))
+    # Normalise to 0/1: the engine writes a byte, and only "is it zero"
+    # is meaningful. Comparing the raw byte against our flag would toggle
+    # on any change of a non-zero value.
+    a.emit(A.cmp_imm(23, 0))
+    a.bcond('pause_none', A.EQ)
+    a.emit(A.movz(23, 1))
+    a.b('pause_have')
+    a.label('pause_none')
+    a.emit(A.mov_reg(23, A.WZR))
+    a.label('pause_have')
+    a.emit(A.ldr(24, 19, PAUSE_OFF))
+    a.emit(A.cmp_reg(23, 24))
+    a.bcond('pause_done', A.EQ)
+    a.emit(A.str_(23, 19, PAUSE_OFF))
+    # The player pointer, re-read rather than trusting x20: this runs before
+    # the lookup, so x20 is whatever the prologue loaded, and a battle with
+    # no ambience at all has none.
+    a.emit(A.ldr64(20, 19, 0))
+    a.cbz64(20, 'pause_done')
+    a.emit(AC.mov64(0, 20))
+    a.cbz(23, 'pause_resume')
+    a.emit(A.bl(a.pc(), OGG_PAUSE))
+    a.b('pause_done')
+    a.label('pause_resume')
+    a.emit(A.bl(a.pc(), OGG_RESUME))
+    a.label('pause_done')
+
+
 def build_battle_cave(cave, addr, scratch, pointer_va, pool_va, lo, hi):
     """Exact `bat_<id>` dispatcher, sharing the field player's state."""
     a = Asm(cave, addr)
     _prologue(a, scratch, save_pair=False)
+    _emit_battle_pause(a)
     AC.mov32(a, 0, BATTLE_ID_GUEST)
     a.emit(A.bl(a.pc(), AC.GUEST_TRANSLATE))
     a.emit(A.ldrh(22, 0, 0))
@@ -530,11 +655,63 @@ def _build_stop_cave(cave, addr, scratch, reg, resume):
     a.emit(A.str_(31, 19, 8))
     a.emit(A.str_(31, 19, 12))
     a.emit(A.str_(31, 19, 16))
+    # ... and OUR pause flag. A disposed player is not paused, and leaving a
+    # 1 here would make the next battle's first frame call resume on a
+    # player that was never paused.
+    a.emit(A.str_(31, 19, PAUSE_OFF))
     a.label('out')
     a.emit(AC.ldp_off(19, 20, 0x10))
     a.emit(A.ldp64_post(29, 30, 31, 0x30))
     a.emit(A.adrp(reg, a.pc(), ADRP_PAGE))  # re-encoded, as above
     a.emit(A.b(a.pc(), resume))
+    return a.resolve()
+
+
+def build_mode_stop_cave(cave, addr, scratch):
+    """
+    Dispose any live ambience on entering a mode that does not play it.
+
+    This is FFNx's `default: stopAmbient()` (ff7/misc.cpp:760) expressed as an
+    event rather than a poll: FIELD and BATTLE are the only modes that play,
+    so every other one stops. It covers game over, the title screen, the
+    credits, the swirl and anything else, instead of enumerating them.
+
+    `w0` is the incoming mode and must reach the displaced `mov w19, w0`
+    intact, so it is kept in the frame across OGG_DELETE -- which is a
+    blocking dispose, and blocking here is the point: the worker has to be
+    gone before the new module's loop starts.
+    """
+    a = Asm(cave, addr)
+    a.emit(A.stp64_pre(29, 30, 31, -0x30))
+    a.emit(AC.stp_off(19, 20, 0x10))
+    a.emit(A.str_(0, A.SP, MODE_SAVE_W0))
+    a.emit(A.cmp_imm(0, MODE_DRIVER_FIELD))
+    a.bcond('out', A.EQ)
+    a.emit(A.cmp_imm(0, MODE_DRIVER_BATTLE))
+    a.bcond('out', A.EQ)
+    AC.bss_ptr(a, 19, scratch)
+    a.emit(A.ldr(8, 19, 16))
+    a.emit(A.cmp_imm(8, 0))
+    a.bcond('out', A.EQ)
+    a.emit(A.ldr64(20, 19, 0))
+    a.cbz64(20, 'clear')
+    a.emit(AC.mov64(0, 20))
+    a.emit(A.bl(a.pc(), OGG_DELETE))
+    a.label('clear')
+    a.emit(A.str64(31, 19, 0))
+    a.emit(A.str_(31, 19, 8))
+    a.emit(A.str_(31, 19, 12))
+    a.emit(A.str_(31, 19, 16))
+    # ... and OUR pause flag. A disposed player is not paused, and leaving a
+    # 1 here would make the next battle's first frame call resume on a
+    # player that was never paused.
+    a.emit(A.str_(31, 19, PAUSE_OFF))
+    a.label('out')
+    a.emit(A.ldr(0, A.SP, MODE_SAVE_W0))
+    a.emit(AC.ldp_off(19, 20, 0x10))
+    a.emit(A.ldp64_post(29, 30, 31, 0x30))
+    a.emit(MODE_ORIG)                       # mov w19, w0 -- after the restore
+    a.emit(A.b(a.pc(), MODE_RESUME))
     return a.resolve()
 
 
@@ -629,12 +806,14 @@ def apply_to_nso(src, dest, field_table, battle_table=None, space=None):
         return None
 
     for hook, orig, what in ((WORLD_HOOK, WORLD_ORIG, 'ambient world stop'),
-                             (MENU_HOOK, MENU_ORIG, 'ambient menu stop')):
+                             (MENU_HOOK, MENU_ORIG, 'ambient menu stop'),
+                             (MODE_HOOK, MODE_ORIG, 'ambient mode stop')):
         AC.expect_word(text, hook, orig, what)
         sites.append((hook, orig, what))
 
     for builder, hook, key in ((build_world_stop_cave, WORLD_HOOK, 'world'),
-                               (build_menu_stop_cave, MENU_HOOK, 'menu')):
+                               (build_menu_stop_cave, MENU_HOOK, 'menu'),
+                               (build_mode_stop_cave, MODE_HOOK, 'mode')):
         entry, words = ff7nx_cave.emit_laid_out(
             pool, lambda cave, addr, b=builder: b(cave, addr, scratch))
         placed.update(words)

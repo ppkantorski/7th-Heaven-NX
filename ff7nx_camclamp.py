@@ -69,9 +69,27 @@ units wider and the same target runs off the end.
 
 FFNx hit exactly this and fixed it in exactly this place -- it adds
 `field_widescreen_width_clip_with_camera_range` to both functions, eight call
-sites in all, including one **unconditional** clamp of `field_curr_delta_world_pos`
-at the very end of the update (background.cpp:855). This module is that last
-one, and only that one.
+sites in all, including one clamp of `field_curr_delta_world_pos` that is
+unconditional **within the active-update block** (background.cpp:855). This
+module is that last one, and only that one.
+
+The distinction between "end of the function" and "end of the active block"
+matters.  `SCR2D` is mode 4: its one-shot initializer writes the authored
+camera and immediately changes `world_move_status` to 2.  FFNx's tail is
+inside `if (world_move_status == 1)`, so it does not blindly re-clamp every
+completed mode-4 placement on every frame.  The original version of this
+module hooked the common function epilogue without reproducing the movie-
+camera state that decides which completed placement is still live.
+
+`southmk2` makes the error measurable rather than theoretical.  Its setup
+executes `SCR2D (+32, -32)`.  At the PC capture's scale, +32 field units are
+about 112 pixels -- exactly the black strip FFNx leaves on the left so the
+live models, broken bridge and post-boss movie line up.  The two movies then
+state their intent explicitly: the pre-battle path executes `MVCAM 1` and
+must return to the centred field; the post-battle path executes `MVCAM 0` and
+must retain the authored +32 field camera.  Gating on status alone preserved
+both and introduced the left strip before battle.  Gating on status plus
+MVCAM preserves only the second.
 
 =============================================================================
 2. WHY THE PATCH IS THE STOCK +/-160 AND NOT FFNx's half_width
@@ -127,6 +145,16 @@ are therefore the caller's -- the cave does not touch them.
 =============================================================================
 4. THE CAVE
 =============================================================================
+    mov   w0, #0xda7
+    movk  w0, #0xcc, lsl #16          0xCC0DA7, world_move_status
+    bl    #0x10fc3a0
+    ldrb  w8, [x0]
+    cmp   w8, #1
+    b.eq  clamp                       an active move is always constrained
+    ldrb  w8, [x0, #0x1a]            MVCAM_flag at global-object +0x39
+    cbz   w8, skip                    MVCAM 0 -> retain authored placement
+  clamp:
+
     mov   w0, #0xf454
     movk  w0, #0xcf, lsl #16          0xCFF454, field_triggers_header
     bl    #0x10fc3a0
@@ -153,6 +181,16 @@ are therefore the caller's -- the cave does not touch them.
     ldr   w0, [x22, #0x14]            <- displaced
     b     #0x9f8750
 
+MOVEMENT / MOVIE-CAMERA GATE
+----------------------------
+Before touching either axis the cave reads the game's
+`modules_global_object->world_move_status` byte (guest 0xCC0DA7). Active
+movement (status 1) is always clamped. For a completed placement it also
+reads `MVCAM_flag` from the same object: `MVCAM 1` takes the centred/clamped
+path used by the pre-battle movie, while `MVCAM 0` retains the authored field
+camera used by the post-battle composite. This fixes the handoff without
+naming `southmk2` and without shifting centered movies.
+
 IDEMPOTENT BY CONSTRUCTION, WHICH IS THE POINT
 ----------------------------------------------
 On every frame that did go through `field_clip_with_camera_range`, the value
@@ -164,7 +202,7 @@ that are already outside the bounds -- which is the definition of the bug.
 
 Y, WHICH THIS MODULE NOW ALSO DOES  (was "WHY NOT Y")
 -----------------------------------------------------
-It used to say: FFNx's unconditional tail clamp is
+It used to say: FFNx's active-update tail clamp is
 `field_widescreen_width_clip_with_camera_range`, which is horizontal; the
 vertical twin `field_uncropped_height_clip_with_camera_range` is gated behind
 `isScriptedVerticalClipEnabled()` and its own per-field config key; vanilla
@@ -217,6 +255,35 @@ SDOUT_MAIN = os.path.join('atmosphere', 'contents',
 FUNC_LO = 0x9F7DB0              # field_update_scripted_bg_movement, x86 0x643D22
 FUNC_HI = 0x9F8790
 
+# THE EARLY-OUT, AND WHY THE CLAMP MUST NOT SEE IT.
+#
+# FFNx's per-frame clamp lives INSIDE `if (world_move_status == 1)`
+# (background.cpp:720 opens that block, 856 is the clamp). The compiler turned
+# that `if` into one branch:
+#
+#     +9F7E04  ldrsb w8, [x0]        world_move_status
+#     +9F7E08  cmp   w8, #1
+#     +9F7E18  b.ne  #0x9f874c       <- straight to our hook, skipping the if
+#
+# Four branches reach +0x9F874C. Three are inside the status==1 block; this
+# one is the early-out, where FFNx does nothing at all. Hooking the shared
+# epilogue therefore clamps on a path FFNx leaves alone, every frame, forever.
+#
+# That matters because `field_curr_delta_world_pos_x` is not only the scripted
+# camera's. `field_update_background_positions` reads it on its MOVIE path
+# (x86 +0x98C, gated on MVCAM_flag == 1) to anchor the field to the 4:3 centre
+# the movie is drawn at. Re-clamping it on a frame where no scripted move is
+# running overwrites a value this module does not own, and the field stops
+# agreeing with the movie.
+#
+# The fix is the branch, not a runtime gate: send the early-out to a two-word
+# trampoline that replays the displaced word and rejoins. State read AT the
+# hook cannot work -- the mode handlers set status to 2 inside the switch, so
+# by the epilogue "status == 1" is already false for a move that just landed.
+EARLY_OUT_VA = 0x9F7E18
+EARLY_OUT_ORIG = 0x540049A1     # b.ne #0x9f874c
+EARLY_OUT_REACH = 0x100000      # b.cond is +/-1 MB; stay inside it
+
 HOOK_VA = 0x9F874C              # ldr w0, [x22, #0x14]   -- x86 0x644055
 HOOK_ORIG = 0xB94016C0
 RETURN_VA = 0x9F8750
@@ -250,8 +317,16 @@ COND_LT = 11
 VCLIP_FLAG_OFF = 0x30
 VCLIP_FLAG_SITES = 8            # bytes at +0x30..+0x37, only the first used
 
-N_WORDS_X = 24                  # horizontal only -- the shipped v1
-N_WORDS_XY = 47                 # both axes, y gated per field  (v3)
+# ff7_modules_global_object begins at guest 0xCC0D88.  The struct layout in
+# FFNx's ff7.h places world_move_status at +0x1F.  This gate is deliberately a
+# direct byte read through XLAT: it does not depend on a host pointer or on a
+# register remaining live from one of the function's earlier branches.
+WORLD_MOVE_STATUS = 0xCC0DA7
+WORLD_MOVE_ACTIVE = 1
+MVCAM_FROM_STATUS = 0x1A        # 0xCC0DC1 - 0xCC0DA7
+
+N_WORDS_X = 24                  # horizontal only                  (v1)
+N_WORDS_XY = 47                 # x and y, vertically gated        (v3)
 
 # EVERY LENGTH THIS MODULE HAS EVER WRITTEN, newest first.
 #
@@ -263,11 +338,35 @@ N_WORDS_XY = 47                 # both axes, y gated per field  (v3)
 # no longer a length it knew about. Removing a length from this list strands
 # every module built with it.
 #
-#   24  v1  x only
-#   45  v2  x and y, ungated -- the one that froze 198 cameras
-#   47  v3  x and y, gated on field_trigger_header + 0x30
-LEGACY_LENGTHS = (45,)
-KNOWN_LENGTHS = (N_WORDS_XY,) + LEGACY_LENGTHS + (N_WORDS_X,)
+#   24  v1  x only, but ran after completed one-shot camera placements
+#   45  v2  x and y, ungated vertically
+#   47  v3  x and y, vertically gated, but still ran after completed moves
+#   30  v4  x only, active-movement gated (preserved both southmk2 movies)
+#   53  v4  x and y, same over-broad completed-move gate
+#   32  v5  x only, movement/MVCAM gated            WITHDRAWN, see below
+#   55  v5  x and y, movement/MVCAM and vertical-option gated   WITHDRAWN
+#
+# v5 IS WITHDRAWN AND v3's LENGTHS ARE THE CURRENT ONES AGAIN.
+#
+# v5 gated the clamp on `world_move_status` read AT THE HOOK plus an MVCAM
+# byte. Both halves are wrong, and the arithmetic says so:
+#
+#   * `southmk2`'s camera range is -192..192. FFNx's own half_width for it is
+#     `160 + min(53, 192-160)` = 192, so FFNx's bounds are [0, 0] -- it pins
+#     that field's camera to dead centre in widescreen and the authored
+#     SCR2D +32 can never survive on FFNx either. The +32 that v5 was built
+#     to preserve is not what puts the black strip on the left in the PC
+#     capture; the movie compositor does that, not the field camera.
+#   * MVCAM defaults to 0 in every field that never executes it, so "MVCAM 0
+#     -> preserve" skipped the clamp on every completed placement in the
+#     game. That is the Sector 1 station band this module exists to remove,
+#     reintroduced.
+#   * Read at the hook, `world_move_status` is already 2 on the frame a pan
+#     completes -- the mode handler sets it inside the switch -- so the
+#     resting position was left unclamped even for ordinary moves.
+LEGACY_LENGTHS = (55, 53, 45, 32, 30)
+KNOWN_LENGTHS = tuple(dict.fromkeys(
+    (N_WORDS_XY,) + LEGACY_LENGTHS + (N_WORDS_X,)))
 N_WORDS = N_WORDS_X             # kept so old callers still read something
 
 
@@ -414,6 +513,27 @@ def _clamp_tail(addr, i0):
     ]
 
 
+def _active_gate(addr, i0, skip):
+    """Eight words: select active/centred versus retained movie cameras.
+
+    Active movement always clamps.  A completed mode-4/SCR2D placement is
+    retained only for MVCAM 0, the field-camera movie-composite path. MVCAM 1
+    uses the centred path and must not leave the pre-battle black strip.
+    """
+    clamp = addr(i0 + 8)
+    return [
+        A.movz(0, WORLD_MOVE_STATUS & 0xFFFF),
+        A.movk_hi(0, WORLD_MOVE_STATUS >> 16),
+        A.bl(addr(i0 + 2), XLAT),
+        A.ldrb(8, 0, 0),
+        A.cmp_imm(8, WORLD_MOVE_ACTIVE),
+        A.bcond(addr(i0 + 5), clamp, 0),          # b.eq: active -> clamp
+        A.ldrb(8, 0, MVCAM_FROM_STATUS),
+        A.cbz(8, addr(i0 + 7), skip),             # MVCAM 0 -> preserve
+                                                    # MVCAM 1 -> fall through
+    ]
+
+
 def _header_ptr(addr, i0, skip=None):
     """
     The host pointer to `field_triggers_header` in x0.
@@ -515,8 +635,8 @@ def cave_words(addr, return_va, vertical=True):
     """
     The whole cave, laid out at addr(i).
 
-    `vertical=False` reproduces the shipped horizontal-only v1 byte for byte,
-    which is what makes `--revert` of an older module and the A/B possible.
+    Older layouts remain discoverable by ``KNOWN_LENGTHS`` for safe reversion;
+    this revision prefixes both variants with the active-movement gate.
     """
     n = n_words(vertical)
     skip = addr(n - 2)                            # the displaced instruction
@@ -729,7 +849,7 @@ def installed_vertical(t):
     n = cave_length(t)
     if n is None:
         return None
-    return n != N_WORDS_X
+    return n not in (N_WORDS_X, 30, 24)
 
 
 def installed_current(t):
@@ -738,13 +858,50 @@ def installed_current(t):
 
 
 # ------------------------------------------------------------------ patches
+def _trampoline(pool, log):
+    """Two words the early-out can branch to instead of the clamp.
+
+    `b.cond` reaches +/-1 MB, and the padding near this function is nearly
+    spent, so the cave itself cannot be moved here -- but two words can. If
+    even those are out of reach the gate is skipped and said so: the clamp
+    then behaves as it did before, which is a known state rather than a
+    mis-encoded branch.
+    """
+    near = [h for h in pool.free if abs(h[0] - EARLY_OUT_VA) < EARLY_OUT_REACH]
+    if sum(max(0, n - 1) for _va, n in near) < 2:
+        log('  ! no padding within %#x of the early-out; the status gate is '
+            'NOT installed and the clamp keeps running on the do-nothing '
+            'path' % EARLY_OUT_REACH)
+        return None, {}
+    keep = pool.free
+    pool.free = sorted(near, key=lambda h: (-h[1], h[0]))
+    try:
+        entry, words = ff7nx_cave.emit_laid_out(
+            pool, lambda _e, addr: [HOOK_ORIG,
+                                    A.b(addr(1), RETURN_VA)])
+    finally:
+        used = set(pool.free)
+        pool.free = [h for h in keep if h in used or h not in near]
+    return entry, words
+
+
 def build_patches(img, starts, log=print, vertical=True):
     def build(_entry, addr):
         return cave_words(addr, RETURN_VA, vertical)
 
-    entry, out = ff7nx_cave.emit_laid_out(
-        ff7nx_cave.HolePool(bytearray(img), starts=starts), build, span=0x80000)
+    pool = ff7nx_cave.HolePool(bytearray(img), starts=starts)
+    entry, out = ff7nx_cave.emit_laid_out(pool, build, span=0x80000)
     out[HOOK_VA] = A.b(HOOK_VA, entry)
+
+    skip_entry, skip_words = _trampoline(pool, log)
+    if skip_entry is not None:
+        out.update(skip_words)
+        out[EARLY_OUT_VA] = A.bcond(EARLY_OUT_VA, skip_entry, A.NE)
+        log('  status gate: +%#x now branches past the clamp to +%#x, so a '
+            'frame with no scripted movement leaves '
+            'field_curr_delta_world_pos alone -- which is what FFNx does and '
+            'what the movie path depends on'
+            % (EARLY_OUT_VA, skip_entry))
     log('  scripted camera clamp cave: %d words in padding, entry +%#x  (%s)'
         % (n_words(vertical), entry,
            'x and y' if vertical else 'x only'))
@@ -753,6 +910,9 @@ def build_patches(img, starts, log=print, vertical=True):
             'field_clip_with_camera_range uses' % (HALF_W, HALF_W))
         log('    y -> [top  + %d, bottom - %d]  MEASURED in that function at '
             '+0xA11720/+0xA117E8' % (HALF_H, HALF_H))
+        log('    every scripted camera write is clamped, which is what v1 '
+            'through v3 did; v5\'s movement/MVCAM gate is withdrawn -- see '
+            'FINDINGS-495 for the arithmetic that disproves it')
     log('  (the 60 FPS cave region is not touched)')
     return out
 
@@ -767,9 +927,36 @@ def revert_patches(t, log=print):
     for va in walk_physical(t, n=n):
         if va != HOOK_VA:
             out[va] = 0
+    # ... and the status gate, if this module installed one. The trampoline is
+    # two words and it is only ever reached from that one branch, so decoding
+    # the branch is how it is found; a site already holding the stock word
+    # means there is nothing to undo.
+    here = w32(t, EARLY_OUT_VA)
+    if here != EARLY_OUT_ORIG:
+        target = _bcond_target(here, EARLY_OUT_VA)
+        if target is None:
+            log('  ! +%#x is neither the stock branch nor one this module '
+                'wrote; leaving it alone' % EARLY_OUT_VA)
+        else:
+            out[EARLY_OUT_VA] = EARLY_OUT_ORIG
+            if w32(t, target) == HOOK_ORIG:
+                out[target] = 0
+                out[target + 4] = 0
+            log('  status gate removed (+%#x restored, trampoline at +%#x '
+                'returned)' % (EARLY_OUT_VA, target))
     log('  scripted camera clamp removed (%d word(s) of padding returned)'
         % (len(out) - 1))
     return out
+
+
+def _bcond_target(word, va):
+    """Where a `b.cond` points, or None if this is not one."""
+    if word & 0xFF000010 != 0x54000000:
+        return None
+    imm = (word >> 5) & 0x7FFFF
+    if imm & 0x40000:
+        imm -= 0x80000
+    return va + imm * 4
 
 
 # ------------------------------------------------------------------ emulation
@@ -781,7 +968,7 @@ def _emu():
 
 def emulate(delta_x, left, right, hdr=0x2200000,
             delta_y=0, top=0, bottom=0, no_field=False, vertical=True,
-            vclip=1):
+            vclip=1, world_move_status=WORLD_MOVE_ACTIVE, mvcam_flag=0):
     """
     Execute the cave's real words against a fake guest memory.
 
@@ -793,6 +980,8 @@ def emulate(delta_x, left, right, hdr=0x2200000,
     mem = arm64emu.Mem()
     base = 0x3000000
     n = n_words(vertical)
+    mem.setu(WORLD_MOVE_STATUS, world_move_status & 0xFF, 1)
+    mem.setu(WORLD_MOVE_STATUS + MVCAM_FROM_STATUS, mvcam_flag & 0xFF, 1)
     mem.setu(HDR_PTR, 0 if no_field else hdr, 4)
     mem.setu(hdr + RANGE_LEFT, left & 0xFFFF, 2)
     mem.setu(hdr + RANGE_RIGHT, right & 0xFFFF, 2)
@@ -847,7 +1036,7 @@ def check_encoding(log=print, vertical=True):
         log('  ! capstone decoded %d of %d words' % (len(got), len(words)))
         return False
     for k, (g, want) in enumerate(zip(got, disasm(vertical))):
-        loose = '#skip' in want or want.startswith('b #')
+        loose = '#skip' in want or '#clamp' in want or want.startswith('b #')
         if (g.split()[0] if loose else g) != (want.split()[0] if loose
                                               else want):
             log('  ! word %2d encodes `%s`, meant `%s`' % (k, g, want))
@@ -888,6 +1077,23 @@ def verify(main=None, log=print):
         good = got['x'] == want
         ck(good, '%5d..%-5d  %6d -> %6d  (model %6d, travel %4d)  %s'
            % (left, right, dx, got['x'], want, travel(left, right), what))
+
+    log('')
+    log('  southmk2, THE FIELD v5 WAS BUILT AROUND -- and the arithmetic')
+    log('  that withdrew it. Its camera range is -192..192, so FFNx\'s own')
+    log('  half_width is 160 + min(53, 192-160) = 192 and its bounds are')
+    log('  [0, 0]: FFNx pins that camera to dead centre in widescreen and')
+    log('  the authored SCR2D +32 cannot survive there either. The strip')
+    log('  on the left of the PC capture is the movie compositor, not the')
+    log('  field camera, which is why gating this clamp could never')
+    log('  reproduce it.')
+    got = emulate(-32, -160, 160, world_move_status=2)
+    ck(got['x'] == 0,
+       'southmk2 after ff7nx_ws pulls its range to -160..160: a +32 camera '
+       'is clamped to 0, the same [0,0] FFNx computes')
+    got = emulate(40, -160, 160, world_move_status=1)
+    ck(got['x'] == 0,
+       'a fixed-range camera is clamped while movement is active')
 
     log('')
     log('  the VERTICAL leg, executed, against the same model at half = %d:'
@@ -952,11 +1158,12 @@ def verify(main=None, log=print):
 
     log('')
     log('  BACKWARD COMPATIBILITY -- the check that v3 shipped without:')
-    ck(24 in KNOWN_LENGTHS and 45 in KNOWN_LENGTHS
-       and N_WORDS_XY in KNOWN_LENGTHS,
+    ck(all(n in KNOWN_LENGTHS
+           for n in (24, 30, 45, 47, 53, N_WORDS_X, N_WORDS_XY)),
        'KNOWN_LENGTHS carries every cave this module has written '
-       '(v1 24, v2 45, v3 %d) -- a module built with any of them can still '
-       'be reverted' % N_WORDS_XY)
+       '(v1 24, v2 45, v3 47, v4-x 30, v4 53, v5-x %d, v5 %d) -- a '
+       'module built with any of them can still be reverted'
+       % (N_WORDS_X, N_WORDS_XY))
     ck(KNOWN_LENGTHS[0] == N_WORDS_XY,
        'the current length is probed first, so a fresh cave is never '
        'mistaken for a legacy one')
@@ -965,6 +1172,29 @@ def verify(main=None, log=print):
     ck(N_WORDS_XY not in LEGACY_LENGTHS,
        'the current length is not also marked legacy -- if it were, --apply '
        'would try to upgrade a module that is already correct, forever')
+
+    log('')
+    log('  THE STATUS GATE -- the two ways into the epilogue, executed:')
+    import arm64emu
+    tramp = [HOOK_ORIG, A.b(0x900004, RETURN_VA)]
+    mem = arm64emu.Mem()
+    cpu = arm64emu.Cpu(mem)
+    EBP_SLOT, MARK = 0x5000, 0x1234ABCD
+    cpu.x[22] = EBP_SLOT
+    mem.setu(EBP_SLOT + 0x14, MARK, 4)
+    DELTA = 0x7000
+    mem.setu(DELTA, 0xFFFF & -40, 2)          # a camera nobody may touch
+    out = cpu.run(0x900000, tramp)
+    ck(out == RETURN_VA,
+       'the early-out trampoline rejoins the function at +%#x' % RETURN_VA)
+    ck(cpu.x[0] == MARK,
+       'and it replays the displaced `ldr w0, [x22, #0x14]` first')
+    ck(mem.u(DELTA, 2) == (0xFFFF & -40),
+       'a frame with no scripted movement leaves field_curr_delta_world_pos '
+       'untouched -- the value the movie path reads')
+    got = emulate(-40, -160, 160)
+    ck(got['x'] == 0,
+       'while the in-block path still clamps that same camera to 0')
 
     log('')
     log('  the guards:')
@@ -1162,7 +1392,7 @@ def apply(main, revert=False, log=print, vertical=True):
         if state(t) == 'patched':
             got = installed_vertical(t)
             n_now = cave_length(t)
-            stale = (vertical and n_now in LEGACY_LENGTHS)
+            stale = n_now in LEGACY_LENGTHS
             if stale:
                 log('  scripted camera clamp: a LEGACY %d-word cave is '
                     'installed (ungated vertical leg) -- removing it first'
@@ -1223,7 +1453,8 @@ def apply(main, revert=False, log=print, vertical=True):
             return 1
         log('  the scripted camera is now clamped to '
             '[range.left + %d, range.right - %d]%s, the same bounds '
-            'field_clip_with_camera_range uses on the normal path'
+            'field_clip_with_camera_range uses on the normal path. Every '
+            'scripted camera write is clamped, as v1 through v3 did'
             % (HALF_W, HALF_W,
                ' and [range.top + %d, range.bottom - %d]' % (HALF_H, HALF_H)
                if vertical else ''))
@@ -1240,9 +1471,9 @@ def main(argv=None):
     ap.add_argument('--show', action='store_true')
     ap.add_argument('--verify', action='store_true')
     ap.add_argument('--horizontal-only', action='store_true',
-                    help='ship the v1 cave (x only). For an A/B against the '
-                         'build that is already on hardware -- the vertical '
-                         'leg is what fixes the band at the top of a pan.')
+                    help='ship the current active-gated x-only cave. For an '
+                         'A/B without the vertical leg that fixes the band '
+                         'at the top of selected pans.')
     a = ap.parse_args(argv)
     vertical = not a.horizontal_only
 

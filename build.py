@@ -8,6 +8,7 @@ Copyright (c) 2026 ppkantorski
 """
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -18,6 +19,7 @@ import tempfile
 import time
 from collections import Counter
 
+import a64
 import exe_patch
 import iro
 import lgp
@@ -666,6 +668,20 @@ class Mod:
         folders = iro.active_folders(self.manifest, settings,
                                      read=read, log=log) \
             if self.manifest else []
+        # A toggle WE invented, switched off. The mod declares these folders
+        # unconditionally -- 7th Heaven always applies them -- so this is the
+        # one kind of "Off" in the dialog that removes content the author
+        # never made optional, and it has to be said out loud. Cosmo Memory's
+        # `Base` is the case that found it: 996 .ogg files and a config.toml
+        # mapping 720 of the game's 750 sound slots, gone, silently, and the
+        # symptom was "the sound effects are still the vanilla ones".
+        if log and self.manifest:
+            for ident, dropped in self.manifest.synthesized_off(settings):
+                log('    ! %r is OFF, and it is not one of this mod\'s own '
+                    'options -- we add a switch for folders it ships with no '
+                    'ActiveWhen. 7th Heaven applies %s unconditionally. '
+                    'Turn it back on unless you meant to exclude it.'
+                    % (ident, ', '.join(dropped) or ident))
         out = []
         declared = bool(self.manifest and self.manifest.folders)
         resolve = self._folder_resolver()
@@ -827,6 +843,10 @@ class Plan:
                                    # IS an archive rather than an entry in one
         self.music = {}           # basename -> (src, mod)
         self.movies = {}          # lowercase stem -> (src, mod)
+        self.movie_audio = {}     # (stem, 'music'|'voice') -> (src, mod).
+                                  # FFNx's two audio layers for a cutscene;
+                                  # muxed into the mp4 at emplacement, see
+                                  # movies.py THE MOVIE AUDIO LAYER.
         self.loose = {}           # (holder, name) -> (src, mod)
         self.battle_bg = {}       # (stage_num, tile_num) -> (src, mod)
         self.sfx = []             # ordered (rel, full, mod) under sfx/
@@ -1431,6 +1451,26 @@ def build_plan(mods, settings_by_mod, catalogs, log=lambda *_: None,
                     # unrelated FFNx voice mod cannot be half-ingested.
                     if voicemod.classify_voice_path(rel):
                         plan.voice.append((rel, full, mod))
+                    else:
+                        plan.skipped_ffnx_audio[holder] = \
+                            plan.skipped_ffnx_audio.get(holder, 0) + 1
+                    continue
+                if holder == 'movies':
+                    # THE OTHER FFNX AUDIO DIRECTORY THAT NOW HAS SOMEWHERE
+                    # TO GO. `movies/<NAME>.ogg` replaces a cutscene's
+                    # soundtrack and `movies/<NAME>_va.ogg` is the voice
+                    # layer over it; the port has neither, but it does play
+                    # an mp4 with an audio track, and this packer builds
+                    # that mp4. So they are collected here and MUXED at
+                    # emplacement time -- FFNx's mix, computed earlier.
+                    #
+                    # Dropping them was not a small omission: with Echo-S
+                    # and Cosmo Memory installed it is 15 voice tracks --
+                    # every word spoken during an FMV -- and 64 remastered
+                    # soundtracks.
+                    layer = movie_convert.movie_audio_kind(rel)
+                    if layer:
+                        plan.movie_audio[(layer[1], layer[0])] = (full, mod)
                     else:
                         plan.skipped_ffnx_audio[holder] = \
                             plan.skipped_ffnx_audio.get(holder, 0) + 1
@@ -8778,7 +8818,7 @@ def _emplace_movies(plan, romfs, sdout, dump, log, progress, produced):
     through, because the caves are unconditional and a movie at a third rate
     would desync against both.
     """
-    if not plan.movies and not movie_30fps():
+    if not plan.movies and not plan.movie_audio and not movie_30fps():
         return
     quality = movie_quality()
     fit = movie_fit()
@@ -8842,6 +8882,17 @@ def _emplace_movies(plan, romfs, sdout, dump, log, progress, produced):
     work = {}
     for stem, (msrc, mmod) in plan.movies.items():
         work[(home_for(stem), stem)] = (msrc, mmod)
+    # A movie whose PICTURE nobody replaced but whose SOUND somebody did has
+    # to be rebuilt too -- Echo-S ships `SOUTHMK_VA.ogg` and no southmk
+    # video, and Cosmo Memory ships 64 soundtracks and no video at all. It
+    # comes from the dump, exactly like the frame-rate pass below.
+    audio_stems = {stem for stem, _kind in plan.movie_audio}
+    for stem in sorted(audio_stems):
+        key = (home_for(stem), stem)
+        if key not in work and key in vanilla_at:
+            work[key] = (vanilla_at[key], None)
+    unplaced = sorted(s for s in audio_stems
+                      if (home_for(s), s) not in work)
     borrowed = 0
     if normalise:
         if not vanilla_at:
@@ -8882,6 +8933,7 @@ def _emplace_movies(plan, romfs, sdout, dump, log, progress, produced):
 
     done = failed = cached = copied = 0
     resized = recoloured = 0
+    muxed_music = muxed_voice = 0
     oversize_left = []       # (stem, w, h) when fit is off but should not be
     undersize = []           # (stem, w, h) -- the shader has to magnify these
     spent = 0.0
@@ -8900,6 +8952,8 @@ def _emplace_movies(plan, romfs, sdout, dump, log, progress, produced):
         progress(i, len(work), f'movie {stem}')
         dest = os.path.join(romfs, *reldir.split('/'), stem + '.mp4')
         vanilla = vanilla_at.get((reldir, stem))
+        music = (plan.movie_audio.get((stem, 'music')) or (None,))[0]
+        voice = (plan.movie_audio.get((stem, 'voice')) or (None,))[0]
 
         try:
             # Everything that changes the OUTPUT goes in the key, and nothing
@@ -8913,8 +8967,14 @@ def _emplace_movies(plan, romfs, sdout, dump, log, progress, produced):
             # carried the cap but not the code that applied it, so an
             # unchanged input with unchanged settings kept serving the old
             # output. Any change to what convert() emits bumps that string.
+            # The two audio layers go in the key by CONTENT, for the same
+            # reason the video does: re-extracting an .iro must not re-encode
+            # a soundtrack that has not changed, and swapping which mod
+            # supplies one must. `audio_key_part` is EMPTY when a movie has
+            # no layer, so introducing the feature did not invalidate the
+            # hundred-odd cached movies that have nothing to gain from it.
             key = movie_convert.source_key(
-                src, '%s|%s|%d|%s|%s|%d|%d|%s|%s|%s'
+                src, '%s|%s|%d|%s|%s|%d|%d|%s|%s|%s%s'
                 % (movie_convert.CONVERTER_VERSION,
                    quality,
                    movie_convert.crf_for(quality),
@@ -8924,7 +8984,8 @@ def _emplace_movies(plan, romfs, sdout, dump, log, progress, produced):
                    vanilla is not None,
                    target_fps,
                    fit,
-                   colour))
+                   colour,
+                   movie_convert.audio_key_part(music, voice)))
             tag = stem if reldir == movie_convert.MOVIE_DIR else \
                 '%s.%s' % (reldir.replace('/', '_'), stem)
             cached_file = os.path.join(cache, f'{tag}.{key}.mp4')
@@ -8954,10 +9015,14 @@ def _emplace_movies(plan, romfs, sdout, dump, log, progress, produced):
             # soundtrack muxed in, which means a real encode.
             # Copying is only right when the file is ALREADY what we want,
             # which under normalisation means already at the target rate.
+            # ... and never when there is a soundtrack or a voice layer to
+            # mux in, because then the file is exactly NOT what we want: its
+            # audio is the one we are replacing.
             at_rate = (not target_fps
                        or abs(info['fps'] - target_fps) < 0.01)
             if movie_convert.already_target(info, fit=fit, colour=colour) \
-                    and info['has_audio'] and at_rate:
+                    and info['has_audio'] and at_rate \
+                    and not music and not voice:
                 shutil.copyfile(src, cached_file)
                 _link_or_copy(cached_file, dest)
                 copied += 1
@@ -8975,7 +9040,8 @@ def _emplace_movies(plan, romfs, sdout, dump, log, progress, produced):
             t0 = time.time()
             r = movie_convert.convert(src, cached_file, vanilla=vanilla,
                                       quality=quality, target_fps=target_fps,
-                                      fit=fit, colour=colour, log=log)
+                                      fit=fit, colour=colour,
+                                      music=music, voice=voice, log=log)
             took = time.time() - t0
             spent += took
             _link_or_copy(cached_file, dest)
@@ -8987,6 +9053,20 @@ def _emplace_movies(plan, romfs, sdout, dump, log, progress, produced):
                 plan.opening_dims = (r['out']['width'],
                                      r['out']['height'])
             extra = ' + original audio' if r['borrowed_audio'] else ''
+            if r.get('music'):
+                extra += ' + mod soundtrack'
+                muxed_music += 1
+            if r.get('voice_is_programme'):
+                extra += (' + voice %+.1f dB (silent cutscene, so the voice '
+                          'IS the soundtrack)' % r['voice_gain'])
+                muxed_voice += 1
+            elif r.get('voice') is not None and r.get('voice_gain') is not None:
+                extra += (' + voice %+.1f dB (bed %.1f, voice %.1f LUFS)'
+                          % (r['voice_gain'], r['bed_lufs'], r['voice_lufs']))
+                muxed_voice += 1
+            elif r.get('voice'):
+                extra += ' + voice (unmeasured, level unchanged)'
+                muxed_voice += 1
             if r.get('doubled'):
                 extra += ' (frame-doubled)'
             shown = stem if reldir == movie_convert.MOVIE_DIR else \
@@ -9024,6 +9104,28 @@ def _emplace_movies(plan, romfs, sdout, dump, log, progress, produced):
     # answerable from the log rather than from ffprobe -- and so is the
     # question behind it, which is not "what size is the file" but "what
     # size does the console DRAW it". describe_drawn() answers the second.
+    if plan.movie_audio:
+        # Counted against what the mods SHIPPED, not against what was built,
+        # so a layer that silently went nowhere shows up as a gap here
+        # instead of as a quiet cutscene on the console.
+        want_music = sum(1 for _s, k in plan.movie_audio if k == 'music')
+        want_voice = sum(1 for _s, k in plan.movie_audio if k == 'voice')
+        log('        movie audio: %d/%d soundtrack(s) and %d/%d voice '
+            'track(s) muxed in (FFNx plays these beside the video; the port '
+            'has no such layer, so they go into the mp4)'
+            % (muxed_music, want_music, muxed_voice, want_voice))
+        if muxed_voice:
+            log('        the voice sits %+g LU above each movie\'s own audio, '
+                'measured per movie (%s to override)'
+                % (movie_convert.voice_balance_lu(),
+                   movie_convert.VOICE_BALANCE_ENV))
+        if unplaced:
+            log('        ! no movie named %s, so its audio was not used: %s'
+                % ('them' if len(unplaced) > 1 else 'it',
+                   ', '.join(unplaced[:8])))
+        if muxed_music + muxed_voice < want_music + want_voice and cached:
+            log('        (layers on movies served from the cache are already '
+                'in those files -- the cache key carries them)')
     if resized:
         log('        %d movie(s) resampled to the drawn size with Lanczos '
             '(instead of being bilinear-minified on the console)' % resized)
@@ -9627,6 +9729,64 @@ def _battle_text_entries(plan, log):
     return made, None
 
 
+# The shapes an unusable Echo-S voice file comes in, checked file by file
+# against the real release. NONE of them is a line we are failing to ship:
+#
+#   not a field     the folder names no field map. `nvl_cl` (14 files) is a
+#                   misspelling of `niv_cl`, which exists and already ships
+#                   every one of those line numbers -- with DIFFERENT audio,
+#                   so they are earlier takes in a misspelt folder and
+#                   attaching them would collide with the real ones.
+#                   `gon_wa/3.ogg` is the same shape: the fields are
+#                   `gon_wa1` and `gon_wa2`, and `gon_wa1/3.ogg` is shipped.
+#
+#   switched off    a leading underscore is how this mod turns a file off in
+#                   place (`_12`, `_44a`, `_69`). None has an enabled
+#                   counterpart, so these are lines the authors removed.
+#
+#   duplicate       a real name with something stuck to it -- a trailing
+#                   space (`40_0 `), an apostrophe (`22'`), a take number
+#                   (`3-2`, `38a-2`) -- whose CLEAN name is already staged.
+#
+#   no line         the rest: working titles (`yeah thanks`, `alright`), a
+#                   clip named after its own folder (`mtcrl_8/mtcrl_8`), and
+#                   bigwheel's `36 1`..`36 8` -- eight distinct takes for an
+#                   ASK that has exactly two options, whose option text is
+#                   two control bytes rather than words. Which two takes were
+#                   meant is not recoverable from the files, and that is the
+#                   only genuine gap in the 38.
+def _explain_voice_skips(notes, plan):
+    """Group the skipped names by WHY, with examples."""
+    staged = set()
+    for rel, _full, _mod in plan.voice:
+        parts = rel.replace('\\', '/').lower().split('/')
+        if len(parts) >= 2:
+            staged.add((parts[-2], os.path.splitext(parts[-1])[0]))
+    buckets = {}
+    for note in notes:
+        path = note.rsplit(': ', 1)[-1].replace('\\', '/')
+        parts = path.lower().split('/')
+        field = parts[-2] if len(parts) >= 2 else ''
+        stem = os.path.splitext(parts[-1])[0] if parts else ''
+        if 'unknown field' in note:
+            why = 'the folder names no field map'
+        elif stem.startswith('_'):
+            why = 'switched off by the authors (leading underscore)'
+        else:
+            clean = stem.rstrip(" '").split('-')[0].strip()
+            why = ('a duplicate of a clip that IS staged'
+                   if clean != stem and (field, clean) in staged
+                   else 'the name matches no dialogue line')
+        buckets.setdefault(why, []).append('/'.join(path.split('/')[-2:]))
+    out = []
+    for why in sorted(buckets, key=lambda k: (-len(buckets[k]), k)):
+        names = sorted(buckets[why])
+        out.append('%3d  %s  (%s%s)'
+                   % (len(names), why, ', '.join(names[:3]),
+                      ', ...' if len(names) > 3 else ''))
+    return out
+
+
 def _emplace_voice(plan, romfs, log, produced, progress=None):
     """
     Stage Echo-S's dialogue clips under data/music_ogg, in native form.
@@ -9715,19 +9875,14 @@ def _emplace_voice(plan, romfs, log, produced, progress=None):
     # have reported four times as many skipped files as there were.
     notes = [n for n in notes if n.startswith('skip')]
     if notes:
-        # Named, not just counted. These are authoring leftovers whose names
-        # do not match FFNx's own <dialog><page> convention, so there is no
-        # line they could be attached to -- but "unrecognised" is also what a
-        # genuinely mis-ingested file looks like, and the only way to tell the
-        # two apart is to be able to read the names.
-        shown = []
-        for note in notes[:4]:
-            path = note.rsplit(': ', 1)[-1]
-            shown.append('/'.join(path.replace('\\', '/').split('/')[-2:]))
-        log('  %d file(s) skipped as unrecognised -- names that match no '
-            'dialogue line: %s%s'
-            % (len(notes), ', '.join(shown),
-               ' ...' if len(notes) > len(shown) else ''))
+        # CLASSIFIED, not just named. 38 unexplained skips in a build log
+        # is a question every time; the same 38 sorted into WHY is an
+        # answer. Every bucket was checked against the real Echo-S release
+        # and not one of them is a dialogue line we are failing to ship --
+        # see FINDINGS-502 for the file-by-file working.
+        log('  %d file(s) skipped, by reason:' % len(notes))
+        for line in _explain_voice_skips(notes, plan):
+            log('    ' + line)
 
     out = os.path.join(romfs, MUSIC_DIR)
     tick = None
@@ -9745,6 +9900,26 @@ def _emplace_voice(plan, romfs, log, produced, progress=None):
         'already in place' % (report['encoded'], report['cached'],
                               report['linked'], report['kept']))
     log('  loudness: %s' % voice_ogg.normalization_detail())
+    if voice_ogg.NORMALIZE_MODE == 'loudness':
+        # SAID BEFORE THE 25 MINUTES, NOT AFTER. A saved `loudness:` from
+        # before build 501 is still a valid choice, so the settings file wins
+        # over the new default and a whole re-encode can go by at the mode
+        # that was measured to be the wrong one -- 2.2 dB flat by this meter
+        # and 13.4 dB apart in the band speech actually lives in.
+        log('! this is the PRE-501 broadband mode, kept only so the old '
+            'behaviour stays reachable. It levels energy below 300 Hz, '
+            'which carries no speech, and it is what made some lines read '
+            'loud and sound faint. Pick "Even voices" in the settings '
+            'dialog, or %s=%s, unless you are deliberately comparing.'
+            % (voice_ogg.NORMALIZE_ENV, voice_ogg.NORMALIZE_DEFAULT))
+    probed, corrected, off = voice_ogg.settle_counts()
+    if probed:
+        # The third number is the honest one: clips whose gain was corrected
+        # against the limited audio and STILL did not reach the target,
+        # because more gain was not buying more loudness. They are compressed
+        # as far as is worth doing, not quietly written off.
+        log('  gain settled on %d clip(s); %d needed correcting, %d are '
+            'still short of the target' % (probed, corrected, off))
     if voice_ogg.unmeasured():
         log('! %d clip(s) could not be measured and were encoded at the '
             'level the mod shipped them at, rather than dropped'
@@ -10444,6 +10619,9 @@ MAIN_ONLY_ENV = frozenset((
     'SEVENTH_NX_VOICE_BITRATE',  # voice_ogg  encode quality (its own cache)
     'SEVENTH_NX_VOICE_NORMALIZE',  # voice_ogg  dialogue loudness, ditto
     'SEVENTH_NX_VOICE_LOOPTAG',  # voice_ogg  where the loop tag points, ditto
+    ff7nx_camclamp.CAMCLAMP_ENV, # ff7nx_camclamp  writes exefs/main and only
+                                 # exefs/main, so toggling it must not cost a
+                                 # 40-minute archive rebuild
     ff7nx_calendar.ENV,          # ff7nx_calendar  the menu date row
     ff7nx_calendar.LAYOUT_ENV,   # ff7nx_calendar  ... and its columns
     'SEVENTH_NX_VOICE_WORKERS',  # voice_ogg  encoder parallelism
@@ -10453,6 +10631,7 @@ MAIN_ONLY_ENV = frozenset((
     'SEVENTH_NX_VOICE_MESSAGE_PHASE',  # ff7nx_voice  which MESSAGE site
     'SEVENTH_NX_VOICE_MESSAGE_STUB',   # ff7nx_voice  diagnostic empty cave
     'SEVENTH_NX_VOICE_DUCK',     # ff7nx_voice   BGM level under speech
+    'SEVENTH_NX_VOICE_GAIN',     # ff7nx_voice   voice playback gain
     'SEVENTH_NX_VOICE_FOREIGN',  # ff7nx_voice   second-window line: defer/drop
     'SEVENTH_NX_VOICE_BURST',    # ff7nx_voice   same-tick burst: first/last
     'SEVENTH_NX_VOICE_CLOSE',    # ff7nx_voice   window close: play/stop
@@ -10501,6 +10680,7 @@ MAIN_ONLY_MODULES = frozenset((
     # change an archive's bytes -- and this feature has taken enough builds
     # without each one also costing a 1.4 GB flevel rebuild.
     'ff7nx_calendar.py',
+    'ff7nx_camclamp.py',
     'ff7nx_daynight.py',
 ))
 
@@ -12552,9 +12732,51 @@ ECHO_AUTO_OPTION = 'auto'
 # `state + 0x448`. That is fixed in `_emit_bgm_release_step`, and the reason
 # to keep ducking off went with it. `SEVENTH_NX_VOICE_DUCK=100` turns it off
 # again without editing this file, and it is an ExeFS-only rebuild.
+# The PLAYBACK gain for a voice clip. FFNx uses 2.75 (see ff7nx_voice.py
+# VOICE_GAIN_DEFAULT for the line of C that computes it) and Echo-S is mixed
+# against that; we have always used 1.0, which is 8.8 dB quieter than the mod
+# was authored for.
+#
+# IT STAYS AT 1.0, AND THAT IS A DECISION, NOT AN OVERSIGHT.
+#
+# A constant multiplies an uneven set by a constant: it cannot make anything
+# more even, which is what was actually being asked for. Worse, the reference
+# the whole set is now matched to -- Jessie's "My hero!" -- was judged to be
+# at the right level while playing at 1.0. Raising this would move the one
+# line that is known to be correct.
+#
+# So the gain exists, it is tested, and it is parked at unity. Use it only if
+# EVERY line is uniformly too quiet once they are even; it is an
+# exefs/main-only rebuild, so trying 1.25 or 1.5 costs seconds. Evenness is
+# not its job and never was.
+ECHO_VOICE_GAIN = 1.0
+
 ECHO_DUCK_PERCENT = 25
 ECHO_DUCK_ATTACK_FRAMES = 12          # 0.2s at 60 FPS
 ECHO_DUCK_RELEASE_FRAMES = 45         # 0.75s at 60 FPS
+
+
+def _echo_voice_gain(log):
+    raw = os.environ.get('SEVENTH_NX_VOICE_GAIN', '').strip()
+    if not raw:
+        return ECHO_VOICE_GAIN
+    try:
+        value = float(raw)
+    except ValueError:
+        log('! SEVENTH_NX_VOICE_GAIN=%r is not a number -- using %g'
+            % (raw, ECHO_VOICE_GAIN))
+        return ECHO_VOICE_GAIN
+    if not 0.0 < value <= ff7nx_voice.VOICE_GAIN_MAX:
+        log('! SEVENTH_NX_VOICE_GAIN=%g is outside 0..%g -- using %g'
+            % (value, ff7nx_voice.VOICE_GAIN_MAX, ECHO_VOICE_GAIN))
+        return ECHO_VOICE_GAIN
+    # Only 256 values are encodable as an FMOV immediate. Snapping is better
+    # than refusing, and saying so is better than snapping in silence.
+    nearest = a64.nearest_fmov_imm(value)
+    if abs(nearest - value) > 1e-6:
+        log('  SEVENTH_NX_VOICE_GAIN=%g is not an encodable FMOV immediate; '
+            'using the nearest, %g' % (value, nearest))
+    return nearest
 
 
 def _echo_duck_percent(log):
@@ -12737,6 +12959,7 @@ def apply_echo_voice(sdout, dump, plan, log=lambda *_: None, produced=()):
             # The staged Ogg loops only its final sample. Decoder state and
             # the shared music worker remain stock.
             stream_once=False,
+            voice_gain=_echo_voice_gain(log),
             duck_percent=_echo_duck_percent(log),
             duck_attack_frames=ECHO_DUCK_ATTACK_FRAMES,
             duck_release_frames=ECHO_DUCK_RELEASE_FRAMES)
@@ -12794,6 +13017,14 @@ def apply_echo_voice(sdout, dump, plan, log=lambda *_: None, produced=()):
     for site, who, entry in report['chained']:
         log('  +0x%X chained in front of %s (its cave at +0x%X is unchanged)'
             % (site, who, entry))
+    if report.get('voice_gain', 1.0) != 1.0:
+        log('  voice playback gain %gx (%+.1f dB). FFNx uses 2.75; 1.0 is '
+            'what every build before this one used'
+            % (report['voice_gain'],
+               20.0 * math.log10(report['voice_gain'])))
+    else:
+        log('  voice playback gain 1.0x -- FFNx plays these clips at 2.75. '
+            'SEVENTH_NX_VOICE_GAIN=1.5 (say) raises it; main-only rebuild')
     if report['duck_percent'] < 100:
         log('  BGM ducks to %d%% under speech over %d frame(s), releases '
             'over %d' % (report['duck_percent'],

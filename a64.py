@@ -1,5 +1,8 @@
 """Minimal ARM64 encoder. Every form here is checked against capstone by
 test_a64() -- nothing is trusted on the strength of my bit-twiddling."""
+import math
+import struct
+
 SP, WZR, XZR = 31, 31, 31
 
 def ldr(rt, rn, imm=0):    return 0xB9400000 | ((imm >> 2) << 10) | (rn << 5) | rt
@@ -376,6 +379,55 @@ def bfi(rd, rn, lsb, width):
     immr = (-lsb) % 32
     imms = width - 1
     return 0x33000000 | (immr << 16) | (imms << 10) | (rn << 5) | rd
+
+
+def _fmov_imm8_table():
+    """
+    The 256 float values `FMOV Sd, #imm` can encode, as {value: imm8}.
+
+    ARM's rule for the 8-bit immediate `abcdefgh` is
+    `imm32 = a : ~b : Replicate(b,5) : c : d : e : f : g : h : Zeros(19)`,
+    which is +-(1 + m/16) * 2^n for m in 0..15 and n in -3..4. It is built
+    here by construction rather than written out, because a table of 256
+    hand-copied floats is a place for one of them to be wrong.
+    """
+    table = {}
+    for imm8 in range(256):
+        a = (imm8 >> 7) & 1
+        b = (imm8 >> 6) & 1
+        rest = imm8 & 0x3F                       # c d e f g h
+        bits = (a << 31) | ((b ^ 1) << 30) | ((0x1F if b else 0) << 25) \
+            | (rest << 19)
+        value = struct.unpack('<f', struct.pack('<I', bits))[0]
+        table.setdefault(value, imm8)
+    return table
+
+
+FMOV_IMM8 = _fmov_imm8_table()
+
+
+def fmov_s_imm(rd, value):
+    """
+    FMOV Sd, #value -- a single-precision immediate, with no literal pool.
+
+    Only 256 values are encodable (+-(1 + m/16) * 2^n, n in -3..4), so this
+    RAISES on anything else rather than rounding silently: a gain that came
+    out 2% away from what the caller asked for would be a very quiet bug.
+    `nearest_fmov_imm` is there for callers that want to be told what they
+    can have.
+    """
+    key = float(value)
+    if key not in FMOV_IMM8:
+        raise ValueError(
+            '%r cannot be an FMOV immediate; nearest is %r'
+            % (value, nearest_fmov_imm(value)))
+    return 0x1E201000 | (FMOV_IMM8[key] << 13) | rd
+
+
+def nearest_fmov_imm(value):
+    """The encodable value closest to `value`, in the ratio sense."""
+    return min(FMOV_IMM8, key=lambda v: abs(math.log(abs(v) / abs(value)))
+               if v and value else abs(v - value))
 
 
 EQ = 0

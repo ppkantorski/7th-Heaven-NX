@@ -252,6 +252,17 @@ class Cpu:
             a = self._addr(rn, ((w >> 10) & 0xFFF) * 4)
             self.mem.setu(a, self.fp[rd], 4)
             return None
+        if (w & 0xFFE01FE0) == 0x1E201000:                    # fmov Sd,#imm
+            # The 8-bit immediate expands as ARM defines it:
+            #   a : ~b : Replicate(b,5) : c : d : e : f : g : h : Zeros(19)
+            # Only 256 values exist; a64.fmov_s_imm builds them the same way
+            # and test_voice_gain.py checks that encoder against capstone.
+            imm8 = (w >> 13) & 0xFF
+            sign, b = (imm8 >> 7) & 1, (imm8 >> 6) & 1
+            self.fp[rd] = ((sign << 31) | ((b ^ 1) << 30)
+                           | ((0x1F if b else 0) << 25)
+                           | ((imm8 & 0x3F) << 19))
+            return None
         if (w & 0xFFFFFC00) == 0x1E230000:                    # ucvtf Sd,Wn
             x = float(g(rn, True))
             self.fp[rd] = struct.unpack('<I', struct.pack('<f', x))[0]

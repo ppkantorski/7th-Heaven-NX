@@ -462,6 +462,7 @@ class Manifest:
         # like this). Synthesize a toggle for each so the user can exclude
         # them. Default On, to stay faithful to how the mod ships.
         existing = {o.id for o in self.options}
+        self.synthesized = set()
         path_to_id = {}
         gated = []
         for folder, cond in self.folders:
@@ -484,8 +485,38 @@ class Manifest:
                 path_to_id[folder] = ident
                 self.options.append(
                     Option(ident, label, [(0, 'Off'), (1, 'On')], 1))
+                # Remember which toggles we invented. Switching one OFF is
+                # not a choice the mod offers -- 7th Heaven applies these
+                # folders unconditionally -- so turning one off silently can
+                # remove the mod's core content and look like a packaging
+                # bug. Cosmo Memory's `Base` is 996 .ogg files and a
+                # config.toml mapping 720 of the game's 750 sound slots.
+                # See `synthesized_off`.
+                self.synthesized.add(ident)
             gated.append((folder, f'{path_to_id[folder]} = 1'))
         self.folders = gated
+
+    def synthesized_off(self, settings):
+        """
+        Toggles WE invented that the user has switched off, as
+        `[(option id, [folder, ...])]`.
+
+        The mod declares these folders with no `ActiveWhen`, so 7th Heaven
+        applies them unconditionally and offers no way to disable them. We
+        add a switch anyway, which is useful -- and is also the one setting
+        in the dialog whose "Off" removes content the mod's author never
+        made optional. Cosmo Memory's `Base` is the case that found this:
+        996 .ogg files and a config.toml mapping 720 of the game's 750 sound
+        slots. With it off, essentially none of that mod's sound effects
+        reach the game, and nothing said so.
+        """
+        out = []
+        for ident in sorted(getattr(self, 'synthesized', ())):
+            if str(settings.get(ident, 1)) == '0':
+                folders = [f for f, cond in self.folders
+                           if cond == '%s = 1' % ident]
+                out.append((ident, folders))
+        return out
 
     def defaults(self):
         d = {o.id: o.default for o in self.options}

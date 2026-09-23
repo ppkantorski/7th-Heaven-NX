@@ -40,7 +40,8 @@ Echo-S's lines come from many people, many microphones and many years, and
 they arrive at very different levels. `_measure` gives each clip ONE gain,
 measured from the clip itself, so the whole set lands where the setting says.
 See the block above `NORMALIZE_ENV` for the measurements, why the default is
-EBU R128 loudness rather than equal peaks, and where -15.3 LUFS comes from.
+the SPEECH BAND rather than the whole signal, and where the target
+comes from.
 
 WHAT IS VERIFIED, AND WHEN
 ==========================
@@ -86,34 +87,182 @@ class VoiceEncodeError(Exception):
 # hear, EBU R128 integrated loudness, and `peak` remains available for
 # anyone who wants literally equal maxima.
 #
-# THE TARGET IS NOT INVENTED. -15.3 LUFS is the measured integrated loudness
-# of Jessie's "My hero!" in `nmkin_3` (dialogue id 6), which is the line the
-# level was chosen against.
+# WHY THE TARGET IS -12 AND NOT -15.3.
+#
+# -15.3 LUFS was the measured loudness of Jessie's "My hero!" in `nmkin_3`
+# (dialogue id 6) -- a real line, picked so the level was not invented. It
+# was still the wrong number, for a reason the reference clip could not show:
+# the set's median source loudness is -16.1 LUFS, so a target of -15.3 sits
+# in the MIDDLE of the material. Measured over 60 random clips, **19 of them
+# (32%) were being turned DOWN** to reach it.
+#
+# That is what "I can barely hear this line" was. `chrin_1b/1` -- the church,
+# after the fall -- is recorded at -11.0 LUFS, one of the loudest clips in
+# the game, and we attenuated it by 4.4 dB. Normalising a set that is mostly
+# quiet TO ITS OWN MIDDLE makes the loud half quieter, and the loud half is
+# not the problem.
+#
+# -12 is the highest target at which NOTHING is turned down and almost
+# everything still reaches it. Measured on the same 60 clips:
+#
+#     target   turned down   >0.5 dB short   out peaks (dBFS)   spread
+#     -15.3      19 (32%)        0            -6.9 .. -1.2      1.1 dB
+#     -12         0 (0%)         4            -4.9 .. -1.5      2.5 dB
+#     -11         0 (0%)         6            -4.9 .. -1.5      3.1 dB
+#
+# -12 also tightens the PEAKS, which is the thing that was audibly
+# inconsistent between recordings: a 3.4 dB spread against 5.7 dB.
+#
+# The spread of the loudness grows slightly because the limiter cannot lift
+# every clip that far; that is the honest cost and it is smaller than the
+# 4 dB of attenuation it replaces. Above -12 it grows faster for less.
+#
+# THIS IS ONLY HALF THE LEVEL. The other half is the PLAYBACK gain -- FFNx
+# plays every voice clip at 2.75 and we played 1.0. See
+# `ff7nx_voice.VOICE_GAIN_DEFAULT`; no encoder target can make up 8.8 dB.
 #
 # WHAT IS APPLIED IS ONE NUMBER PER CLIP. Not `dynaudnorm`, not `speechnorm`,
 # not single-pass `loudnorm` -- all three vary the gain THROUGH the clip and
 # audibly pump on speech. This measures the whole clip, computes one scalar
-# gain, and applies it with `volume`. A pure gain cannot change timbre,
-# cannot pump, and cannot clip, because the gain is capped by the clip's own
-# true peak against `TRUE_PEAK_CEILING` before it is used.
+# gain, and applies it with `volume`. A pure gain cannot change timbre and
+# cannot pump. What stops it clipping is a true-peak limiter on the few
+# samples that would have -- NOT a smaller gain; see `LIMITER_CEILING_DB`
+# for why the second version had to stop capping.
 NORMALIZE_ENV = 'SEVENTH_NX_VOICE_NORMALIZE'
-NORMALIZE_DEFAULT = 'loudness:-15.3'
+NORMALIZE_DEFAULT = 'speech:-16.2'
 REFERENCE_LINE = 'nmkin_3 dialogue 6, Jessie "My hero!"'
-TRUE_PEAK_CEILING = -1.0      # dBTP, so a gained clip still cannot clip
+TRUE_PEAK_CEILING = -1.0
+
+# WHY THE GAIN IS NO LONGER CAPPED BY THE PEAK, AND WHAT STOPS IT CLIPPING.
+#
+# The first version computed `min(wanted, ceiling - true_peak)`: a pure gain
+# that could never clip because it refused to be large enough to. That reads
+# as a safe trade and it is the wrong one for dialogue. A line whose loudest
+# sample is a plosive, a click in the take or a door in the background has no
+# headroom, so the SPEECH stays quiet -- the peak is not the voice.
+#
+# Measured over 120 of Echo-S's own clips: **41 of them, 34%, were held below
+# the target by that cap**, median 1.7 dB short and worst 5.2 dB. That is the
+# unevenness -- a third of the game's lines sitting audibly under the rest
+# while the build reported a tidy median.
+#
+# So the full gain is applied and a true-peak limiter catches the few samples
+# that would have clipped. `alimiter` limits SAMPLE peaks, and an inter-sample
+# peak runs higher, so the limiter sits 1 dB below the true-peak ceiling it is
+# there to respect. Measured across the worst offenders:
+#
+#     limiter -1.0 dB   spread 1.1 dB   worst true peak -0.4 dBTP   over
+#     limiter -1.5 dB   spread 1.3 dB   worst true peak -0.9 dBTP   over
+#     limiter -2.0 dB   spread 1.5 dB   worst true peak -1.4 dBTP   OK
+#
+# -2.0 it is: the only one that actually keeps the ceiling, and 1.5 dB of
+# residual spread against the 5.3 dB the cap was leaving.
+#
+# It only runs when the gain is POSITIVE. A negative gain lowers every peak on
+# its own, so a clip being turned down never meets the limiter at all.
+LIMITER_CEILING_DB = -2.0      # dBTP, so a gained clip still cannot clip
 SILENCE_FLOOR = -60.0         # below this a clip is silence, not a quiet line
 MAX_GAIN_DB = 20.0            # a noise floor lifted 20 dB is loud enough
 
+# WHY THE GAIN IS THEN CHECKED AGAINST THE FILTERED AUDIO.
+#
+# The limiter does not only touch the samples it holds down: its release keeps
+# some gain reduction in place after each one, so a clip with a big peak and a
+# quiet voice comes out BELOW the gain it was given. Measured over 120 random
+# clips with the limiter in and no correction:
+#
+#     median 0.10 dB short    p90 0.80 dB    worst 4.60 dB
+#     27% short by more than 0.3 dB, 4% by more than 1 dB
+#
+# Far better than the 34%/1.7 dB the cap was leaving, but the tail is exactly
+# the kind of line the report was about: `nvdun31/7`, 8.6 dB of gain asked
+# for and 4.6 dB of it eaten. So the chain is PROBED -- `ebur128` on the end
+# of the real filter chain, decoding but not encoding -- and the gain is
+# corrected until the finished clip measures the target.
+#
+# The correction is a secant step, not a retry: the first probe plus the
+# source measurement give the slope of "loudness out per dB in" for THIS clip
+# (0.61 for `fship_25/127a`, because most of its gain is going into a
+# transient), so the next guess is a solve rather than a nudge. Two steps put
+# every clip measured inside the tolerance.
+#
+# It is not a second gain stage -- one `volume` is still applied to the audio,
+# and the limiter still guarantees the ceiling however large it grows. What
+# changes is only which number that one `volume` gets.
+NORMALIZE_TOLERANCE_DB = 0.3   # closer than this and nobody can hear it
+NORMALIZE_SETTLE_STEPS = 2     # probes after the first; each costs a decode
+
+
+# THE MEASUREMENT BAND, AND WHY IT IS NOT THE WHOLE SIGNAL.
+#
+# Everything above levels the set by BROADBAND loudness, and by build 348 it
+# had succeeded completely: 400 of the 15,787 clips that actually shipped
+# measure
+#
+#     min -16.8  p25 -15.5  median -15.4  p75 -15.3  max -14.6 LUFS
+#     spread 2.2 dB, and NOT ONE clip outside +-1.5 dB of the median
+#
+# and the report was still "some lines are too loud, others far too faint".
+# Both of those are true at once, because broadband loudness is not what you
+# hear a VOICE at. Measured across those same shipped, already-levelled files:
+#
+#     broadband RMS                  spread   5.1 dB
+#     peak                           spread   7.3 dB
+#     speech band 300 Hz - 4 kHz     spread  13.4 dB   <- carries the words
+#     energy below 300 Hz            spread  28.0 dB
+#     spectral tilt                  spread  38.1 dB
+#
+# Energy under 300 Hz counts fully towards the loudness number and does
+# almost nothing for whether a line is intelligible. The gap between a clip's
+# loudness and its speech-band level is fixed by the recording, and a flat
+# gain -- which is all this applies -- cannot change it:
+#
+#     nmkin_3/6   Jessie, "My hero!"      -3.2   <- the level that sounds right
+#     chrin_1b/15 same conversation       -2.0
+#     chrin_1b/1  same conversation      -11.3
+#     chrin_1b/10 same conversation      -13.8
+#     chrin_1b/11 same conversation      -14.1
+#
+# Two lines of ONE conversation, written to the card at the same measured
+# loudness, 12 dB apart in the band you hear speech in. Close-miced actors
+# (Aerith, Tifa) read loud; a distant or filtered take reads faint. That is
+# the unevenness, and no target and no playback gain can touch it, because
+# both of those are constants applied to every clip alike.
+#
+# So the gain is MEASURED THROUGH THE SPEECH BAND. Same 60 clips, encoded for
+# real, gain measured through different weightings, then the speech band of
+# the RESULT measured:
+#
+#     measured through                speech band of the result      spread
+#     broadband K-weighting (today)   min -21.7 med -17.6 max -15.5  6.2 dB
+#     high-pass 150 Hz                min -21.1 med -17.2 max -15.5  5.7 dB
+#     high-pass 200 Hz                min -20.7 med -17.0 max -15.6  5.1 dB
+#     high-pass 300 Hz                min -20.2 med -16.8 max -15.4  4.8 dB
+#     speech band 300 Hz - 4 kHz      min -18.6 med -16.5 max -15.8  2.8 dB
+#
+# Monotonic, and the last row is the default.
+#
+# NOTHING IS FILTERED ON THE WAY OUT. The clip is still encoded whole and
+# still gets ONE flat gain -- no EQ, no compression, no change of timbre. The
+# band exists only to decide what that one number should be. `loudness`
+# remains available for the broadband behaviour every build up to 348 had.
+SPEECH_BAND_LOW = 300
+SPEECH_BAND_HIGH = 4000
+SPEECH_FILTER = 'highpass=f=%d,lowpass=f=%d' % (SPEECH_BAND_LOW,
+                                                SPEECH_BAND_HIGH)
+
 
 def _normalization():
-    """`(mode, target_db)` -- mode is 'off', 'loudness' or 'peak'."""
+    """`(mode, target_db)` -- 'off', 'speech', 'loudness' or 'peak'."""
     raw = os.environ.get(NORMALIZE_ENV, NORMALIZE_DEFAULT).strip()
     if not raw or raw.lower() in ('off', '0', 'none', 'false'):
         return 'off', 0.0
     mode, _, target = raw.partition(':')
     mode = mode.strip().lower()
-    if mode not in ('loudness', 'peak'):
-        raise VoiceEncodeError('%s=%r: the mode must be off, loudness or peak'
-                               % (NORMALIZE_ENV, raw))
+    if mode not in ('speech', 'loudness', 'peak'):
+        raise VoiceEncodeError(
+            '%s=%r: the mode must be off, speech, loudness or peak'
+            % (NORMALIZE_ENV, raw))
     try:
         value = float(target)
     except ValueError:
@@ -136,8 +285,16 @@ def normalization_detail():
     if NORMALIZE_MODE == 'peak':
         return ('peak, %g dBFS -- every clip\'s loudest sample is made equal'
                 % NORMALIZE_TARGET)
-    return ('loudness (EBU R128), %g LUFS -- the measured loudness of %s'
-            % (NORMALIZE_TARGET, REFERENCE_LINE))
+    if NORMALIZE_MODE == 'speech':
+        return ('SPEECH BAND (%d-%d Hz, EBU R128), %g LUFS -- the level of '
+                '%s, which is the line the set is matched to. Broadband '
+                'loudness was already flat to 2.2 dB and the speech band '
+                'was still 13.4 dB apart; that is the spread you hear'
+                % (SPEECH_BAND_LOW, SPEECH_BAND_HIGH, NORMALIZE_TARGET,
+                   REFERENCE_LINE))
+    return ('broadband loudness (EBU R128), %g LUFS -- the pre-349 behaviour; '
+            'levels the whole signal, including energy below 300 Hz that '
+            'does not carry speech' % NORMALIZE_TARGET)
 
 
 _MAX_VOLUME = re.compile(r'max_volume:\s*(-?[0-9.]+) dB')
@@ -167,6 +324,56 @@ def _float_or_none(match):
     return value
 
 
+def _measure_level(ffmpeg, source):
+    """
+    What this clip measures at: LUFS in loudness mode, dBFS peak in peak mode.
+
+    Returns `(level, reason)` with the same `reason` contract as `_measure`,
+    and `level` None whenever `reason` is set. Split out from `_measure` so
+    the settle loop below can work in the units it measures in rather than
+    in gains relative to a target.
+    """
+    if NORMALIZE_MODE == 'off':
+        return None, None
+    if NORMALIZE_MODE == 'peak':
+        chain = 'volumedetect'
+    elif NORMALIZE_MODE == 'speech':
+        # The band decides the NUMBER. Nothing here is written out, so the
+        # clip is not filtered -- see SPEECH_FILTER.
+        chain = SPEECH_FILTER + ',loudnorm=print_format=json'
+    else:
+        chain = 'loudnorm=print_format=json'
+    probe = subprocess.run(
+        [ffmpeg, '-hide_banner', '-nostdin', '-i', source,
+         '-af', chain, '-f', 'null', '-'],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if probe.returncode:
+        return None, 'ffmpeg could not measure it'
+    text = probe.stderr
+    if NORMALIZE_MODE == 'peak':
+        peak = _float_or_none(_MAX_VOLUME.search(text))
+        if peak is None:
+            return None, 'no max_volume in the probe'
+        if peak <= SILENCE_FLOOR:
+            return None, 'silence'
+        return peak, None
+    loudness = _float_or_none(_INPUT_I.search(text))
+    true_peak = _float_or_none(_INPUT_TP.search(text))
+    if loudness is None:
+        return None, 'no integrated loudness in the probe'
+    if loudness <= SILENCE_FLOOR:
+        return None, 'silence'
+    # THE PEAK NO LONGER HOLDS THE VOICE DOWN. See LIMITER_CEILING_DB.
+    # `true_peak` is still measured because it is what decides whether the
+    # limiter will have anything to do, and the build reports it.
+    del true_peak
+    return loudness, None
+
+
+def _clamped(gain):
+    return max(-MAX_GAIN_DB, min(MAX_GAIN_DB, gain))
+
+
 def _measure(ffmpeg, source):
     """
     The gain this clip needs, in dB, measured rather than assumed.
@@ -177,43 +384,22 @@ def _measure(ffmpeg, source):
     chose. A clip that cannot be measured is shipped UNCHANGED -- a line at
     the wrong volume is better than a line that is missing.
     """
-    if NORMALIZE_MODE == 'off':
-        return 0.0, None
-    if NORMALIZE_MODE == 'peak':
-        chain = 'volumedetect'
-    else:
-        chain = 'loudnorm=print_format=json'
-    probe = subprocess.run(
-        [ffmpeg, '-hide_banner', '-nostdin', '-i', source,
-         '-af', chain, '-f', 'null', '-'],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    if probe.returncode:
-        return 0.0, 'ffmpeg could not measure it'
-    text = probe.stderr
-    if NORMALIZE_MODE == 'peak':
-        peak = _float_or_none(_MAX_VOLUME.search(text))
-        if peak is None:
-            return 0.0, 'no max_volume in the probe'
-        if peak <= SILENCE_FLOOR:
-            return 0.0, 'silence'
-        gain = NORMALIZE_TARGET - peak
-    else:
-        loudness = _float_or_none(_INPUT_I.search(text))
-        true_peak = _float_or_none(_INPUT_TP.search(text))
-        if loudness is None:
-            return 0.0, 'no integrated loudness in the probe'
-        if loudness <= SILENCE_FLOOR:
-            return 0.0, 'silence'
-        gain = NORMALIZE_TARGET - loudness
-        if true_peak is not None:
-            # Never let the gain push the clip into the ceiling. This is what
-            # makes a pure gain safe: the result cannot clip, it just lands
-            # short of the target for a clip with no headroom.
-            gain = min(gain, TRUE_PEAK_CEILING - true_peak)
-    return max(-MAX_GAIN_DB, min(MAX_GAIN_DB, gain)), None
+    level, why = _measure_level(ffmpeg, source)
+    if level is None:
+        return 0.0, why
+    return _clamped(NORMALIZE_TARGET - level), None
 
 
 _unmeasured = 0
+# (clips settled, clips that needed a correction, clips still outside the
+# tolerance when the step budget ran out). The third number is the one worth
+# reading: it is how many lines this build knows are not at the target.
+_settled = [0, 0, 0]
+
+
+def settle_counts():
+    """`(probed, corrected, still off target)` for the build log."""
+    return tuple(_settled)
 
 
 def unmeasured():
@@ -321,12 +507,21 @@ LEGACY_RECIPE = ('ECHO-VOICE-V3 adelay=%d ar=%d ac=%d vorbis %s LOOPSTART=0'
 # build-458 tail loop, and a cache holding those must not answer a build that
 # wants the proven `LOOPSTART=0` back -- which is exactly how the withdrawn
 # shape survived build 459 in the first place.
-RECIPE = ('ECHO-VOICE-V6 adelay=%d ar=%d ac=%d vorbis %s loop=%s norm=%s'
+# V7 replaces the peak CAP with a peak LIMITER, and settles the gain against
+# the limited audio instead of trusting it. V4..V6 all shipped the cap, which
+# left a third of the set below the target, so a build that wants the limiter
+# must not be handed one of their entries. The tolerance is in the key
+# because it is what "at the target" means.
+RECIPE = ('ECHO-VOICE-V7 adelay=%d ar=%d ac=%d vorbis %s loop=%s norm=%s'
           % (LEAD_IN_MS, TARGET_SAMPLE_RATE, TARGET_CHANNELS, TARGET_BITRATE,
              LOOP_TAG_MODE,
              'off' if NORMALIZE_MODE == 'off'
-             else '%s:%g:tp%g' % (NORMALIZE_MODE, NORMALIZE_TARGET,
-                                  TRUE_PEAK_CEILING)))
+             else '%s%s:%g:lim%g:settle%g/%d'
+             % (NORMALIZE_MODE,
+                '%d-%d' % (SPEECH_BAND_LOW, SPEECH_BAND_HIGH)
+                if NORMALIZE_MODE == 'speech' else '',
+                NORMALIZE_TARGET, LIMITER_CEILING_DB,
+                NORMALIZE_TOLERANCE_DB, NORMALIZE_SETTLE_STEPS)))
 
 
 # THE LEGACY MIGRATION IS A RETAG, SO IT IS ONLY VALID FOR A TAG CHANGE.
@@ -824,6 +1019,120 @@ def _publish_final_sample_loop(source, target):
             os.unlink(temporary)
 
 
+def _filter_chain(gain):
+    """
+    The ffmpeg filter chain for one measured gain.
+
+    Order matters twice over:
+
+      * `volume` runs BEFORE `adelay`, so the lead-in silence this pass adds
+        can never be part of what was measured;
+      * `alimiter` runs AFTER `volume`, so it only ever catches the samples a
+        POSITIVE gain pushed too high. A clip being turned down cannot clip,
+        so it gets no limiter at all -- which also means the quiet-clip path
+        and the loud-clip path are not both paying for the same filter.
+
+    Up to V6 a clip whose peak was already near full scale simply got less
+    gain, and 34% of the set landed short of the target because of it (median
+    1.7 dB, worst 5.2 dB). That, not the target, is what made the set sound
+    uneven. The limiter replaces the cap: every clip now gets the gain its
+    LOUDNESS asks for, and the few samples that would have clipped are held
+    down individually. See `LIMITER_CEILING_DB`.
+    """
+    chain = 'adelay=%d:all=1' % LEAD_IN_MS
+    if not gain:
+        return chain
+    if gain > 0:
+        return 'volume=%.2fdB,alimiter=limit=%.6f:level=disabled,%s' % (
+            gain, 10.0 ** (LIMITER_CEILING_DB / 20.0), chain)
+    return 'volume=%.2fdB,%s' % (gain, chain)
+
+
+_EBUR128_I = re.compile(r'^\s*I:\s*(-?[0-9.]+) LUFS', re.M)
+
+
+def _probe_chain(ffmpeg, source, chain):
+    """
+    The integrated loudness `source` would have AFTER `chain`, or None.
+
+    `ebur128` is a pass-through meter, so this is the finished clip's level
+    measured on the finished clip's audio -- verified equal to measuring the
+    written .ogg afterwards to within 0.1 dB, at a fraction of the cost
+    because nothing is encoded. `-f null` throws the audio away.
+
+    It needs `-loglevel info`, which is where `ebur128` prints its summary,
+    so the output is noisy; only the last `I:` line is the summary's.
+    """
+    measured = chain
+    if NORMALIZE_MODE == 'speech':
+        # THE PROBE MUST MEASURE WHAT THE GAIN WAS MEASURED IN. Probing the
+        # broadband level of a speech-band-targeted encode would have the
+        # settle loop chase a number nobody asked for, and it would converge
+        # -- on the wrong answer.
+        measured += ',' + SPEECH_FILTER
+    probe = subprocess.run(
+        [ffmpeg, '-hide_banner', '-nostdin', '-loglevel', 'info',
+         '-i', source, '-af', measured + ',ebur128=peak=true',
+         '-f', 'null', '-'],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if probe.returncode:
+        return None
+    found = _EBUR128_I.findall(probe.stderr)
+    if not found:
+        return None
+    try:
+        value = float(found[-1])
+    except ValueError:
+        return None
+    return None if value <= SILENCE_FLOOR else value
+
+
+def _settled_gain(ffmpeg, source, gain, level):
+    """
+    `gain`, corrected for whatever the limiter takes back. See
+    `NORMALIZE_TOLERANCE_DB`.
+
+    Only loudness mode and only a positive gain: with no gain there is no
+    limiter and nothing to correct, and peak mode is measuring the thing it
+    is setting. A probe that fails leaves the gain exactly as it was, so this
+    can never make a clip worse than the version without it.
+    """
+    if NORMALIZE_MODE not in ('loudness', 'speech') \
+            or gain <= 0.0 or level is None:
+        return gain
+    _settled[0] += 1
+    corrected = False
+    # (0, level) is the second point the secant needs and it is free: it is
+    # the measurement already taken, the loudness at no gain at all.
+    last_gain, last_out = 0.0, level
+    for _ in range(1 + NORMALIZE_SETTLE_STEPS):
+        out = _probe_chain(ffmpeg, source, _filter_chain(gain))
+        if out is None:
+            return gain
+        short = NORMALIZE_TARGET - out
+        if abs(short) <= NORMALIZE_TOLERANCE_DB:
+            return gain
+        slope = ((out - last_out) / (gain - last_gain)
+                 if abs(gain - last_gain) > 1e-6 else 1.0)
+        # A slope at or below zero means more gain is not producing more
+        # loudness, so there is nothing left to win and pushing harder would
+        # only compress it further. Stop on the value that measured best.
+        if slope <= 0.05:
+            _settled[2] += 1
+            return gain
+        last_gain, last_out = gain, out
+        stepped = _clamped(gain + short / min(1.0, slope))
+        if abs(stepped - gain) < 0.05:
+            _settled[2] += 1
+            return gain
+        gain = stepped
+        if not corrected:
+            corrected = True
+            _settled[1] += 1
+    _settled[2] += 1
+    return gain
+
+
 def encode(source, target):
     """
     Re-encode one clip into the native shape, atomically, and verify it.
@@ -849,13 +1158,13 @@ def encode(source, target):
     # loudness down; the filters then run gain-then-delay for the same
     # reason. A clip that cannot be measured is encoded unchanged and
     # counted, never dropped.
-    gain, unmeasurable = _measure(ffmpeg, source)
+    level, unmeasurable = _measure_level(ffmpeg, source)
     if unmeasurable and unmeasurable != 'silence':
         global _unmeasured
         _unmeasured += 1
-    chain = 'adelay=%d:all=1' % LEAD_IN_MS
-    if gain:
-        chain = 'volume=%.2fdB,%s' % (gain, chain)
+    gain = 0.0 if level is None else _clamped(NORMALIZE_TARGET - level)
+    gain = _settled_gain(ffmpeg, source, gain, level)
+    chain = _filter_chain(gain)
     common = [ffmpeg, '-hide_banner', '-nostdin', '-loglevel', 'error', '-y',
               '-i', source,
               '-af', chain,

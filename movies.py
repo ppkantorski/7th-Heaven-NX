@@ -199,7 +199,140 @@ GEOMETRY_ASSERTS = {
 # in the movie cache key. The 768px texture fix silently did nothing because
 # its key carried the setting but not the code version; this is that lesson
 # applied here.
+# It is deliberately NOT bumped for the movie audio layers below. A movie
+# with no layer is built by the same command with the same inputs and comes
+# out byte for byte what it was, so bumping would re-encode the whole FMV set
+# -- over a hundred files -- to produce the files already in the cache. What
+# identifies a movie that DID gain a layer is the content hash of that layer,
+# which build.py appends to the key only when there is one.
 CONVERTER_VERSION = 'MOVIECONV-V2'
+
+
+def audio_key_part(music=None, voice=None, balance=None):
+    """
+    The part of a movie's cache key that describes its audio layers.
+
+    EMPTY when there are none, which is the point: the key of a movie nobody
+    shipped audio for must be exactly the string it was before this existed,
+    or introducing the feature re-encodes everything.
+    """
+    if not music and not voice:
+        return ''
+    if balance is None:
+        balance = voice_balance_lu()
+    return '|mu=%s|va=%s|lu=%g|lim=%g|prog=%g' % (
+        source_key(music) if music else '-',
+        source_key(voice) if voice else '-',
+        balance if voice else 0.0,
+        MOVIE_LIMITER_DB, MOVIE_PROGRAMME_LUFS)
+
+# --------------------------------------------------------------------------
+# THE MOVIE AUDIO LAYER
+#
+# FFNx does not only play a movie's own soundtrack. `ff7_prepare_movie`
+# (src/movies.cpp) builds TWO audio paths beside the video file and
+# `ff7_start_movie` plays both:
+#
+#     movies/<NAME>.ogg      replaces the movie's own audio entirely --
+#                            `ffmpeg_prepare_movie(name, !has_ext_audio_file)`
+#                            opens the video WITHOUT its audio stream when
+#                            this file exists
+#     movies/<NAME>_va.ogg   a voice layer, mixed on top, at volume 3.0f
+#
+# Both start with the picture and are stopped by `ff7_stop_movie`, so a track
+# longer than its movie is simply cut off at the end.
+#
+# The Switch port has neither layer: it plays `data/movies/<name>.mp4` and
+# whatever audio stream is inside it. So for as long as this packer has
+# existed, every file under a mod's `movies/` folder has been counted as
+# "FFNx audio with nowhere to go" and dropped -- which with Echo-S and Cosmo
+# Memory installed is 15 voice tracks and 64 remastered soundtracks.
+#
+# There IS somewhere for them to go: the mp4 this module is building anyway.
+# Muxing at build time is not an approximation of what FFNx does at play
+# time, it is the same sum computed earlier, and it cannot drift in sync
+# because there is only one clock left.
+#
+# THE VOICE LEVEL IS MEASURED, NOT COPIED.
+#
+# FFNx's 3.0f is a fixed gain into SoLoud's CLIP_ROUNDOFF soft clipper, and
+# the tracks it is applied to are not uniform -- measured over Echo-S's own
+# files the voice varies from -11.4 to -17.4 LUFS and the beds under them
+# from -15.0 to -22.4 LUFS. A single constant on that spread is the same
+# mistake the dialogue normalisation had to undo: it puts the voice 6 dB
+# further forward in one scene than another for no reason but the recording.
+#
+# Also, the voice tracks already peak at 0 dBFS, so +9.5 dB of it is 12 dB of
+# clipping. FFNx gets away with it because the soft clipper turns that into
+# saturation rather than crackle, and the result is a voice that buries the
+# movie.
+#
+# So instead the voice is placed a fixed number of LU ABOVE THAT MOVIE'S OWN
+# AUDIO, measured per movie by EBU R128 -- whose gating means "the loudness
+# of the speech", not of the silence between lines. For `southmk` that works
+# out at +4.2 dB. The sum is then true-peak limited, because even at unity
+# the two tracks together overshoot by 3.4 dB.
+MOVIE_AUDIO_EXT = {'.ogg'}
+VOICE_SUFFIX = '_va'
+VOICE_BALANCE_ENV = 'SEVENTH_NX_MOVIE_VOICE_LU'
+VOICE_BALANCE_LU = 6.0          # how far above the bed the voice sits
+VOICE_MAX_GAIN_DB = 12.0        # never move a track further than this
+# Two of the cutscenes Echo-S voices are SILENT -- `biskdead` and `monitor`
+# have no audio stream in the mod's file or in the port's own. There is no
+# bed to sit above, so the voice simply becomes the programme, and the level
+# it should be at is the level the rest of the game's movies are at:
+# 26 measurable movies out of the dump's own `data/movies` give
+#
+#     min -21.8   p25 -16.3   median -15.1   p75 -14.1   max -11.4 LUFS
+#
+# which is also, independently, where the dialogue and the music landed.
+MOVIE_PROGRAMME_LUFS = -15.1
+# The ceiling for the sum. `alimiter` limits SAMPLE peaks and an inter-sample
+# peak runs higher, so this is not where the true peak lands. Measured over
+# all 15 of Echo-S's cutscenes with their soundtracks under them:
+#
+#     limiter -1.0 dBFS    worst true peak  +0.2 dBTP   over full scale
+#     limiter -2.0 dBFS    worst true peak  -0.8 dBTP   OK
+#
+# -2.0 it is. It is not held tighter than that because the material being
+# mixed is already there: Cosmos' own `southmk` audio measures -0.8 dBTP and
+# Echo-S's voice tracks peak at 0 dBFS. A mix quieter than both its sources
+# would be a strange thing to insist on.
+MOVIE_LIMITER_DB = -2.0
+
+
+def voice_balance_lu():
+    """The voice-over-bed offset in LU, overridable for a build."""
+    raw = os.environ.get(VOICE_BALANCE_ENV)
+    if raw is None or not raw.strip():
+        return VOICE_BALANCE_LU
+    try:
+        value = float(raw)
+    except ValueError:
+        raise ValueError('%s=%r is not a number of LU'
+                         % (VOICE_BALANCE_ENV, raw))
+    if not -12.0 <= value <= 24.0:
+        raise ValueError('%s=%g is outside the sane range'
+                         % (VOICE_BALANCE_ENV, value))
+    return value
+
+
+def movie_audio_kind(filename):
+    """
+    `('voice'|'music', stem)` for a file under a mod's `movies/` folder, or
+    None when it is not one of the two layers.
+
+    A leading underscore is how these mods disable a file in place
+    (`_OPENING.ogg`, `_BIKE.ogg`), and the game has no movie whose name
+    begins with one, so those are not a layer.
+    """
+    stem, ext = os.path.splitext(os.path.basename(filename).lower())
+    if ext not in MOVIE_AUDIO_EXT or not stem or stem.startswith('_'):
+        return None
+    if stem.endswith(VOICE_SUFFIX):
+        stem = stem[:-len(VOICE_SUFFIX)]
+        return ('voice', stem) if stem and not stem.startswith('_') else None
+    return 'music', stem
 
 # How the picture is sized.
 #   fit      resample to the size the console actually draws (Lanczos, on the
@@ -635,6 +768,54 @@ def crf_for(quality):
     return QUALITY_CRF.get(quality, QUALITY_CRF[QUALITY_DEFAULT])
 
 
+_LOUDNESS_I = re.compile(r'"input_i"\s*:\s*"(-?[0-9.]+)"')
+
+
+def loudness(path, stream=None):
+    """
+    EBU R128 integrated loudness of one audio track, in LUFS, or None.
+
+    `stream` picks an input's audio when the file also has video. Returns
+    None for anything that cannot be measured or is effectively silent, and
+    the caller then leaves the level alone rather than guessing.
+    """
+    tool = _tool('ffmpeg')
+    if not tool or not path or not os.path.exists(path):
+        return None
+    cmd = [tool, '-hide_banner', '-nostdin', '-i', path]
+    if stream:
+        cmd += ['-map', stream]
+    cmd += ['-af', 'loudnorm=print_format=json', '-f', 'null', '-']
+    probe = subprocess.run(cmd, stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE, text=True)
+    if probe.returncode:
+        return None
+    found = _LOUDNESS_I.search(probe.stderr)
+    if not found:
+        return None
+    try:
+        value = float(found.group(1))
+    except ValueError:
+        return None
+    return None if value <= -60.0 else value
+
+
+def voice_gain_db(bed_lufs, voice_lufs, balance=None):
+    """
+    How far to move a voice track so it sits `balance` LU above its bed.
+
+    Either measurement missing means the level is left exactly as the mod
+    recorded it: an unmeasurable track is still a track, and a guessed gain
+    on it would be worse than none. See THE MOVIE AUDIO LAYER above.
+    """
+    if bed_lufs is None or voice_lufs is None:
+        return 0.0
+    if balance is None:
+        balance = voice_balance_lu()
+    wanted = (bed_lufs + balance) - voice_lufs
+    return max(-VOICE_MAX_GAIN_DB, min(VOICE_MAX_GAIN_DB, wanted))
+
+
 def source_key(path, extra=''):
     """
     Cache identity for a source file: its CONTENT, not its timestamp.
@@ -654,7 +835,8 @@ def source_key(path, extra=''):
 
 def convert(src, dest, vanilla=None, quality=QUALITY_DEFAULT,
             preset=TARGET_PRESET, target_fps=None, fit=FIT_DEFAULT,
-            colour=COLOUR_DEFAULT, log=lambda *_: None):
+            colour=COLOUR_DEFAULT, music=None, voice=None,
+            voice_balance=None, log=lambda *_: None):
     """
     Write `dest` (.mp4) from `src`, in the shape the Switch port plays.
 
@@ -662,6 +844,10 @@ def convert(src, dest, vanilla=None, quality=QUALITY_DEFAULT,
     used as an audio donor when the mod's file is silent but the original was
     not -- an FMV pack may rebuild the picture only, and a replacement that
     arrived without its soundtrack would be a silent cutscene.
+
+    `music` and `voice` are FFNx's two movie-audio layers, if the mods
+    shipped them: `music` REPLACES this movie's soundtrack and `voice` is
+    mixed on top at a measured level. See THE MOVIE AUDIO LAYER.
 
     Returns a dict describing what happened, or raises.
     """
@@ -681,8 +867,63 @@ def convert(src, dest, vanilla=None, quality=QUALITY_DEFAULT,
     fps = str(target_fps) if target_fps else info['fps_exact']
     crf = crf_for(quality)
 
+    # `music` REPLACES the movie's own audio, exactly as FFNx does by opening
+    # the video without its audio stream. So it also settles the borrow: a
+    # picture-only mod file that has been given a soundtrack does not need
+    # the original's.
+    if music and not os.path.exists(music):
+        music = None
+    if voice and not os.path.exists(voice):
+        voice = None
     borrow_audio = (not info['has_audio']) and van is not None \
-        and van['has_audio']
+        and van['has_audio'] and not music
+
+    # Which input is the BED -- the thing the voice is balanced against and
+    # the thing that is heard when there is no voice.
+    inputs = [src]
+    if borrow_audio:
+        inputs.append(vanilla)
+        # The third element is the map used to MEASURE the bed, and the
+        # measurement opens that file on its own -- so it is stream 0 of it,
+        # not the index this command gives it.
+        bed = ('1:a:0', vanilla, '0:a:0')
+    elif music:
+        bed = (None, music, None)      # index filled in below
+    elif info['has_audio']:
+        bed = ('0:a:0', src, '0:a:0')
+    else:
+        bed = None
+    if music:
+        inputs.append(music)
+        bed = ('%d:a:0' % (len(inputs) - 1), music, None)
+    voice_index = None
+    if voice and bed is not None:
+        inputs.append(voice)
+        voice_index = len(inputs) - 1
+    solo_voice = False
+    if voice and bed is None:
+        # A SILENT cutscene with a voice track: `biskdead` and `monitor` have
+        # no audio stream in the mod's file or in the port's own. There is
+        # nothing to sit above, so the voice becomes the programme -- and is
+        # levelled to where the rest of the game's movies are, rather than
+        # left wherever it was recorded. `monitor`'s track is at -26.8 LUFS,
+        # which would be a whispered line in an otherwise silent scene.
+        inputs.append(voice)
+        bed = ('%d:a:0' % (len(inputs) - 1), voice, '0:a:0')
+        solo_voice = True
+
+    gain = 0.0
+    bed_lufs = voice_lufs = None
+    if solo_voice:
+        voice_lufs = loudness(voice)
+        if voice_lufs is not None:
+            gain = max(-VOICE_MAX_GAIN_DB,
+                       min(VOICE_MAX_GAIN_DB,
+                           MOVIE_PROGRAMME_LUFS - voice_lufs))
+    elif voice_index is not None:
+        bed_lufs = loudness(bed[1], bed[2])
+        voice_lufs = loudness(voice)
+        gain = voice_gain_db(bed_lufs, voice_lufs, voice_balance)
 
     vf, (want_w, want_h, fit_reason) = video_filter(info, fit, colour)
     colour_convert = colour_plan(info, colour)[2]
@@ -690,14 +931,34 @@ def convert(src, dest, vanilla=None, quality=QUALITY_DEFAULT,
     os.makedirs(os.path.dirname(dest), exist_ok=True)
     tmp = dest + '.part.mp4'
 
-    cmd = [_tool('ffmpeg'), '-y', '-nostdin', '-loglevel', 'error', '-i', src]
-    if borrow_audio:
-        cmd += ['-i', vanilla]
+    cmd = [_tool('ffmpeg'), '-y', '-nostdin', '-loglevel', 'error']
+    for path in inputs:
+        cmd += ['-i', path]
     cmd += ['-map', '0:v:0']
-    if borrow_audio:
-        cmd += ['-map', '1:a:0']
-    elif info['has_audio']:
-        cmd += ['-map', '0:a:0']
+    if voice_index is not None:
+        # amix with normalize=0 SUMS; the default divides by the number of
+        # inputs, which would quietly halve the movie. `duration=longest`
+        # plus the `-shortest` below is FFNx's behaviour exactly: both start
+        # with the picture and whichever outlasts it is cut off at the end.
+        #
+        # Both legs are forced to the SAME rate and layout before the mix.
+        # Two of Echo-S's voice tracks are mono (`BRGNVL_VA`, `JENOVA_E_VA`)
+        # and they are all 48 kHz over 44.1 kHz movies, so leaving the
+        # conversion to whatever ffmpeg inserts would make the result depend
+        # on which file happened to be first.
+        shape = 'aresample=%d,aformat=sample_fmts=fltp:channel_layouts=%s' % (
+            TARGET_ARATE, 'stereo' if TARGET_ACHANNELS == 2 else 'mono')
+        filtergraph = (
+            '[%s]%s[bed];'
+            '[%d:a:0]volume=%.2fdB,%s[vo];'
+            '[bed][vo]amix=inputs=2:duration=longest:dropout_transition=0'
+            ':normalize=0,alimiter=limit=%.6f:level=disabled,'
+            'asetpts=N/SR/TB[aout]'
+            % (bed[0], shape, voice_index, gain, shape,
+               10.0 ** (MOVIE_LIMITER_DB / 20.0)))
+        cmd += ['-filter_complex', filtergraph, '-map', '[aout]']
+    elif bed is not None:
+        cmd += ['-map', bed[0]]
     else:
         cmd += ['-an']
 
@@ -721,7 +982,7 @@ def convert(src, dest, vanilla=None, quality=QUALITY_DEFAULT,
         # gets verified without a hardware test.
         cmd += ['-colorspace', 'bt709', '-color_primaries', 'bt709',
                 '-color_trc', 'bt709', '-color_range', 'tv']
-    if info['has_audio'] or borrow_audio:
+    if bed is not None:
         cmd += ['-c:a', TARGET_ACODEC, '-b:a', TARGET_ABITRATE,
                 '-ar', str(TARGET_ARATE), '-ac', str(TARGET_ACHANNELS),
                 # Rebuild the audio timeline from the sample count.
@@ -746,10 +1007,25 @@ def convert(src, dest, vanilla=None, quality=QUALITY_DEFAULT,
                 # broken timeline in place (77.18s), and putting it in front
                 # of asetpts reintroduced the fault, because asetpts then
                 # works in the timebase aresample chose.
-                '-af', 'asetpts=N/SR/TB',
-                # Do not let a shorter audio track extend the video, or a
-                # longer one pad it: the picture decides the length.
-                '-shortest']
+                #
+                # When a voice layer is being mixed the same `asetpts` is the
+                # last link of the filter_complex instead: `-af` cannot be
+                # applied to a stream that came out of one.
+                ]
+        if voice_index is None:
+            chain = 'asetpts=N/SR/TB'
+            if solo_voice and gain:
+                # The lone voice track, levelled to programme loudness. The
+                # limiter is the same one the mix uses and for the same
+                # reason: these tracks already peak at full scale.
+                chain = ('volume=%.2fdB,alimiter=limit=%.6f:level=disabled,%s'
+                         % (gain, 10.0 ** (MOVIE_LIMITER_DB / 20.0), chain))
+            cmd += ['-af', chain]
+        # Do not let a shorter audio track extend the video, or a longer one
+        # pad it: the picture decides the length. This is also what cuts a
+        # voice track that outlasts its movie, which is what FFNx's
+        # `ff7_stop_movie` does to it.
+        cmd += ['-shortest']
     cmd += ['-map_metadata', '-1', '-movflags', '+faststart', tmp]
 
     p = _run(cmd)
@@ -793,6 +1069,11 @@ def convert(src, dest, vanilla=None, quality=QUALITY_DEFAULT,
         'fps': fps, 'quality': quality, 'crf': crf,
         'doubled': bool(target_fps) and info['fps'] < target_fps - 0.01,
         'borrowed_audio': borrow_audio,
+        'music': music, 'voice': voice,
+        'voice_gain': gain if (voice_index is not None or solo_voice)
+        else None,
+        'voice_is_programme': solo_voice,
+        'bed_lufs': bed_lufs, 'voice_lufs': voice_lufs,
         'fit': fit, 'fit_reason': fit_reason,
         'colour': colour, 'colour_converted': colour_convert,
         'drawn': device_footprint(info['width'], info['height']),

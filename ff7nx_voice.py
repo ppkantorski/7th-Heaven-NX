@@ -105,6 +105,31 @@ OGG_VOLUME = AM.OGG_VOLUME
 OGG_DELETE = AM.OGG_DELETE
 PLAYER_BYTES = AM.PLAYER_BYTES
 
+# HOW LOUD A VOICE CLIP IS PLAYED, AND WHY IT IS NOT 1.0 BY ACCIDENT.
+#
+# FFNx does not play a voice at unity. `set_voice_volume()` in src/voice.cpp:
+#
+#     voice_volume = 2.0f + (100 - external_voice_music_fade_volume) / 100.0f
+#
+# which with the shipped fade of 25 is **2.75**, and it is passed to
+# `nxAudioEngine.playVoice(name, window, voice_volume, ...)` UNCONDITIONALLY
+# -- it is computed outside the `enable_voice_music_fade` branch, so it
+# applies whether or not the music ducks. Echo-S is mixed against that.
+#
+# We played 1.0. Every line in every build so far has therefore been 8.8 dB
+# below the level the mod was authored for, uniformly, which is why the
+# encoder could measure every clip at exactly its target and the lines could
+# still be hard to hear.
+#
+# We CANNOT simply copy 2.75. SoLoud runs a soft clipper (CLIP_ROUNDOFF), so
+# on PC that gain saturates rather than crackles; this port's mixer is a
+# float path with an unknown ceiling, and a clip that already peaks at
+# -1.5 dBFS would be 7 dB over full scale. So the gain is a SETTING with a
+# safe default, and finding the port's real headroom is one exefs/main
+# rebuild per try rather than a guess baked into 22,000 files.
+VOICE_GAIN_DEFAULT = 1.0
+VOICE_GAIN_MAX = 4.0
+
 # -> the stock MusicManager singleton, for ducking the BGM under speech.
 # Relocated, so it is a pointer to a holder rather than the object.
 MUSIC_MANAGER_HOLDER = 0x12CE238
@@ -958,9 +983,16 @@ def _emit_native_stop_async(a, player):
 
 
 def _emit_deadline_stop(a, player, bss, out_label,
-                        deadline_off=CLOCK_DEADLINE_OFF):
-    """Refresh independent gain and asynchronously stop at its host deadline."""
-    a.emit(0x1E2E1000)                  # fmov s0, #1.0
+                        deadline_off=CLOCK_DEADLINE_OFF,
+                        voice_gain=VOICE_GAIN_DEFAULT):
+    """Refresh independent gain and asynchronously stop at its host deadline.
+
+    The refresh has to carry the SAME gain the player was created with. It
+    runs every field callback, so a 1.0 here would silently undo the boost
+    one tick after the line started -- the line would begin at the right
+    level and drop.
+    """
+    a.emit(A.fmov_s_imm(0, voice_gain))
     a.emit(_mov64(0, player))
     a.emit(A.bl(a.pc(), OGG_VOLUME))
     a.emit(A.bl(a.pc(), HOST_TICK_NOW))
@@ -2396,8 +2428,23 @@ def _build_battle_text_command_cave(cave, addr, scratch):
     return a.resolve()
 
 
+def _check_voice_gain(voice_gain):
+    """Refuse a gain before it can assemble as something else.
+
+    Only 256 values are `FMOV Sd, #imm` immediates. An unencodable one must
+    not be rounded here -- the caller that wants rounding asks `a64` for the
+    nearest and says so.
+    """
+    if not 0.0 < voice_gain <= VOICE_GAIN_MAX:
+        raise ValueError('voice_gain must be above 0 and at most %g, not %r'
+                         % (VOICE_GAIN_MAX, voice_gain))
+    A.fmov_s_imm(0, voice_gain)
+    return voice_gain
+
+
 def _build_field_clocked_voice_service(cave, addr, scratch,
                                        retain_completed=False,
+                                       voice_gain=VOICE_GAIN_DEFAULT,
                                        duck_percent=25,
                                        duck_attack_frames=12,
                                        duck_release_frames=45,
@@ -2417,6 +2464,7 @@ def _build_field_clocked_voice_service(cave, addr, scratch,
     after the worker reaches state 1, and is then deleted by its own native
     destructor before the next queued source is constructed.
     """
+    _check_voice_gain(voice_gain)
     # Build 449's lesson, enforced here rather than trusted to every caller:
     # the duplicate is a FIELD dialogue defect, and the world and battle
     # services are built from this same function. Asking for the guard in
@@ -2462,7 +2510,8 @@ def _build_field_clocked_voice_service(cave, addr, scratch,
     a.bcond('stop_discard', A.EQ)
     a.emit(A.cmp_imm(22, VOICE_CMD_PLAY))
     a.bcond('play_pending', A.EQ)
-    _emit_deadline_stop(a, 20, 19, 'out', VOICE_DEADLINE_OFF)
+    _emit_deadline_stop(a, 20, 19, 'out', VOICE_DEADLINE_OFF,
+                        voice_gain=voice_gain)
     a.b('out')
 
     a.label('play_pending')
@@ -2529,7 +2578,8 @@ def _build_field_clocked_voice_service(cave, addr, scratch,
     # `defer_foreign_play=False` restores the historical discard, so which of
     # the two is responsible for any change on hardware is one rebuild.
     if defer_foreign_play:
-        _emit_deadline_stop(a, 20, 19, 'out', VOICE_DEADLINE_OFF)
+        _emit_deadline_stop(a, 20, 19, 'out', VOICE_DEADLINE_OFF,
+                        voice_gain=voice_gain)
     else:
         a.emit(A.str_(A.WZR, 19, VOICE_PENDING_CMD_OFF))
     a.b('out')
@@ -2756,7 +2806,7 @@ def _build_field_clocked_voice_service(cave, addr, scratch,
         # key really is the one a player was built from.
         a.emit(A.str_(21, 19, VOICE_ACTIVE_KEY_HASH_OFF))
     _emit_host_deadline(a, 20, 19, VOICE_DEADLINE_OFF)
-    a.emit(0x1E2E1000)                  # fmov s0, #1.0
+    a.emit(A.fmov_s_imm(0, voice_gain))
     a.emit(_mov64(0, 20))
     a.emit(A.bl(a.pc(), OGG_VOLUME))
     if duck_percent < 100:
@@ -3016,6 +3066,7 @@ def patch_main_clocked_dialogue(src, dest, forced_name=None,
                                 music_thread_name=None,
                                 key_mode='hash',
                                 folder_forced_suffix=None,
+                                voice_gain=VOICE_GAIN_DEFAULT,
                                 duck_percent=25,
                                 duck_attack_frames=12,
                                 duck_release_frames=45,
@@ -3034,6 +3085,7 @@ def patch_main_clocked_dialogue(src, dest, forced_name=None,
     """
     if not isinstance(duck_percent, int) or not 0 <= duck_percent <= 100:
         raise ValueError('duck_percent must be an integer from 0 through 100')
+    _check_voice_gain(voice_gain)
     if (not isinstance(duck_attack_frames, int) or
             not 1 <= duck_attack_frames <= 600):
         raise ValueError('duck_attack_frames must be an integer from 1 through 600')
@@ -3296,6 +3348,7 @@ def patch_main_clocked_dialogue(src, dest, forced_name=None,
         field_entry, field_placed = ff7nx_cave.emit_laid_out(
             pool, lambda cave, address: _build_field_clocked_voice_service(
                 cave, address, scratch, retain_completed=retain_completed,
+                voice_gain=voice_gain,
                 duck_percent=duck_percent,
                 duck_attack_frames=duck_attack_frames,
                 duck_release_frames=duck_release_frames,
@@ -3327,6 +3380,7 @@ def patch_main_clocked_dialogue(src, dest, forced_name=None,
         battle_service_entry, battle_service_placed = ff7nx_cave.emit_laid_out(
             pool, lambda cave, address: _build_field_clocked_voice_service(
                 cave, address, scratch, retain_completed=retain_completed,
+                voice_gain=voice_gain,
                 duck_percent=duck_percent,
                 duck_attack_frames=duck_attack_frames,
                 duck_release_frames=duck_release_frames,
@@ -3352,6 +3406,7 @@ def patch_main_clocked_dialogue(src, dest, forced_name=None,
             ff7nx_cave.emit_laid_out(
                 pool, lambda cave, address: _build_field_clocked_voice_service(
                     cave, address, scratch, retain_completed=retain_completed,
+                    voice_gain=voice_gain,
                     duck_percent=duck_percent,
                     duck_attack_frames=duck_attack_frames,
                     duck_release_frames=duck_release_frames,
@@ -3515,6 +3570,7 @@ def patch_main_clocked_dialogue(src, dest, forced_name=None,
             'music_thread_name': music_thread_name,
             'key_mode': key_mode,
             'folder_forced_suffix': folder_forced_suffix,
+            'voice_gain': voice_gain,
             'duck_percent': duck_percent,
             'duck_attack_frames': duck_attack_frames,
             'duck_release_frames': duck_release_frames,
@@ -3577,7 +3633,8 @@ def _level_flags(level):
     }
 
 
-def apply_to_nso(src, dest, auto_advance=True, duck_percent=85,
+def apply_to_nso(src, dest, auto_advance=True, voice_gain=VOICE_GAIN_DEFAULT,
+                 duck_percent=85,
                  duck_attack_frames=12, duck_release_frames=45,
                  battle_probability=0, battle_text=False, level='full',
                  forced_name=None, message_phase='pre',
@@ -3648,6 +3705,7 @@ def apply_to_nso(src, dest, auto_advance=True, duck_percent=85,
         src, dest, music_thread_name='music stream', key_mode='folder',
         message_phase=message_phase, forced_name=forced_name,
         message_stub=message_stub,
+        voice_gain=voice_gain,
         duck_percent=duck_percent, duck_attack_frames=duck_attack_frames,
         duck_release_frames=duck_release_frames,
         battle_probability=battle_probability, battle_text=battle_text,

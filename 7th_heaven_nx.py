@@ -844,11 +844,10 @@ TEX_CACHE_BY_LABEL = {v: k for k, v in TEX_CACHE_CHOICES}
 # port already loads from romfs; these are drop-in replacements that used to
 # have to be copied onto the card by hand. See ff7nx_shaders.py.
 VOICE_NORM_CHOICES = [
-    ('loudness:-15.3', 'Match “My hero!” — −15.3 LUFS (recommended)'),
-    ('loudness:-17', 'Quieter — −17 LUFS'),
-    ('loudness:-16', 'A little quieter — −16 LUFS'),
-    ('loudness:-14', 'A little louder — −14 LUFS'),
-    ('loudness:-13', 'Louder — −13 LUFS'),
+    ('speech:-16.2', 'Even voices — match “My hero!” (recommended)'),
+    ('speech:-15.2', 'Even voices, louder'),
+    ('speech:-17.2', 'Even voices, quieter'),
+    ('loudness:-15.3', 'Broadband loudness — the pre-349 behaviour'),
     ('peak:-1.1', 'Equal peaks only — −1.1 dBFS'),
     ('off', 'Off — as the mod shipped'),
 ]
