@@ -288,6 +288,15 @@ HOOK_VA = 0x9F874C              # ldr w0, [x22, #0x14]   -- x86 0x644055
 HOOK_ORIG = 0xB94016C0
 RETURN_VA = 0x9F8750
 
+# SCR2D (mode 4) is a one-shot placement. FFNx clamps that placement in
+# field_init_scripted_bg_movement before changing world_move_status to 2.
+# The original port omitted that call. Once the early-out above was fixed to
+# match FFNx, the omission became visible as a one-frame horizontal snap when
+# a following smooth move entered the (correctly clamped) active path.
+INIT_HOOK_VA = 0x9F7AF4         # b #0x9f7c78, after SCR2D stores x and y
+INIT_RETURN_VA = 0x9F7C78       # set world_move_status = 2, then epilogue
+INIT_HOOK_ORIG = 0x14000061
+
 XLAT = 0x10FC3A0                # guest address -> host pointer
 
 HDR_PTR = 0xCFF454              # &field_triggers_header
@@ -299,6 +308,8 @@ RANGE_BOTTOM = 0x12
 W19_BASE = 0xCC15EC             # scripted_world_move_step_index
 DELTA_X_OFF = 4                 # -> 0xCC15F0  field_curr_delta_world_pos_x
 DELTA_Y_OFF = 8                 # -> 0xCC15F4
+DELTA_X = W19_BASE + DELTA_X_OFF
+DELTA_Y = W19_BASE + DELTA_Y_OFF
 
 HALF_W = 0xA0                   # 160, the stock half-view; see §2
 HALF_H = 0x78                   # 120, and MEASURED -- see §2.1
@@ -308,6 +319,7 @@ BASE = 19                       # w19 = 0xCC15EC
 
 COND_GT = 12
 COND_LT = 11
+COND_GE = 10
 
 # +0x30 in field_trigger_header -- FFNx calls it `short field_30[4]` and
 # never touches it. MEASURED zero in all 711 fields of the built archive, all
@@ -316,6 +328,74 @@ COND_LT = 11
 # use it.
 VCLIP_FLAG_OFF = 0x30
 VCLIP_FLAG_SITES = 8            # bytes at +0x30..+0x37, only the first used
+
+# THE INITIALIZER'S MOVIE GATE -- WHO OWNS THE CAMERA RIGHT NOW.
+#
+# The SCR2D initializer clamp (case 4 of `field_init_scripted_bg_movement`)
+# must NOT be unconditional, and the condition is not a property of the
+# field. Two dead ends were tried and both are recorded here so they are not
+# tried again.
+#
+# WRONG ANSWER 1: `is_fieldmap_wide()` AS A PER-FIELD DATA FLAG.
+# FFNx guards the clamp with `if (is_fieldmap_wide())`, which reads as a
+# per-field property, and build 511 baked it into section 8 as a byte. It is
+# not a per-field property. `utils.h:49` and `widescreen.h:127`:
+#
+#     bool is_fieldmap_wide()
+#     { return widescreen_enabled && widescreen.getMode() != WM_DISABLED; }
+#
+#     WIDESCREEN_MODE Widescreen::getMode()
+#     {
+#         if (getmode_cached()->driver_mode != MODE_FIELD) return WM_DISABLED;
+#         return widescreen_mode;
+#     }
+#
+# It is a RUNTIME test that collapses to false whenever the driver is not in
+# field mode, and movies carry their own `getMovieMode()` entirely. Baked as
+# data it is also just wrong for the field it was built to protect:
+# `southmk2` resolves to WM_EXTEND_ONLY, not WM_DISABLED, so the flag would
+# have been 1 and the clamp would have fired anyway. (It was believed to be
+# disabled because `field_camera_ranges.csv` says so; that file is a stale
+# artifact from August. FINDINGS-85 2.4, again: read the resolution, not a
+# table that looks like it.)
+#
+# WRONG ANSWER 2: `MVCAM == 0 -> PRESERVE` (v5). Right for southmk2, wrong
+# everywhere else, because MVCAM_flag is 0 in the 700-odd fields that never
+# run a movie at all -- so it skipped every completed placement in the game
+# and brought the Sector 1 station band back.
+#
+# THE ACTUAL CONDITION is the one FFNx's renderer itself branches on,
+# `background.cpp:953`:
+#
+#     if (*word_CC1638 && !modules_global_object->BGMOVIE_flag)
+#     {
+#         if (MVCAM_flag == 1 && is_position_valid(field_curr_delta_world_pos))
+#             field_3d_world_pos.x = (field_curr_delta_world_pos.x
+#                                     + field_bg_offset->x - 160) * mult;
+#     }
+#     else if (*field_bg_flag_CC15E4) { ... the normal clipped path ... }
+#
+# When a movie is in this field and has not been handed back,
+# `field_curr_delta_world_pos` is the MOVIE's anchor -- the `- 160` is the
+# same 4:3 half-view our port's movie path uses (FINDINGS-496). Clamping it
+# then moves the picture. When no movie is involved, that variable is the
+# ordinary field camera and clamping it is exactly what removes the snap.
+#
+# southmk2 states both intents explicitly and hardware confirmed both
+# (section 1 above): `MVCAM 1` before the Airbuster battle -> the field must
+# return to centre, so the clamp SHOULD run; `MVCAM 0` after it -> the
+# authored `SCR2D (+32, -32)` must survive, so it must NOT.
+#
+#     word_CC1638 == 0                     no movie here     -> CLAMP
+#     word_CC1638 != 0, BGMOVIE != 0       not the MVCAM path-> CLAMP
+#     word_CC1638 != 0, MVCAM  == 1        movie owns it,
+#                                          centred is correct-> CLAMP
+#     word_CC1638 != 0, MVCAM  == 0        handed back       -> PRESERVE
+#
+# All three are reached from w19, which at this hook is &world_move_status.
+MOVIE_FLAG = 0xCC1638           # word_CC1638, a movie is live in this field
+MOVIE_FLAG_FROM_STATUS = 0x891  # 0xCC1638 - 0xCC0DA7
+BGMOVIE_FROM_STATUS = 0x1B      # 0xCC0DC2 - 0xCC0DA7, global object +0x3A
 
 # ff7_modules_global_object begins at guest 0xCC0D88.  The struct layout in
 # FFNx's ff7.h places world_move_status at +0x1F.  This gate is deliberately a
@@ -327,6 +407,8 @@ MVCAM_FROM_STATUS = 0x1A        # 0xCC0DC1 - 0xCC0DA7
 
 N_WORDS_X = 24                  # horizontal only                  (v1)
 N_WORDS_XY = 47                 # x and y, vertically gated        (v3)
+INIT_N_WORDS_X = 24             # SCR2D initializer; absolute delta address
+INIT_N_WORDS_XY = 48            # (the gate is a condition code, not words)
 
 # EVERY LENGTH THIS MODULE HAS EVER WRITTEN, newest first.
 #
@@ -372,6 +454,33 @@ N_WORDS = N_WORDS_X             # kept so old callers still read something
 
 def n_words(vertical=True):
     return N_WORDS_XY if vertical else N_WORDS_X
+
+
+def init_n_words(vertical=True):
+    return INIT_N_WORDS_XY if vertical else INIT_N_WORDS_X
+
+
+# EVERY length the SCR2D initializer cave has ever been written at.
+#
+#   24  ungated: clamped case 4 on every field, movie or not
+#   48  the same with the vertical leg
+#   26  gated on a per-field `is_fieldmap_wide` data byte  -- WRONG SHAPE
+#   50  the same with the vertical leg
+#
+# 24/48 are the ungated cave: it pins `southmk2` to dead centre even on the
+# post-battle path that must keep its authored `SCR2D (+32, -32)`, which is
+# the FMV misalignment. 26/50 gated on section 8 +0x31, which is the wrong
+# kind of test (see MOVIE_FLAG) and, for southmk2, resolves to 1 anyway --
+# so that build behaved exactly like 24/48 wherever the flag reached the
+# archive, and like no cave at all where it did not.
+#
+# All four are kept for exactly one reason: `--revert` has to be able to
+# REMOVE a module already on hardware carrying any of them.
+# `init_cave_current` deliberately still says False for them, so `--apply`
+# rewrites rather than leaving them alone.
+INIT_LEGACY_LENGTHS = (60, 50, 36, 26)
+INIT_KNOWN_LENGTHS = tuple(dict.fromkeys(
+    (INIT_N_WORDS_XY, INIT_N_WORDS_X) + INIT_LEGACY_LENGTHS))
 
 ANCHORS = [
     (0x9F7DC4, 0xF00046B6, 'adrp x22, #0x12ce000  \\ the guest context,'),
@@ -498,6 +607,53 @@ def _clamp_block(addr, i0, skip, guest_off, lo_off, hi_off, half):
         A.bl(addr(i0 + 7), XLAT),
         A.ldrsh(8, 0, 0),
         A.sub_reg(8, 31, 8),                      # neg w8, w8
+    ]
+
+
+def _clamp_block_abs(addr, i0, skip, guest_addr, lo_off, hi_off, half):
+    """Initializer form of `_clamp_block`, using an absolute guest address.
+
+    w19 has a different meaning in field_init_scripted_bg_movement, so the
+    updater's `add w0, w19, #off` would address unrelated memory here.  This
+    function keeps x20 live as its guest CPU context until its epilogue, so
+    the updater cave's w20 scratch is *not* available here.  x21/x22 were
+    saved by the prologue and mode 4 does not read them after this hook.
+    """
+    return [
+        A.ldrsh(22, 0, hi_off),
+        A.ldrsh(21, 0, lo_off),
+        A.sub_imm(22, 22, half),
+        A.add_imm(21, 21, half),
+        A.cmp_reg(21, 22),
+        # COND_GE, NOT COND_GT -- and that one letter is the whole fix.
+        # `lo > hi` (GT) is a range too narrow to admit anything, and it
+        # never happens on x: MEASURED over the shipped archive, 0 of 711
+        # fields. So as GT this guard was dead code.
+        # `lo == hi` DOES happen, on 394 of 711 fields, and it is not a
+        # clamp at all -- it admits exactly one value, so it replaces the
+        # authored one-shot camera with a constant. `southmk2` is one of
+        # them: shipped range -160..160, bounds [0, 0], so clamping its
+        # SCR2D (+32, -32) centres the field and the post-Airbuster black
+        # bar disappears. `mds7pb_1` has bounds [-42, 42] and real travel,
+        # so it still clamps and the 7th Heaven snap stays fixed.
+        A.bcond(addr(i0 + 5), skip, COND_GE),
+        A.movz(0, guest_addr & 0xFFFF),
+        A.movk_hi(0, guest_addr >> 16),
+        A.bl(addr(i0 + 8), XLAT),
+        A.ldrsh(8, 0, 0),
+        A.sub_reg(8, 31, 8),
+    ]
+
+
+def _init_clamp_tail(addr, i0):
+    """Initializer counterpart to `_clamp_tail`; x20 must stay untouched."""
+    return [
+        A.cmp_reg(8, 22),
+        A.csel(8, 22, 8, COND_GT),
+        A.cmp_reg(8, 21),
+        A.csel(8, 21, 8, COND_LT),
+        A.sub_reg(8, 31, 8),
+        A.strh(8, 0, 0),
     ]
 
 
@@ -631,6 +787,14 @@ def _vclip_gate(addr, i0, skip):
     ]
 
 
+def _init_vclip_gate(addr, i0, skip):
+    """Initializer vertical gate; unlike `_vclip_gate`, preserve x20."""
+    return [
+        A.ldrb(22, 0, VCLIP_FLAG_OFF),
+        A.cbz(22, addr(i0 + 1), skip),
+    ]
+
+
 def cave_words(addr, return_va, vertical=True):
     """
     The whole cave, laid out at addr(i).
@@ -652,6 +816,25 @@ def cave_words(addr, return_va, vertical=True):
         w += _clamp_tail(addr, 39)                            # 6  -> 45
     w += [HOOK_ORIG, A.b(addr(len(w) + 1), return_va)]        # 2
     assert len(w) == n, 'n_words is %d, body is %d' % (n, len(w))
+    return w
+
+
+def init_cave_words(addr, return_va=INIT_RETURN_VA, vertical=True):
+    """Clamp SCR2D at initialization, as FFNx does in mode 4."""
+    n = init_n_words(vertical)
+    skip = addr(n - 1)                            # terminal return branch
+    w = _header_ptr(addr, 0, skip)                            # 6
+    w += _clamp_block_abs(addr, 6, skip, DELTA_X,
+                          RANGE_LEFT, RANGE_RIGHT, HALF_W)    # 11 -> 17
+    w += _init_clamp_tail(addr, 17)                           # 6  -> 23
+    if vertical:
+        w += _header_ptr(addr, 23)                            # 5  -> 28
+        w += _init_vclip_gate(addr, 28, skip)                 # 2  -> 30
+        w += _clamp_block_abs(addr, 30, skip, DELTA_Y,
+                              RANGE_TOP, RANGE_BOTTOM, HALF_H) # 11 -> 41
+        w += _init_clamp_tail(addr, 41)                       # 6  -> 47
+    w += [A.b(addr(len(w)), return_va)]
+    assert len(w) == n, 'init_n_words is %d, body is %d' % (n, len(w))
     return w
 
 
@@ -725,6 +908,15 @@ def state(t):
     return 'unknown'
 
 
+def init_state(t):
+    got = w32(t, INIT_HOOK_VA)
+    if got == INIT_HOOK_ORIG:
+        return 'stock'
+    if (got & 0xFC000000) == 0x14000000:
+        return 'patched'
+    return 'unknown'
+
+
 def check_anchors(t, log=lambda *_: None):
     bad = []
     for va, want, what in ANCHORS:
@@ -735,6 +927,10 @@ def check_anchors(t, log=lambda *_: None):
     if state(t) == 'unknown':
         bad.append('+%#09x is %08X -- neither the stock `ldr w0, [x22, #0x14]` '
                    'nor a branch; refusing' % (HOOK_VA, w32(t, HOOK_VA)))
+    if init_state(t) == 'unknown':
+        bad.append('+%#09x is %08X -- neither the stock SCR2D continuation '
+                   'nor a branch; refusing'
+                   % (INIT_HOOK_VA, w32(t, INIT_HOOK_VA)))
     # w19 must be written exactly once in the whole function, or `add w0, w19,
     # #4` is not field_curr_delta_world_pos_x at the hook.
     writes = _w19_writes(t)
@@ -776,7 +972,7 @@ def _b_target(word, va):
     return va + imm * 4
 
 
-def walk(t, hook=HOOK_VA, n=None):
+def walk(t, hook=HOOK_VA, n=None, return_va=RETURN_VA):
     """The cave's logical words: chain links followed, not recorded."""
     n = N_WORDS if n is None else n
     tgt = _b_target(w32(t, hook), hook)
@@ -789,7 +985,7 @@ def walk(t, hook=HOOK_VA, n=None):
         seen.add(va)
         x = w32(t, va)
         b = _b_target(x, va)
-        if b is not None and b != RETURN_VA:
+        if b is not None and b != return_va:
             va = b
             continue
         out.append((va, x))
@@ -797,7 +993,7 @@ def walk(t, hook=HOOK_VA, n=None):
     return out
 
 
-def walk_physical(t, hook=HOOK_VA, n=None):
+def walk_physical(t, hook=HOOK_VA, n=None, return_va=RETURN_VA):
     """Every address the cave occupies, chain links included."""
     n = N_WORDS if n is None else n
     tgt = _b_target(w32(t, hook), hook)
@@ -808,7 +1004,7 @@ def walk_physical(t, hook=HOOK_VA, n=None):
         x = w32(t, va)
         out.append(va)
         b = _b_target(x, va)
-        if b is not None and b != RETURN_VA:
+        if b is not None and b != return_va:
             va = b
             continue
         logical += 1
@@ -836,6 +1032,35 @@ def cave_length(t):
     return None
 
 
+def init_cave_length(t):
+    """
+    The installed initializer cave's word count, or None.
+
+    Structural, like `cave_length`: a run of `n` words ending in a branch to
+    `INIT_RETURN_VA`. It accepts the ungated lengths as well as this
+    revision's so that a module built with the ungated cave can still be
+    reverted -- which is the only way this revision can replace it on a
+    module that is already on hardware.
+    """
+    for n in INIT_KNOWN_LENGTHS:
+        got = walk(t, hook=INIT_HOOK_VA, n=n, return_va=INIT_RETURN_VA)
+        if got and len(got) == n \
+                and _b_target(got[-1][1], got[-1][0]) == INIT_RETURN_VA:
+            return n
+    return None
+
+
+def init_cave_current(t, vertical=True):
+    n = init_n_words(vertical)
+    got = walk(t, hook=INIT_HOOK_VA, n=n, return_va=INIT_RETURN_VA)
+    if not got or len(got) != n:
+        return False
+    if _b_target(got[-1][1], got[-1][0]) != INIT_RETURN_VA:
+        return False
+    want = init_cave_words(lambda i: got[i][0], INIT_RETURN_VA, vertical)
+    return [x for _, x in got] == want
+
+
 def installed_vertical(t):
     """
     True/False for which variant is in the module, None if none is.
@@ -854,7 +1079,7 @@ def installed_vertical(t):
 
 def installed_current(t):
     """True only for the cave THIS revision writes."""
-    return cave_length(t) == N_WORDS_XY
+    return cave_length(t) == N_WORDS_XY and init_cave_current(t, True)
 
 
 # ------------------------------------------------------------------ patches
@@ -893,6 +1118,14 @@ def build_patches(img, starts, log=print, vertical=True):
     entry, out = ff7nx_cave.emit_laid_out(pool, build, span=0x80000)
     out[HOOK_VA] = A.b(HOOK_VA, entry)
 
+    def build_init(_entry, addr):
+        return init_cave_words(addr, INIT_RETURN_VA, vertical)
+
+    init_entry, init_words = ff7nx_cave.emit_laid_out(
+        pool, build_init, span=0x80000)
+    out.update(init_words)
+    out[INIT_HOOK_VA] = A.b(INIT_HOOK_VA, init_entry)
+
     skip_entry, skip_words = _trampoline(pool, log)
     if skip_entry is not None:
         out.update(skip_words)
@@ -905,6 +1138,9 @@ def build_patches(img, starts, log=print, vertical=True):
     log('  scripted camera clamp cave: %d words in padding, entry +%#x  (%s)'
         % (n_words(vertical), entry,
            'x and y' if vertical else 'x only'))
+    log('  SCR2D initialization clamp: %d words, entry +%#x; one-shot and '
+        'smooth camera paths now use identical horizontal bounds'
+        % (init_n_words(vertical), init_entry))
     if vertical:
         log('    x -> [left + %d, right - %d]   the bounds '
             'field_clip_with_camera_range uses' % (HALF_W, HALF_W))
@@ -926,6 +1162,20 @@ def revert_patches(t, log=print):
     out = {HOOK_VA: HOOK_ORIG}
     for va in walk_physical(t, n=n):
         if va != HOOK_VA:
+            out[va] = 0
+    if init_state(t) == 'patched':
+        init_n = init_cave_length(t)
+        if init_n is None:
+            log('  ! the SCR2D initializer cave does not end in a branch to '
+                '+%#x at any length this module has written; refusing to '
+                'erase unknown code' % INIT_RETURN_VA)
+            return None
+        if init_n in INIT_LEGACY_LENGTHS:
+            log('  the initializer cave is the UNGATED %d-word version '
+                '(no is_fieldmap_wide test) -- removing it' % init_n)
+        out[INIT_HOOK_VA] = INIT_HOOK_ORIG
+        for va in walk_physical(t, hook=INIT_HOOK_VA, n=init_n,
+                                return_va=INIT_RETURN_VA):
             out[va] = 0
     # ... and the status gate, if this module installed one. The trampoline is
     # two words and it is only ever reached from that one branch, so decoding
@@ -1018,6 +1268,48 @@ def emulate(delta_x, left, right, hdr=0x2200000,
             'w0': cpu.get(0, True) & 0xFFFFFFFF}
 
 
+def emulate_init(delta_x, left, right, hdr=0x2200000,
+                 delta_y=0, top=0, bottom=0, no_field=False,
+                 vertical=True, vclip=1):
+    """Execute the SCR2D initializer cave against fake guest memory."""
+    Cpu, arm64emu = _emu()
+    mem = arm64emu.Mem()
+    base = 0x4000000
+    n = init_n_words(vertical)
+    mem.setu(HDR_PTR, 0 if no_field else hdr, 4)
+    for off, value in ((RANGE_LEFT, left), (RANGE_RIGHT, right),
+                       (RANGE_TOP, top), (RANGE_BOTTOM, bottom)):
+        mem.setu(hdr + off, value & 0xFFFF, 2)
+    mem.setu(hdr + VCLIP_FLAG_OFF, vclip & 0xFF, 1)
+    mem.setu(DELTA_X, delta_x & 0xFFFF, 2)
+    mem.setu(DELTA_Y, delta_y & 0xFFFF, 2)
+    words = init_cave_words(lambda i: base + 4 * i,
+                            base + 4 * n, vertical)
+
+    class Stub(Cpu):
+        def step(self, w, pc):
+            if (w & 0xFC000000) == 0x94000000:
+                return None
+            return Cpu.step(self, w, pc)
+
+    cpu = Stub(mem)
+    CONTEXT = 0x2400000
+    cpu.set(20, CONTEXT)
+    # At THIS hook w19 is &world_move_status (0xCC0DA7) -- the recompiled
+    # block reaches field_A, field_C, the deltas and the movie flags through
+    # it, and the return point does `mov w0, w19`. So it is both the gate's
+    # base register and a live value, and the cave must give it back.
+    cpu.set(19, WORLD_MOVE_STATUS)
+    out = cpu.run(base, words, stop_at=base + 4 * n)
+
+    def s16(v):
+        return v - 0x10000 if v & 0x8000 else v
+
+    return {'x': s16(mem.u(DELTA_X, 2)),
+            'y': s16(mem.u(DELTA_Y, 2)), 'return': out,
+            'x19': cpu.get(19, True), 'x20': cpu.get(20, True)}
+
+
 # ------------------------------------------------------------------ verify
 def check_encoding(log=print, vertical=True):
     try:
@@ -1044,6 +1336,46 @@ def check_encoding(log=print, vertical=True):
     return ok
 
 
+def check_init_encoding(log=print, vertical=True):
+    try:
+        from capstone import Cs, CS_ARCH_ARM64, CS_MODE_LITTLE_ENDIAN
+    except ImportError:
+        log('  (capstone not installed -- initializer encodings NOT checked)')
+        return True
+    base = 0x2000
+    words = init_cave_words(lambda i: base + 4 * i,
+                            base + 4 * init_n_words(vertical), vertical)
+    blob = b''.join(struct.pack('<I', x) for x in words)
+    got = list(Cs(CS_ARCH_ARM64, CS_MODE_LITTLE_ENDIAN).disasm(blob, base))
+    if len(got) != len(words):
+        log('  ! capstone decoded %d of %d initializer words'
+            % (len(got), len(words)))
+        return False
+    # STRUCTURAL, not positional. The first version of this check named word
+    # 12 and word 13, and adding the two-word `is_fieldmap_wide` gate at word
+    # 6 moved them to 14 and 15 -- a passing check turned into a failing one
+    # without anything being wrong. What actually matters is that the gate is
+    # there, that the absolute delta address is still materialised by a
+    # mov/movk pair, and that the cave ends in a branch.
+    # The zero-travel guard is ONE condition code, and getting it wrong is
+    # invisible in a word count -- GT and GE differ in four bits. So it is
+    # checked by name, out of capstone, not by length.
+    ge = [i for i, g in enumerate(got) if g.mnemonic == 'b.ge']
+    gt = [i for i, g in enumerate(got) if g.mnemonic == 'b.gt']
+    if not ge:
+        log('  ! the initializer cave has no b.ge -- the zero-travel guard '
+            'is the whole southmk2 fix and it is not there')
+        return False
+    if gt:
+        log('  ! the initializer cave still contains b.gt at word %d -- that '
+            'guard is dead on x (0 of 711 fields) and pins the 394 '
+            'zero-travel fields' % gt[0])
+        return False
+    pairs = [j for j in range(len(got) - 1)
+             if got[j].mnemonic == 'mov' and got[j + 1].mnemonic == 'movk']
+    return bool(pairs) and got[-1].mnemonic == 'b'
+
+
 def verify(main=None, log=print):
     fails = []
 
@@ -1055,6 +1387,9 @@ def verify(main=None, log=print):
     log('  encodings, cross-checked against capstone rather than the encoder:')
     ck(check_encoding(log), 'every word disassembles to what it is '
                                       'named in DISASM')
+    ck(check_init_encoding(log), 'the SCR2D initializer cave fully '
+                                 'disassembles, including absolute delta '
+                                 'address materialization and return')
 
     log('')
     log('  the cave, executed, against clamp() derived from the x86:')
@@ -1077,6 +1412,53 @@ def verify(main=None, log=print):
         good = got['x'] == want
         ck(good, '%5d..%-5d  %6d -> %6d  (model %6d, travel %4d)  %s'
            % (left, right, dx, got['x'], want, travel(left, right), what))
+
+    log('')
+    log('  SCR2D INITIALIZATION -- the missing FFNx path behind the abrupt')
+    log('  horizontal offsets in mds7pb_1:')
+    for dx, want, what in ((-96, -42, 'Barret entry: 54 field units'),
+                           (64, 42, 'chair dialogue: outside +42 bound')):
+        got = emulate_init(dx, -202, 202, delta_y=-83,
+                           top=-256, bottom=256, vclip=0)
+        active = emulate(dx, -202, 202, delta_y=-83,
+                         top=-256, bottom=256, vclip=0)
+        ck(got['x'] == want and got['x'] == active['x'],
+           '%s: SCR2D %d -> %d, identical to active path %d'
+           % (what, dx, got['x'], active['x']))
+        ck(got['y'] == -83,
+           '%s: vertical target remains -83 because this field has no '
+           'vertical-clip opt-in' % what)
+    log('')
+    log('  ...AND THE ZERO-TRAVEL GUARD. A clamp whose bounds meet is not a')
+    log('  clamp: it admits one value and replaces the authored one-shot')
+    log('  camera with a constant. 394 of 711 shipped fields are like that.')
+    for dx in (32, -32, 96, -162):
+        got = emulate_init(dx, -160, 160, vclip=0)
+        ck(got['x'] == dx,
+           'southmk2 (shipped -160..160, bounds [0,0]): SCR2D %5d stays '
+           '%5d -- the post-Airbuster black bar survives' % (dx, got['x']))
+    for dx, want in ((-96, -42), (64, 42), (-162, -42), (162, 42)):
+        got = emulate_init(dx, -202, 202, vclip=0)
+        ck(got['x'] == want,
+           'mds7pb_1 (shipped -202..202, bounds [-42,42]): SCR2D %5d -> '
+           '%4d -- the 7th Heaven snap stays fixed' % (dx, got['x']))
+    for dx in (-40, 0, 40):
+        got = emulate_init(dx, -202, 202, vclip=0)
+        ck(got['x'] == dx, 'and a legal position is a fixed point: %5d' % dx)
+    got = emulate_init(32, -160, 160, delta_y=-32, top=-120, bottom=120,
+                       vclip=1)
+    ck(got['x'] == 32 and got['y'] == -32,
+       'the guard covers BOTH legs: a zero-travel y is left alone too, '
+       'which is the elevator freeze ff7nx_vclip documents')
+    ck(N_WORDS_X == 24 and init_n_words(False) == 24,
+       'the guard costs no words -- GT became GE')
+
+    got = emulate_init(-96, -202, 202, vclip=0)
+    ck(got['return'] == 0x4000000 + 4 * init_n_words(True),
+       'the initializer rejoins its requested continuation after clamping')
+    ck(got['x20'] == 0x2400000,
+       'the SCR2D cave preserves x20, the initializer\'s live guest-CPU '
+       'context required by its continuation')
 
     log('')
     log('  southmk2, THE FIELD v5 WAS BUILT AROUND -- and the arithmetic')
@@ -1293,6 +1675,13 @@ def verify(main=None, log=print):
             ck([x for _, x in got] == want,
                'every word in the WRITTEN module matches what cave_words() '
                'lays out at those exact addresses')
+    ist = init_state(t)
+    log('    +%#09X  %s   SCR2D init %s'
+        % (INIT_HOOK_VA, _fmt(w32(t, INIT_HOOK_VA)), ist))
+    if ist == 'patched':
+        ck(init_cave_current(t, True) or init_cave_current(t, False),
+           'the installed SCR2D initializer cave exactly matches this '
+           'revision and returns to +%#x' % INIT_RETURN_VA)
 
     # Does the vertical evidence actually bite? Rewrite the module's own
     # `sub w9, w8, #120` as `#112` -- i.e. manufacture the world HANDOFF-93
@@ -1318,7 +1707,9 @@ def verify(main=None, log=print):
             ('an extra write to w19 inside the function', FUNC_LO + 0x100,
              0x52800013),
             ('a hook that is neither the stock word nor a branch',
-             HOOK_VA, 0xD503201F)):
+             HOOK_VA, 0xD503201F),
+            ('an initializer hook that is neither stock nor a branch',
+             INIT_HOOK_VA, 0xD503201F)):
         mut = bytearray(t)
         struct.pack_into('<I', mut, va, word)
         ck(bool(check_anchors(bytes(mut))), '%s is refused' % name)
@@ -1359,6 +1750,8 @@ def show(main, log=print):
     t = _text(main)
     log('  %s' % main)
     log('    +%#09X  %s  %s' % (HOOK_VA, _fmt(w32(t, HOOK_VA)), state(t)))
+    log('    +%#09X  %s  SCR2D init %s'
+        % (INIT_HOOK_VA, _fmt(w32(t, INIT_HOOK_VA)), init_state(t)))
     if state(t) == 'patched':
         n = cave_length(t)
         vert = installed_vertical(t)
@@ -1382,9 +1775,13 @@ def apply(main, revert=False, log=print, vertical=True):
         return 1
 
     if revert:
-        if state(t) == 'stock':
+        if state(t) == 'stock' and init_state(t) == 'stock':
             log('  scripted camera clamp: not installed')
             return 0
+        if state(t) != 'patched':
+            log('  ! updater cave is not installed but the SCR2D hook is; '
+                'refusing a partial/unknown reversion')
+            return 1
         words = revert_patches(t, log)
         if words is None:
             return 1
@@ -1402,10 +1799,16 @@ def apply(main, revert=False, log=print, vertical=True):
                 log('  ! run --revert, then --apply. Refusing to write two '
                     'caves in one pass.')
                 return 1
-            if got == vertical:
+            if got == vertical and init_cave_current(t, vertical):
                 log('  scripted camera clamp: already installed (%s)'
                     % ('x and y' if vertical else 'x only'))
                 return 0
+            if got == vertical and init_state(t) == 'stock':
+                log('  scripted camera clamp: updater cave is installed but '
+                    'the FFNx SCR2D initialization clamp is missing')
+                log('  ! run --revert, then --apply. Refusing to layer a '
+                    'second revision over the installed cave.')
+                return 1
             # An x-only cave is in the module and the y leg is wanted, or the
             # reverse. Upgrading in place would leave the old words live, so
             # take the old one out first rather than layering. This is the
@@ -1420,7 +1823,8 @@ def apply(main, revert=False, log=print, vertical=True):
             log('  ! run --revert, rebuild, then apply. Refusing to write two '
                 'caves in one pass.')
             return 1
-        if not check_encoding(log, vertical):
+        if not check_encoding(log, vertical) \
+                or not check_init_encoding(log, vertical):
             log('! scripted camera clamp: an encoder disagrees with capstone; '
                 'refusing')
             return 1
@@ -1451,6 +1855,12 @@ def apply(main, revert=False, log=print, vertical=True):
             log('  ! the written cave differs from cave_words(). '
                 'DO NOT BOOT THIS.')
             return 1
+        if not init_cave_current(t2, vertical):
+            log('  ! the written SCR2D initializer cave differs from '
+                'init_cave_words(). DO NOT BOOT THIS.')
+            return 1
+        log('  read back: +%#09X is patched; SCR2D initializer cave '
+            'matches exactly' % INIT_HOOK_VA)
         log('  the scripted camera is now clamped to '
             '[range.left + %d, range.right - %d]%s, the same bounds '
             'field_clip_with_camera_range uses on the normal path. Every '

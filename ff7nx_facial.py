@@ -1293,6 +1293,47 @@ SITES = (
 )
 SPEAK_SITE = ('speak', SPEAK_HOOK, SPEAK_ORIG, 'MESSAGE opcode handler entry')
 
+# ---------------------------------------------------------------------------
+# THE BLINK HOOK IS WITHHELD BY DEFAULT -- FINDINGS-515
+# ---------------------------------------------------------------------------
+# Isolated on hardware: with this hook installed, the guest heap drains as
+# fields are walked until an allocation fails. `ff7nx_heap` NOPs the
+# allocation-failure abort, so the failure is SILENT and the next large
+# request draws from whatever is at the null pointer -- the reported battle
+# texture corruption, the low frame rate and the freeze.
+#
+# The measurements, all on the same repro and all with `heapabort --on`:
+#
+#     everything on          corruption / abort
+#     initclamp   off        corruption   -- the camera is not it
+#     facial      off        CLEAN, repeatedly
+#     facial-speak off       corruption   -- not the voice-driven mouth
+#     facial-kawai off       corruption   -- not the emotional eye art
+#     facial-blink off       CLEAN, 2-3 runs, and blinking still works
+#
+# The last row is what this constant ships. Blinking is VANILLA -- the port
+# blinked long before this module existed -- so withholding the hook costs
+# only the emotional eye expressions (index >= 2). Everything else stays:
+# the mouth apply, KAWAI, the free cave and the voice lip-flap sites are all
+# still installed, which is exactly the configuration that was tested.
+#
+# WHY NOT JUST SKIP THE WHOLE MODULE: because that is a different, untested
+# configuration. Ship what was measured.
+#
+# The caves are still built and still placed in padding; only the branch at
+# `BLINK_HOOK` is withheld, so the module is byte-identical to the tested
+# `diag_toggle.py facial-blink --off` state.
+#
+# Set SEVENTH_NX_FACIAL_BLINK=1 to install it anyway -- for testing a fix,
+# not for shipping.
+BLINK_ENV = 'SEVENTH_NX_FACIAL_BLINK'
+
+
+def blink_hook_wanted():
+    import os
+    return os.environ.get(BLINK_ENV, '').strip().lower() in (
+        '1', 'true', 'yes', 'on')
+
 
 def sites(voice_bss=None):
     return SITES + ((SPEAK_SITE,) if voice_bss is not None else ())
@@ -1351,6 +1392,8 @@ def build_all(pool, bss, voice_bss=None, flap_shift=FLAP_SHIFT_60):
     placed.update(words)
 
     for name, site, _orig, _what in sites(voice_bss):
+        if name == 'blink' and not blink_hook_wanted():
+            continue                      # FINDINGS-515; cave built, unhooked
         placed[site] = A.b(site, entries[name])
     return entries, placed
 
@@ -1393,8 +1436,14 @@ def apply_to_nso(src, dest, space=None, voice_bss=None, fps=60):
 
     out = AC.pack(blob, space.commit(), BSS_BYTES)
     _segs, check_raw = AC.segments(out)
-    for name, site, _orig, _what in sites(voice_bss):
+    for name, site, orig, _what in sites(voice_bss):
         got = struct.unpack_from('<I', check_raw[0], site)[0]
+        if name == 'blink' and not blink_hook_wanted():
+            # Withheld on purpose: the site must still hold the STOCK word.
+            if got != orig:
+                raise ValueError('facial: the blink site was withheld but '
+                                 'does not hold the stock word')
+            continue
         if got != A.b(site, entries[name]):
             raise ValueError('facial: the %s hook did not survive the repack'
                              % name)
@@ -1405,7 +1454,8 @@ def apply_to_nso(src, dest, space=None, voice_bss=None, fps=60):
     os.makedirs(os.path.dirname(os.path.abspath(dest)), exist_ok=True)
     with open(dest, 'wb') as handle:
         handle.write(out)
-    return {'bss_bytes': BSS_BYTES, 'bss_base': bss, 'entries': entries,
+    return {'blink_hook': blink_hook_wanted(),
+            'bss_bytes': BSS_BYTES, 'bss_base': bss, 'entries': entries,
             'cave_words': len(placed) - len(sites(voice_bss)),
             'table_bytes': 0, 'models': MAX_MODELS, 'max_index': MAX_INDEX,
             'lip_flap': voice_bss is not None, 'flap_shift': flap_shift,

@@ -7840,6 +7840,7 @@ def _bake_widescreen_ranges(archive, payloads, widescreen, log):
         log(f'  ! vertical clip: pass skipped ({exc}); the scripted camera '
             f'will not be clamped vertically on any field')
 
+
     gap = ff7nx_ws.config_report(config)
     if gap['point_shift']:
         log(f'    note: {len(gap["point_shift"])} field(s) also ask for '
@@ -13355,6 +13356,21 @@ def apply_facial(sdout, dump, plan, log=lambda *_: None, produced=()):
             'did before this pass existed')
         return []
     os.replace(tmp, dest)
+    if not report.get('blink_hook'):
+        log('  ** THE BLINK HOOK IS WITHHELD -- FINDINGS-515 **')
+        log('     Isolated on hardware: with it installed the guest heap '
+            'drains as fields are walked until an allocation fails, and '
+            'because ff7nx_heap NOPs the failure abort that shows up as '
+            'corrupt battle textures, low frame rate and a freeze rather '
+            'than a crash.')
+        log('     WHAT YOU LOSE: the emotional eye expressions (index >= 2).')
+        log('     WHAT YOU KEEP: blinking -- that is VANILLA and was never '
+            'this module\'s -- plus the mouth, KAWAI, the free cave and the '
+            'voice lip flap. This is exactly the configuration tested clean '
+            'with `diag_toggle.py facial-blink --off`.')
+        log('     The caves are still built and placed; only the branch at '
+            'the hook is withheld. Set %s=1 to install it anyway -- for '
+            'testing a fix, not for shipping.' % ff7nx_facial.BLINK_ENV)
     log('  eyes: the blink index now names a texture. `eye_<model>_<n>` '
         'first, then the eye set\'s own `<name>_<n>` -- 164 of the 388 HRC '
         'models the shipped fields load have their own pair, and the cast '
