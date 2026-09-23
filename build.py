@@ -10570,6 +10570,13 @@ FPS_SIG_TAG = 'fps='
 # `exefs/main` through nso_patcher -- none of them touch an .lgp, a .tex or a
 # field file. Adding a name here is only safe under that rule.
 MAIN_ONLY_ENV = frozenset((
+    # BUILD 514. The facial blink hook is withheld by default (FINDINGS-515)
+    # and this puts it back for testing a fix. `ff7nx_facial` writes only
+    # into exefs/main, so this cannot change an archive byte -- and without
+    # this line the generic SEVENTH_NX* sweep folds it into flevel's INPUTS
+    # key and `SEVENTH_NX_REUSE_ARCHIVES=1` refuses with "flevel inputs or
+    # build code changed". Same rule as FPS_ENV and DW_HRC_ENV.
+    'SEVENTH_NX_FACIAL_NO_BLINK',  # ff7nx_facial    withhold the blink hook
     'SEVENTH_NX_FX_DISC',        # ff7nx_fxdisc      the floor disc radius
     'SEVENTH_NX_FX_DEPTH',       # ff7nx_fxdepth     the disc's DEPTH only
     'SEVENTH_NX_FX_ORIGIN_Z',    # ff7nx_fxorigin    where the disc's centre is
@@ -13357,20 +13364,21 @@ def apply_facial(sdout, dump, plan, log=lambda *_: None, produced=()):
         return []
     os.replace(tmp, dest)
     if not report.get('blink_hook'):
-        log('  ** THE BLINK HOOK IS WITHHELD -- FINDINGS-515 **')
+        log('  ** THE BLINK HOOK IS WITHHELD ON REQUEST **')
         log('     Isolated on hardware: with it installed the guest heap '
             'drains as fields are walked until an allocation fails, and '
             'because ff7nx_heap NOPs the failure abort that shows up as '
             'corrupt battle textures, low frame rate and a freeze rather '
             'than a crash.')
-        log('     WHAT YOU LOSE: the emotional eye expressions (index >= 2).')
-        log('     WHAT YOU KEEP: blinking -- that is VANILLA and was never '
-            'this module\'s -- plus the mouth, KAWAI, the free cave and the '
-            'voice lip flap. This is exactly the configuration tested clean '
-            'with `diag_toggle.py facial-blink --off`.')
+        log('     WHAT YOU LOSE: the emotional eye expressions (index >= 2) '
+            'AND THE VOICE LIP FLAP -- the flap decision is made inside this '
+            'same cave, so although the mouth hook is still installed '
+            'nothing ever asks for a flap and mouths stay shut.')
+        log('     You have asked for this with %s. The heap leak it was '
+            'introduced for is FIXED (build 517), so the normal build '
+            'installs the hook.' % ff7nx_facial.NO_BLINK_ENV)
         log('     The caves are still built and placed; only the branch at '
-            'the hook is withheld. Set %s=1 to install it anyway -- for '
-            'testing a fix, not for shipping.' % ff7nx_facial.BLINK_ENV)
+            'the hook is withheld.')
     log('  eyes: the blink index now names a texture. `eye_<model>_<n>` '
         'first, then the eye set\'s own `<name>_<n>` -- 164 of the 388 HRC '
         'models the shipped fields load have their own pair, and the cast '

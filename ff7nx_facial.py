@@ -120,7 +120,7 @@ GUEST_TRANSLATE = AC.GUEST_TRANSLATE
 # lower, the complement of HS -- is not among them, and guessing 0x3 wrong
 # would encode a loop that runs once. tests/test_facial.py decodes every
 # branch this file emits through capstone.
-EQ, NE, HS, LO, LE = A.EQ, A.NE, A.HS, 0x3, A.LE
+EQ, NE, HS, LO, LE, HI = A.EQ, A.NE, A.HS, 0x3, A.LE, A.HI
 
 
 # ------------------------------------------------------------------ module
@@ -205,6 +205,32 @@ P_NUMGROUPS = 0x10
 P_PER_GROUP = 0x38
 P_GROUP_ARRAY = 0x3C
 MOUTH_GROUP = 3                       # what FFNx repoints; guarded on numgroups
+
+# GROUP 3 IS NOT ALWAYS A MOUTH -- AND THAT IS THE WHOLE oldm3 BUG.
+#
+# FFNx's rule is "group 3 is the mouth", copied here. On `ujun_wstd_oldm3`
+# and the other hunched old men it is not: group 3 is the ENTIRE textured
+# head -- 162 polygons on the 1024x1024 NPC20.TEX -- so pointing it at a
+# 32x32 mouth texture replaced the whole face and the head flashed pink
+# while he spoke.
+#
+# The first fix for that banned the generic mouth for EVERY model carrying
+# the NPC eye-set marker. It stopped the pink head and it also stopped the
+# lip flap on every NPC in the game, because `npc_mouth_<n>` does not exist
+# in the shipped art -- MEASURED: npc_mouth_2 ABSENT, c_mouth_2 PRESENT. The
+# cast kept flapping, everyone else went silent, which is what was reported.
+#
+# This is the narrow test the model itself answers. A mouth is a quad; a
+# head is not. `polygon_group_array[MOUTH_GROUP].numvert` separates them by
+# an order of magnitude, so the flap is refused on geometry rather than on a
+# blanket rule about who is an NPC.
+P_POLY_GROUPS = 0x5C                  # ff7_polygon_set.polygon_group_array
+PG_STRIDE = 0x24                      # sizeof(struct polygon_group)
+PG_NUMVERT = 0x04                     # polygon_group.numvert
+MOUTH_MAX_VERTS = 32                  # a quad is 4; oldm3's head group is 162
+                                      # polygons. Anything in between splits
+                                      # them; 32 keeps 8x margin over a mouth
+                                      # and stays far under any head.
 
 # struc_3, from the frame field_load_model_eye_tex builds at ebp-0x78
 S3_BYTES = 0x80
@@ -1046,14 +1072,11 @@ def build_mload_cave(cave, addr, bss, gen_entry):
     # particular it must never fall through to c_mouth_N: many NPC heads have
     # a fourth material group that covers the whole face rather than a mouth
     # quad, and feeding Cloud's tiny mouth texture to it recolours the head.
-    a.emit(A.ldrb(9, 20, SL_FLAGS))
-    a.emit(A.lsr(9, 9, 1))
-    a.emit(A.and_mask(9, 9, 1))
-    a.cbz(9, 'cand1_generic')
-    _emit_name(a, 'm1npc', 28, GS_NAME_M, 24, 20,
-               [('lit', b'npc_mouth_'), ('digit',), ('lit', b'.tim')])
-    a.b('named')
-    a.label('cand1_generic')
+    # The NPC-only `npc_mouth_<n>` probe is GONE. It never resolved -- that
+    # name is not in the shipped art -- so it cost every NPC its lip flap to
+    # protect the handful of models whose group 3 is a whole head. Those are
+    # now refused by MOUTH_MAX_VERTS in the apply cave, on the geometry, so
+    # an NPC takes the generic mouth exactly as it did before that fix.
     a.emit(A.ldr(9, 24, HDR_GENR_LEN))
     a.cbz(9, 'settle')
     _emit_name(a, 'm1', 28, GS_NAME_M, 24, 20,
@@ -1165,6 +1188,15 @@ def build_mouth_apply_cave(cave, addr, bss):
     _gld32(a, 21, P_NUMGROUPS, 27)
     a.emit(A.cmp_imm(27, MOUTH_GROUP + 1))
     a.bcond('out', LO)
+    # Is group 3 actually a mouth? See MOUTH_MAX_VERTS. Seven words, and it
+    # is what lets every NPC flap again without recolouring the old men.
+    _gld32(a, 21, P_POLY_GROUPS, 27)
+    a.cbz(27, 'out')
+    a.emit(A.add_imm(0, 27, PG_STRIDE * MOUTH_GROUP + PG_NUMVERT))
+    a.emit(A.bl(a.pc(), GUEST_TRANSLATE))
+    a.emit(A.ldr(9, 0, 0))
+    a.emit(A.cmp_imm(9, MOUTH_MAX_VERTS))
+    a.bcond('out', HI)                 # a head, not a mouth -- leave it alone
     _gld32(a, 21, P_GROUP_ARRAY, 27)
     a.cbz(27, 'out')
     a.emit(A.add_imm(0, 27, 4 * MOUTH_GROUP))
@@ -1263,17 +1295,52 @@ def build_free_cave(cave, addr, bss):
     AC.mov32(a, 9, G_ANIM_STRIDE)
     a.emit(A.mul(9, 23, 9))
     a.emit(A.add_reg(21, 22, 9))
-    for off, sl in ((A_CUSTOM_L, SL_STOCK_CL), (A_STATIC_L, SL_STOCK_L),
-                    (A_CUSTOM_R, SL_STOCK_CR), (A_STATIC_R, SL_STOCK_R)):
-        a.emit(A.ldr(26, 20, sl))
-        _gst32(a, 21, off, 26)
-    a.label('unload')
-    for sl in (SL_ART_L, SL_ART_R, SL_MOUTH_TEX):
-        a.emit(A.ldr(26, 20, sl))
-        a.cbz(26, 'skip_%02x' % sl)
+    # PUT BACK ONLY WHAT WE ACTUALLY PARKED -- FINDINGS-515.
+    #
+    # The old form wrote all four captured pointers back unconditionally, and
+    # that is the leak. This cave runs at the NEXT field's model teardown, so
+    # the contract "anim still holds what we put there" only survives if
+    # nothing re-created the model's textures in between. A BATTLE DOES, and
+    # so does exiting to the title: both tear the models down and reload them
+    # without ever reaching this hook. The slot is then stale, and writing it
+    # back put a dead pointer over the texture the game had just made -- that
+    # texture became unreachable and was never freed, once per model per
+    # field, which is why it scaled with fields walked.
+    #
+    # So each side is now checked against the anim entry before anything is
+    # written or freed: restore the stock pointer ONLY where the entry still
+    # holds OUR art, and free our art ONLY in that same case. If the game
+    # replaced it, it is not ours any more -- leave it alone and let the
+    # stock teardown own it.
+    #
+    # The two CUSTOM pointers are no longer written here at all. The loader
+    # clears all four and `build_load_cave` puts the custom pair back in the
+    # same breath, so by teardown the entry already holds them; rewriting
+    # them could only be a no-op or the same stale-pointer damage.
+    for off, stock_sl, art_sl in ((A_STATIC_L, SL_STOCK_L, SL_ART_L),
+                                  (A_STATIC_R, SL_STOCK_R, SL_ART_R)):
+        a.emit(A.ldr(26, 20, art_sl))
+        a.cbz(26, 'keep_%02x' % art_sl)          # nothing of ours parked
+        _gld32(a, 21, off, 9)                    # what the entry holds NOW
+        a.emit(A.cmp_reg(9, 26))
+        a.bcond('keep_%02x' % art_sl, NE)        # the game replaced it
+        # W27, not W9: `_gst32` calls the translator, and only the
+        # callee-saved registers survive that `bl` -- see its docstring. The
+        # first cut of this used W9 and stored the translator's leftovers.
+        a.emit(A.ldr(27, 20, stock_sl))
+        _gst32(a, 21, off, 27)                   # the stock pointer goes back
         a.emit(A.ldr(27, 24, HDR_GCALL))
         _guest_call(a, 19, 27, 24, UNLOAD_MODEL_TEX, [('reg', 26)])
-        a.label('skip_%02x' % sl)
+        a.label('keep_%02x' % art_sl)
+    a.label('unload')
+    # The mouth is never parked in the anim entry -- the stock body resets
+    # `hundred_data_group_array` every frame -- so nothing else can own it
+    # and it is always ours to give back.
+    a.emit(A.ldr(26, 20, SL_MOUTH_TEX))
+    a.cbz(26, 'skip_mouth')
+    a.emit(A.ldr(27, 24, HDR_GCALL))
+    _guest_call(a, 19, 27, 24, UNLOAD_MODEL_TEX, [('reg', 26)])
+    a.label('skip_mouth')
     for off in range(0, SLOT_BYTES, 8):
         a.emit(A.str64(A.XZR, 20, off))
     a.label('next')
@@ -1294,44 +1361,34 @@ SITES = (
 SPEAK_SITE = ('speak', SPEAK_HOOK, SPEAK_ORIG, 'MESSAGE opcode handler entry')
 
 # ---------------------------------------------------------------------------
-# THE BLINK HOOK IS WITHHELD BY DEFAULT -- FINDINGS-515
+# THE BLINK HOOK IS INSTALLED AGAIN -- THE LEAK IS FIXED (build 517)
 # ---------------------------------------------------------------------------
-# Isolated on hardware: with this hook installed, the guest heap drains as
-# fields are walked until an allocation fails. `ff7nx_heap` NOPs the
-# allocation-failure abort, so the failure is SILENT and the next large
-# request draws from whatever is at the null pointer -- the reported battle
-# texture corruption, the low frame rate and the freeze.
+# Build 514 withheld this hook because the guest heap drained as fields were
+# walked until an allocation failed, and `ff7nx_heap` NOPs the failure abort,
+# so it showed up as corrupt battle textures rather than a crash.
 #
-# The measurements, all on the same repro and all with `heapabort --on`:
+# The cause was in `build_free_cave` and is fixed: it wrote all four captured
+# pointers back into the anim entry unconditionally, which is only valid if
+# nothing re-created the model's textures since the capture. A BATTLE does,
+# and so does exiting to the title -- both reload the models without ever
+# reaching FREE_HOOK. The stale write then buried the texture the game had
+# just made, once per model per field.
 #
-#     everything on          corruption / abort
-#     initclamp   off        corruption   -- the camera is not it
-#     facial      off        CLEAN, repeatedly
-#     facial-speak off       corruption   -- not the voice-driven mouth
-#     facial-kawai off       corruption   -- not the emotional eye art
-#     facial-blink off       CLEAN, 2-3 runs, and blinking still works
+# It now restores and frees ONLY where the anim entry still holds our art,
+# and `test_teardown_after_the_game_replaced_the_textures_itself` is that
+# case: it fails on the old code with the fresh pointer overwritten, and
+# passes now.
 #
-# The last row is what this constant ships. Blinking is VANILLA -- the port
-# blinked long before this module existed -- so withholding the hook costs
-# only the emotional eye expressions (index >= 2). Everything else stays:
-# the mouth apply, KAWAI, the free cave and the voice lip-flap sites are all
-# still installed, which is exactly the configuration that was tested.
-#
-# WHY NOT JUST SKIP THE WHOLE MODULE: because that is a different, untested
-# configuration. Ship what was measured.
-#
-# The caves are still built and still placed in padding; only the branch at
-# `BLINK_HOOK` is withheld, so the module is byte-identical to the tested
-# `diag_toggle.py facial-blink --off` state.
-#
-# Set SEVENTH_NX_FACIAL_BLINK=1 to install it anyway -- for testing a fix,
-# not for shipping.
-BLINK_ENV = 'SEVENTH_NX_FACIAL_BLINK'
+# Set SEVENTH_NX_FACIAL_NO_BLINK=1 to withhold it again -- which costs the
+# emotional eye expressions AND the voice lip flap, because the flap
+# decision is made inside this same cave.
+NO_BLINK_ENV = 'SEVENTH_NX_FACIAL_NO_BLINK'
+BLINK_ENV = NO_BLINK_ENV              # kept: build.py reports the name
 
 
 def blink_hook_wanted():
     import os
-    return os.environ.get(BLINK_ENV, '').strip().lower() in (
+    return os.environ.get(NO_BLINK_ENV, '').strip().lower() not in (
         '1', 'true', 'yes', 'on')
 
 
