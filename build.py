@@ -8057,6 +8057,31 @@ def _build_flevel(archive_path, chunks, field_files, romfs, log,
                 'ORDER from this port\'s own records, matched by HRC id -- '
                 'Echo-S renames the models there so nothing matched by name: '
                 '%s' % (len(remapped), ', '.join(sorted(remapped))))
+        # A `while (MVIEF != 0)` wait is `wait until the movie stops`, and on
+        # this runtime MVIEF hands the script a poll counter that only MOVIE
+        # ever resets -- so 1140 polls into a scene the wait cannot end. That
+        # is the bugin1c black-screen hang, measured. Reported either way: a
+        # pass that silently does nothing is how a fix gets lost in a rebuild.
+        retired = echo_s_flevel.RETIRED_MVIEF_WAITS
+        if retired:
+            log('  Echo-S: endless `wait until MVIEF reports 0` retired in '
+                '%d field(s) -- that counter only resets when MOVIE starts, '
+                'so the wait never ends: %s'
+                % (len(retired), ', '.join(sorted(retired))))
+        else:
+            log('  Echo-S: no endless MVIEF wait in the selected field(s)')
+        kept = echo_s_flevel.KEPT_STOCK_MVIEF_WAITS
+        if kept:
+            log('  Echo-S: the same wait is in the STOCK script of %s and was '
+                'left alone -- it runs immediately after MOVIE, while the '
+                'counter is still 0, so it falls straight through'
+                % ', '.join(sorted(kept)))
+        unwalkable = echo_s_flevel.UNWALKABLE_MVIEF_SCAN
+        if unwalkable:
+            log('  Echo-S: a routine would not decode to its end in %d '
+                'field(s), so the MVIEF scan stopped short there (not fatal '
+                '-- nothing was changed in them): %s'
+                % (len(unwalkable), ', '.join(sorted(unwalkable))))
         equivalent = echo_s_flevel.EQUIVALENT_MODEL_LOADERS
         if equivalent:
             log('  Echo-S: %d field(s) name their models differently but '

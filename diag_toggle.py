@@ -71,6 +71,9 @@ if _HERE not in sys.path:
 import ff7nx_camclamp as C                                      # noqa: E402
 import ff7nx_facial as F                                        # noqa: E402
 import ff7nx_daynight as D                                      # noqa: E402
+import ff7nx_dispatch as DP                                     # noqa: E402
+import ff7nx_voice as V                                         # noqa: E402
+import a64 as A                                                 # noqa: E402
 
 NOP = 0xD503201F
 
@@ -119,6 +122,80 @@ SWITCHES = {
         'on_says': 'the day/night cycle is active again.',
         'off_says': 'day/night is OFF -- no tint, no clock. If the camera '
                     'jumps or the hang go with it, that is the cause.',
+    },
+    'voice-field': {
+        # The Echo-S voice runtime, FIELD SIDE ONLY.
+        #
+        #   FIELD_HOOK        the field voice service (builds/owns the player)
+        #   MESSAGE_HOOK      the MESSAGE producer -- what asks for a line
+        #   ASK_PRE_HOOK      the ASK window's producer
+        #   MAPJUMP_HOOK      the map-change latch that retires a line
+        #   NAME_CHANGE_HOOK  the rename window
+        #
+        # DELIBERATELY NOT INCLUDED: BATTLE_HOOK (0x8FB20) and
+        # WORLD_SERVICE_HOOK (0xF1E0EC). `ff7nx_ambient` hooks THE SAME TWO
+        # ADDRESSES, so restoring them would silently tear out half of the
+        # ambient runtime as well and the result would mean nothing. Verified
+        # against the built module before this switch was written.
+        #
+        # Off means no voice is requested or built in fields: dialogue is
+        # silent, and the lip flap stops with it (the flap's third gate is a
+        # live player). Everything else -- battle voice, ambient, the audio
+        # worker -- is untouched.
+        'words': {V.FIELD_HOOK: V.FIELD_ORIG,
+                  V.MESSAGE_HOOK: V.MESSAGE_ORIG,
+                  V.ASK_PRE_HOOK: V.ASK_PRE_ORIG,
+                  V.MAPJUMP_HOOK: V.MAPJUMP_ORIG,
+                  V.NAME_CHANGE_HOOK: V.NAME_CHANGE_ORIG},
+        'on_says': 'the field voice runtime is active again.',
+        'off_says': 'field dialogue is SILENT and mouths do not flap. If the '
+                    'bugin1c hang clears, the voice runtime is holding the '
+                    'script up.',
+    },
+    'moviepoll': {
+        # The 30 fps FMV frame-counter halving, at BOTH sites.
+        #
+        # The mod's movies are re-encoded at 30 fps, so `ff7nx_60fps` halves
+        # the movie frame counter and the MVIEF poll counter to keep scripted
+        # cues on their original 15 fps frame numbers. Both do a plain
+        # `lsr #1` -- floor.
+        #
+        # MEASURED over the shipped movies: the 30 fps encode produces 2n-1
+        # frames, not 2n, so the halved counter tops out ONE SHORT of the
+        # number the 15 fps original reached:
+        #
+        #     zmind01  135 -> 269 -> 134   (bugin1c, the observatory)
+        #     zmind02  135 -> 269 -> 134
+        #     zmind03  225 -> 449 -> 224
+        #     southmk  242 -> 483 -> 241
+        #
+        # A script that waits for the movie's LAST frame therefore waits for
+        # a number that never arrives. bugin1c polls MVIEF 24 times over the
+        # zmind movies and hangs on a black screen with the music still
+        # playing, which is that shape exactly.
+        #
+        # OFF restores both stock words: the counters run at the raw 30 fps
+        # rate. Scripted cues keyed to frame numbers then fire EARLY (that is
+        # the bug the halving exists to fix, and the log warns about it for
+        # the opening), so this is a diagnostic and not a setting. If the
+        # bugin1c hang goes away with it off, the halving is implicated and
+        # the fix is to round up rather than down.
+        #
+        # THE ORIGINALS COME FROM `ff7nx_dispatch`, NOT FROM READING THE CAVE.
+        # The first version of this switch guessed them by disassembling the
+        # cave's first instruction, which is right for the poll site (the
+        # cave replays the displaced `ldrh`) and WRONG for the frame site:
+        # +0x42298 is `get_movie_frame`'s TAIL-CALL `b #0xA510`, and the
+        # cave's first word is its own prologue. Writing that prologue back
+        # left the stub falling through instead of tail-calling, and the game
+        # crashed on save load. Declared constants, never inference.
+        'words': {DP.MVIEF_POLL_HOOK: DP.MVIEF_POLL_DISPLACED,
+                  DP.MOVIE_FRAME_TAILCALL: A.b(DP.MOVIE_FRAME_TAILCALL,
+                                               DP.MOVIE_FRAME_DISPATCH)},
+        'on_says': 'the 30 fps counter halving is active again.',
+        'off_says': 'movie counters run raw. Cues keyed to frame numbers '
+                    'fire early -- diagnostic only. If the bugin1c hang '
+                    'clears, the halving is the cause.',
     },
     'facial-blink': {
         # The blink/eye hook (x86 0x649B50 field_blink_3d_model). This is the

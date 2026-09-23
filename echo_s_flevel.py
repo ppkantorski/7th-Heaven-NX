@@ -683,6 +683,243 @@ def validate_akao_offsets(script_section: bytes):
         raise EchoFlevelError('AKAO container has no AKAO header')
 
 
+# --------------------------------------------------- endless MVIEF waits
+#
+# MEASURED on hardware, 2026-09-23: `bugin1c` stopped on a black screen after
+# the observatory FMV with the music still running, and swapping that one
+# field back to its vanilla script (`field_swap.py`) made the scene play.
+# Five runtime candidates had already come back negative.  The disassembly
+# (`field_dis.py`) names the instruction -- Echo-S's script ends the FMV with
+#
+#     fade  ...00 0C 02 00           ; to BLACK
+#     mvief 06 05                    ; v = MVIEF
+#     if2   v != 0  -> out           ; FF7 jumps when the test FAILS
+#     back  0B                       ; -> the mvief
+#
+# which is `do { v = MVIEF; } while (v != 0);` -- wait until the movie stops.
+# Vanilla wrote the same place as `while (v < 0x0491)`, a frame threshold.
+#
+# MVIEF has two return paths, chosen by a byte at guest 0xCC0B68 (read out of
+# the shipped module at the handler entry, 0x979800):
+#
+#     byte[0xCC0B68] != 0  ->  u16 [0xCC0B70], THE POLL COUNTER, then ++
+#     byte[0xCC0B68] == 0  ->  u16 [*0xCBF9D8 + 0x88], the movie object
+#
+# `ff7nx_dispatch` documents the first, and the MOVIE handler at 0x979550
+# resets 0xCC0B70 ONLY when playback starts.  MVIEF itself is the only thing
+# that increments it, so it climbs and never returns to zero.  About 1140
+# polls into that scene `v != 0` is permanently true and the field spins for
+# ever, on the black frame the FADE just produced.
+#
+# THE IDIOM IS NOT ECHO-S'S INVENTION, which is why this pass is general
+# rather than a fix for one field.  MEASURED over all 711 fields of both
+# archives:
+#
+#     vanilla   149 MVIEF   2 `!= 0` waits   both in seto1
+#     shipped   144 MVIEF   3 `!= 0` waits   seto1's two, and bugin1c's
+#
+# `seto1` survives because its wait runs IMMEDIATELY after MOVIE, while the
+# counter is still 0, so it falls straight through.  Same instruction, and
+# the only difference is how many polls have happened first.
+#
+# WHY `<=` AND NOT A THRESHOLD.  Rewriting this to vanilla's `v < 0x0491`
+# would be the faithful spelling, but that constant is a guess about a frame
+# numbering this port does not reproduce, and it can hang if the guess is
+# high.  `v <= 0` cannot: the loop body runs while the test is true, and the
+# MVIEF that just ran has already incremented the count, so it leaves after
+# at most two polls WHATEVER MVIEF returns -- poll counter or movie frame.
+# It is also the configuration that was tested on hardware.
+#
+# WHAT THIS DOES NOT DO.  A wait the STOCK script already has is left alone,
+# matched on the MVIEF bank and address rather than on the field name.  seto1
+# is the case: Echo-S ships that field too, so without the check this pass
+# would rewrite an instruction the game itself wrote and nobody reported.  On
+# this runtime seto1's wait is a no-op either way -- worth remembering if
+# that scene ever looks like it cuts its movie short, but it is not this bug.
+#
+# VERIFIED end to end: `merge_field_payload` on Echo-S's own `bugin1c` file
+# produces a section 1 BYTE-IDENTICAL to the archive that was tested on
+# hardware, and all 702 Echo-S field scripts walk without a rejection.
+OP_MVIEF = 0xFA
+OP_IFSW = 0x16                  # signed word compare
+OP_IFUW = 0x18                  # unsigned word compare -- what bugin1c uses
+IF_WORD_LEN = 8                 # opcode + banks + left u16 + right u16 + cmp + jump
+IF_CMP_OFFSET = 6               # the comparison byte within the instruction
+# FFNx's `opcode_IFSW_compare_sub`: 0 ==, 1 !=, 2 >, 3 <, 4 >=, 5 <=.
+CMP_NOT_EQUAL = 1
+CMP_LESS_OR_EQUAL = 5
+RETIRED_MVIEF_WAITS = []
+# Fields whose wait was left alone because the STOCK script has the same one.
+KEPT_STOCK_MVIEF_WAITS = []
+# Fields where a routine could not be decoded to its end. Reported, never
+# fatal: this pass is a correction, not a validator, and refusing a field the
+# build has always accepted would be a far worse failure than missing a site.
+UNWALKABLE_MVIEF_SCAN = []
+
+
+def _script_code_start(script_section: bytes) -> int:
+    actor_count = script_section[2]
+    akao_count = struct.unpack_from('<H', script_section, 6)[0]
+    return (_SECTION1_FIXED_HEADER + actor_count * 8 + akao_count * 4
+            + actor_count * _SECTION1_ROUTINE_TABLE_BYTES)
+
+
+def _routine_blocks(script_section: bytes):
+    """``[(start, end)]`` for every DISTINCT routine entry, in order.
+
+    Walking straight from the code start to the string table is wrong on a
+    modded script.  `disable_pc_time_cycle_actor` points an actor's 32 entries
+    at a bare RET and leaves its old body in place as orphaned bytes; Echo-S's
+    own edits leave similar tails.  MEASURED: `anfrst_1`, `anfrst_3` and
+    `anfrst_4` all carry an undecodable 0x1A in that dead region, and a
+    straight sweep hits it.  Nothing branches there, so the fix is to decode
+    only what a routine entry actually points at.
+    """
+    actor_count = script_section[2]
+    akao_count = struct.unpack_from('<H', script_section, 6)[0]
+    string_offset = struct.unpack_from('<H', script_section, 4)[0]
+    table = _SECTION1_FIXED_HEADER + actor_count * 8 + akao_count * 4
+    code_start = _script_code_start(script_section)
+    entries = set()
+    for index in range(actor_count * _SECTION1_ROUTINES_PER_ACTOR):
+        at = table + index * 2
+        if at + 2 > len(script_section):
+            break
+        offset = struct.unpack_from('<H', script_section, at)[0]
+        if code_start <= offset < string_offset:
+            entries.add(offset)
+    ordered = sorted(entries)
+    return [(start, ordered[i + 1] if i + 1 < len(ordered) else string_offset)
+            for i, start in enumerate(ordered)]
+
+
+def _decode_block(script_section: bytes, start: int, end: int):
+    """``([(offset, opcode, size)], truncated)`` for one routine.
+
+    A routine that cannot be decoded to its end stops where it stops.  The
+    instructions before that point are still real, so the sites found in them
+    are still real.
+    """
+    stream, cursor = [], start
+    while cursor < end:
+        # CATCH EVERYTHING. `instruction_size` raises whatever its tables
+        # happen to raise: IndexError past the end, ValueError on a bad
+        # length, and -- MEASURED, it broke a build -- KeyError out of
+        # `SPECIAL_OP_CODES[sub_op]`, which only holds 0xF5..0xFF, so any
+        # other byte after a 0x0F SPECIAL throws. Naming the exceptions was
+        # a bet on a third-party table's failure modes, and it lost. The
+        # contract here is `stop, report, change nothing`, and that has to
+        # hold for every way this can fail, including ones not yet seen.
+        try:
+            size = instruction_size(script_section, cursor)
+        except Exception:                                    # noqa: BLE001
+            return stream, True
+        if size <= 0 or cursor + size > end:
+            return stream, True
+        stream.append((cursor, script_section[cursor], size))
+        cursor += size
+    return stream, False
+
+
+def _mvief_wait_sites(script_section: bytes, comparison_wanted):
+    """Offsets of every ``MVIEF``-paired ``if <var> <cmp> 0`` in the script.
+
+    A site has to satisfy BOTH halves or it is not one:
+
+      * an ``IFSW``/``IFUW`` comparing against a LITERAL 0 with ``comparison
+        _wanted``;
+      * an adjacent ``MVIEF`` whose bank and address are EXACTLY the pair the
+        comparison reads.
+
+    The second condition is what keeps this off the ordinary ``if var != 0``
+    tests every field is full of, and the bank/address match makes a
+    coincidence essentially impossible.  Returns ``(sites, truncated)`` where
+    a site is ``(offset, bank, address)``.
+    """
+    sites, truncated = [], False
+    for start, end in _routine_blocks(script_section):
+        stream, cut = _decode_block(script_section, start, end)
+        truncated = truncated or cut
+        for index, (offset, opcode, size) in enumerate(stream):
+            if opcode not in (OP_IFSW, OP_IFUW) or size != IF_WORD_LEN:
+                continue
+            banks = script_section[offset + 1]
+            left_bank, right_bank = banks >> 4, banks & 0x0F
+            left_address = struct.unpack_from('<H', script_section,
+                                              offset + 2)[0]
+            right_value = struct.unpack_from('<H', script_section,
+                                             offset + 4)[0]
+            if right_bank or right_value:
+                continue
+            if script_section[offset + IF_CMP_OFFSET] != comparison_wanted:
+                continue
+            for neighbour in (index - 1, index + 1):
+                if not 0 <= neighbour < len(stream):
+                    continue
+                n_offset, n_opcode, n_size = stream[neighbour]
+                if n_opcode != OP_MVIEF or n_size != 3:
+                    continue
+                if (script_section[n_offset + 1] != left_bank or
+                        script_section[n_offset + 2] != left_address):
+                    continue
+                sites.append((offset, left_bank, left_address))
+                break
+    return sites, truncated
+
+
+def retire_endless_mvief_waits(script_section: bytes, stock_section=None,
+                               field_name=None):
+    """Turn ``while (MVIEF != 0)`` into ``while (MVIEF <= 0)``.
+
+    One byte per site, no length change, so no routine offset moves.
+
+    A wait the STOCK script already has is LEFT ALONE.  `seto1` is the case:
+    it carries this idiom in vanilla, and it survives because its wait runs
+    immediately after MOVIE while the counter is still 0, so it falls straight
+    through.  Rewriting the game's own script to fix a mod's script would be
+    changing something that is not broken, and would put a difference into a
+    field nobody reported.  The match is on bank and address, not merely on
+    the field name, so a genuinely NEW wait in a field that also has a stock
+    one is still retired.
+    """
+    if len(script_section) < _SECTION1_FIXED_HEADER:
+        raise EchoFlevelError('short field script section')
+    # Same contract as `_decode_block`: this pass NEVER refuses a field. A
+    # malformed header here means no site is found, not a build that stops.
+    try:
+        sites, truncated = _mvief_wait_sites(script_section, CMP_NOT_EQUAL)
+    except Exception:                                        # noqa: BLE001
+        sites, truncated = [], True
+    if truncated and field_name and field_name not in UNWALKABLE_MVIEF_SCAN:
+        UNWALKABLE_MVIEF_SCAN.append(field_name)
+    if not sites:
+        return bytes(script_section), 0
+
+    stock_pairs = set()
+    if stock_section is not None:
+        try:
+            stock_sites, _ = _mvief_wait_sites(stock_section, CMP_NOT_EQUAL)
+        except Exception:                                    # noqa: BLE001
+            # A stock script we cannot read is not a licence to rewrite the
+            # mod's. Fail CLOSED: keep every site rather than retire one that
+            # might be the game's own.
+            return bytes(script_section), 0
+        stock_pairs = {(bank, address) for _, bank, address in stock_sites}
+
+    result = bytearray(script_section)
+    changed = 0
+    for offset, bank, address in sites:
+        if (bank, address) in stock_pairs:
+            if field_name and field_name not in KEPT_STOCK_MVIEF_WAITS:
+                KEPT_STOCK_MVIEF_WAITS.append(field_name)
+            continue
+        result[offset + IF_CMP_OFFSET] = CMP_LESS_OR_EQUAL
+        changed += 1
+        if field_name and field_name not in RETIRED_MVIEF_WAITS:
+            RETIRED_MVIEF_WAITS.append(field_name)
+    return bytes(result), changed
+
+
 def model_loader_names(section3: bytes):
     """The model names of a field's section 3, in the index order scripts use.
 
@@ -880,6 +1117,11 @@ def merge_field_payload(stock_payload: bytes, echo_payload: bytes,
     if not _removed_time_actor:
         echo_sections[0], _disabled_time_routines = disable_pc_time_cycle_actor(
             echo_sections[0])
+    # A `while (MVIEF != 0)` wait can never end on this runtime's poll
+    # counter -- see the block above `retire_endless_mvief_waits`. This is
+    # the bugin1c black-screen hang, measured.
+    echo_sections[0], _retired_waits = retire_endless_mvief_waits(
+        echo_sections[0], stock_sections[0], field_name)
     validate_akao_offsets(echo_sections[0])
     # Section 3 travels with section 1 when it can: they are one unit, because
     # a script binds an entity to a model by INDEX into this list.
@@ -976,4 +1218,12 @@ def build_archive(stock_archive: str, echo_field_dir: str, destination: str,
         % (stats['fields'], ', '.join(
             'section %d=%d' % (section, stats['sections'][section])
             for section in sorted(stats['sections']))))
+    # Say it out loud. A pass that silently does nothing is how a fix gets
+    # lost in a rebuild, and this one changes one byte in one field.
+    if RETIRED_MVIEF_WAITS:
+        log('   endless MVIEF wait retired in: %s'
+            % ', '.join(sorted(RETIRED_MVIEF_WAITS)))
+    else:
+        log('   no endless MVIEF wait found in the Echo-S field set')
+    stats['mvief_waits'] = sorted(RETIRED_MVIEF_WAITS)
     return stats
