@@ -1541,6 +1541,11 @@ def run_build(mods, enabled, settings_by_mod, log, progress,
     # builds on everything above; it also rewrites the field frame_time in
     # the ff7_en the 60 FPS pass produced. See ff7nx_fieldpace.
     produced += build.apply_field_pacing(SDOUT_DIR, DUMP, plan, log, produced)
+    # BUILD 533. The zero-travel SCR2D rule; see ff7nx_campreserve.
+    produced += build.apply_cam_preserve(SDOUT_DIR, DUMP, plan, log, produced)
+    # BUILD 528. Diagnostic frame probe, off unless SEVENTH_NX_FRAME_PROBE=1.
+    # Must be the last module pass. See ff7nx_frameprobe.
+    produced += build.apply_frame_probe(SDOUT_DIR, DUMP, plan, log, produced)
     # The custom PIXEL shader sets (background scaler, FXAA). These touch no
     # module at all, so they can go anywhere -- but they must go BEFORE
     # prune_stale, because that is what deletes them again when the setting

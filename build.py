@@ -65,6 +65,8 @@ import ff7nx_modelcull
 import ff7nx_moviealign
 import ff7nx_moviecam
 import ff7nx_fieldpace
+import ff7nx_frameprobe
+import ff7nx_campreserve
 import ff7nx_moviecull
 import ff7nx_moviebars
 import ff7nx_camclamp
@@ -10869,8 +10871,19 @@ MOVIECAM_ONLY_ENV = frozenset((MOVIECAM_INTERP_ENV,
                                # BUILD 523: the opt-in loop rate changes
                                # loose files under music_ogg/, which are
                                # staged every build and are not archives.
-                               ff7nx_ambient.RATE_ENV))
-MOVIECAM_ONLY_MODULES = frozenset(('ff7nx_moviecam.py',))
+                               ff7nx_ambient.RATE_ENV,
+                               # BUILD 528: the frame probe edits exefs/main
+                               # only -- a diagnostic, never an archive.
+                               ff7nx_frameprobe.ENV,
+                               # BUILD 531: the late gate is main-only too.
+                               ff7nx_fieldpace.LATE_ENV,
+                               ff7nx_fieldpace.BATTLE_LATE_ENV,
+                               # BUILD 533: exefs/main only.
+                               ff7nx_campreserve.ENV))
+MOVIECAM_ONLY_MODULES = frozenset(('ff7nx_moviecam.py',
+                                   'ff7nx_frameprobe.py',
+                                   'ff7nx_campreserve.py',
+                                   'ff7nx_deadspace.py'))
 
 ARCHIVE_NEUTRAL_ENV = MAIN_ONLY_ENV | SHADER_ONLY_ENV | MOVIECAM_ONLY_ENV
 ARCHIVE_NEUTRAL_MODULES = (MAIN_ONLY_MODULES | SHADER_ONLY_MODULES
@@ -12733,28 +12746,122 @@ def apply_field_pacing(sdout, dump, plan, log=lambda *_: None, produced=()):
         % (src, '   (previous patch output)' if built else '   (from dump)'))
     tmp = dest + '.fieldpace-tmp'
     try:
-        report = ff7nx_fieldpace.apply_to_nso(src, tmp, divisor)
+        report = ff7nx_fieldpace.apply_to_nso(src, tmp, divisor,
+                                              stock=dump.nso)
     except Exception as exc:                                   # noqa: BLE001
         if os.path.exists(tmp):
             os.remove(tmp)
-        log('! field frame pacing: %s: %s -- stock limiter kept'
+        log('! field frame pacing: %s: %s -- NOT INSTALLED, stock limiter '
+            'kept' % (type(exc).__name__, exc))
+        return []
+    os.replace(tmp, dest)
+    if report.get('late_entry'):
+        log('  late gate at +0x%X (cave +0x%X): an overrun raises the debt '
+            'flag only when the frame is late for 60 by more than %.1f ms '
+            '(elapsed - T >= %.2f ms). Frames that are only late for the %g '
+            'aim are no longer padded into the catch-up mode. %s=off '
+            'removes it'
+            % (ff7nx_fieldpace.LATE_HOOK, report['late_entry'],
+               report['late_ms'], report['late_slack_ms'], divisor,
+               ff7nx_fieldpace.LATE_ENV))
+    else:
+        log('  late gate: off (%s=off)' % ff7nx_fieldpace.LATE_ENV)
+    if report.get('battle_entry'):
+        log('  battle late gate at +0x%X (cave +0x%X): the battle overrun '
+            'raises its debt flag only when the frame is late for 60 by more '
+            'than %.1f ms (elapsed - T >= %.2f ms; battle T has no fudge). '
+            '%s=off removes it'
+            % (ff7nx_fieldpace.BATTLE_LATE_HOOK, report['battle_entry'],
+               report['battle_late_ms'], report['battle_slack_ms'],
+               ff7nx_fieldpace.BATTLE_LATE_ENV))
+    else:
+        log('  battle late gate: off (%s=off)'
+            % ff7nx_fieldpace.BATTLE_LATE_ENV)
+    if report['mode'] == 'hybrid':
+        log('  hybrid deadline (%s=hybrid): release recorded at +0x%X (cave '
+            '+0x%X), baseline lowered after %s, slack %.2f ms'
+            % (ff7nx_fieldpace.ENV, ff7nx_fieldpace.EXIT_HOOK,
+               report['exit_entry'],
+               ', '.join('+0x%X (cave +0x%X)' % (h, e) for h, e in
+                         zip(ff7nx_fieldpace.START_HOOKS,
+                             report['start_entries'])),
+               report['slack_ms']))
+    log('  %d cave words, all branch-free (ANY_SPAN). %s=stock installs '
+        'nothing' % (report['words'], ff7nx_fieldpace.ENV))
+    return [dest] if not built else []
+
+
+def apply_cam_preserve(sdout, dump, plan, log=lambda *_: None, produced=()):
+    """BUILD 533: the zero-travel SCR2D rule. See ff7nx_campreserve."""
+    if not ff7nx_campreserve.enabled():
+        log('')
+        log('camera preserve: off (%s=off) -- BUILD 513 rule kept'
+            % ff7nx_campreserve.ENV)
+        return []
+    src, built = _audio_bridge_base(sdout, dump, log, produced,
+                                    'camera preserve')
+    if src is None:
+        return []
+    dest = os.path.join(sdout, 'atmosphere', 'contents', TITLE_ID, 'exefs',
+                        'main')
+    flevel = os.path.join(sdout, 'atmosphere', 'contents', TITLE_ID, ROMFS,
+                          ARCHIVES['flevel.lgp'])
+    if not os.path.exists(flevel):
+        flevel = os.path.join(HERE, 'game_data_files', 'field', 'flevel.lgp')
+    log('')
+    log('camera preserve (zero-travel SCR2D) ...')
+    tmp = dest + '.campreserve-tmp'
+    try:
+        maplist = ff7nx_daynight.read_maplist(flevel)
+        rep = ff7nx_campreserve.apply_to_nso(src, tmp, maplist, dump.nso)
+    except Exception as exc:                                   # noqa: BLE001
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        log('! camera preserve: %s: %s -- NOT INSTALLED (BUILD 513 rule '
+            'kept: every zero-travel field keeps its SCR2D)'
             % (type(exc).__name__, exc))
         return []
     os.replace(tmp, dest)
-    log('  the stock limiter is kept (divisor %g, debt path, 3x) -- each '
-        'frame now waits for the EARLIER of its stock deadline and "previous '
-        'release + 1/60 s". A normal frame is paced exactly as before; a frame '
-        'whose flip outgrows the %.2f ms of slack the %g aim leaves is no '
-        'longer stretched by it (the mds7 fence-jump drop)'
-        % (divisor, report['slack_ms'], divisor))
-    log('  release recorded at the limiter exit +0x%X (cave +0x%X); baseline '
-        'lowered after field_main_loop\'s frame start %s (catch-up frame '
-        'left stock); %d words, %d-byte BSS at +0x%X. %s=stock installs nothing'
-        % (ff7nx_fieldpace.EXIT_HOOK, report['exit_entry'],
-           ', '.join('+0x%X (cave +0x%X)' % (h, e) for h, e in
-                     zip(ff7nx_fieldpace.START_HOOKS,
-                         report['start_entries'])), report['words'],
-           ff7nx_fieldpace.BSS_BYTES, report['bss'], ff7nx_fieldpace.ENV))
+    log('  initializer clamp redirected to +0x%X (%d words, %s) in dead space; '
+        'a zero-travel field keeps its authored SCR2D only if it drives a '
+        'movie camera: %s. Every other field clamps as FFNx does (tin_1..3 '
+        'train bar). %s=off restores the BUILD 513 rule'
+        % (rep['entry'], rep['words'], 'x and y' if rep['vertical'] else 'x',
+           ', '.join(rep['preserved']), ff7nx_campreserve.ENV))
+    return [dest] if not built else []
+
+
+def apply_frame_probe(sdout, dump, plan, log=lambda *_: None, produced=()):
+    """BUILD 528 diagnostic: per-frame timing, dumped on the 3x toggle.
+
+    OFF unless SEVENTH_NX_FRAME_PROBE=1. It must be the LAST module pass: it
+    wraps call sites and function entries every earlier pass left alone, and
+    refuses (logs and skips) if any of them has been changed.
+    """
+    if not ff7nx_frameprobe.enabled():
+        return []
+    src, built = _audio_bridge_base(sdout, dump, log, produced, 'frame probe')
+    if src is None:
+        return []
+    dest = os.path.join(sdout, 'atmosphere', 'contents', TITLE_ID, 'exefs',
+                        'main')
+    log('')
+    log('frame probe (%s=1) -- DIAGNOSTIC BUILD ...' % ff7nx_frameprobe.ENV)
+    tmp = dest + '.frameprobe-tmp'
+    try:
+        rep = ff7nx_frameprobe.apply_to_nso(src, tmp, dump.nso)
+    except Exception as exc:                                   # noqa: BLE001
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        log('! frame probe: %s: %s -- NOT installed' % (type(exc).__name__,
+                                                        exc))
+        return []
+    os.replace(tmp, dest)
+    log('  %d call sites wrapped, %d words of cave in the dead PSX tile '
+        'rasteriser body at +0x%X, %d-byte BSS at +0x%X'
+        % (rep['sites'], rep['words'], rep['region'], rep['bss'], rep['base']))
+    log('  press the 3x booster to dump: the game closes with a crash report '
+        '(atmosphere/crash_reports). Decode it with frameprobe_read.py')
     return [dest] if not built else []
 
 

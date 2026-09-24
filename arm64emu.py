@@ -21,6 +21,10 @@ M32 = 0xFFFFFFFF
 GARBAGE = 0xDEADBEEFCAFEF00D
 
 
+class Udf(Exception):
+    """`udf #0` executed -- a deliberate trap (ff7nx_frameprobe's dump)."""
+
+
 class Unsupported(Exception):
     pass
 
@@ -110,6 +114,12 @@ class Cpu:
         # is free to touch registers and memory exactly as it would.
         self.native = dict(native or {})
         self.translate_calls = 0
+        # ff7nx_frameprobe: the hardware counter and the TLS base. Each
+        # `mrs cntpct_el0` returns `cntpct` and then advances it by
+        # `cntpct_step`, so a test controls every reading.
+        self.cntpct = 0
+        self.cntpct_step = 0
+        self.tls = 0
         self.sp = 0
         self.executed = 0
         self._block_lo = self._block_hi = None
@@ -215,6 +225,58 @@ class Cpu:
         rn = (w >> 5) & 0x1F
         rm = (w >> 16) & 0x1F
 
+        if w == 0x00000000:                                   # udf #0
+            raise Udf('udf at 0x%X' % pc)
+        if w == 0xD40004C1:                                   # svc #0x26 (Break)
+            raise Udf('svcBreak at 0x%X' % pc)
+        if (w & 0xFFFFFFE0) == 0xD53BE020:                    # mrs Xt,cntpct_el0
+            self.set(rd, self.cntpct)
+            self.cntpct += self.cntpct_step
+            return None
+        if (w & 0xFFFFFFE0) == 0xD53BD060:                    # mrs Xt,tpidrro_el0
+            self.set(rd, self.tls)
+            return None
+        if (w & 0xFFE00C00) == 0xDA800400:                    # csneg Xd,Xn,Xm,c
+            cond = (w >> 12) & 0xF
+            vn = 0 if rn == 31 else self.x[rn]
+            vm = 0 if rm == 31 else self.x[rm]
+            self.set(rd, vn if self.cond(cond) else (-vm) & M64)
+            return None
+        if (w & 0xFFFFFC00) == 0x9E670000:                    # fmov Dd, Xn
+            self.fp[rd] = (0 if rn == 31 else self.x[rn]) & M64
+            return None
+        if (w & 0xFFFFFC00) == 0x9E780000:                    # fcvtzs Xd, Dn
+            v = struct.unpack('<d', struct.pack('<Q', self.fp[rn] & M64))[0]
+            if v != v:
+                r = 0
+            else:
+                r = max(-(1 << 63), min((1 << 63) - 1, int(v)))
+            self.set(rd, r & M64)
+            return None
+        if (w & 0xFFE00C00) == 0xFC000C00:                    # str Dt,[Xn,#i]!
+            imm = (w >> 12) & 0x1FF
+            if imm & 0x100:
+                imm -= 0x200
+            addr = ((self.sp if rn == 31 else self.x[rn]) + imm) & M64
+            self.mem.setu(addr, self.fp[rd] & M64, 8)
+            if rn == 31:
+                self.sp = addr
+            else:
+                self.x[rn] = addr
+            return None
+        if (w & 0xFFC00000) == 0xA8800000:                    # stp Xa,Xb,[Xn],#i
+            imm = (w >> 15) & 0x7F
+            if imm & 0x40:
+                imm -= 0x80
+            rt2 = (w >> 10) & 0x1F
+            addr = self.sp if rn == 31 else self.x[rn]
+            self.mem.setu(addr, 0 if rd == 31 else self.x[rd], 8)
+            self.mem.setu(addr + 8, 0 if rt2 == 31 else self.x[rt2], 8)
+            if rn == 31:
+                self.sp = (addr + imm * 8) & M64
+            else:
+                self.x[rn] = (addr + imm * 8) & M64
+            return None
         if (w & 0xFFFFFFE0) == 0xD53B4200:                    # mrs Xt,nzcv
             self.set(rd, (self.n << 31) | (self.z << 30) |
                      (self.c << 29) | (self.v << 28))
@@ -287,6 +349,27 @@ class Cpu:
             y = struct.unpack('<f', struct.pack('<I', self.fp[rm]))[0]
             self.fp[rd] = struct.unpack(
                 '<I', struct.pack('<f', 0.0 if y == 0 else x / y))[0]
+            return None
+        if (w & 0xFF800000) == 0xD2800000:                    # movz Xd,#i,lsl #hw
+            hw = (w >> 21) & 3
+            self.set(rd, ((w >> 5) & 0xFFFF) << (16 * hw))
+            return None
+        if (w & 0xFF800000) == 0xF2800000:                    # movk Xd,#i,lsl #hw
+            hw = (w >> 21) & 3
+            m = 0xFFFF << (16 * hw)
+            self.set(rd, (self.x[rd] & ~m & M64) | (((w >> 5) & 0xFFFF)
+                                                     << (16 * hw)))
+            return None
+        if (w & 0xFFE0FC00) == 0x1E602000:                    # fcmp Dn,Dm
+            x = struct.unpack('<d', struct.pack('<Q', self.fp[rn] & M64))[0]
+            y = struct.unpack('<d', struct.pack('<Q', self.fp[rm] & M64))[0]
+            if x != x or y != y:
+                self.n, self.z, self.c, self.v = 0, 0, 1, 1
+            else:
+                self.n = int(x < y)
+                self.z = int(x == y)
+                self.c = int(x >= y)
+                self.v = 0
             return None
         if (w & 0xFFE0FC00) == 0x1E202000:                    # fcmp Sn,Sm
             x = struct.unpack('<f', struct.pack('<I', self.fp[rn]))[0]
