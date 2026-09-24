@@ -1537,6 +1537,10 @@ def run_build(mods, enabled, settings_by_mod, log, progress,
     # movie. This preserves the real materia tutorial and redirects only
     # that field to an otherwise unused movie slot.
     produced += build.apply_echo_tutorial(SDOUT_DIR, DUMP, plan, log, produced)
+    # BUILD 525. FFNx's field frame limiter, LAST of the module passes so it
+    # builds on everything above; it also rewrites the field frame_time in
+    # the ff7_en the 60 FPS pass produced. See ff7nx_fieldpace.
+    produced += build.apply_field_pacing(SDOUT_DIR, DUMP, plan, log, produced)
     # The custom PIXEL shader sets (background scaler, FXAA). These touch no
     # module at all, so they can go anywhere -- but they must go BEFORE
     # prune_stale, because that is what deletes them again when the setting

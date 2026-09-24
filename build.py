@@ -64,6 +64,7 @@ import ff7nx_vclip
 import ff7nx_modelcull
 import ff7nx_moviealign
 import ff7nx_moviecam
+import ff7nx_fieldpace
 import ff7nx_moviecull
 import ff7nx_moviebars
 import ff7nx_camclamp
@@ -10862,6 +10863,9 @@ SHADER_ONLY_MODULES = frozenset(('ff7nx_shaders.py',))
 # the module can change a cached archive's bytes, and letting either into the
 # sweep would cost a 40-minute flevel rebuild to toggle a 2 MB camera file.
 MOVIECAM_ONLY_ENV = frozenset((MOVIECAM_INTERP_ENV,
+                               # BUILD 525: exefs/main plus ff7_en, which is
+                               # rewritten every build and is not an archive.
+                               ff7nx_fieldpace.ENV,
                                # BUILD 523: the opt-in loop rate changes
                                # loose files under music_ogg/, which are
                                # staged every build and are not archives.
@@ -12701,6 +12705,59 @@ def _footstep_tick_hz():
     return limiter_fps() or 60.0
 
 
+def _field_tick_hz():
+    """The field loop rate. BUILD 526's hybrid limiter keeps stock pacing,
+    so this is the same number the other bridges use."""
+    return _footstep_tick_hz()
+
+
+def apply_field_pacing(sdout, dump, plan, log=lambda *_: None, produced=()):
+    """Stock field limiter, minus the post-limiter tail. See ff7nx_fieldpace."""
+    if not fps_60_requested():
+        return []
+    if not ff7nx_fieldpace.enabled():
+        log('')
+        log('field frame pacing: stock limiter (%s=stock)'
+            % ff7nx_fieldpace.ENV)
+        return []
+    src, built = _audio_bridge_base(sdout, dump, log, produced,
+                                    'field frame pacing')
+    if src is None:
+        return []
+    dest = os.path.join(sdout, 'atmosphere', 'contents', TITLE_ID, 'exefs',
+                        'main')
+    divisor = limiter_fps() or 60.0
+    log('')
+    log('field frame pacing ...')
+    log('  base main   %s%s'
+        % (src, '   (previous patch output)' if built else '   (from dump)'))
+    tmp = dest + '.fieldpace-tmp'
+    try:
+        report = ff7nx_fieldpace.apply_to_nso(src, tmp, divisor)
+    except Exception as exc:                                   # noqa: BLE001
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        log('! field frame pacing: %s: %s -- stock limiter kept'
+            % (type(exc).__name__, exc))
+        return []
+    os.replace(tmp, dest)
+    log('  the stock limiter is kept (divisor %g, debt path, 3x) -- each '
+        'frame now waits for the EARLIER of its stock deadline and "previous '
+        'release + 1/60 s". A normal frame is paced exactly as before; a frame '
+        'whose flip outgrows the %.2f ms of slack the %g aim leaves is no '
+        'longer stretched by it (the mds7 fence-jump drop)'
+        % (divisor, report['slack_ms'], divisor))
+    log('  release recorded at the limiter exit +0x%X (cave +0x%X); baseline '
+        'lowered after field_main_loop\'s frame start %s (catch-up frame '
+        'left stock); %d words, %d-byte BSS at +0x%X. %s=stock installs nothing'
+        % (ff7nx_fieldpace.EXIT_HOOK, report['exit_entry'],
+           ', '.join('+0x%X (cave +0x%X)' % (h, e) for h, e in
+                     zip(ff7nx_fieldpace.START_HOOKS,
+                         report['start_entries'])), report['words'],
+           ff7nx_fieldpace.BSS_BYTES, report['bss'], ff7nx_fieldpace.ENV))
+    return [dest] if not built else []
+
+
 def _audio_bridge_budget(src, log):
     """Log what contiguous module data is still free before a bridge claims it."""
     try:
@@ -13320,7 +13377,7 @@ def apply_daynight(sdout, dump, plan, log=lambda *_: None, produced=()):
                 'of the cycle is unaffected' % (type(exc).__name__, exc))
             sky_rows = []
         report = ff7nx_daynight.apply_to_nso(
-            src, tmp, bitmap, fps=_footstep_tick_hz(),
+            src, tmp, bitmap, fps=_field_tick_hz(),
             freeze_hour=ff7nx_daynight.freeze_hour_from_env(),
             strength=ff7nx_daynight.strength_from_env(),
             sky_rows=sky_rows)
@@ -13736,7 +13793,7 @@ def apply_field_footsteps(sdout, dump, plan, log=lambda *_: None, produced=()):
     try:
         report = ff7nx_fieldsteps.apply_to_nso(src, tmp, scratch,
                                                terrain=terrain,
-                                               tick_hz=_footstep_tick_hz())
+                                               tick_hz=_field_tick_hz())
     except Exception as exc:                                   # noqa: BLE001
         report = None
         log('! field footsteps: %s: %s' % (type(exc).__name__, exc))

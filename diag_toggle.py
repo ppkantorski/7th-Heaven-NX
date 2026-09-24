@@ -258,6 +258,27 @@ SWITCHES = {
                    'the file would not open; closes = the audio pool.',
         'off_says': 'the file-open exit is back (stock).',
     },
+    'fieldpace-debt': {
+        # BUILD 525's third change, on its own. The stock field limiter has
+        # a DEBT path: a frame that overruns sets 0xCFFA98 and the next call
+        # (field_sub_6388EE) runs an extra, lighter logic tick to catch the
+        # game clock up. Build 525 disabled it (FFNx has none).
+        #
+        # Reported after 525: the 3x booster no longer speeds you up, and
+        # movement feels jagged at 60. Both fit the catch-up tick being gone:
+        # it is how the game logic gets AHEAD of the render rate (the
+        # booster's virtual clock makes every frame overrun), and it is what
+        # keeps game time steady when one frame runs long.
+        #
+        # ON = the stock `mov w21, #1` back (catch-up restored); the new
+        # release-based baseline and the 1/60 frame time stay as they are.
+        'va': 0x9E615C,
+        'on': 0x320003F5,                       # orr w21, wzr, #1 (stock)
+        'off': A.mov_reg(21, 31),               # mov w21, wzr (build 525)
+        'on_says': 'the field limiter\'s catch-up tick is back (stock). Check '
+                   '3x speed and whether movement is smooth again.',
+        'off_says': 'the catch-up tick is disabled again (build 525).',
+    },
     'moviepoll': {
         # The 30 fps FMV frame-counter halving, at BOTH sites.
         #
