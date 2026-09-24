@@ -63,6 +63,7 @@ import ff7nx_letterbox
 import ff7nx_vclip
 import ff7nx_modelcull
 import ff7nx_moviealign
+import ff7nx_moviecam
 import ff7nx_moviecull
 import ff7nx_moviebars
 import ff7nx_camclamp
@@ -9207,7 +9208,57 @@ def _emplace_movies(plan, romfs, sdout, dump, log, progress, produced):
             'frame-rate setting changes')
 
 
-def _emplace_moviecam(sdout, dump, log, produced):
+# The movie camera between records. On by default; `0` puts back the plain
+# duplicating stretch on every track. Writes moviecam.lgp and nothing else --
+# not exefs/main, not a cached archive -- so it is in ARCHIVE_NEUTRAL_ENV.
+MOVIECAM_INTERP_ENV = 'SEVENTH_NX_MOVIECAM_INTERP'
+# A source at or above this rate is taken to carry real motion on every
+# frame. Cosmos FMV 30 measures 29.97 and 30.00 and has no repeated frames;
+# the game's own movies are 15. Nothing ships in between.
+MOVIECAM_TRUE_RATE_MIN = 25.0
+
+
+def moviecam_interp():
+    return os.environ.get(MOVIECAM_INTERP_ENV, '').strip().lower() not in (
+        '0', 'false', 'no', 'off')
+
+
+def _moviecam_true_rate_stems(plan, stems, log):
+    """
+    The camera tracks whose MOVIE really moves 30 times a second.
+
+    Interpolating the camera is only right when the picture behind it moves
+    on every frame. `_emplace_movies` frame-DOUBLES every movie no mod
+    replaced, from the game's own 15 fps copy, so those show each picture
+    twice -- and a camera sliding between two identical pictures would make
+    the models swim against a background that is standing still. That is
+    worse than the step it removes.
+
+    So the question is asked of the SOURCE the build is going to use, per
+    stem: a mod movie is probed, and a movie no mod supplies is 15 fps by
+    construction. A probe that fails for any reason answers "no", which is
+    the shipped behaviour.
+    """
+    out, rates = set(), {}
+    movies = getattr(plan, 'movies', None) or {}
+    for stem in sorted(stems):
+        src = movies.get(stem)
+        if not src:
+            continue
+        try:
+            info = movie_convert.probe(src[0])
+        except Exception as exc:                               # noqa: BLE001
+            log(f'  ! movie camera: could not probe {stem} ({exc}) -- '
+                f'kept on the 15 Hz stretch')
+            continue
+        fps = (info or {}).get('fps') or 0.0
+        rates[stem] = fps
+        if fps >= MOVIECAM_TRUE_RATE_MIN:
+            out.add(stem)
+    return out, rates
+
+
+def _emplace_moviecam(sdout, dump, log, produced, plan=None):
     """
     Extend the movie-camera budget so a 30 fps movie does not run out of
     camera track halfway through.
@@ -9309,27 +9360,70 @@ def _emplace_moviecam(sdout, dump, log, produced):
     rel = os.path.relpath(found, dump.workingdir)
     dest = os.path.join(sdout, 'atmosphere', 'contents', TITLE_ID, ROMFS, rel)
     ratio = movie_convert.NORMALISED_RATIO
-    def stretch(payload):
-        if not payload or len(payload) % CAM_RECORD:
-            return payload * ratio      # not camera data; nothing indexes it
-        body = b''.join(payload[i:i + CAM_RECORD] * ratio
-                        for i in range(0, len(payload), CAM_RECORD))
-        return body + payload[-CAM_RECORD:] * (CAM_TAIL_FRAMES * ratio)
+    assert ff7nx_moviecam.REC == CAM_RECORD
+    # BUILD 522. Repeating each record keeps the camera on the 15 Hz beat
+    # while a true 30 fps movie moves on every frame, so the models composited
+    # over it step against the background. Where the movie really is 30 fps
+    # the in-between record is BLENDED instead -- same length, same even
+    # records, same tail, so index, budget and track still land together.
+    # Cuts, sentinels and frame-doubled movies keep the repeat. See
+    # ff7nx_moviecam for the measurements behind every threshold.
     try:
         arc = lgp.Archive(found)
-        arc.replace({n: stretch(e['payload']) for n, e in arc.index.items()})
+    except Exception as exc:                                   # noqa: BLE001
+        log(f'! moviecam.lgp: {exc} -- left alone')
+        return
+    live = {n[:-4].lower() for n, e in arc.index.items()
+            if n.lower().endswith('.cam') and any(
+                ff7nx_moviecam.valid(e['payload'][i:i + CAM_RECORD])
+                for i in range(0, len(e['payload']) - CAM_RECORD + 1,
+                               CAM_RECORD))}
+    smooth, rates = set(), {}
+    if moviecam_interp():
+        smooth, rates = _moviecam_true_rate_stems(plan, live, log)
+    blended = held = 0
+    new = {}
+    try:
+        for n, e in arc.index.items():
+            stem = n[:-4].lower() if n.lower().endswith('.cam') else None
+            if stem in smooth:
+                data, b, h = ff7nx_moviecam.stretch_interpolated(
+                    e['payload'], ratio, CAM_TAIL_FRAMES)
+                blended += b
+                held += h
+            else:
+                data = ff7nx_moviecam.stretch_repeat(
+                    e['payload'], ratio, CAM_TAIL_FRAMES)
+            new[n] = data
+        arc.replace(new)
         arc.write(dest)
     except Exception as exc:                                   # noqa: BLE001
         log(f'! moviecam.lgp: {exc} -- left alone')
         return
     produced.append(dest)
-    log(f'movie camera: {len(arc.entries)} track(s) stretched x{ratio} -- each '
-        f'{CAM_RECORD}-byte record repeated in place, one per '
-        f'{movie_convert.NORMALISED_FPS} fps frame, '
-        f'+{CAM_TAIL_FRAMES * ratio} held records so a movie a few frames '
-        f'long does not run off the end into a zeroed camera')
+    log(f'movie camera: {len(arc.entries)} track(s) stretched x{ratio} -- one '
+        f'{CAM_RECORD}-byte record per {movie_convert.NORMALISED_FPS} fps '
+        f'frame, +{CAM_TAIL_FRAMES * ratio} held records so a movie a few '
+        f'frames long does not run off the end into a zeroed camera')
     log('              (the reader inlines get_movie_frame at ARM64 0x42078, '
         'so it reads the RAW counter that movie-fps cannot reach)')
+    if not moviecam_interp():
+        log(f'              in-between records REPEATED on every track '
+            f'({MOVIECAM_INTERP_ENV}=0)')
+    elif smooth:
+        log(f'              {len(smooth)} of {len(live)} camera track(s) have '
+            f'a true 30 fps movie and are INTERPOLATED: {blended} in-between '
+            f'record(s) blended, {held} held at a cut or a gap -- '
+            f'{", ".join(sorted(smooth))}')
+        rest = sorted(live - smooth)
+        if rest:
+            log(f'              {len(rest)} keep the repeat -- their movie is '
+                f'the game\'s own, frame-doubled from 15 fps, and a camera '
+                f'moving between identical pictures would make models swim: '
+                f'{", ".join(rest)}')
+    else:
+        log(f'              no camera track has a true 30 fps movie behind it '
+            f'-- every in-between record repeated')
 
 
 def _emplace_sfx(plan, romfs, sdout, dump, log, produced):
@@ -10280,6 +10374,25 @@ def _emplace_ambient(plan, romfs, log, produced):
     else:
         log('         reused all %d unchanged loop file(s); no ambient OGG I/O'
             % total)
+    # BUILD 523. The new-game abort was the engine's own `g_WaveBufferAllocator
+    # alloc failed` -- one fixed 32 MB pool shared by every stream -- and a
+    # loop's ring is rate * channels * 6 bytes. Say what was brought down.
+    conv = list(ff7nx_ambient.CONVERTED)
+    if conv:
+        saved = sum((r - ff7nx_ambient.MAX_RATE) * 2 * 6 for _i, r in conv)
+        log('         %d loop(s) above 48 kHz staged at 48 kHz (%s) -- each '
+            'loop\'s PCM ring comes from the 32 MB audio pool, and the '
+            'console mixes at 48 kHz anyway; the largest ring drops by up '
+            'to %.2f MB' % (len(conv), ', '.join(
+                '%d Hz x%d' % (r, sum(1 for _j, q in conv if q == r))
+                for r in sorted({q for _j, q in conv})),
+                max((r - ff7nx_ambient.MAX_RATE) * 2 * 6 for _i, r in conv)
+                / 1048576.0))
+    elif not ff7nx_ambient.convert_enabled():
+        log('         loops staged at their shipped rate (%s=48k brings the '
+            'ones above 48 kHz down, halving their share of the 32 MB audio '
+            'pool -- opt-in until its loop seam is proven)'
+            % ff7nx_ambient.RATE_ENV)
     if field_table and not battle_table:
         log('         battle ambience is not in this build -- the active '
             'option set selects the field-only folder')
@@ -10743,8 +10856,21 @@ SHADER_ONLY_MODULES = frozenset(('ff7nx_shaders.py',))
 # What the archive fingerprints actually exclude: everything that provably
 # writes somewhere no archive lives. One name for the rule, two lists for the
 # two places it applies.
-ARCHIVE_NEUTRAL_ENV = MAIN_ONLY_ENV | SHADER_ONLY_ENV
-ARCHIVE_NEUTRAL_MODULES = MAIN_ONLY_MODULES | SHADER_ONLY_MODULES
+# BUILD 522. The movie camera interpolation writes `moviecam.lgp` and nothing
+# else, and `_emplace_moviecam` rebuilds that file from the dump on EVERY
+# build -- it is never one of the cached archives. So neither the switch nor
+# the module can change a cached archive's bytes, and letting either into the
+# sweep would cost a 40-minute flevel rebuild to toggle a 2 MB camera file.
+MOVIECAM_ONLY_ENV = frozenset((MOVIECAM_INTERP_ENV,
+                               # BUILD 523: the opt-in loop rate changes
+                               # loose files under music_ogg/, which are
+                               # staged every build and are not archives.
+                               ff7nx_ambient.RATE_ENV))
+MOVIECAM_ONLY_MODULES = frozenset(('ff7nx_moviecam.py',))
+
+ARCHIVE_NEUTRAL_ENV = MAIN_ONLY_ENV | SHADER_ONLY_ENV | MOVIECAM_ONLY_ENV
+ARCHIVE_NEUTRAL_MODULES = (MAIN_ONLY_MODULES | SHADER_ONLY_MODULES
+                           | MOVIECAM_ONLY_MODULES)
 
 
 def _stat_sig(path):
@@ -11553,7 +11679,7 @@ def apply_plan(plan, archive_paths, sdout, log=lambda *_: None,
             log('! flevel.lgp not in workingdir, skipping')
 
     _emplace_movies(plan, romfs, sdout, dump, log, progress, produced)
-    _emplace_moviecam(sdout, dump, log, produced)
+    _emplace_moviecam(sdout, dump, log, produced, plan)
     _emplace_sfx(plan, romfs, sdout, dump, log, produced)
     # AFTER _emplace_sfx, which is where the field route table and its payload
     # offsets become final, and after the ordinary flevel rebuild above, so
@@ -12690,6 +12816,10 @@ def apply_ambient(sdout, dump, plan, log=lambda *_: None, produced=()):
     log('  world/menu stop caves +0x%X / +0x%X; %d-byte BSS at +0x%X'
         % (report['world_entry'], report['menu_entry'], report['bss_bytes'],
            report['scratch']))
+    log('  preflight: before a field loop is constructed the cave opens '
+        'data/music_ogg/ambient/NNNN.ogg itself; if that fails the loop is '
+        'skipped and retried next frame instead of the engine\'s "music file '
+        'can not be loaded" exit(-1) -- the New Game crash (BUILD 524)')
     return [dest] if not built else []
 
 

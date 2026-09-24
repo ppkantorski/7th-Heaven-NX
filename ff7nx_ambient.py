@@ -344,6 +344,144 @@ def _set_safe_music_thread_name(space):
         len(MUSIC_THREAD_NAME_FORMAT_STOCK), b'\0')
 
 
+# THE SAMPLE RATE IS A MEMORY BUDGET  (BUILD 523)
+# ===============================================
+# NativeOggPlayer's PCM ring is `rate * channels * 2 * 3` bytes, carved from
+# the same fixed 32 MB `g_WaveBufferAllocator` pool every music stream, sound
+# effect and voice line uses; SoundBufferImpl.cpp exits the game when it
+# cannot allocate from it ("g_WaveBufferAllocator alloc failed"). MEASURED over the 105 shipped loops: 42 are 96 kHz, one is
+# 192 kHz and one 88.2 kHz. A 96 kHz stereo loop asks for 1,152,000 bytes, a
+# 192 kHz one 2,304,000; at 48 kHz either asks for 576,000.
+#
+# The console mixes at 48 kHz, so nothing above it survives to the speaker
+# anyway -- the renderer resamples it down on every frame. Converting at build
+# time spends that once, here, and halves the loop's share of the pool.
+#
+# Only loops ABOVE 48 kHz are converted. 44.1 kHz loops are smaller than
+# 48 kHz ones already and are copied exactly as before, byte for byte. The
+# loop point stays at sample 0 (every shipped loop is tagged LOOPSTART=0),
+# which is the one loop target valid in every stream -- see voice_ogg.
+#
+# OFF BY DEFAULT, AND WHY.  The conversion works -- 48 kHz stereo out, loop
+# tag kept, 0.998+ correlation with the source -- but MEASURED at the loop
+# WRAP it is not yet clean: the re-encoded end lands 7..13 ms off the
+# source's length, and on 1525 and 1501 the last ~10 ms decays to near
+# silence where the source does not. At LOOPSTART=0 that is a small hole every
+# time the bed wraps. 96 kHz loops have played in the Sector 7 fields for
+# months, so this ships as an opt-in memory-margin lever, not as a fix:
+#
+#     SEVENTH_NX_AMBIENT_RATE=48k     bring loops above 48 kHz down to it
+MAX_RATE = 48000
+RATE_ENV = 'SEVENTH_NX_AMBIENT_RATE'     # `48k` converts; default stages as shipped
+CONVERT_RECIPE = 'AMBIENT-48K-V2 ar=48000 exact-length vorbis-q6 LOOPSTART=0'
+CONVERT_QUALITY = '6'                    # ~192 kbps stereo; the sources run
+                                         # 128-190 kbps, so this loses nothing
+CONVERTED = []                           # (ogg id, source rate) this build
+
+
+def convert_enabled():
+    return os.environ.get(RATE_ENV, '').strip().lower() in ('48k', '48000')
+
+
+def _rate_channels(path):
+    import voice_ogg
+    with open(path, 'rb') as handle:
+        head = handle.read(1 << 16)
+    return voice_ogg._identification(head)
+
+
+def _cache_dir():
+    here = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(here, 'cache', '_ambient_ogg')
+
+
+def _converted_copy(source):
+    """A 48 kHz Vorbis copy of `source` in the build cache, made once.
+
+    Keyed on the source's CONTENT, the recipe and the encoder, so an unchanged
+    loop is never re-encoded and a changed one always is.
+    """
+    import hashlib
+    import subprocess
+    import tempfile
+    import movies
+    import voice_ogg
+    chosen = voice_ogg._chosen()
+    if not chosen:
+        raise ValueError('ambient: no Vorbis encoder -- cannot bring a loop '
+                         'above 48 kHz down (install ffmpeg with libvorbis, '
+                         'or set %s=native)' % RATE_ENV)
+    ffmpeg, encoder, codec_args, oggenc = chosen
+    digest = hashlib.sha1()
+    with open(source, 'rb') as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b''):
+            digest.update(chunk)
+    digest.update(('|%s|%s' % (CONVERT_RECIPE, encoder)).encode())
+    cache = _cache_dir()
+    os.makedirs(cache, exist_ok=True)
+    out = os.path.join(cache, digest.hexdigest()[:24] + '.ogg')
+    if os.path.exists(out):
+        try:
+            if _rate_channels(out)[0] == MAX_RATE:
+                return out
+        except Exception:                                     # noqa: BLE001
+            pass
+    # The loop must stay exactly as long as it was. Left to itself the
+    # resampler flushes its filter tail as extra samples -- MEASURED on 1503:
+    # 864 samples, 18 ms, at an RMS of 0.0014 against 0.068 for the body. At
+    # LOOPSTART=0 that is an 18 ms hole in the ambience every time the loop
+    # wraps. So the output is cut to the source's exact duration at the new
+    # rate, taken from the source's own final granule.
+    with open(source, 'rb') as handle:
+        data = handle.read()
+    src_rate = voice_ogg._identification(data)[0]
+    want = int(round(voice_ogg._last_granule(data) * MAX_RATE
+                     / float(src_rate)))
+    handle, tmp = tempfile.mkstemp(prefix='.amb.', suffix='.ogg', dir=cache)
+    os.close(handle)
+    try:
+        base = [ffmpeg, '-hide_banner', '-nostdin', '-loglevel', 'error',
+                '-y', '-i', source, '-af',
+                'aresample=%d,atrim=end_sample=%d' % (MAX_RATE, want)]
+        if oggenc:
+            wav = subprocess.run(base + ['-map_metadata', '-1', '-f', 'wav',
+                                         '-'], stdout=subprocess.PIPE,
+                                 stderr=subprocess.PIPE)
+            if wav.returncode:
+                raise ValueError('ambient: ffmpeg could not resample %s' % source)
+            run = subprocess.run([oggenc, '-Q', '-q', CONVERT_QUALITY, '-c',
+                                  'LOOPSTART=0', '-o', tmp, '-'],
+                                 input=wav.stdout, stdout=subprocess.PIPE,
+                                 stderr=subprocess.PIPE)
+        else:
+            args = list(codec_args)
+            if encoder == 'libvorbis':
+                args += ['-q:a', CONVERT_QUALITY]
+            else:
+                args += ['-b:a', '192k']
+            run = subprocess.run(base + args + ['-map_metadata', '-1',
+                                                '-metadata', 'LOOPSTART=0',
+                                                tmp],
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if run.returncode:
+            raise ValueError('ambient: could not encode %s: %s' % (
+                source, (run.stderr or b'').decode('utf-8', 'replace')[:200]))
+        rate, _channels = _rate_channels(tmp)
+        if rate != MAX_RATE:
+            raise ValueError('ambient: %s came out at %d Hz' % (source, rate))
+        with open(tmp, 'rb') as handle:
+            got = voice_ogg._last_granule(handle.read())
+        if abs(got - want) > 1:
+            raise ValueError('ambient: %s came out %d samples long, not %d -- '
+                             'the loop would gap' % (source, got, want))
+        os.replace(tmp, out)
+        tmp = None
+        return out
+    finally:
+        if tmp and os.path.exists(tmp):
+            os.unlink(tmp)
+
+
 def stage_loops(oggs, dest_dir, ogg_ids):
     """Stage loops once; reuse a byte-identical timestamped output on rebuild.
 
@@ -359,12 +497,21 @@ def stage_loops(oggs, dest_dir, ogg_ids):
     os.makedirs(dest_dir, exist_ok=True)
     missing, total = [], 0
     copied_bytes = copied = 0
+    del CONVERTED[:]
     for ogg_id in sorted(set(ogg_ids)):
         source = oggs.get(str(ogg_id))
         if source is None:
             missing.append(ogg_id)
             continue
         target = os.path.join(dest_dir, '%04d.ogg' % ogg_id)
+        if convert_enabled():
+            try:
+                rate = _rate_channels(source)[0]
+            except Exception:                                 # noqa: BLE001
+                rate = 0                  # unreadable header: ship as-is
+            if rate > MAX_RATE:
+                source = _converted_copy(source)
+                CONVERTED.append((ogg_id, rate))
         src_stat = os.stat(source)
         total += src_stat.st_size
         try:
@@ -440,8 +587,89 @@ def _epilogue(a, save_pair):
     a.emit(A.ldp64_post(29, 30, 31, FRAME))
 
 
-def _emit_swap(a):
-    """Shared tail: retire the old loop, start the selected one, hold gain."""
+# THE PREFLIGHT  (BUILD 524)
+# ==========================
+# MEASURED on hardware, one variable at a time:
+#
+#   ambient-mode off   still crashes        ambient-menu off   still crashes
+#   ambient-field off  FIXED                1503 -> 1511 swap  still crashes
+#   abort-hang         freezes (so it is one of the engine's own exit(-1)s)
+#   abort-hang-file    freezes, no welcome text
+#
+# The last one names it: NativeOggPlayer's constructor calls
+#
+#     sprintf(path, "%s/data/music_ogg/%s.ogg", base, name)     +0x2FF0
+#     vgmstream_open(path) -> fopen(path, "rb")                  +0x10FE9C0
+#
+# and when that returns NULL it prints "music file can not be loaded" and
+# calls exit(-1) (+0x3108..+0x3150). That is a reasonable rule for the game's
+# own music, which must exist. It is the wrong rule for an OPTIONAL ambience
+# bed: a loop that cannot be opened at this instant should simply not play
+# yet, not close the software.
+#
+# So before constructing anything the cave builds the SAME path with the SAME
+# base, format and name the constructor will use, and opens it itself:
+#
+#     NULL -> nothing is allocated, and the location is forgotten so the next
+#             frame asks again. The loop starts the first frame the open
+#             succeeds.
+#     ok   -> fclose, then the constructor runs exactly as it always has.
+#
+# The constructor's open is on this same thread, a few instructions later,
+# with nothing in between that could take the file away.
+#
+# What this does NOT explain is WHY the open fails only on New Game -- the
+# file is present, other loops open fine, and a different loop's content under
+# the same name failed the same way. The preflight makes the game correct
+# whatever the reason; finding the reason is a separate question.
+BASE_PATH = 0x10FAEE0                    # returns the content root (char *)
+SPRINTF = 0x1150FC0
+FOPEN = 0x11511A0
+FCLOSE = 0x11511B0
+PATH_FORMAT = 0x11A89B3                  # "%s/data/music_ogg/%s.ogg"
+MODE_RB = 0x11AA299                      # "rb"
+PREFLIGHT_BYTES = 0x120                  # 0x100 path + a 16-byte stem slot
+PREFLIGHT_STEM = 0x100
+PREFLIGHT_FAILS = []                     # tests only
+
+
+def _emit_preflight(a):
+    """Open the loop's file ourselves; on failure, play nothing and retry."""
+    a.emit(A.sub_imm64(31, 31, PREFLIGHT_BYTES))
+    a.emit(A.add_imm64(1, 31, PREFLIGHT_STEM))
+    _emit_stem(a, pointer_reg=1)
+    a.emit(A.bl(a.pc(), BASE_PATH))
+    a.emit(AC.mov64(2, 0))                       # base
+    a.emit(A.add_imm64(3, 31, PREFLIGHT_STEM))   # name
+    AC.bss_ptr(a, 1, PATH_FORMAT)
+    a.emit(A.add_imm64(0, 31, 0))                # path buffer
+    a.emit(A.bl(a.pc(), SPRINTF))
+    a.emit(A.add_imm64(0, 31, 0))
+    AC.bss_ptr(a, 1, MODE_RB)
+    a.emit(A.bl(a.pc(), FOPEN))
+    a.cbz64(0, 'preflight_fail')
+    a.emit(A.bl(a.pc(), FCLOSE))
+    a.emit(A.add_imm64(31, 31, PREFLIGHT_BYTES))
+    a.b('preflight_ok')
+    a.label('preflight_fail')
+    a.emit(A.add_imm64(31, 31, PREFLIGHT_BYTES))
+    # Forget this location and this loop, so the next frame comes back
+    # through location_change -> change -> create and asks again.
+    a.emit(A.str_(31, 19, 12))
+    a.emit(A.movz(9, 0xFFFF))
+    a.emit(A.movk_hi(9, 0xFFFF))
+    a.emit(A.str_(9, 19, 8))
+    a.b('volume')
+    a.label('preflight_ok')
+
+
+def _emit_swap(a, preflight=False):
+    """Shared tail: retire the old loop, start the selected one, hold gain.
+
+    `preflight` (the FIELD cave) opens the loop's file first -- see
+    _emit_preflight. The battle cave passes False: nothing has implicated it,
+    the padding pool is nearly full, and the preflight is ~30 words.
+    """
     a.label('change')
     a.emit(A.ldr(8, 19, 12))
     a.emit(A.cmp_reg(21, 8))
@@ -455,6 +683,8 @@ def _emit_swap(a):
 
     a.label('create')
     a.cbz64(21, 'volume')
+    if preflight:
+        _emit_preflight(a)
     a.emit(A.movz(0, PLAYER_ALLOC_BYTES))
     a.emit(A.bl(a.pc(), MALLOC))
     a.cbz64(0, 'out')
@@ -559,7 +789,7 @@ def build_field_cave(cave, addr, scratch, pointer_va, pool_va, lo, hi):
     a.emit(A.bl(a.pc(), AC.GUEST_TRANSLATE))
     a.emit(A.ldrh(22, 0, 0))
     _emit_lookup(a, pointer_va, pool_va, lo, hi, FIELD_MODE)
-    _emit_swap(a)
+    _emit_swap(a, preflight=True)
     a.label('out')
     _epilogue(a, save_pair=True)
     a.emit(FIELD_ORIG)                      # ldr w22, [x25] -- not PC-relative

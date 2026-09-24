@@ -73,6 +73,7 @@ import ff7nx_facial as F                                        # noqa: E402
 import ff7nx_daynight as D                                      # noqa: E402
 import ff7nx_dispatch as DP                                     # noqa: E402
 import ff7nx_voice as V                                         # noqa: E402
+import ff7nx_ambient as AM                                      # noqa: E402
 import a64 as A                                                 # noqa: E402
 
 NOP = 0xD503201F
@@ -151,6 +152,111 @@ SWITCHES = {
         'off_says': 'field dialogue is SILENT and mouths do not flap. If the '
                     'bugin1c hang clears, the voice runtime is holding the '
                     'script up.',
+    },
+    'ambient': {
+        # Cosmo Memory's per-location ambience: the field tick that starts a
+        # loop, and the two caves that dispose it on a menu or a mode change.
+        #
+        # WHY IT IS A NEW-GAME SUSPECT. A new game enters `md1stin` (field
+        # 116), which HAS an ambience entry (1503, a 96 kHz loop), and on its
+        # first main-loop tick Echo-S's script MAPJUMPs to `blackbgh` (field
+        # 109), which has none. So the loop is started and disposed within a
+        # frame or two of the title screen -- a start-then-stop no loaded
+        # save ever performs. If the native player does not survive being
+        # deleted while its worker is still opening the stream, that is an
+        # instant crash before any text is drawn, which is what is reported.
+        #
+        # All three sites are owned by ff7nx_ambient alone (the battle and
+        # world hooks are shared with the voice runtime and are NOT touched).
+        # Off = no ambience anywhere; nothing else changes.
+        'words': {AM.FIELD_HOOK: AM.FIELD_ORIG,
+                  AM.MENU_HOOK: AM.MENU_ORIG,
+                  AM.MODE_HOOK: AM.MODE_ORIG},
+        'on_says': 'per-location ambience is active again.',
+        'off_says': 'no field ambience is ever started. If a new game now '
+                    'reaches the Echo-S welcome screen, the ambience start/'
+                    'stop on md1stin is the crash.',
+    },
+    # The same three sites one at a time, so a single boot says WHICH.
+    'ambient-field': {
+        # The per-frame field tick: the only site that CREATES a player.
+        'va': AM.FIELD_HOOK, 'on': None, 'off': AM.FIELD_ORIG,
+        'on_says': 'the field ambience tick is active again.',
+        'off_says': 'no field loop is ever started; the menu and mode stops '
+                    'stay installed (and have nothing to stop).',
+    },
+    'ambient-menu': {
+        # The menu-loop entry stop -- runs on the in-game menu, the title
+        # hand-over and any field MENU opcode (Echo-S's naming screen).
+        'va': AM.MENU_HOOK, 'on': None, 'off': AM.MENU_ORIG,
+        'on_says': 'the ambient menu stop is active again.',
+        'off_says': 'the menu-loop stop is gone; field loops still play and '
+                    'the mode stop still disposes them.',
+    },
+    'ambient-mode': {
+        # set_driver_mode's stop -- the BUILD 506 game-over fix, chained
+        # behind ff7nx_daynight's hook two instructions earlier.
+        'va': AM.MODE_HOOK, 'on': None, 'off': AM.MODE_ORIG,
+        'on_says': 'the ambient mode stop (the game-over fix) is active again.',
+        'off_says': 'the set_driver_mode stop is gone -- the game-over hang '
+                    'can come back; field loops still play.',
+    },
+    'abort-hang': {
+        # INSTRUMENT, not a fix. Starting an ambience loop on New Game closes
+        # the software, file-independently. The engine has exactly three
+        # places on that path where it deliberately calls exit(-1), each
+        # after printing an [ASSERT] nobody can see:
+        #
+        #   +0x3150     MusicStream ctor   "music file can not be loaded"
+        #   +0x36B4     MusicStream worker "music buffer can not be created"
+        #   +0x1126A64  SoundBufferImpl    "g_WaveBufferAllocator alloc failed"
+        #
+        # ON turns each `bl exit` into `b .` -- the thread that hit it stops
+        # there forever instead of taking the process down. The FIRST runs on
+        # the main thread (inside the ambience cave), the other two on the
+        # player's own worker thread, so the symptom names the site:
+        #
+        #   the picture FREEZES         -> +0x3150, the file would not open
+        #   the game CARRIES ON         -> +0x36B4 / +0x1126A64, the worker
+        #                                  could not get its sound buffer
+        #   still "software was closed" -> none of these three; it is a
+        #                                  system abort elsewhere
+        #
+        # A `b .` encodes to the same word at every address.
+        'words': {0x3150: A.bl(0x3150, 0x1150EC0),
+                  0x36B4: A.bl(0x36B4, 0x1150EC0),
+                  0x1126A64: A.bl(0x1126A64, 0x1150EC0)},
+        'on': 0x14000000,
+        'on_says': 'the three audio exit(-1) sites now HANG instead. Freeze '
+                   '= file open failed; game carries on = no sound buffer; '
+                   'still closes = something else.',
+        'off_says': 'the engine\'s own exit(-1) calls are back (stock).',
+    },
+    'abort-hang-file': {
+        # abort-hang's ONE site that can be told apart by symptom.
+        #
+        # abort-hang froze the picture -- so it IS one of the three engine
+        # exits, not a system abort. But its symptom table was wrong: the
+        # worker hits +0x36B4 / +0x1126A64 WHILE HOLDING the player's lock
+        # (taken at +0x3368, released at +0x3450), and the ambience cave
+        # calls OGG_VOLUME -- which takes that same lock -- on every field
+        # frame. So a hung worker freezes the main thread too, and all three
+        # sites look identical.
+        #
+        # Two of the three are really one: SoundBufferImpl's create (+0x1126940)
+        # returns 0 or exits at +0x1126A64 itself, so the worker's own null
+        # check at +0x36B4 is unreachable. That leaves exactly two:
+        #
+        #   ON (this site hangs, the other stays exit):
+        #     the picture FREEZES   -> the loop's FILE would not open (+0x3150)
+        #     "software was closed" -> the 32 MB audio pool refused the
+        #                              buffer (+0x1126A64)
+        'va': 0x3150,
+        'on': 0x14000000,
+        'off': A.bl(0x3150, 0x1150EC0),
+        'on_says': 'only the file-open exit (+0x3150) hangs now. Freeze = '
+                   'the file would not open; closes = the audio pool.',
+        'off_says': 'the file-open exit is back (stock).',
     },
     'moviepoll': {
         # The 30 fps FMV frame-counter halving, at BOTH sites.

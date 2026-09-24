@@ -911,6 +911,18 @@ class Cpu:
             rm = (w >> 16) & 0x1F
             return s(rd, self.mem.u((self._rd64(rn) + (self.x[rm] & M32))
                                     & M64, 1), True)
+        if (w & 0xFFE0FC00) == 0xB8605800:                    # ldr Wt,[Xn,Wm,UXTW #2]
+            # `ff7nx_audio_cave.ldr_uxtw_scaled`: the ambient lookup's u32
+            # block-pointer table. BUILD 523 is the first test to run a
+            # lookup that actually FINDS a loop, which is how this surfaced.
+            rm = (w >> 16) & 0x1F
+            addr = (self._rd64(rn) + ((self.x[rm] & M32) << 2)) & M64
+            return s(rd, self.mem.u(addr, 4), True)
+        if (w & 0xFFE0FC00) == 0x78605800:                    # ldrh Wt,[Xn,Wm,UXTW #1]
+            # `ff7nx_audio_cave.ldrh_uxtw_scaled`: the ambient OGG-id pool.
+            rm = (w >> 16) & 0x1F
+            addr = (self._rd64(rn) + ((self.x[rm] & M32) << 1)) & M64
+            return s(rd, self.mem.u(addr, 2), True)
         if (w & 0xFFE0FC00) == 0xB8607800:                    # ldr Wt,[Xn,Xm,LSL#2]
             # Replays the stock uniform-buffer selector displaced by the
             # day/night transport hook.
