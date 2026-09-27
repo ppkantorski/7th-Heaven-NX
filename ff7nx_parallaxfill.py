@@ -877,8 +877,56 @@ def plan_layer_edge_x(sec9, first, n, hdr, layer):
     return add
 
 
+# BUILD 581 -- A SPARSE ADDITIVE OVERLAY IS NOT A BACKDROP.
+#
+# `ujunon2` layer 4 is the wave foam along the shore: 432 additive fx records
+# in a band across the middle of the picture, and NO row of it spans the
+# layer's width.  The vertical filler measured that band as a 'span' and
+# stamped copies of it one span above and below -- which lands the shore foam
+# on the open water at the bottom of the screen (hardware report, build 580).
+# `las1_1` layer 4 does the same: the copied floor glow paints over the
+# Cosmos pillar above it.
+#
+# An additive layer cannot leave a black bar: where it has no tile the layers
+# beneath simply show unlit, so skipping the copy can never create the band
+# this pass exists to remove.  What it prevents is duplicated light.  Full
+# backdrops (every hyou*/move_* snow sheet, trnad_4, loslake1, del3, las0_3)
+# have most rows spanning the width and keep the fill.
+SPARSE_ROW_FULL = 0.5           # fraction of rows that span the layer width
+SPARSE_ADDITIVE = 0.99          # fraction of records that are fx + blend 1
+T_USE_FX = 28
+T_BLEND = 30
+
+
+def sparse_additive_overlay(sec9, first, n):
+    """True for an additive layer whose rows do not span its own width."""
+    if n <= 0:
+        return False
+    add = 0
+    rows = {}
+    for i in range(n):
+        off = first + i * TILE_SIZE
+        if sec9[off + T_USE_FX] and sec9[off + T_BLEND] == 1:
+            add += 1
+        x, y = struct.unpack_from('<hh', sec9, off + T_DSTX)
+        rows.setdefault(y, set()).add(x)
+    if add < SPARSE_ADDITIVE * n:
+        return False
+    xs = [x for r in rows.values() for x in r]
+    width = (max(xs) - min(xs)) // PTILE + 1
+    full = sum(1 for r in rows.values() if len(r) >= width)
+    return full < SPARSE_ROW_FULL * len(rows)
+
+
 def _vertical_plan(sec9, first, n, hdr, layer):
-    """The build-127 pass, unchanged, as (offset, value, word, group) tuples."""
+    """The build-127 pass, unchanged, as (offset, value, word, group) tuples.
+
+    Build 581: except on a sparse additive overlay -- see above."""
+    # BUILD 582: layer 4 only. junonl2/junonr2 layer 3 also measure sparse,
+    # but build 134 proved on hardware that they need their fill (the
+    # searchlight layer); only the layer-4 overlays showed copied art.
+    if layer == 4 and sparse_additive_overlay(sec9, first, n):
+        return []
     return [(o, v, T_DSTY, None)
             for o, v in plan_layer(sec9, first, n, hdr, layer)]
 

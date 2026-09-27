@@ -1571,6 +1571,8 @@ def run_build(mods, enabled, settings_by_mod, log, progress,
     # BUILD 567. Per-field 4:3 zoom (convil_2). See ff7nx_fieldzoom.
     produced += build.apply_field_zoom(SDOUT_DIR, DUMP, log, produced)
     produced += build.apply_condorpad(SDOUT_DIR, DUMP, log, produced)
+    # BUILD 580. 60 FPS partial field animations. See ff7nx_canim60.
+    produced += build.apply_canim60(SDOUT_DIR, DUMP, log, produced)
     # BUILD 528. Diagnostic frame probe, off unless SEVENTH_NX_FRAME_PROBE=1.
     # Must be the last module pass. See ff7nx_frameprobe.
     produced += build.apply_frame_probe(SDOUT_DIR, DUMP, plan, log, produced)

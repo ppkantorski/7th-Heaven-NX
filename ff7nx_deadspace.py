@@ -25,7 +25,9 @@ It is split so a shipping pass and the diagnostic probe can never collide:
                                 per-field 4:3 zoom (convil_2's window view)
     [lo + 0x2600,  lo + 0x2A00) 'condorpad': ff7nx_condorpad (BUILD 569) --
                                 Fort Condor's 360-degree, slower cursor
-    [lo + 0x2A00,  hi)          ff7nx_frameprobe, diagnostic builds only
+    [lo + 0x2A00,  lo + 0x2E00) 'canim': ff7nx_canim60 (BUILD 580) -- the
+                                60 FPS partial-animation frame mapping
+    [lo + 0x2E00,  hi)          ff7nx_frameprobe, diagnostic builds only
 
 Each owner checks that ITS part is still the stock bytes before writing, so
 a second writer to the same part is refused rather than silently merged.
@@ -44,7 +46,8 @@ COASTER_AT = 0x1800
 CONDOR_AT = 0x2000
 ZOOM_AT = 0x2400
 PAD_AT = 0x2600
-PROBE_AT = 0x2A00
+CANIM_AT = 0x2A00
+PROBE_AT = 0x2E00
 
 
 def region(src, stock=None):
@@ -79,7 +82,9 @@ def part(src, which, stock=None):
     elif which == 'zoom':
         p = (lo + ZOOM_AT, lo + PAD_AT)
     elif which == 'condorpad':
-        p = (lo + PAD_AT, lo + PROBE_AT)
+        p = (lo + PAD_AT, lo + CANIM_AT)
+    elif which == 'canim':
+        p = (lo + CANIM_AT, lo + PROBE_AT)
     elif which == 'probe':
         p = (lo + PROBE_AT, hi)
     else:

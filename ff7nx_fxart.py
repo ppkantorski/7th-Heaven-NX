@@ -111,8 +111,16 @@ def _donor_cell(page_art, sx, sy, palette_rgb, rgb_cache=None):
     return np.where(cover, idx, np.uint8(0)).astype(np.uint8), error
 
 
-def apply_to_section9(name, sec9, palettes565, art):
-    """Return ``(new_section9, stats)``; fail closed on every ambiguity."""
+def apply_to_section9(name, sec9, palettes565, art, animated=frozenset()):
+    """Return ``(new_section9, stats)``; fail closed on every ambiguity.
+
+    BUILD 581: beyond the proved FIELDS, a blank margin cell whose records
+    draw with a SCRIPT-ANIMATED palette (``animated``, ff7nx_palanim) is also
+    filled. Those pages now stay paletted so their glow keeps pulsing
+    (ff7nx_fxpages' animation veto), and this is the only way their Cosmos
+    widescreen cells get art. For them the donor is exactly the DDS FFNx
+    loads -- the record's own palette, else palette 0 -- never a sibling.
+    """
     stats = {
         "fields": 0,
         "cells": 0,
@@ -122,7 +130,9 @@ def apply_to_section9(name, sec9, palettes565, art):
         "unrepresentable": 0,
         "names": [],
     }
-    if (disabled() or name.lower() not in FIELDS
+    proved = name.lower() in FIELDS
+    live = frozenset(animated) if not proved else frozenset()
+    if (disabled() or not (proved or live)
             or sec9.find(b"BACK") < 0 or not len(palettes565)):
         return sec9, stats
     provider = getattr(art, "provider", None)
@@ -157,6 +167,13 @@ def apply_to_section9(name, sec9, palettes565, art):
                     ("fx", layer, dx, dy, pal, off)
                 )
 
+    # Pages some record draws through a script-animated palette: exactly the
+    # pages ff7nx_fxpages now keeps paletted. Their margin records often name
+    # a palette of their own (Cosmos authored past the table's end and
+    # ff7nx_palrange re-seated them), so admission is by PAGE, not record.
+    live_slots = {key[0] for key, uses in refs.items()
+                  if any(role == "fx" and p in live
+                         for role, _l, _x, _y, p, _o in uses)}
     arrays = {
         slot: np.frombuffer(page.data, np.uint8).reshape(256, 256).copy()
         for slot, page in pages.items()
@@ -189,12 +206,18 @@ def apply_to_section9(name, sec9, palettes565, art):
         pal = next(iter(pals))
         if pal >= len(palette_rgb):
             continue
+        if not proved and slot not in live_slots:
+            continue
 
         # Prefer the tile's own DDS when it paints this cell.  Otherwise a
         # sibling may supply missing geometry, but only one distinct indexed
         # answer may survive.  That is what makes the donor choice factual.
         candidates = []
-        for donor_pal in sorted(provider.palettes(slot), key=lambda q: (q != pal, q)):
+        donors = sorted(provider.palettes(slot), key=lambda q: (q != pal, q))
+        if not proved:
+            have = set(donors)
+            donors = [pal] if pal in have else ([0] if 0 in have else [])
+        for donor_pal in donors:
             key = (name.lower(), slot, donor_pal)
             if key in provider.ambiguous_slots:
                 continue
@@ -260,7 +283,10 @@ def apply_to_flevel(archive, payloads, art, encode=None, log=lambda *_a: None):
             raw = lgp.lzs_decompress(payload[4:]) if payload else archive.decompressed(entry)
             parts = list(lgp.split_sections(raw))
             cols, _h, _n, _c = MB.palette_colours(parts[3])
-            new9, one = apply_to_section9(name, parts[8], cols, art)
+            import ff7nx_palanim
+            new9, one = apply_to_section9(
+                name, parts[8], cols, art,
+                animated=ff7nx_palanim.animated_palettes(parts[0]))
         except Exception as exc:
             total["refused"].append((name, "%s: %s" % (type(exc).__name__, str(exc)[:60])))
             continue

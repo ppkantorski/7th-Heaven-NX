@@ -262,8 +262,22 @@ def _repair_ambiguous_mask(name, sec9, page, refs, palettes, art):
     }), None
 
 
+# BUILD 581: fields whose FX page stayed paletted BECAUSE a palette on it is
+# animated by the field script. ff7nx_fxart fills those pages' blank
+# widescreen cells in the page's own (animated) palette instead.
+ANIM_KEPT = set()
+KEEP_STATIC_ENV = 'SEVENTH_NX_FX_STATIC_ANIMATED'
+
+
+def static_animated():
+    """True: convert script-animated palettes anyway (the BUILD 579/580
+    behaviour -- HD, but the glow stops)."""
+    return os.environ.get(KEEP_STATIC_ENV, '').strip().lower() in (
+        '1', 'true', 'yes', 'on')
+
+
 def upgrade_section9(name, sec9, art, px, max_raw_delta=None,
-                     max_runtime_delta=None):
+                     max_runtime_delta=None, animated=frozenset()):
     """Return ``(section9, stats)`` after page-neutral additive conversion.
 
     The optional deltas are hard remaining byte budgets. A page either fits
@@ -276,6 +290,7 @@ def upgrade_section9(name, sec9, art, px, max_raw_delta=None,
         'mask_fields': 0, 'mask_pages': 0, 'mask_cells': 0,
         'mask_tiles': 0, 'mask_holes': 0, 'mask_cleared': 0,
         'mask_veto': 0, 'mask_names': [], 'mask_page_names': [],
+        'anim_veto': 0, 'anim_names': [],
     }
     if not enabled() or name.lower() in DEFER_FIELDS:
         st['deferred'] = int(name.lower() in DEFER_FIELDS)
@@ -347,6 +362,16 @@ def upgrade_section9(name, sec9, art, px, max_raw_delta=None,
         # native additive page band either, so mode 1 is the complete rule.
         if any(sec9[t.off + T_BLEND_MODE] != 1 for t in refs):
             st['blend_veto'] += 1
+            continue
+        # BUILD 581. A palette the field script loads at runtime (LDPAL /
+        # LDPLS -- see ff7nx_palanim) is a colour ANIMATION: ghotel's fog
+        # pulse, sinbil_1's green glow. One truecolor page would freeze it.
+        if (not static_animated()
+                and any(t.pal in animated for t in refs)):
+            st['anim_veto'] += 1
+            if name not in st['anim_names']:
+                st['anim_names'].append(name)
+            ANIM_KEPT.add(name.lower())
             continue
         image, _why = _page_image(art, name, slot, all_pals[slot], px)
         if image is None:
@@ -427,19 +452,22 @@ def merge(total, one):
     """Accumulate one field's stats into an archive summary."""
     for key in ('fields', 'pages', 'tiles', 'bytes', 'blend_veto', 'base_veto',
                 'art_veto', 'budget_veto', 'deferred', 'mask_fields',
+                'anim_veto',
                 'mask_pages', 'mask_cells', 'mask_tiles', 'mask_holes',
                 'mask_cleared', 'mask_veto'):
         total[key] = total.get(key, 0) + one.get(key, 0)
     total.setdefault('names', []).extend(one.get('names', ()))
     total.setdefault('page_names', []).extend(one.get('page_names', ()))
     total.setdefault('mask_names', []).extend(one.get('mask_names', ()))
+    total.setdefault('anim_names', []).extend(one.get('anim_names', ()))
     total.setdefault('mask_page_names', []).extend(
         one.get('mask_page_names', ()))
     return total
 
 
 def summarise(st):
-    if not st or not (st.get('pages') or st.get('mask_pages')):
+    if not st or not (st.get('pages') or st.get('mask_pages')
+                      or st.get('anim_veto')):
         return ''
     line = ('ADDITIVE FX PAGES: %d complete Cosmos page(s), %d FX tile '
             'reference(s), in place across %d field(s); slots, page count, '
@@ -448,6 +476,12 @@ def summarise(st):
             'missing/different art, %d budget.'
             % (st['pages'], st['tiles'], st['fields'], st['blend_veto'],
                st['base_veto'], st['art_veto'], st['budget_veto']))
+    if st.get('anim_veto'):
+        line += (' -- %d page(s) KEPT PALETTED because the field script '
+                 'animates a palette on them (glow/pulse; BUILD 581, %s=1 '
+                 'converts them anyway and freezes the effect): %s'
+                 % (st['anim_veto'], KEEP_STATIC_ENV,
+                    ', '.join(st.get('anim_names', [])[:40])))
     if st.get('mask_pages'):
         line += (' -- ANIMATED FX MASK: %d paletted page(s), %d cell(s), %d '
                  'tile reference(s) in %d field(s) kept every RGB/palette '

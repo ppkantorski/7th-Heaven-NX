@@ -91,6 +91,11 @@ import ff7nx_blackcell
 import ff7nx_marginpage
 import ff7nx_fxmargin
 import ff7nx_fxpages
+import ff7nx_fxsplit
+import ff7nx_palanim
+import ff7nx_fxrequant
+import ff7nx_lostdetail
+import ff7nx_chardds
 import ff7nx_vanillatc
 import ff7nx_parallaxfill
 import ff7nx_trnad4
@@ -1057,6 +1062,8 @@ class Plan:
         self.spell_dds = []          # [(rel, full, mod)] FFNx magic.lgp DDS.
         self.minigame_dds = {}       # archive -> {(TEX name,palette): IRO path}
         self.minigame_mod = None     # the selected SYW minigame IRO
+        self.char_dds = {}           # BUILD 580: {(TEX name, pal): IRO path}
+        self.char_dds_mod = None
         self.mod_rank = {}           # later enabled mod wins a TEX collision
                                      # Collected, not routed: magic.lgp has
                                      # 652 duplicate entry names and picking
@@ -1223,6 +1230,21 @@ def build_plan(mods, settings_by_mod, catalogs, log=lambda *_: None,
             'archive(s); %d IRO DDS files handled without extraction' %
             (sum(len(v) for v in plan.minigame_dds.values()),
              len(plan.minigame_dds), supported))
+
+    # BUILD 580: Cosmos's HD field-prop textures (char/<tex>_<pal>.dds).
+    # FFNx loads them over the model TEX; nothing here used to. See
+    # ff7nx_chardds.
+    import ff7nx_chardds
+    try:
+        plan.char_dds, plan.char_dds_mod = ff7nx_chardds.collect(
+            mods, settings_by_mod, catalogs.get('char.lgp') or set())
+    except Exception as exc:                                   # noqa: BLE001
+        log('  ! Cosmos HD field props: not collected (%s)' % exc)
+        plan.char_dds, plan.char_dds_mod = {}, None
+    if plan.char_dds:
+        plan.archive_files.setdefault('char.lgp', {})
+        log('  Cosmos HD field props: %d DDS palette(s) for char.lgp from %s'
+            % (len(plan.char_dds), plan.char_dds_mod.filename))
 
     # THE DEPTH-1 PAGE SIZE, RESOLVED ONCE AND SHARED. FINDINGS-223.
     #
@@ -5125,6 +5147,7 @@ def _convert_field_backgrounds(archive, payloads, log, dds_sources=(),
                  'blend_veto': 0, 'base_veto': 0, 'art_veto': 0,
                  'budget_veto': 0,
                  'deferred': 0, 'names': [], 'page_names': []}
+    fxs_stats = ff7nx_fxsplit.new_stats()
     # THE PAGES THAT WERE ALREADY TRUECOLOR IN 1997. FINDINGS-282.
     vtc_stats = ff7nx_vanillatc.Stats()
     # (field, pages_with_filler_arm, pages_without) -- see FINDINGS-288.
@@ -5257,13 +5280,45 @@ def _convert_field_backgrounds(archive, payloads, log, dds_sources=(),
                     - _runtime
                     - _reserve * field_bg_repack._page_bytes(px, 2))
                 _raw_now = len(raw) - len(parts[8]) + len(new9)
+                _animated = ff7nx_palanim.animated_palettes(parts[0])
                 new9, _fxp_one = ff7nx_fxpages.upgrade_section9(
                     name, new9, fx_art, px,
                     max_raw_delta=max(0, FIELD_BG_RAW_CAP - _raw_now),
-                    max_runtime_delta=_runtime_headroom)
+                    max_runtime_delta=_runtime_headroom,
+                    animated=_animated)
                 ff7nx_fxpages.merge(fxp_stats, _fxp_one)
             except Exception as exc:                           # noqa: BLE001
                 log('  ! additive FX page: %s left unchanged -- %s: %s'
+                    % (name, type(exc).__name__, str(exc)[:80]))
+            # BUILD 579: a page fxpages refused because ONE of its palettes
+            # animates keeps that palette where it is; each static palette
+            # gets its own Cosmos truecolor clone in the same additive band.
+            # Same budgets as above, re-measured after fxpages spent some.
+            try:
+                _fp, _fs, _fe = field_bg_native.parse_texture_block(new9, px)
+                _present = [p for p in _fp if p is not None]
+                _runtime = sum(field_bg_repack._page_bytes(p.px, p.depth)
+                               for p in _present)
+                _ordinary_d2 = sum(
+                    1 for p in _present
+                    if p.depth == 2 and not (0x0F <= p.slot < 0x18))
+                _reserve = (max(0, field_bg_dense.MAX_TRUECOLOR_PAGES
+                                - _ordinary_d2)
+                            + ff7nx_fxpages.DOWNSTREAM_D2_RESERVE)
+                _runtime_headroom = max(
+                    0, int(field_bg_dense.FIELD_MB_CAP * 1048576.0)
+                    - _runtime
+                    - _reserve * field_bg_repack._page_bytes(px, 2))
+                _raw_now = len(raw) - len(parts[8]) + len(new9)
+                new9, _fxs_one = ff7nx_fxsplit.split_section9(
+                    name, new9, fx_art, px,
+                    max_raw_delta=max(0, FIELD_BG_RAW_CAP - _raw_now),
+                    max_runtime_delta=_runtime_headroom,
+                    reserve_pages=_reserve,
+                    animated=ff7nx_palanim.animated_palettes(parts[0]))
+                ff7nx_fxsplit.merge(fxs_stats, _fxs_one)
+            except Exception as exc:                           # noqa: BLE001
+                log('  ! FX palette split: %s left unchanged -- %s: %s'
                     % (name, type(exc).__name__, str(exc)[:80]))
         # Repack AFTER the rescale, so the pre-existing truecolor pages are
         # already at `px` and parse_texture_block agrees with itself.
@@ -6588,6 +6643,12 @@ def _convert_field_backgrounds(archive, payloads, log, dds_sources=(),
     _fxp_line = ff7nx_fxpages.summarise(fxp_stats)
     if _fxp_line:
         log('  ' + _fxp_line)
+    _fxs_line = ff7nx_fxsplit.summarise(fxs_stats)
+    if _fxs_line:
+        log('  ' + _fxs_line)
+        if fxs_stats['names']:
+            log('      fields: ' + ', '.join(fxs_stats['names'][:40])
+                + ('' if len(fxs_stats['names']) <= 40 else ', ...'))
     if filler_pageback:
         log('  shared-cell layer-1 key: %d field(s) gave the cell back rather '
             'than gain a page (%s)'
@@ -7818,7 +7879,7 @@ def _build_model_archive(name, archive_path, mod_files, romfs, pack_lgp,
                          log, folder_of=None, battle_bg_native_names=None,
                          spell_dds=None, dynweapon=None,
                          minigame_dds=None, minigame_mod=None,
-                         mod_rank=None):
+                         mod_rank=None, char_dds=None, char_dds_mod=None):
     """
     Rebuild a model LGP (char/battle/magic/world/menu) with PyFF7: reuse
     every untouched vanilla entry, overlay the mod's files unchanged, add any
@@ -7972,6 +8033,14 @@ def _build_model_archive(name, archive_path, mod_files, romfs, pack_lgp,
         mod_files = _convert_world_normal_probe(mod_files, log)
     elif name in MINIGAME_PRELIT_ARCHIVES:
         mod_files = _convert_world_prelit(mod_files, log, archive=name)
+
+    # BUILD 580: Cosmos's HD props, AFTER the field cap (they have their own
+    # ceiling, ff7nx_chardds.CAP) and BEFORE de-fringe, which then treats
+    # them like any other model texture.
+    if name == 'char.lgp' and char_dds:
+        import ff7nx_chardds
+        mod_files, _cd = ff7nx_chardds.convert(mod_files, van, char_dds,
+                                               char_dds_mod, log)
 
     # Every model archive, and AFTER both the battle conversion and the field
     # cap so neither can undo it. Idempotent on anything already de-fringed.
@@ -9104,6 +9173,32 @@ def _build_flevel(archive_path, chunks, field_files, romfs, log,
             log('  ! trnad_4 rock detail: unchanged (%s)'
                 % ', '.join('%s: %s' % r
                             for r in td_stats['refused'][:3]))
+
+    # BUILD 582. trnaddetail's rule, archive-wide: an opaque Cosmos pixel the
+    # dense conversion keyed is a notch or a missing sliver at 3x (ghotel's
+    # rock at the 4:3 edge, wcrimb_1/2's machinery). Small components that
+    # touch drawn art, or any component in the two 4:3-edge cells, get
+    # Cosmos's own texels back. Texels only; records/UVs/pages unchanged.
+    if _bc_art is not None:
+        ld_stats = ff7nx_lostdetail.apply_to_flevel(
+            archive, payloads, _bc_art,
+            encode=lambda raw: _encode_field_cached(archive, raw), log=log)
+        ld_line = ff7nx_lostdetail.summarise(ld_stats)
+        if ld_line:
+            log(ld_line)
+
+    # BUILD 582. A script-animated FX palette whose widescreen strips Cosmos
+    # painted (ghotel's fog) is 1997 art in the 4:3 centre and Cosmos art in
+    # the strips -- they do not join. Where the script only multiplies/adds
+    # the WHOLE palette, rebuild that palette's cells from the Cosmos images
+    # FFNx draws and requantise them jointly: one picture, same pulse.
+    if _bc_art is not None:
+        rq_stats = ff7nx_fxrequant.apply_to_flevel(
+            archive, payloads, _bc_art,
+            encode=lambda raw: _encode_field_cached(archive, raw), log=log)
+        rq_line = ff7nx_fxrequant.summarise(rq_stats)
+        if rq_line:
+            log(rq_line)
 
     # Withdrawn build-160 experiment. It is default-off; retained only so an
     # old environment setting has an explicit, logged owner.
@@ -11306,6 +11401,7 @@ MAIN_ONLY_ENV = frozenset((
     'SEVENTH_NX_CONDOR_BANNER_Y',  # BUILD 571, ff7nx_condorpad.BANNER_ENV
     'SEVENTH_NX_CONDOR_MSG_Y',   # BUILD 575, ff7nx_condorpad.MSG_ENV
     'SEVENTH_NX_CONDOR_BUTTONS', # BUILD 575, ff7nx_condorpad.BUTTONS_ENV
+    'SEVENTH_NX_CANIM60',        # BUILD 580, ff7nx_canim60.ENV
 ))
 
 # The modules those settings reach, by the same rule: each writes into
@@ -11360,6 +11456,8 @@ MAIN_ONLY_MODULES = frozenset((
     # BUILD 567. Per-field 4:3 zoom (convil_2), one dead-space cave.
     'ff7nx_fieldzoom.py',
     'ff7nx_condorpad.py',
+    # BUILD 580. 60 FPS partial field animations, two dead-space caves.
+    'ff7nx_canim60.py',
     # BUILD 552. Two caves on the two GL draw calls.
     'ff7nx_sublines.py',
 ))
@@ -12178,6 +12276,10 @@ def apply_plan(plan, archive_paths, sdout, log=lambda *_: None,
              # actually writes into can change when this flips.
              (ff7nx_dynweapon.hrc_rewrite_enabled()
               if name in _dynweapon_targets(plan) else 0),
+             # BUILD 580: Cosmos's HD props in char.lgp.
+             ((sorted((n, p, r) for (n, p), r in plan.char_dds.items()),
+               ff7nx_chardds.cap(), ff7nx_chardds.VERSION.decode())
+              if name == 'char.lgp' and plan.char_dds else 0),
              # BUILD 561: the coaster's widened visibility streams.
              ((ff7nx_coasterworld.widen(), ff7nx_coasterworld.far_factor(),
                ff7nx_coasterworld.VERSION)
@@ -12216,7 +12318,9 @@ def apply_plan(plan, archive_paths, sdout, log=lambda *_: None,
                                     plan.spell_dds
                                     if name == 'magic.lgp' else None,
                                     plan.dynweapon,
-                                    _mini, plan.minigame_mod, plan.mod_rank)
+                                    _mini, plan.minigame_mod, plan.mod_rank,
+                                    plan.char_dds if name == 'char.lgp'
+                                    else None, plan.char_dds_mod)
         if dest:
             produced.append(dest)
             _archive_cache_store(
@@ -13777,6 +13881,44 @@ def apply_field_zoom(sdout, dump, log=lambda *_: None, produced=()):
         'BUILD 569: carried by every draw\'s projection, BSS flag at +0x%X)'
         % (', '.join('%s #%d' % kv for kv in sorted(index.items())),
            report['words'], report['bss']))
+    return [dest] if not built else []
+
+
+def apply_canim60(sdout, dump, log=lambda *_: None, produced=()):
+    """
+    BUILD 580. At 60 FPS the field's partial animations (CANM!/CANIM) name
+    frames in the original numbering while the 60 FPS mod has doubled every
+    field animation; FFNx remaps them after the stock handler and so does
+    this (wcrimb_1's bar swung only half way). See ff7nx_canim60.
+    """
+    import ff7nx_canim60
+    if not fps_60_requested() or not ff7nx_canim60.enabled():
+        log('')
+        log('60 FPS partial animations: stock (%s)' % (
+            'not a 60 FPS build' if not fps_60_requested()
+            else '%s=0' % ff7nx_canim60.ENV))
+        return []
+    src, built = _audio_bridge_base(sdout, dump, log, produced,
+                                    '60 FPS partial animations')
+    if src is None:
+        return []
+    dest = os.path.join(sdout, 'atmosphere', 'contents', TITLE_ID, 'exefs',
+                        'main')
+    tmp = dest + '.canim60-tmp'
+    log('')
+    log('60 FPS partial animations ...')
+    try:
+        report = ff7nx_canim60.apply_to_nso(src, tmp, log, stock=dump.nso)
+    except Exception as exc:                                   # noqa: BLE001
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        log('! 60 FPS partial animations: NOT installed (%s)' % exc)
+        return []
+    os.replace(tmp, dest)
+    log('  CANM!/CANIM frames mapped to the doubled animations like FFNx: '
+        'current = first x2 x16, last = last x2 + 1, clamped to the '
+        "animation's frames (BUILD 580; wcrimb_1's swinging bar) "
+        '(%d words written)' % report['words'])
     return [dest] if not built else []
 
 

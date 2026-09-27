@@ -205,7 +205,21 @@ def _flatten_activewhen(fragment):
                 return parts[0]
             joiner = ' OR ' if node.tag == 'Or' else ' AND '
             return '(%s)' % joiner.join(parts)
-        return None                       # RuntimeVar, Not, anything else
+        # BUILD 579: <Not>. It used to fall through to None, and a folder
+        # whose condition flattens to None is treated as having NO gate --
+        # so a <Not> made its folder UNCONDITIONAL (then given a synthesized
+        # default-On toggle). Cosmos Limit Break's "AA REMOVED" is gated
+        # `LIMITBREAK = 2 AND NOT (ATA = 0)`; with the recommended
+        # LIMITBREAK = 1 7th Heaven leaves it OFF, but we emplaced it, and its
+        # per-palette static DDS then shadowed the palette-0 art FFNx
+        # actually uses (mogu_1's fog, ghotel's). `NOT(x)` is one token so an
+        # option id containing the word "not" can never be misread.
+        if node.tag == 'Not':
+            kids = [walk(c) for c in node]
+            if len(kids) != 1 or kids[0] is None:
+                return None
+            return 'NOT(%s)' % kids[0]
+        return None                       # RuntimeVar, anything else
 
     return walk(root)
 
@@ -579,6 +593,9 @@ def evaluate(condition, settings):
     parts = _split_top(text, ' AND ')
     if len(parts) > 1:
         return all(evaluate(p, settings) for p in parts)
+    if text.startswith('NOT(') and text.endswith(')') \
+            and _unwrap(text[3:]) != text[3:]:
+        return not evaluate(text[4:-1], settings)
     m = _TERM.match(text)
     if not m:
         return False
