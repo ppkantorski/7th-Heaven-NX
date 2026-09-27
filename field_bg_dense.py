@@ -360,6 +360,40 @@ SUBUNIT_KEY = os.environ.get('SEVENTH_NX_NO_SUBUNIT_KEY') != '1'
 # refuses. `SEVENTH_NX_NO_STALE_KEY_UNITS=1` restores build 170 exactly.
 STALE_KEY_UNITS = os.environ.get('SEVENTH_NX_NO_STALE_KEY_UNITS') != '1'
 
+# BUILD 568 -- A HOLE NEITHER AUTHORITY DRAWS. `convil_2`, the condor's head.
+#
+# Two layer-2 tiles of the SAME (param, state) often sit at the same
+# destination and split one picture between them. Vanilla and Cosmos do not
+# always split it the same way: at convil_2 (20,-75) vanilla draws the texel
+# from the palette-3 tile (index 56) and keys the palette-2 tile (index 0);
+# Cosmos does the opposite -- palette 3 alpha 0, palette 2 alpha 255.
+#
+# Each arm in this file then does the locally right thing and the stack ends
+# up EMPTY: MOD-CLEAR keys palette 3 (the mod paints nothing, and layer 1
+# covers it), and palette 2 stays keyed on vanilla's index 0 (the `lost`
+# population of FINDINGS-263, deliberately left alone). Nothing in the group
+# draws, layer 1's dark room shows through, and that is the black square on
+# the bird. MEASURED by compositing ours against Cosmos's own chunk 9: the
+# four photographed squares are exactly these texels, and Cosmos has none.
+#
+# The rule un-keys a texel ONLY where all of these hold, per logical unit:
+#   * the cell is paletted, 16-unit, and EVERY tile drawing it is layer 2;
+#   * vanilla's index is 0 there, and Cosmos paints the WHOLE unit
+#     (`hmask` over every destination texel of it);
+#   * at every destination of the cell, another tile of the same
+#     (param, state) draws that point in VANILLA (index != 0) -- so the
+#     1997 picture had overlay here -- and every such partner is CLEAR in
+#     Cosmos (`tmask` over the whole unit) -- so nothing in our output does.
+#
+# i.e. vanilla draws the overlay here, Cosmos draws it here, and only the
+# combination of our two keys leaves a hole. Filling it with the mod's own
+# opaque art is what the reference renderer shows and can never hide a
+# texel that either authority draws, because no tile of the group draws it.
+# Disjoint from MOD-CLEAR (alpha >= 128 against < 8) and from the wire
+# rescue, so it cannot fight either. A field without such a stack is byte
+# identical. `SEVENTH_NX_NO_STACK_HOLE=1` restores build 567 exactly.
+STACK_HOLE = os.environ.get('SEVENTH_NX_NO_STACK_HOLE') != '1'
+
 # BUILD 121 -- THE MOD'S ALPHA IS THE AUTHORITY ON ITS OWN SILHOUETTE.
 # FINDINGS-253. THIS IS THE OPPOSITE DIRECTION FROM SUBUNIT_KEY ABOVE.
 #
@@ -1720,6 +1754,127 @@ def margin_overlay_keys(pages, arrays, tiles, keys):
     return out
 
 
+def stack_hole_keys(sec9, pages, arrays, tiles, keys, art_for, origin,
+                    pal565, scale):
+    """`{cell_key: bool (16*scale, 16*scale)}` -- texels to UN-key.
+
+    See STACK_HOLE. Judged PER DESTINATION TEXEL: a unit where the partner's
+    antialiased edge still paints one of nine texels at alpha 128 has a hole
+    in the other eight, and the photographed square at (20,-75) is exactly
+    that shape -- a per-unit test refused it.
+    """
+    if art_for is None or scale < 2:
+        return {}
+    n = TILE * scale
+    grp = {}
+    for t in tiles:
+        p = pages.get(t.slot)
+        if (t.layer != 2 or p is None or p.depth != 1
+                or getattr(p, 'size_flag', 0)):
+            continue
+        grp.setdefault((sec9[t.off + 26], sec9[t.off + 27]), []).append(t)
+    if not grp:
+        return {}
+    art_c, cell_c = {}, {}
+
+    def _art(asl, pal):
+        if (asl, pal) not in art_c:
+            try:
+                art_c[(asl, pal)] = art_for(asl, pal)
+            except Exception:                                  # noqa: BLE001
+                art_c[(asl, pal)] = None
+        return art_c[(asl, pal)]
+
+    def _cell(t):
+        """(zero, paint, clear) at destination resolution, or None."""
+        ck = (t.slot, t.sx, t.sy, t.pal)
+        if ck in cell_c:
+            return cell_c[ck]
+        r = None
+        idx = arrays.get(t.slot)
+        if idx is not None:
+            idx = idx[t.sy:t.sy + TILE, t.sx:t.sx + TILE]
+        asl, asx, asy = t.slot, t.sx, t.sy
+        if origin:
+            o = origin.get((t.slot, t.sx, t.sy))
+            if o:
+                asl, asx, asy = o
+        # THE SAME ART `source_cell` WILL USE: its own palette, else the
+        # palette-0 borrow under the same BORROW_MAX_DIST test. A partner
+        # whose borrow is refused is drawn from vanilla and is not clear.
+        art = _art(asl, t.pal)
+        if (art is None and t.pal != 0 and idx is not None
+                and idx.shape == (TILE, TILE)
+                and (BORROW_MAX_DIST == float('inf') or _pal_distance(
+                    pal565, t.pal, idx) <= BORROW_MAX_DIST)):
+            art = _art(asl, 0)
+        if (idx is not None and idx.shape == (TILE, TILE) and art is not None
+                and art.px // 256 == scale):
+            hm = getattr(art, 'hmask', None)
+            tm = getattr(art, 'tmask', None)
+            if isinstance(hm, np.ndarray) and isinstance(tm, np.ndarray):
+                h = hm[asy * scale:asy * scale + n, asx * scale:asx * scale + n]
+                c = tm[asy * scale:asy * scale + n, asx * scale:asx * scale + n]
+                if h.shape == (n, n) and c.shape == (n, n):
+                    r = (_up(idx == 0, scale), h, c)
+        cell_c[ck] = r
+        return r
+
+    per_tile = {}
+    for g in grp.values():
+        bucket = {}
+        for t in g:
+            bucket.setdefault((t.dx // TILE, t.dy // TILE), []).append(t)
+        for t in g:
+            u = _cell(t)
+            if u is None:
+                continue
+            zero, paint, _clr = u
+            cand = zero & paint
+            if not cand.any():
+                continue
+            seen = np.zeros((n, n), bool)     # a partner draws it in vanilla
+            bad = np.zeros((n, n), bool)      # ...and something draws it now
+            for gx in (t.dx // TILE - 1, t.dx // TILE, t.dx // TILE + 1):
+                for gy in (t.dy // TILE - 1, t.dy // TILE, t.dy // TILE + 1):
+                    for t2 in bucket.get((gx, gy), ()):
+                        ox, oy = t2.dx - t.dx, t2.dy - t.dy
+                        if t2.off == t.off or abs(ox) >= TILE or abs(oy) >= TILE:
+                            continue
+                        # the overlap, in t's texels and in t2's
+                        ax0, ay0 = max(0, ox) * scale, max(0, oy) * scale
+                        ax1 = (TILE + min(0, ox)) * scale
+                        ay1 = (TILE + min(0, oy)) * scale
+                        bx0, by0 = max(0, -ox) * scale, max(0, -oy) * scale
+                        bx1, by1 = bx0 + (ax1 - ax0), by0 + (ay1 - ay0)
+                        u2 = _cell(t2)
+                        if u2 is None:
+                            # unknown partner: assume it draws everywhere
+                            bad[ay0:ay1, ax0:ax1] = True
+                            continue
+                        z2, _p2, c2 = u2
+                        van = ~z2[by0:by1, bx0:bx1]
+                        seen[ay0:ay1, ax0:ax1] |= van
+                        bad[ay0:ay1, ax0:ax1] |= van & ~c2[by0:by1, bx0:bx1]
+            hole = cand & seen & ~bad
+            if hole.any():
+                per_tile[t.off] = hole
+    out = {}
+    for k, rec in keys.items():
+        if k[3] < 0 or not rec.get('tiles'):
+            continue
+        m = None
+        for off in rec['tiles']:
+            h = per_tile.get(off)
+            if h is None:
+                m = None
+                break
+            m = h.copy() if m is None else (m & h)
+        if m is not None and m.any():
+            out[k] = m
+    return out
+
+
 def collect(sec9, pages, tiles):
     """
     keys      {(slot, sx, sy, pal): {'band', 'key', 'l2', 'tiles': [...]}}
@@ -2701,6 +2856,21 @@ def source_cell(k, rec, pages, arrays, pal565, art_for, pals_for, st,
                     getattr(dense_repack, 'stale_key_units', 0) + _ncan)
                 dense_repack.stale_key_texels = (
                     getattr(dense_repack, 'stale_key_texels', 0) + _ns)
+            # See STACK_HOLE. Disjoint from `_mck` by threshold, and applied
+            # before it, so MOD-CLEAR can never re-key what this fills.
+            _sh = rec.get('hole') if (STACK_HOLE and art is not None
+                                      and edge == TILE) else None
+            if _sh is not None:
+                _shf = _sh
+                if _shf.shape == keep.shape:
+                    _nsh = int((keep & _shf).sum())
+                    if _nsh:
+                        keep = keep & ~_shf
+                        dense_repack.stack_hole_cells = (
+                            getattr(dense_repack, 'stack_hole_cells', 0) + 1)
+                        dense_repack.stack_hole_texels = (
+                            getattr(dense_repack, 'stack_hole_texels', 0)
+                            + _nsh)
             if _mck is not None:
                 _final = keep | _mck
                 _added = int(_final.sum() - keep.sum())
@@ -3905,6 +4075,14 @@ def dense_repack(sec3, sec9, field='', art_for=None, pals_for=None, px=256,
         _org = _MPG.ORIGIN.get(field) or None
     except Exception:                                          # noqa: BLE001
         _org = None
+    if STACK_HOLE:
+        try:
+            _shk = stack_hole_keys(sec9, pages, arrays, tiles, keys,
+                                   art_for, _org, pal565, max(1, px // 256))
+        except Exception:                                      # noqa: BLE001
+            _shk = {}
+        for k, m in _shk.items():
+            keys[k]['hole'] = m
     _mp_force = set()
     # Candidates admitted only by the cross-layer exception are a monotonic
     # bonus population: they must never displace or reorder an established

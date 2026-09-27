@@ -403,9 +403,128 @@ SWITCHES = {
     },
 }
 
+# ---------------------------------------------------------------------------
+# exit-report -- MAKE EVERY SILENT CLOSE WRITE A CRASH REPORT
+# ---------------------------------------------------------------------------
+# "The software was closed" with no crash report is always one of the
+# engine's own `exit()` calls: `abort`, `std::terminate` and
+# `nn::diag::AbortImpl` all end in svcBreak, and Atmosphere reports those.
+# `main` calls `exit` (PLT stub +0x1150EC0, resolved through .rela.plt) from
+# exactly these 231 sites -- measured identical in the stock dump and the
+# build 535 module. Almost all of them follow an [ASSERT] message nobody can
+# see (texture ids, the 32 MB audio pool, music files, GL formats, saves).
+#
+# ON replaces each `bl exit` with `udf #0`. Nothing changes while the game
+# runs normally; the moment it WOULD have closed, it takes an undefined-
+# instruction exception at that exact site instead, and the crash report's
+# PC names the assert (see _mg/exit_labels.txt / BUILD-536).
+#
+# THE DISPATCHER GETS ONE WORD EARLIER. `+0x9CA4` and `+0xA2A0` are the
+# x86 -> ARM64 indirect-call lookup: a hash walk over the recompilation map
+# that ends in `mov w0, #1; bl exit` when the guest jumps to an x86 address
+# that was never translated -- a corrupted function pointer. Trapping on the
+# `mov` instead of the `bl` keeps the bad target in the report: X0 at +0x9CA4,
+# X19 at +0xA2A0, and LR names the translated function that made the call.
+# `+0xA698` is the same shape (a stub that only exits), trapped the same way
+# so LR names its caller.
+EXIT_PLT = 0x1150EC0
+EXIT_SITES = (
+    0x3A4, 0x50C, 0x7C8, 0xE54, 0xED4, 0x12D4,
+    0x1468, 0x152C, 0x1830, 0x267C, 0x2D4C, 0x3150,
+    0x36B4, 0x3B1C, 0x3B68, 0x3BB4, 0x3C00, 0x3C4C,
+    0x3D6C, 0x3FE4, 0x4030, 0x42A0, 0x44D8, 0x48E0,
+    0x492C, 0x4A50, 0x4A9C, 0x554C, 0x57CC, 0x5A08,
+    0x5A54, 0x5C88, 0x9CA8, 0xA2A4, 0xA69C, 0x10B71A4,
+    0x10C41FC, 0x10C4240, 0x10C425C, 0x10C4390, 0x10C5C9C, 0x10C618C,
+    0x10C62B8, 0x10C639C, 0x10CE250, 0x10CE3A0, 0x10CE3D0, 0x10CE55C,
+    0x10CE580, 0x10CE5B0, 0x10CE5CC, 0x10CE5DC, 0x10CE5EC, 0x10CE5FC,
+    0x10CE620, 0x10CE650, 0x10CE66C, 0x10CE67C, 0x10CE68C, 0x10CE69C,
+    0x10CE6C0, 0x10CE6F0, 0x10CE70C, 0x10CE71C, 0x10CE72C, 0x10CE73C,
+    0x10CE760, 0x10CE790, 0x10CE7AC, 0x10CE7BC, 0x10CE7CC, 0x10CE7DC,
+    0x10CE800, 0x10CE830, 0x10CE84C, 0x10CE85C, 0x10CE86C, 0x10CE87C,
+    0x10CE8A0, 0x10CE8D0, 0x10CE8EC, 0x10CE8FC, 0x10CE90C, 0x10CE91C,
+    0x10CE940, 0x10CE970, 0x10CE98C, 0x10CE99C, 0x10CE9AC, 0x10CE9D0,
+    0x10CEA00, 0x10CEB50, 0x10CECC4, 0x10CED8C, 0x10CEE5C, 0x10CEFD4,
+    0x10CF140, 0x10CF20C, 0x10CF2DC, 0x10CF35C, 0x10CFAA8, 0x10CFCB0,
+    0x10CFFA4, 0x10D002C, 0x10D006C, 0x10D07B4, 0x10D09BC, 0x10D0CB0,
+    0x10D0D38, 0x10D0D7C, 0x10D3F64, 0x10D401C, 0x10D4068, 0x10D40B4,
+    0x10D5BB0, 0x10D5BFC, 0x10D5C48, 0x10D5C94, 0x10D5CE0, 0x10D5D2C,
+    0x10D5D78, 0x10D5DC4, 0x10D5E10, 0x10D76BC, 0x10D7708, 0x10D7754,
+    0x10D77A0, 0x10DAFE4, 0x10DCC0C, 0x10DCD80, 0x10DD0BC, 0x10DE94C,
+    0x10DEC9C, 0x10DF004, 0x10DF0E8, 0x10DF6BC, 0x10E0670, 0x10E0E74,
+    0x10E1314, 0x10E1754, 0x10EDAB0, 0x10EDAFC, 0x10EDE78, 0x10EE310,
+    0x10EE364, 0x10F4754, 0x10F4CBC, 0x10F4D08, 0x10F4D54, 0x10F50BC,
+    0x10F5108, 0x10F7FA0, 0x10F7FDC, 0x10F8018, 0x10F8054, 0x10FB584,
+    0x10FCF34, 0x10FD38C, 0x110AE04, 0x1118EEC, 0x111B2F8, 0x111B8FC,
+    0x11209AC, 0x1126760, 0x112686C, 0x1126A64, 0x1126BEC, 0x1126E5C,
+    0x1126EA8, 0x1126EF4, 0x1126F40, 0x1126F8C, 0x11270D4, 0x112729C,
+    0x11273AC, 0x11274DC, 0x11276DC, 0x1127728, 0x1127848, 0x1127894,
+    0x1127B80, 0x1127E74, 0x1127EC0, 0x1127F0C, 0x1127F58, 0x1127FA4,
+    0x1127FF0, 0x112803C, 0x112ADC0, 0x1132574, 0x1132784, 0x1132B04,
+    0x1132F20, 0x1133328, 0x11346A0, 0x11348B8, 0x1134904, 0x1134988,
+    0x1134D8C, 0x1135620, 0x11359F8, 0x1135AD0, 0x1135B1C, 0x1135B98,
+    0x1135E50, 0x1135E9C, 0x1136AC0, 0x1136C80, 0x1136CE0, 0x1136D40,
+    0x1136DA0, 0x1137178, 0x1137354, 0x1137420, 0x1137534, 0x113772C,
+    0x1137868, 0x1137B60, 0x113969C, 0x11399C0, 0x1139A20, 0x1139BB8,
+    0x1139C04, 0x1139C84, 0x1139CE0, 0x113A0E4, 0x113B108, 0x113C694,
+    0x113CAA0, 0x113CD7C, 0x113CDC8,
+)
+_MOV_W0_1 = 0x320003E0       # `mov w0, #1` as the compiler emitted it: orr w0, wzr, #1
+_EXIT_EARLY = {0x9CA8: 0x9CA4, 0xA2A4: 0xA2A0, 0xA69C: 0xA698}
+_UDF0 = 0x00000000
+
+
+def _exit_report_words():
+    words = {}
+    for site in EXIT_SITES:
+        early = _EXIT_EARLY.get(site)
+        if early is not None:
+            words[early] = _MOV_W0_1
+        else:
+            words[site] = A.bl(site, EXIT_PLT)
+    return words
+
+
+SWITCHES['exit-report'] = {
+    'words': _exit_report_words(),
+    'on': _UDF0,
+    'on_says': 'every engine exit() now crashes WITH a report instead of '
+               'closing silently. Reproduce, then send the newest file from '
+               'atmosphere/crash_reports on the SD card. Nothing changes '
+               'while the game runs normally.',
+    'off_says': 'the engine exit() calls are back (stock): silent close.',
+}
+
 
 def read_word(path, va):
     return C.w32(C._text(path), va)
+
+
+def read_words(path, vas):
+    """Many words from ONE parse of the module (exit-report has 231)."""
+    t = C._text(path)
+    return {va: C.w32(t, va) for va in vas}
+
+
+def write_words(path, target, why):
+    """Write {va: word} in ONE verified apply + ONE rebuild.
+
+    Same checks as write_word -- nso_patcher still refuses any site whose
+    current word is not the one read here -- without recompressing the whole
+    module once per word."""
+    import nso_patcher
+    from pathlib import Path
+    p = Path(path)
+    cur = read_words(path, target)
+    patches = [{'name': '%s @%#x' % (why, va), 'va': '0x%X' % va,
+                'expect': C._fmt(cur[va]), 'set': C._fmt(word)}
+               for va, word in sorted(target.items()) if cur[va] != word]
+    if not patches:
+        return 0
+    nso = nso_patcher.read_nso(p)
+    nso_patcher.apply_spec(nso, {'name': 'diag_toggle', 'patches': patches})
+    p.write_bytes(nso_patcher.rebuild(nso))
+    return len(patches)
 
 
 def write_word(path, va, word, why):
@@ -434,7 +553,7 @@ def off_words(sw):
 def state_of(path, name):
     sw = SWITCHES[name]
     off = off_words(sw)
-    cur = {va: read_word(path, va) for va in off}
+    cur = read_words(path, off)
     if cur == off:
         return 'off'
     if 'words' in sw:
@@ -486,17 +605,18 @@ def main(argv=None):
         print('  %s is already %s -- nothing to do' % (a.switch, want))
         return 0
     if st.startswith('unknown'):
-        print('  ! +%#x holds %s, which is neither state this tool knows; '
-              'refusing to guess' % (sw['va'], st))
+        print('  ! %s is %s, which is neither state this tool knows; '
+              'refusing to guess' % (a.switch, st))
         return 1
 
     off = off_words(sw)
     if want == 'off':
         # Save what is there now so --on can put back the exact words,
         # including branch targets this tool cannot recompute.
+        _now = read_words(a.main, off)
         with open(side, 'w') as f:
             for va in sorted(off):
-                f.write('%#x %#010x\n' % (va, read_word(a.main, va)))
+                f.write('%#x %#010x\n' % (va, _now[va]))
         target = off
     else:
         static = {va: sw['on'] for va in off} if sw.get('on') is not None \
@@ -517,8 +637,7 @@ def main(argv=None):
                       'refusing')
                 return 1
 
-    for va in sorted(target):
-        write_word(a.main, va, target[va], '%s -> %s' % (a.switch, want))
+    write_words(a.main, target, '%s -> %s' % (a.switch, want))
     back = state_of(a.main, a.switch)
     if back != want:
         print('  ! the write did not take (now %s) -- do not boot this' % back)

@@ -276,9 +276,22 @@ def test_prelit():
           build.WORLD_PRELIT_ARCHIVE == 'world_us.lgp')
     src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
                             'build.py'), 'r').read()
+    # The minigame archives take the same repair (vanilla chocobo.lgp and
+    # high-us.lgp have no unlit part either); char.lgp still never does.
     check('nothing calls the pre-lit pass for char.lgp',
-          src.count('_convert_world_prelit(') == 2
-          and 'if name == WORLD_PRELIT_ARCHIVE:' in src)
+          src.count('_convert_world_prelit(') == 3
+          and 'if name == WORLD_PRELIT_ARCHIVE:' in src
+          and 'elif name in MINIGAME_PRELIT_ARCHIVES:' in src
+          and 'char.lgp' not in build.MINIGAME_PRELIT_ARCHIVES)
+    check('every minigame archive is in the pre-lit scope',
+          {'chocobo.lgp', 'high-us.lgp', 'condor.lgp', 'snowboard-us.lgp',
+           'sub.lgp', 'coaster.lgp'} <= build.MINIGAME_PRELIT_ARCHIVES
+          and not (build.MINIGAME_PRELIT_ARCHIVES
+                   & {'char.lgp', 'world_us.lgp', 'battle.lgp', 'magic.lgp',
+                      'flevel.lgp', 'menu_us.lgp'}))
+    out, lines = run_prelit({'ce.p': unlit})
+    check('a minigame call can name its own archive in the log',
+          out['ce.p'] != unlit)
 
 
 def main():

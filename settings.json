@@ -109,8 +109,8 @@
    "dwbarret": 1,
    "dwcid": 1,
    "dwcloud": 1,
-   "Buster Sword F": 0,
-   "Buster Sword B": 0,
+   "Buster Sword F": 1,
+   "Buster Sword B": 1,
    "Barret": 0,
    "Cloud": 0,
    "Tifa": 0,
@@ -212,7 +212,7 @@
   }
  },
  "[Tsunamods].SYW.Unified.MiniGames.Textures.V1.04.iro": {
-  "enabled": false,
+  "enabled": true,
   "options": {
    "SYWU": 1
   }
@@ -252,6 +252,7 @@
   "world_tex_cap": 768,
   "battle_bg_tex_cap": 768,
   "spell_tex_cap": 768,
+  "minigame_tex_cap": 768,
   "spell_fx_cap": 768,
   "field_bg_page_px": 768,
   "field_bg_budget_mb": 0.0,

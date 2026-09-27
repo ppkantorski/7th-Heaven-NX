@@ -76,6 +76,13 @@ import ff7nx_terrainfx
 import ff7nx_swirlscale
 import ff7nx_uiclip
 import ff7nx_credits
+import ff7nx_minifade
+import ff7nx_minipace
+import ff7nx_snowdraw
+import ff7nx_snowface
+import ff7nx_coasterworld
+import ff7nx_deferredvt
+import ff7nx_subgrid
 import ff7nx_uncrop
 import ff7nx_marginblack
 import ff7nx_palettedart
@@ -94,6 +101,8 @@ import ff7nx_fxcoverage
 import ff7nx_fxart
 import ff7nx_fxbake
 import ff7nx_spelltex
+import ff7nx_ddstex
+import ff7nx_minigametex
 import ff7nx_fshipart
 import ff7nx_marginpal
 import ff7nx_palkey
@@ -290,6 +299,27 @@ ARCHIVES = {
     # language fallback: the US build really opens this exact file, and
     # Dynamic Weapons supplies Cloud's BSCA1 mesh there.
     'high-us.lgp': 'data/minigame/high-us.lgp',
+    'high-fr.lgp': 'data/minigame/high-fr.lgp',
+    'high-ge.lgp': 'data/minigame/high-ge.lgp',
+    'high-sp.lgp': 'data/minigame/high-sp.lgp',
+    'chocobo.lgp': 'data/minigame/chocobo.lgp',
+    'fchocobo.lgp': 'data/minigame/fchocobo.lgp',
+    'gchocobo.lgp': 'data/minigame/gchocobo.lgp',
+    'schocobo.lgp': 'data/minigame/schocobo.lgp',
+    'coaster.lgp': 'data/minigame/coaster.lgp',
+    'condor.lgp': 'data/minigame/condor.lgp',
+    'condorj.lgp': 'data/minigame/condorj.lgp',
+    'fcondor.lgp': 'data/minigame/fcondor.lgp',
+    'gcondor.lgp': 'data/minigame/gcondor.lgp',
+    'scondor.lgp': 'data/minigame/scondor.lgp',
+    'snowboard-us.lgp': 'data/minigame/snowboard-us.lgp',
+    'snowboard-fr.lgp': 'data/minigame/snowboard-fr.lgp',
+    'snowboard-ge.lgp': 'data/minigame/snowboard-ge.lgp',
+    'snowboard-sp.lgp': 'data/minigame/snowboard-sp.lgp',
+    'sub.lgp': 'data/minigame/sub.lgp',
+    'fsub.lgp': 'data/minigame/fsub.lgp',
+    'gsub.lgp': 'data/minigame/gsub.lgp',
+    'ssub.lgp': 'data/minigame/ssub.lgp',
     'menu_us.lgp': 'data/menu/menu_us.lgp',
 }
 
@@ -463,9 +493,88 @@ VGMSTREAM_DIR = 'vgmstream'
 ECHO_S_MOD_ID = '09e81530-3f09-46b9-831b-df431b8f319c'
 
 
+# BUILD 577: OPTION TWINS.
+# A mod's alternative options ship files with the SAME name and the SAME
+# size but different bytes, and an .iro is extracted in about a second, so
+# they share a whole-second mtime too -- Ninostyle's "Buster Sword Battle
+# Model" and "... (Alternative)" both have a 1,048,812-byte `rtad` at
+# 1790247214. Every per-asset cache here (_texconv, _texcap, _pfix, ...) was
+# keyed by size + whole-second mtime, so switching the option hit the entry
+# the OTHER option had made: log 374 rebuilt battle.lgp around the default
+# sword's cached conversion, byte for byte. Measured across the extracted
+# mods: 2,366 such groups.
+#
+# A file that has a twin like that in its own mod gets a content hash
+# appended to its signature. Everything without one keeps its old signature,
+# so no existing cache entry or archive record is invalidated by this except
+# the ones that were ambiguous in the first place.
+_MOD_CACHE_ROOT = os.path.realpath(os.path.join(HERE, 'cache'))
+_TWIN_INDEX = {}        # mod dir -> {(name.lower(), size, mtime): [paths]}
+_TWIN_SUFFIX = {}       # realpath -> '' or '-c<sha1>'
+
+
+def _file_sha1(path):
+    h = hashlib.sha1()
+    with open(path, 'rb') as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _twin_suffix(path, st=None):
+    """'' unless `path` is a mod file with a same-name, same-size, same-mtime
+    sibling in its own mod whose bytes differ; then '-c' + its content hash.
+    """
+    try:
+        real = os.path.realpath(path)
+    except OSError:
+        return ''
+    hit = _TWIN_SUFFIX.get(real)
+    if hit is not None:
+        return hit
+    rel = os.path.relpath(real, _MOD_CACHE_ROOT)
+    mod = rel.split(os.sep, 1)[0]
+    if (rel.startswith('..') or os.sep not in rel or mod.startswith('_')
+            or not mod):
+        _TWIN_SUFFIX[real] = ''
+        return ''
+    root = os.path.join(_MOD_CACHE_ROOT, mod)
+    index = _TWIN_INDEX.get(root)
+    if index is None:
+        index = {}
+        for r, _dirs, files in os.walk(root):
+            for f in files:
+                q = os.path.join(r, f)
+                try:
+                    qs = os.stat(q)
+                except OSError:
+                    continue
+                index.setdefault((f.lower(), qs.st_size, int(qs.st_mtime)),
+                                 []).append(q)
+        _TWIN_INDEX[root] = index
+    st = st or os.stat(real)
+    group = index.get((os.path.basename(real).lower(), st.st_size,
+                       int(st.st_mtime)), ())
+    if len(group) < 2:
+        _TWIN_SUFFIX[real] = ''
+        return ''
+    hashes = {}
+    for q in group:
+        try:
+            hashes[os.path.realpath(q)] = _file_sha1(q)
+        except OSError:
+            pass
+    distinct = len(set(hashes.values())) > 1
+    for q, h in hashes.items():
+        _TWIN_SUFFIX[q] = ('-c' + h[:16]) if distinct else ''
+    if real not in _TWIN_SUFFIX:
+        _TWIN_SUFFIX[real] = ('-c' + _file_sha1(real)[:16]) if distinct else ''
+    return _TWIN_SUFFIX[real]
+
+
 def _sig(path):
     st = os.stat(path)
-    return f'{st.st_size}-{int(st.st_mtime)}'
+    return f'{st.st_size}-{int(st.st_mtime)}' + _twin_suffix(path, st)
 
 
 class Mod:
@@ -750,6 +859,72 @@ ARCHIVE_DISPLAY = {
     'music': 'music (.ogg)',
 }
 
+# ---------------------------------------------------------------------------
+# MINIGAME ARCHIVES ARE ADDRESSED BY FOLDER, NEVER BY A BARE NAME MATCH
+# ---------------------------------------------------------------------------
+# 7th Heaven maps a mod file to an archive by the folder it sits in --
+# `direct/chocobo`, `direct/coaster`, `direct/condor`, `direct/snowboard`,
+# `direct/sub` (AppUI/Classes/GameConverter.cs, CreateMissingDirectories) --
+# so `fb/char/AB.tex` is a char.lgp entry and nothing else.
+#
+# The minigame archives use two-letter names (`ab.tex`, `bo.tex`, `br.tex`,
+# `se.tex` ...) that Ninostyle Chibi ALSO uses for brand-new character skins.
+# Once these archives joined the name catalogs, a plain name match beat the
+# folder: build 364 packed six 24-bit Ninostyle skins over the chocobo race's
+# number font (`bo`), racer numbers (`br`), panel art (`ab`, `ae`, `bg`) and
+# the Automatic/Manual sign (`se`). Those are the black boxes where the
+# speed/stamina/gil digits belong. Meanwhile Ninostyle Fixes' five
+# `fb/chocobo/*.TEX` had no name match at all and were dropped as unmatched.
+#
+# So: a minigame archive is a destination ONLY for a file whose own folder is
+# that minigame's 7H folder, and such a file always goes there. `high` is not
+# listed; it was routed by name before these archives existed. Since BUILD
+# 549 its own folder does win it, one-way -- see HIGH_FOLDER.
+MINIGAME_DIRECT_FOLDERS = {
+    'chocobo': ('chocobo.lgp', 'fchocobo.lgp', 'gchocobo.lgp',
+                'schocobo.lgp'),
+    'coaster': ('coaster.lgp',),
+    'condor': ('condor.lgp', 'condorj.lgp', 'fcondor.lgp', 'gcondor.lgp',
+               'scondor.lgp'),
+    'snowboard': ('snowboard-us.lgp', 'snowboard-fr.lgp', 'snowboard-ge.lgp',
+                  'snowboard-sp.lgp'),
+    'sub': ('sub.lgp', 'fsub.lgp', 'gsub.lgp', 'ssub.lgp'),
+}
+_MINIGAME_FOLDER_ARCHIVES = frozenset(
+    a for arcs in MINIGAME_DIRECT_FOLDERS.values() for a in arcs)
+
+# BUILD 549. A file in a `high` folder is a high-us.lgp entry, full stop --
+# 7th Heaven's folder rule. Routed by name instead, `fb/high/BNAA.RSD` (and
+# CLAA, DNAA, EQAA, GIAA, CJAA, CMAA, ALAA, AMAA) lost to the same-named
+# field-model entry in char.lgp: high-us.lgp kept vanilla's texture-less
+# .rsd under Ninostyle's textured .p -- the white scenery -- and
+# `fb/high/GKAA.RSD`, `GMAA.RSD` were packed INTO char.lgp over field parts.
+# ONE-WAY on purpose: unlike the minigames above, high-us.lgp stays open to
+# name matches from other folders. Ninostyle's highway riders (`zc*`, `npc92`,
+# `se`) ship only in `fb/char`, and those names exist only in high-us.lgp;
+# they have always reached the highway that way and still do.
+HIGH_FOLDER = 'high'
+HIGH_ARCHIVE = 'high-us.lgp'
+
+
+def _minigame_direct_hits(rel, hits):
+    """Name-match hits for `rel`, with 7H's folder rule for minigames.
+
+    A file in a minigame folder goes to that minigame's archive (the first,
+    US-named, one) whether or not vanilla has the name. Any other file may
+    not match a minigame archive by name at all. Every other hit is kept in
+    its original order, so non-minigame routing is byte-for-byte unchanged.
+    """
+    leaf = os.path.basename(os.path.dirname(
+        rel.replace('\\', '/'))).lower()
+    own = MINIGAME_DIRECT_FOLDERS.get(leaf)
+    if own is not None:
+        return [own[0]]
+    if leaf == HIGH_FOLDER:
+        return [HIGH_ARCHIVE]
+    return [a for a in hits if a not in _MINIGAME_FOLDER_ARCHIVES]
+
+
 _COND_TERM = re.compile(r'([^()]+?)\s*(?:!=|=)\s*\d+')
 
 
@@ -880,6 +1055,9 @@ class Plan:
                                               # active FFNx frame-zero DDS is
                                               # converted at archive build time
         self.spell_dds = []          # [(rel, full, mod)] FFNx magic.lgp DDS.
+        self.minigame_dds = {}       # archive -> {(TEX name,palette): IRO path}
+        self.minigame_mod = None     # the selected SYW minigame IRO
+        self.mod_rank = {}           # later enabled mod wins a TEX collision
                                      # Collected, not routed: magic.lgp has
                                      # 652 duplicate entry names and picking
                                      # the right one needs the archive's own
@@ -1005,12 +1183,46 @@ def build_plan(mods, settings_by_mod, catalogs, log=lambda *_: None,
     models rendering blank.
     """
     plan = Plan()
+    plan.mod_rank = {mod.filename: i for i, mod in enumerate(mods)}
 
     # FFNx textures held back at extraction (see _no_switch_loader) never
     # reach the walk below, so they are counted in here to keep the
     # "FFNx textures : N (skipped, no Switch loader)" line honest.
     for mod in mods:
         plan.skipped_ffnx += getattr(mod, 'skipped_images', 0)
+
+    # SYW's minigame art stays inside its IRO until a native archive needs
+    # it. The normal cache extraction deliberately skips FFNx DDS files.
+    # Use the same active-folder order as every other mod, including the
+    # Base/selected-language collision rule, then synthesize native TEX only
+    # for archives present in this Switch dump. Resized TEX reuses the
+    # existing logical-UV bridge; no new module cave is needed.
+    import ff7nx_minigametex
+    for mod in mods:
+        if not ff7nx_minigametex.is_pack(mod):
+            continue
+        selected = ff7nx_minigametex.collect(
+            mod, settings_by_mod.get(mod.filename, {}))
+        plan.minigame_mod = mod
+        for archive, files in selected.items():
+            if archive not in catalogs or not files:
+                continue
+            matched = {key: rel for key, rel in files.items()
+                       if key[0] in catalogs[archive]}
+            if not matched:
+                continue
+            plan.minigame_dds.setdefault(archive, {}).update(matched)
+            plan.archive_files.setdefault(archive, {})
+        # These DDS entries were omitted from the extraction cache, but are
+        # now supported by the native conversion path. Unselected language
+        # entries also are not "unsupported external textures".
+        supported = sum(ff7nx_minigametex._asset(e) is not None
+                        for e in mod.entries())
+        plan.skipped_ffnx = max(0, plan.skipped_ffnx - supported)
+        log('  SYW minigames: %d selected DDS palette(s) across %d native '
+            'archive(s); %d IRO DDS files handled without extraction' %
+            (sum(len(v) for v in plan.minigame_dds.values()),
+             len(plan.minigame_dds), supported))
 
     # THE DEPTH-1 PAGE SIZE, RESOLVED ONCE AND SHARED. FINDINGS-223.
     #
@@ -1524,6 +1736,9 @@ def build_plan(mods, settings_by_mod, catalogs, log=lambda *_: None,
                 continue
 
             hits = [a for a, names in catalogs.items() if low in names]
+            # 7th Heaven's own rule for minigame archives: the folder is
+            # the archive. See MINIGAME_DIRECT_FOLDERS.
+            hits = _minigame_direct_hits(rel, hits)
             direct = hits[0] if hits else None
             candidates.append({
                 'mod': mod, 'rel': rel, 'base': base, 'low': low,
@@ -1660,6 +1875,13 @@ def build_plan(mods, settings_by_mod, catalogs, log=lambda *_: None,
                 '(CANCEL -> X, CONFIRM -> O, MENU -> triangle, SWITCH -> '
                 'square) or, where no icon is established, the bare name'
                 % echo_s_flevel.BUTTON_GLYPHS_RETARGETED)
+        # BUILD 558
+        if getattr(echo_s_flevel, 'ITEM_ICONS_REMOVED', 0) or \
+                getattr(echo_s_flevel, 'HEARTS_REMOVED', 0):
+            log('  Echo-S: %d PC item icon(s) removed from lists/prose (the '
+                '"óPotion" in the GP exchange) and %d PC heart(s) removed'
+                % (echo_s_flevel.ITEM_ICONS_REMOVED,
+                   echo_s_flevel.HEARTS_REMOVED))
         log('  Echo-S: %d field script(s) selected for validated section-1 '
             'merge' % len(plan.echo_fields))
     if plan.voice:
@@ -2643,6 +2865,23 @@ WORLD_PRELIT_ENV = 'SEVENTH_NX_WORLD_PRELIT'
 # field lighting that makes them look right.
 WORLD_PRELIT_ARCHIVE = 'world_us.lgp'
 
+# THE SAME OIL-SLICK IN THE MINIGAMES. MEASURED on the dump and on the build
+# 364 SD tree, `.p` parts by vertextype:
+#
+#                        vanilla            shipped (Ninostyle)
+#   chocobo.lgp          203 pre-lit        127 pre-lit + 76 UNLIT
+#   high-us.lgp          219 pre-lit        122 pre-lit + 158 UNLIT
+#   condor.lgp           303 pre-lit        303 pre-lit
+#
+# Exactly the world_us.lgp split: vanilla has no unlit part, so the minigame
+# modules never set light data, and Ninostyle's unlit race chocobo came out
+# rainbow on the Chocobo Race preview. Every one of those parts carries one
+# colour per vertex, so the world repair applies verbatim. char.lgp stays
+# excluded -- the field DOES light its models.
+MINIGAME_PRELIT_ARCHIVES = frozenset(
+    name for name, rel in ARCHIVES.items()
+    if rel.startswith('data/minigame/'))
+
 
 def _world_prelit_enabled():
     raw = os.environ.get(WORLD_PRELIT_ENV, '').strip().lower()
@@ -2688,9 +2927,12 @@ def _world_prelit_p(data):
                         % (numvertcolors, len(data) - 4, len(data)))
 
 
-def _convert_world_prelit(mod_files, log=lambda *_: None):
+def _convert_world_prelit(mod_files, log=lambda *_: None,
+                          archive=WORLD_PRELIT_ARCHIVE):
     """
     Mark the mod's unlit world model parts pre-lit. See FINDINGS-411 above.
+    `archive` only names the archive in the log; the minigame archives in
+    MINIGAME_PRELIT_ARCHIVES take exactly the same repair.
 
     Refusals are logged and leave the part exactly as the mod shipped it, so
     this pass can only ever be a no-op, never a corruption.
@@ -2742,7 +2984,7 @@ def _convert_world_prelit(mod_files, log=lambda *_: None):
         log('  %s: %d model part(s) re-flagged PRE-LIT (vertextype 0 -> 1), '
             '%d already pre-lit, %d refused; set %s=off to restore the '
             'unlit parts'
-            % (WORLD_PRELIT_ARCHIVE, changed, already, refused,
+            % (archive, changed, already, refused,
                WORLD_PRELIT_ENV))
     return out
 
@@ -5731,6 +5973,18 @@ def _convert_field_backgrounds(archive, payloads, log, dds_sources=(),
                 % (f"{_skc:,}",
                    f"{getattr(field_bg_dense.dense_repack, 'stale_key_units', 0):,}",
                    f"{getattr(field_bg_dense.dense_repack, 'stale_key_texels', 0):,}"))
+        _shc = getattr(field_bg_dense.dense_repack, 'stack_hole_cells', 0)
+        if _shc:
+            _dense_line += (
+                ' -- STACK HOLE (BUILD 568): %s layer-2 cell(s) had %s keyed '
+                'texel(s) filled with Cosmos\'s own opaque art where two '
+                'stacked tiles of one (param, state) split the picture the '
+                'other way round from vanilla, so our two keys left a hole '
+                'neither vanilla nor Cosmos has -- convil_2\'s black squares '
+                'on the condor. Only EMPTY texels change; set '
+                'SEVENTH_NX_NO_STACK_HOLE=1 to restore build 567.'
+                % (f"{_shc:,}",
+                   f"{getattr(field_bg_dense.dense_repack, 'stack_hole_texels', 0):,}"))
         # MOD-CLEAR KEY. FINDINGS-253. Same reason as the block above: a pass
         # that silently never fires is HANDOFF-246's second trap, and the log
         # is the only place it can be checked after the fact.
@@ -6541,6 +6795,13 @@ def _debleed_textures(name, mod_files, van, log):
     if os.environ.get(NO_DEBLEED_ENV, '').strip().lower() in (
             '1', 'true', 'yes', 'on'):
         return mod_files
+    if name in PSX_KEYED_ARCHIVES:
+        # BUILD 541. These draw through the PSX-style path where a BLACK
+        # texel is what makes a pixel transparent -- the palette's alpha and
+        # index are not consulted -- so a de-fringed entry 0 is drawn as a
+        # solid box. See _psx_colour_contract.
+        log('  %s: de-fringe skipped (PSX colour-keyed archive)' % name)
+        return mod_files
     os.makedirs(DEBLEED_CACHE, exist_ok=True)
     out = dict(mod_files)
     done = refused = from_van = 0
@@ -6606,6 +6867,184 @@ def _debleed_textures(name, mod_files, van, log):
     if refused:
         log('  ! %s: %d de-fringe(s) REFUSED -- the rewrite would have changed '
             'pixel indices, so the original was kept' % (name, refused))
+    return out
+
+
+# BUILD 541. Minigame archives whose textures are drawn by the PSX-derived
+# path (snowboard: TMD models, sprite packets, fade/frame quads). Measured on
+# hardware (build 540 screenshots): the frame texture `waku`, whose vanilla
+# centre is palette entry 0 = black/alpha 0, drew as a solid grey box once
+# entry 0 was grey/alpha 0 -- so here transparency is the colour black, not
+# the alpha byte or the index. Cloud's eyes lost their black outlines and
+# pupils for the same reason (opaque black = transparent).
+PSX_KEYED_ARCHIVES = frozenset(
+    a for a in ARCHIVES if a.startswith('snowboard-'))
+PSX_CONTRACT_CACHE = os.path.join(HERE, 'cache', '_psx_contract')
+PSX_MIN_OPAQUE = 8          # one 5-bit step: the darkest vanilla opaque grey
+
+
+def psx_contract_palette(van_data, mod_data):
+    """Return mod_data with its palette made to obey the vanilla texture's
+    PSX colour-key contract, or None when nothing applies / changes.
+
+    Vanilla snowboard textures, all 30 measured: every alpha-0 entry is RGB 0
+    and no opaque entry is darker than (8,8,8); a texture's opaque entries
+    share one alpha, 255 or 254 (254 carries the PSX semi-transparency bit).
+    The converted texture gets exactly that: alpha 0 -> black, opaque near
+    black -> (8,8,8), opaque alpha -> the vanilla value. Indices and the
+    header are untouched (checked by the caller).
+    """
+    vt, mt = tex.parse(van_data), tex.parse(mod_data)
+    if not vt or not mt or not vt['palette_flag'] or not mt['palette_flag']:
+        return None
+    if not struct.unpack_from('<I', van_data, tex.O_COLORKEY)[0]:
+        return None
+    vp = vt['palette']
+    ops = {vp[i + 3] for i in range(0, len(vp), 4) if vp[i + 3]}
+    alpha = ops.pop() if len(ops) == 1 else None
+    pal = bytearray(mt['palette'])
+    for i in range(0, len(pal), 4):
+        if pal[i + 3] == 0:
+            pal[i:i + 3] = b'\0\0\0'
+        else:
+            if max(pal[i:i + 3]) < PSX_MIN_OPAQUE:
+                pal[i:i + 3] = bytes((PSX_MIN_OPAQUE,) * 3)
+            if alpha is not None:
+                pal[i + 3] = alpha
+    if bytes(pal) == mt['palette']:
+        return None
+    off = len(mod_data) - len(mt['pixels']) - len(pal)
+    out = bytearray(mod_data)
+    out[off:off + len(pal)] = pal
+    return bytes(out)
+
+
+def _psx_colour_contract(name, mod_files, van, log):
+    """Apply psx_contract_palette to every mod TEX with a vanilla twin."""
+    if name not in PSX_KEYED_ARCHIVES:
+        return mod_files
+    os.makedirs(PSX_CONTRACT_CACHE, exist_ok=True)
+    out = dict(mod_files)
+    fixed = 0
+    for low, (src, mod) in mod_files.items():
+        vpath = (van or {}).get(low)
+        if not vpath:
+            continue
+        try:
+            data = open(src, 'rb').read()
+            vdata = open(vpath, 'rb').read()
+        except OSError:
+            continue
+        key = 'PSXKEY-V1-' + _sig(src) + _sig(vpath)
+        cached = os.path.join(PSX_CONTRACT_CACHE, '%s.%s.%s' % (
+            name, low, hashlib.sha1(key.encode()).hexdigest()[:16]))
+        if os.path.exists(cached):
+            out[low] = (cached, mod)
+            fixed += 1
+            continue
+        new = psx_contract_palette(vdata, data)
+        if new is None:
+            continue
+        if not tex.check_indices_unchanged(data, new):
+            continue
+        with open(cached + '.tmp', 'wb') as f:
+            f.write(new)
+        os.replace(cached + '.tmp', cached)
+        out[low] = (cached, mod)
+        fixed += 1
+    if fixed:
+        log('  %s: %d texture(s) put back on the PSX colour key -- transparent '
+            'entries black, no opaque black, vanilla semi-transparency bit '
+            '(BUILD 541)' % (name, fixed))
+    return out
+
+
+SNOWFACE_CACHE = os.path.join(HERE, 'cache', '_snowface')
+
+
+def _snowboard_face(name, mod_files, van, log):
+    """BUILD 547. Cloud's snowboard face (object 14 of for_gs.tmd and
+    for_ev.tmd, over eyes.tex): lifted off his skin so the port's depth test
+    stops eating it, both sides on one mirrored UV mapping, eyes lower and
+    closer. See ff7nx_snowface. A modded TMD is patched only if its face
+    object is still the stock one."""
+    if not name.lower().startswith('snowboard') or not ff7nx_snowface.enabled():
+        return mod_files
+    out = dict(mod_files)
+    for low in ff7nx_snowface.TMD_NAMES:
+        src = mod_files[low][0] if low in mod_files else (van or {}).get(low)
+        mod = mod_files[low][1] if low in mod_files else None
+        if not src:
+            continue
+        try:
+            data = open(src, 'rb').read()
+        except OSError:
+            continue
+        new, note = ff7nx_snowface.patch(low, data)
+        if new == data:
+            log('  %s: %s' % (name, note))
+            continue
+        os.makedirs(SNOWFACE_CACHE, exist_ok=True)
+        dest = os.path.join(SNOWFACE_CACHE, '%s.%s.%s' % (
+            name, low, hashlib.sha1(new).hexdigest()[:16]))
+        if not os.path.exists(dest):
+            with open(dest + '.tmp', 'wb') as f:
+                f.write(new)
+            os.replace(dest + '.tmp', dest)
+        out[low] = (dest, mod)
+        log('  %s: %s (BUILD 547)' % (name, note))
+    return out
+
+
+COASTERWORLD_CACHE = os.path.join(HERE, 'cache', '_coasterworld')
+
+
+def _coaster_world(name, mod_files, van, log):
+    """BUILD 561. The coaster's precomputed visibility streams (xbin.bin),
+    widened for 16:9 so the world stops vanishing at the screen edges. Same
+    size, rewritten in place. See ff7nx_coasterworld."""
+    if name.lower() != 'coaster.lgp':
+        return mod_files
+    left, right = ff7nx_coasterworld.widen()
+    if (left, right) == (0, 0) and ff7nx_coasterworld.far_factor() == 1.0:
+        log('  coaster.lgp: world visibility stock (%s=0, %s=1)'
+            % (ff7nx_coasterworld.ENV, ff7nx_coasterworld.FAR_ENV))
+        return mod_files
+    lows = (ff7nx_coasterworld.XBIN, ff7nx_coasterworld.XBINADR)
+    srcs = [mod_files[k][0] if k in mod_files else (van or {}).get(k)
+            for k in lows]
+    if not all(srcs):
+        log('  ! coaster.lgp: no xbin.bin/xbinadr.bin; world stays stock')
+        return mod_files
+    try:
+        xbin = open(srcs[0], 'rb').read()
+        adr = open(srcs[1], 'rb').read()
+        far_left = ff7nx_coasterworld.far_steps(
+            ff7nx_coasterworld.far_factor())
+        new = ff7nx_coasterworld.rewrite(xbin, adr, left, right, far_left)
+        before = ff7nx_coasterworld.peaks(xbin, adr)
+        after = ff7nx_coasterworld.peaks(new, adr, len(
+            ff7nx_coasterworld.read_stream(xbin, *ff7nx_coasterworld._region(
+                ff7nx_coasterworld._table(adr), len(xbin), 8))))
+    except (OSError, ValueError) as exc:
+        log('  ! coaster.lgp: world widening skipped (%s)' % exc)
+        return mod_files
+    os.makedirs(COASTERWORLD_CACHE, exist_ok=True)
+    dest = os.path.join(COASTERWORLD_CACHE, 'xbin.%s.bin'
+                        % hashlib.sha1(new).hexdigest()[:16])
+    if not os.path.exists(dest):
+        with open(dest + '.tmp', 'wb') as f:
+            f.write(new)
+        os.replace(dest + '.tmp', dest)
+    out = dict(mod_files)
+    mod = (mod_files[lows[0]][1] if lows[0] in mod_files else None)
+    out[lows[0]] = (dest, mod)
+    log('  coaster.lgp: world visibility widened for 16:9 -- polygons added %d '
+        'step(s) earlier (%d for the far draw-distance adds, x%g), removed '
+        '%d later; peak on screen %d -> %d triangles, %d -> %d quads '
+        '(BUILD 561/564)'
+        % (left, far_left, ff7nx_coasterworld.far_factor(), right,
+           before[0], after[0], before[1], after[1]))
     return out
 
 
@@ -7377,7 +7816,9 @@ def _lookup_unreachable(path):
 
 def _build_model_archive(name, archive_path, mod_files, romfs, pack_lgp,
                          log, folder_of=None, battle_bg_native_names=None,
-                         spell_dds=None, dynweapon=None):
+                         spell_dds=None, dynweapon=None,
+                         minigame_dds=None, minigame_mod=None,
+                         mod_rank=None):
     """
     Rebuild a model LGP (char/battle/magic/world/menu) with PyFF7: reuse
     every untouched vanilla entry, overlay the mod's files unchanged, add any
@@ -7404,6 +7845,9 @@ def _build_model_archive(name, archive_path, mod_files, romfs, pack_lgp,
         toc_names = [f.read(27)[:20].split(b'\0')[0].decode('ascii', 'replace').lower()
                      for _ in range(count)]
     if len(toc_names) != len(set(toc_names)):
+        if minigame_dds:
+            raise ValueError('%s has duplicate entries; refusing name-based '
+                             'SYW minigame conversion' % name)
         return _build_inplace_archive(name, archive_path, mod_files, romfs,
                                       log, folder_of, battle_bg_native_names,
                                       spell_dds)
@@ -7467,6 +7911,31 @@ def _build_model_archive(name, archive_path, mod_files, romfs, pack_lgp,
     if name == 'world_us.lgp':
         mod_files = _convert_world_dds(mod_files, van, log)
 
+    # BUILD 539. The minigame archives take the FIELD texture cap on their
+    # native mod textures, BEFORE the SYW conversion reads any of them.
+    #
+    # These are the same Ninostyle Chibi skins char.lgp carries, and there
+    # they have been capped at the field cap (512 in the shipping settings)
+    # since the field proved the uncapped ones do not fit. Nothing capped them
+    # here: high-us.lgp shipped nineteen 1024x1024 TRUECOLOR skins -- 116 MB
+    # of 32-bit surfaces against vanilla's 2.9 MB -- and the Highway turned
+    # into flicker, black, rainbow specks and a single-digit framerate, with
+    # Cloud's own skin among the textures that could not stay resident.
+    #
+    # Same function, same cache, same format-preserving uniform resample as
+    # char.lgp. SYW's converted TEX are NOT in `mod_files` yet (they are
+    # produced below, under their own cap and with their own scale marker),
+    # so this can never resize one of them behind its marker's back.
+    if name in MINIGAME_PRELIT_ARCHIVES:
+        _mini_cap = _field_tex_cap()
+        if _mini_cap:
+            mod_files = _cap_field_textures(name, mod_files, log, _mini_cap)
+
+    if minigame_dds:
+        mod_files, _mini_stats = ff7nx_minigametex.convert_archive(
+            name, archive_path, mod_files, minigame_dds, minigame_mod,
+            mod_rank or {}, log)
+
     # Opt-in only (see FIELD_TEX_CAP_ENV above) -- disabled by default, so
     # a build with nothing set behaves exactly as before this was added.
     if name in ('char.lgp', 'world_us.lgp'):
@@ -7501,10 +7970,15 @@ def _build_model_archive(name, archive_path, mod_files, romfs, pack_lgp,
         mod_files = _convert_world_prelit(mod_files, log)
         # Diagnostic, off unless asked for.
         mod_files = _convert_world_normal_probe(mod_files, log)
+    elif name in MINIGAME_PRELIT_ARCHIVES:
+        mod_files = _convert_world_prelit(mod_files, log, archive=name)
 
     # Every model archive, and AFTER both the battle conversion and the field
     # cap so neither can undo it. Idempotent on anything already de-fringed.
     mod_files = _debleed_textures(name, mod_files, van, log)
+    mod_files = _psx_colour_contract(name, mod_files, van, log)
+    mod_files = _snowboard_face(name, mod_files, van, log)
+    mod_files = _coaster_world(name, mod_files, van, log)
 
     # Does this mod actually change the archive? Track new entries and whether
     # any replacement differs from vanilla. If nothing changes, we skip the
@@ -8074,6 +8548,22 @@ def _build_flevel(archive_path, chunks, field_files, romfs, log,
                 % (len(retired), ', '.join(sorted(retired))))
         else:
             log('  Echo-S: no endless MVIEF wait in the selected field(s)')
+        paced = echo_s_flevel.PACED_PICKERS
+        if paced:
+            log('  Echo-S: %d inn hour picker(s) had no WAIT, so a held '
+                'direction stepped once per field tick (60 hours a second at '
+                '60 Hz) -- Left/Right now step once per PRESS (key! -> keyon, '
+                'one opcode byte each; BUILD 574): %s'
+                % (len(paced), ', '.join(sorted(paced))))
+        extended = echo_s_flevel.EXTENDED_PICKERS
+        if extended:
+            log('  Echo-S: %d inn hour picker(s) now offer 1..%d hours '
+                '(stock 1..10; the wrap tests 11 -> %d and 0 -> %d, two value '
+                'bytes each; BUILD 576): %s'
+                % (len(extended), echo_s_flevel.HOUR_PICKER_MAX,
+                   echo_s_flevel.HOUR_PICKER_MAX + 1,
+                   echo_s_flevel.HOUR_PICKER_MAX,
+                   ', '.join(sorted(extended))))
         kept = echo_s_flevel.KEPT_STOCK_MVIEF_WAITS
         if kept:
             log('  Echo-S: the same wait is in the STOCK script of %s and was '
@@ -10792,6 +11282,30 @@ MAIN_ONLY_ENV = frozenset((
     # nowhere else, so this cannot change an archive byte.
     ff7nx_daynight.FREEZE_ENV,
     ff7nx_daynight.STRENGTH_ENV,   # how hard the tint lands; module-only too
+    ff7nx_daynight.CONDOR_ENV,     # BUILD 572: Fort Condor minigame tint
+    ff7nx_daynight.FORCE_OUTDOOR_ENV,  # BUILD 572: convil_2 treated outdoor
+    'SEVENTH_NX_AUDIO_POOL_MB',    # BUILD 537, ff7nx_audiopool.MB_ENV
+    'SEVENTH_NX_MINIGAME_FADE', 'SEVENTH_NX_MINIGAME_60', 'SEVENTH_NX_SNOW_DRAW',    # BUILD 538/539, ff7nx_minifade.MINIFADE_ENV
+    'SEVENTH_NX_DEFERRED_VT',    # BUILD 550, ff7nx_deferredvt.ENV
+    'SEVENTH_NX_SUB_GRID', 'SEVENTH_NX_SUB_GRID_RGB',  # BUILD 551, ff7nx_subgrid
+    'SEVENTH_NX_SUB_FPS',        # BUILD 551, ff7nx_minipace.SUB_ENV
+    'SEVENTH_NX_SUB_GRID_BIAS',  # BUILD 553, ff7nx_sublines.BIAS_ENV
+    'SEVENTH_NX_SUB_GRID_ULPS',  # BUILD 553, ff7nx_subgrid.BIAS_ENV (off)
+    'SEVENTH_NX_SUB_FILTER',     # BUILD 553, ff7nx_subgrid.FILTER_ENV
+    'SEVENTH_NX_SUB_PACE',       # BUILD 555, ff7nx_sublines.PACE_ENV
+    'SEVENTH_NX_MINIGAME_FLIP',  # BUILD 562, ff7nx_sublines.FLIP_ENV
+    'SEVENTH_NX_LINE_WIDTH',     # BUILD 552, ff7nx_sublines.ENV
+    'SEVENTH_NX_COASTER_AIM', 'SEVENTH_NX_COASTER_AIM_SPEED',  # BUILD 561
+    'SEVENTH_NX_COASTER_YAW',    # BUILD 563, ff7nx_coaster.YAW_ENV
+    'SEVENTH_NX_COASTER_EDGE',   # BUILD 564, ff7nx_coaster.EDGE_ENV
+    'SEVENTH_NX_CONDOR', 'SEVENTH_NX_CONDOR_UNCROP',  # BUILD 565, ff7nx_condor
+    'SEVENTH_NX_FIELD_ZOOM',     # BUILD 567, ff7nx_fieldzoom.ENV
+    'SEVENTH_NX_CONDOR_PAD',     # BUILD 569, ff7nx_condorpad.ENV
+    'SEVENTH_NX_CONDOR_SPEED',   # BUILD 569, ff7nx_condorpad.SPEED_ENV
+    'SEVENTH_NX_CONDOR_LINE',    # BUILD 570, ff7nx_condorpad.LINE_ENV
+    'SEVENTH_NX_CONDOR_BANNER_Y',  # BUILD 571, ff7nx_condorpad.BANNER_ENV
+    'SEVENTH_NX_CONDOR_MSG_Y',   # BUILD 575, ff7nx_condorpad.MSG_ENV
+    'SEVENTH_NX_CONDOR_BUTTONS', # BUILD 575, ff7nx_condorpad.BUTTONS_ENV
 ))
 
 # The modules those settings reach, by the same rule: each writes into
@@ -10831,6 +11345,23 @@ MAIN_ONLY_MODULES = frozenset((
     'ff7nx_calendar.py',
     'ff7nx_camclamp.py',
     'ff7nx_daynight.py',
+    # BUILD 537. The sound-buffer pool cave: exefs/main only.
+    'ff7nx_audiopool.py',
+    # BUILD 538/539. In-place words in the two minigame fade submitters.
+    'ff7nx_minifade.py', 'ff7nx_minipace.py', 'ff7nx_snowdraw.py',
+    # BUILD 550. Nine in-place words in gfx_drv_draw_deferred.
+    'ff7nx_deferredvt.py',
+    # BUILD 551. Five in-place words in the submarine terrain draw.
+    'ff7nx_subgrid.py',
+    # BUILD 561. Coaster analogue aim, one dead-space cave in exefs/main.
+    'ff7nx_coaster.py',
+    # BUILD 565. Fort Condor 16:9: one dead-space cave + in-place words.
+    'ff7nx_condor.py',
+    # BUILD 567. Per-field 4:3 zoom (convil_2), one dead-space cave.
+    'ff7nx_fieldzoom.py',
+    'ff7nx_condorpad.py',
+    # BUILD 552. Two caves on the two GL draw calls.
+    'ff7nx_sublines.py',
 ))
 
 # The shader half of the same rule.
@@ -10885,13 +11416,38 @@ MOVIECAM_ONLY_MODULES = frozenset(('ff7nx_moviecam.py',
                                    'ff7nx_campreserve.py',
                                    'ff7nx_deadspace.py'))
 
-ARCHIVE_NEUTRAL_ENV = MAIN_ONLY_ENV | SHADER_ONLY_ENV | MOVIECAM_ONLY_ENV
+# This setting changes only SYW minigame TEX. Its value is included in the
+# fingerprint of each affected minigame archive by apply_plan(), so the
+# generic all-archive environment sweep must not treat it as an flevel (or
+# battle/magic/char) input. In particular, raising the cap in the GUI must
+# not make verified SEVENTH_NX_REUSE_FLEVEL=1 reject a valid field archive.
+SCOPED_ARCHIVE_ENV = frozenset((ff7nx_minigametex.CAP_ENV,
+                                # BUILD 554: sub.lgp only; fingerprinted
+                                # into that archive's key below.
+                                ff7nx_minigametex.SUB_SYW_ENV,
+                                # BUILD 561: coaster.lgp only; fingerprinted
+                                # into that archive's key below.
+                                ff7nx_coasterworld.ENV,
+                                # BUILD 564: coaster.lgp AND exefs/main;
+                                # fingerprinted into coaster.lgp's key.
+                                ff7nx_coasterworld.FAR_ENV))
+ARCHIVE_NEUTRAL_ENV = (MAIN_ONLY_ENV | SHADER_ONLY_ENV |
+                       MOVIECAM_ONLY_ENV | SCOPED_ARCHIVE_ENV)
 ARCHIVE_NEUTRAL_MODULES = (MAIN_ONLY_MODULES | SHADER_ONLY_MODULES
                            | MOVIECAM_ONLY_MODULES)
 
 
 def _stat_sig(path):
-    """(size, mtime_ns) for a path, or None if it is not there."""
+    """(size, mtime_ns) for a path, or None if it is not there.
+
+    Unlike `_sig`, this keeps the NANOSECONDS, and that is why BUILD 577's
+    option twins do not reach the archive fingerprint: the two Ninostyle
+    `rtad` files share a whole-second mtime but not a nanosecond one (they
+    were extracted one after the other), so log 374 correctly rebuilt
+    battle.lgp -- from a stale _texconv entry. Left unchanged on purpose:
+    adding the twin hash here would move flevel's record and cost a full
+    flevel rebuild for no difference in bytes.
+    """
     try:
         st = os.stat(path)
         return (st.st_size, st.st_ns if hasattr(st, 'st_ns') else st.st_mtime_ns)
@@ -11503,6 +12059,13 @@ def apply_plan(plan, archive_paths, sdout, log=lambda *_: None,
         os.environ.pop(WORLD_GAIA_SCALE_ENV, None)
         os.environ.pop(WORLD_GAIA_SPECIAL_ENV, None)
 
+    # BUILD 561. coaster.lgp carries the widened world even when no mod
+    # touches it (its xbin.bin is rewritten in _build_model_archive).
+    if ((ff7nx_coasterworld.widen() != (0, 0)
+         or ff7nx_coasterworld.far_factor() != 1.0)
+            and 'coaster.lgp' in archive_paths
+            and 'coaster.lgp' not in plan.archive_files):
+        plan.archive_files['coaster.lgp'] = {}
     model_targets = sorted(a for a in plan.archive_files if a != 'flevel.lgp')
     flevel_fields = plan.archive_files.get('flevel.lgp', {})
     do_flevel = bool(plan.chunks) or bool(flevel_fields) or bool(plan.echo_fields)
@@ -11579,6 +12142,17 @@ def apply_plan(plan, archive_paths, sdout, log=lambda *_: None,
                 continue
         _spell = ([] if name != 'magic.lgp' else
                   sorted(r for r, _f, _m in plan.spell_dds))
+        _mini = plan.minigame_dds.get(name, {})
+        _mini_stat = os.stat(plan.minigame_mod.path) if _mini else None
+        _mini_key = (
+            sorted((native, pal, rel) for (native, pal), rel in _mini.items()),
+            (_mini_stat.st_size, _mini_stat.st_mtime_ns) if _mini else (),
+            ff7nx_minigametex.cap() if _mini else 0,
+            ff7nx_minigametex.CONVERSION_VERSION if _mini else b'',
+            (os.environ.get(ff7nx_minigametex.SUB_SYW_ENV, '0')
+             if name.lower() == 'sub.lgp' else ''),
+            (ff7nx_ddstex.wide_palette(), ff7nx_ddstex.dds_alpha(),
+             ff7nx_ddstex.reseam()) if _mini else ())
         fp = _archive_fingerprint(
             name, archive_paths[name], plan.archive_files[name],
             (sorted((plan.folder_of.get(name) or {}).items()),
@@ -11589,6 +12163,7 @@ def apply_plan(plan, archive_paths, sdout, log=lambda *_: None,
              # finished magic.lgp would otherwise be reused verbatim and the
              # fix would appear to have done nothing.
              _spell,
+             _mini_key,
              # V37 has one cap for every mapped TEX. Frame tables never move;
              # each resized payload carries its own runtime scale marker.
              (ff7nx_spelltex.cap(),
@@ -11602,7 +12177,11 @@ def apply_plan(plan, archive_paths, sdout, log=lambda *_: None,
              # BUILD 439, same rule: only the archives dynamic weapons
              # actually writes into can change when this flips.
              (ff7nx_dynweapon.hrc_rewrite_enabled()
-              if name in _dynweapon_targets(plan) else 0)))
+              if name in _dynweapon_targets(plan) else 0),
+             # BUILD 561: the coaster's widened visibility streams.
+             ((ff7nx_coasterworld.widen(), ff7nx_coasterworld.far_factor(),
+               ff7nx_coasterworld.VERSION)
+              if name.lower() == 'coaster.lgp' else 0)))
         hit, payload = _archive_cache_ok(name, dest_path, fp, log)
         if hit:
             produced.append(dest_path)
@@ -11636,7 +12215,8 @@ def apply_plan(plan, archive_paths, sdout, log=lambda *_: None,
                                     plan.battle_bg_native_names,
                                     plan.spell_dds
                                     if name == 'magic.lgp' else None,
-                                    plan.dynweapon)
+                                    plan.dynweapon,
+                                    _mini, plan.minigame_mod, plan.mod_rank)
         if dest:
             produced.append(dest)
             _archive_cache_store(
@@ -11902,6 +12482,20 @@ def apply_fps_patches(sdout, dump, log=lambda *_: None, produced=()):
         return []
     new_files = sorted(set(_tree_snapshot(sdout)) - set(before))
     log(f'  60 FPS patches applied ({len(new_files)} new file(s))')
+    # BUILD 540. The minigame limiters that are real waits (Fort Condor,
+    # submarine) follow the same dial as the field/battle/world divisors.
+    # ff7_en data only, applied to the file fps.run just wrote. The chocobo
+    # race is deliberately left at 30 -- see ff7nx_minipace.
+    if os.path.exists(built_exe):
+        if ff7nx_minipace.enabled():
+            _mini_fps = limiter_fps() or 60.0
+            log('  minigame limiters -> %g (condor, submarine; chocobo race '
+                'stays 30, coaster/snowboard/highway have no limiter)'
+                % _mini_fps)
+            ff7nx_minipace.apply(built_exe, _mini_fps,
+                                 log=lambda s: log('  ' + s))
+        else:
+            log('  minigame limiters: stock (%s=0)' % ff7nx_minipace.ENV)
     # _tree_snapshot's difference reports files that did not EXIST before, so
     # on a rebuild -- sdout is never cleared -- the module and exe this pass
     # just rewrote are absent from it, and it returns an empty list while
@@ -12631,7 +13225,7 @@ def apply_spelluv(sdout, dump, log=lambda *_: None, produced=(), needed=False):
     if not needed:
         return []
     if dump is None or not dump.nso:
-        log('! spell logical UV: needs exefs/main from a full game dump; skipped')
+        log('! texture logical UV: needs exefs/main from a full game dump; skipped')
         return []
     import ff7nx_spelluv
     dest = os.path.join(sdout, 'atmosphere', 'contents', TITLE_ID, 'exefs',
@@ -12640,7 +13234,7 @@ def apply_spelluv(sdout, dump, log=lambda *_: None, produced=(), needed=False):
     built = os.path.normpath(os.path.abspath(dest)) in fresh
     src = dest if built else dump.nso
     log('')
-    log('spell textures -> per-TEX logical texel coordinates ...')
+    log('resized textures -> per-TEX logical texel coordinates ...')
     if not built and os.path.exists(dest):
         try:
             same = (os.path.getsize(dest) == os.path.getsize(dump.nso)
@@ -12648,7 +13242,7 @@ def apply_spelluv(sdout, dump, log=lambda *_: None, produced=(), needed=False):
         except OSError:
             same = False
         if not same:
-            log('! spell logical UV: existing main was not produced by this '
+            log('! texture logical UV: existing main was not produced by this '
                 'build; delete sdout/ and rebuild')
             return []
     log(f'  base main   {src}'
@@ -12984,6 +13578,299 @@ def apply_ambient(sdout, dump, plan, log=lambda *_: None, produced=()):
         'data/music_ogg/ambient/NNNN.ogg itself; if that fails the loop is '
         'skipped and retried next frame instead of the engine\'s "music file '
         'can not be loaded" exit(-1) -- the New Game crash (BUILD 524)')
+    return [dest] if not built else []
+
+
+def apply_audio_pool(sdout, dump, log=lambda *_: None, produced=()):
+    """
+    Allocate the engine's sound-buffer pool from the nnSdk heap at
+    `ff7nx_audiopool.pool_mb()` MB instead of the static 32 MB block.
+
+    BUILD 537. The Chocobo Race "software was closed" with no report is
+    `SoundBufferImpl::Init` finding `g_WaveBufferAllocator` empty and calling
+    exit(-1) at +0x1126BEC -- read straight off build 536's exit-report crash
+    log. Cosmo Memory's long looping SFX (up to 10 MB decoded each) share that
+    one 32 MB pool with every cached effect and every stream ring; on PC they
+    are ordinary RAM. See ff7nx_audiopool.
+
+    LAST of the cave passes (only the diagnostic frame probe follows), so it
+    takes padding no already-shipping cave was using and moves none of them.
+    If the heap allocation ever fails at boot, the cave falls back to the
+    stock static pool at the stock size.
+    """
+    import ff7nx_audiopool
+    try:
+        mb = ff7nx_audiopool.pool_mb()
+    except ValueError as exc:
+        log('! audio pool: %s; left at the stock 32 MB' % exc)
+        return []
+    if mb == ff7nx_audiopool.STOCK_MB:
+        return []
+    src, built = _audio_bridge_base(sdout, dump, log, produced,
+                                    'audio pool')
+    if src is None:
+        return []
+    dest = os.path.join(sdout, 'atmosphere', 'contents', TITLE_ID, 'exefs',
+                        'main')
+    log('')
+    log('sound-buffer pool ...')
+    log('  base main   %s%s'
+        % (src, '   (previous patch output)' if built else '   (from dump)'))
+    tmp = dest + '.audiopool-tmp'
+    try:
+        report = ff7nx_audiopool.apply_to_nso(src, tmp, mb, log)
+    except Exception as exc:                                   # noqa: BLE001
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        log('! audio pool: NOT installed (%s) -- the game keeps its 32 MB '
+            'pool, and long Cosmo Memory loops can still exhaust it' % exc)
+        return []
+    os.replace(tmp, dest)
+    log('  g_WaveBufferAllocator 32 -> %d MB, allocated 4 KB-aligned from the '
+        'nnSdk heap at audio init (cave +0x%X, %d words; site +0x%X). If the '
+        'heap cannot supply it the stock static 32 MB pool is used instead.'
+        % (report['mb'], report['cave_entry'], report['cave_words'],
+           ff7nx_audiopool.BASE_SITE))
+    log('  %s=32 restores the stock pool; 48/64/128 are the other sizes'
+        % ff7nx_audiopool.MB_ENV)
+    return [dest] if not built else []
+
+
+def apply_line_width(sdout, dump, log=lambda *_: None, produced=()):
+    """
+    BUILD 552. GL_LINES drawn 2 px wide: the submarine grid, heading line and
+    target boxes. Three draws with the viewport nudged one pixel right and one
+    pixel up, restored exactly; everything that is not GL_LINES goes straight
+    to the stub. After the audio pool so no shipping cave moves. See
+    ff7nx_sublines.
+    """
+    import ff7nx_sublines
+    width = ff7nx_sublines.enabled()
+    pct = ff7nx_sublines.bias_pct()
+    pace = ff7nx_sublines.pace_enabled()
+    flip = ff7nx_sublines.flip_enabled()
+    if not width and not pct and not pace and not flip:
+        log('')
+        log('line width: stock 1 px (%s=1), grid depth pull off (%s=0)'
+            % (ff7nx_sublines.ENV, ff7nx_sublines.BIAS_ENV))
+        return []
+    src, built = _audio_bridge_base(sdout, dump, log, produced, 'line width')
+    if src is None:
+        return []
+    dest = os.path.join(sdout, 'atmosphere', 'contents', TITLE_ID, 'exefs',
+                        'main')
+    log('')
+    log('line width ...')
+    tmp = dest + '.sublines-tmp'
+    try:
+        report = ff7nx_sublines.apply_to_nso(src, tmp, log, width, pct,
+                                             pace, stock=dump.nso)
+    except Exception as exc:                                   # noqa: BLE001
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        log('! line width: NOT installed (%s) -- lines stay 1 px' % exc)
+        return []
+    os.replace(tmp, dest)
+    log('  flip 1/30 s wait: %s' % ('highway only (snowboard and coaster '
+                                     'present at the display rate)' if flip
+                                     else 'stock, snowboard/coaster/highway (%s=0)'
+                                     % ff7nx_sublines.FLIP_ENV))
+    log('  submarine limiter: %s' % ('FFNx cadence, 1/60 s per call (30 '
+                                      'logic + 30 draws a second)' if pace
+                                      else 'stock (%s=0)'
+                                      % ff7nx_sublines.PACE_ENV))
+    log('  GL_LINES %s; submarine grid depth pull %s (%d words written). '
+        '%s=1 restores 1 px, %s=0 removes the pull.'
+        % ('2 px wide' if width else '1 px (stock)',
+           ('%g %%' % pct) if pct else 'off', report['words'],
+           ff7nx_sublines.ENV, ff7nx_sublines.BIAS_ENV))
+    return [dest] if not built else []
+
+
+def apply_coaster(sdout, dump, log=lambda *_: None, produced=()):
+    """
+    BUILD 561. Gold Saucer coaster: 360-degree analogue aim, one cave in the
+    dead-space part 'coaster'. After the line-width pass so no earlier cave
+    moves. See ff7nx_coaster. (The 16:9 edge pop-out is coaster.lgp data --
+    ff7nx_coasterworld, in _build_model_archive.)
+    """
+    import ff7nx_coaster
+    aim = ff7nx_coaster.aim_enabled()
+    yaw = ff7nx_coaster.yaw_enabled()
+    edge = ff7nx_coaster.edge_enabled()
+    far = ff7nx_coasterworld.far_factor()
+    if not aim and not yaw and not edge and far == 1.0:
+        log('')
+        log('coaster: stock aim and track yaw (%s=0, %s=0)'
+            % (ff7nx_coaster.AIM_ENV, ff7nx_coaster.YAW_ENV))
+        return []
+    src, built = _audio_bridge_base(sdout, dump, log, produced, 'coaster aim')
+    if src is None:
+        return []
+    dest = os.path.join(sdout, 'atmosphere', 'contents', TITLE_ID, 'exefs',
+                        'main')
+    log('')
+    log('coaster aim ...')
+    tmp = dest + '.coaster-tmp'
+    try:
+        report = ff7nx_coaster.apply_to_nso(src, tmp, log, stock=dump.nso)
+    except Exception as exc:                                   # noqa: BLE001
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        log('! coaster aim: NOT installed (%s) -- stock digital aim' % exc)
+        return []
+    os.replace(tmp, dest)
+    log('  aim: %s' % ('analogue 360, %g units/tick at full tilt'
+                       % ff7nx_coaster.aim_speed() if aim
+                       else 'stock digital (%s=0)' % ff7nx_coaster.AIM_ENV))
+    log('  cursor: %s' % ('reaches the 16:9 edges (x -53..373, hit frustum '
+                          '+-214)' if edge else 'stock 4:3 bounds'))
+    log('  draw distance: x%g (far plane and fog %s)'
+        % (far, 'to %d' % int(14300 * far) if far != 1.0 else 'stock 14300'))
+    log('  track yaw: %s (%d words written)'
+        % ('interpolated through each node (BUILD 563; stock steps it)'
+           if yaw else 'stock (%s=0)' % ff7nx_coaster.YAW_ENV,
+           report['words']))
+    return [dest] if not built else []
+
+
+def apply_field_zoom(sdout, dump, log=lambda *_: None, produced=()):
+    """
+    BUILD 567. FFNx's WM_ZOOM for fields with no widescreen art: the field
+    scene (background and models) scaled 4/3 about the centre, text boxes
+    untouched. Default: convil_2 (Fort Condor's window view). See
+    ff7nx_fieldzoom.
+    """
+    import ff7nx_fieldzoom
+    names = ff7nx_fieldzoom.fields()
+    if not ff7nx_fieldzoom.enabled():
+        log('')
+        log('field zoom: off (%s)' % ('%s=0' % ff7nx_fieldzoom.ENV
+                                      if not names else 'not a 16:9 build'))
+        return []
+    src, built = _audio_bridge_base(sdout, dump, log, produced, 'field zoom')
+    if src is None:
+        return []
+    flevel = os.path.join(dump.workingdir, 'data', 'field', 'flevel.lgp')
+    try:
+        if not flevel or not os.path.exists(flevel):
+            raise ValueError('the dump\'s flevel.lgp was not found')
+        index = ff7nx_fieldzoom.maplist_index(flevel, names)
+    except Exception as exc:                                   # noqa: BLE001
+        log('! field zoom: NOT installed (%s)' % exc)
+        return []
+    dest = os.path.join(sdout, 'atmosphere', 'contents', TITLE_ID, 'exefs',
+                        'main')
+    tmp = dest + '.zoom-tmp'
+    log('')
+    log('field zoom ...')
+    try:
+        report = ff7nx_fieldzoom.apply_to_nso(src, tmp, sorted(index.values()),
+                                              log, stock=dump.nso)
+    except Exception as exc:                                   # noqa: BLE001
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        log('! field zoom: NOT installed (%s)' % exc)
+        return []
+    os.replace(tmp, dest)
+    log('  zoomed 4/3 to fill 16:9 (FFNx WM_ZOOM): %s (%d words written; '
+        'BUILD 569: carried by every draw\'s projection, BSS flag at +0x%X)'
+        % (', '.join('%s #%d' % kv for kv in sorted(index.items())),
+           report['words'], report['bss']))
+    return [dest] if not built else []
+
+
+def apply_condorpad(sdout, dump, log=lambda *_: None, produced=()):
+    """
+    BUILD 569. Fort Condor's cursor: 360 degrees on the left stick and a
+    little slower (SEVENTH_NX_CONDOR_SPEED, default 0.75). One cave in the
+    dead-space part 'condorpad'. See ff7nx_condorpad.
+    """
+    import ff7nx_condorpad
+    if not ff7nx_condorpad.enabled():
+        log('')
+        log('condor cursor: stock (%s=0 or not a 16:9 build)'
+            % ff7nx_condorpad.ENV)
+        return []
+    src, built = _audio_bridge_base(sdout, dump, log, produced,
+                                    'condor cursor')
+    if src is None:
+        return []
+    dest = os.path.join(sdout, 'atmosphere', 'contents', TITLE_ID, 'exefs',
+                        'main')
+    tmp = dest + '.condorpad-tmp'
+    log('')
+    log('condor cursor ...')
+    try:
+        report = ff7nx_condorpad.apply_to_nso(src, tmp, log, stock=dump.nso)
+    except Exception as exc:                                   # noqa: BLE001
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        log('! condor cursor: NOT installed (%s)' % exc)
+        return []
+    os.replace(tmp, dest)
+    log('  cursor: %s' % ('360-degree left stick, speed x%g of stock (BSS at '
+                          '+0x%X)' % (report['speed'], report['bss'])
+                          if report['pad'] else 'stock (%s=0)'
+                          % ff7nx_condorpad.ENV))
+    log('  placement line: %s (%d words written)'
+        % ('full 16:9 width, x -107..747 (BUILD 570)' if report['line']
+           else 'stock 4:3 (%s=0)' % ff7nx_condorpad.LINE_ENV,
+           report['words']))
+    log('  "Start combat." banner: stops at %d%s' % (
+        report['banner'], ' (stock -24; 30 units = 90 px lower, BUILD 571)'
+        if report['banner'] != ff7nx_condorpad.BANNER_STOCK_Y else ' (stock)'))
+    log('  message boxes ("Fighter 01" / "Arrived at ..."): stop at %d%s'
+        % (report['msg'], ' (battle report stock 48 via 0x5FCA52\'s target, '
+           'intro pairs stock 64; name box level with "Start combat.", '
+           'BUILD 576)'
+           if report['msg'] != ff7nx_condorpad.MSG_STOCK_Y else ' (stock)'))
+    log('  B / A button prompts: %s' % (
+        'removed (sprites 0x15/0x33 never drawn; "Set units." and every '
+        'message box, BUILD 575)' if report['buttons']
+        else 'kept (%s=1)' % ff7nx_condorpad.BUTTONS_ENV))
+    return [dest] if not built else []
+
+
+def apply_condor(sdout, dump, log=lambda *_: None, produced=()):
+    """
+    BUILD 565. Fort Condor at 16:9: the map window widened to the 16:9 frame
+    (one cave in the dead-space part 'condor'), a colour clear every frame
+    (FFNx does the same), the 640x440 letterbox opened and the unit cull
+    widened. After apply_coaster so no earlier cave moves. See ff7nx_condor.
+    """
+    import ff7nx_condor
+    if not ff7nx_condor.enabled():
+        log('')
+        log('condor: stock (%s=0)' % ff7nx_condor.ENV)
+        return []
+    src, built = _audio_bridge_base(sdout, dump, log, produced, 'condor')
+    if src is None:
+        return []
+    dest = os.path.join(sdout, 'atmosphere', 'contents', TITLE_ID, 'exefs',
+                        'main')
+    log('')
+    log('fort condor ...')
+    tmp = dest + '.condor-tmp'
+    try:
+        report = ff7nx_condor.apply_to_nso(src, tmp, log, stock=dump.nso)
+    except Exception as exc:                                   # noqa: BLE001
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        log('! fort condor: NOT installed (%s) -- stock 4:3 minigame' % exc)
+        return []
+    os.replace(tmp, dest)
+    log('  colour clear every frame (FFNx MODE_CONDOR)')
+    log('  map window: %s' % ('16:9, 428 of the picture\'s 512 units '
+                              '(units culled at camx-70..camx+390)'
+                              if report['wide'] else 'stock 4:3 (not a 16:9 build)'))
+    log('  camera: held on the picture (x 54..138%s), cursor to the 16:9 edges'
+        % (', y 10..794' if report['uncrop'] else ''))
+    log('  letterbox: %s (%d words written)'
+        % ('opened -- driver viewport 640x480, game and 3D projection keep '
+           '640x440, 3D rows matched to the map (BUILDs 566-567), map rows +-10 units'
+           if report['uncrop'] else 'stock 640x440 (%s=0)'
+           % ff7nx_condor.UNCROP_ENV, report['words']))
     return [dest] if not built else []
 
 
@@ -13538,6 +14425,11 @@ def apply_daynight(sdout, dump, plan, log=lambda *_: None, produced=()):
         '(x86 +0x175/+0x1BE/+0x208) and the battle main loop\'s text, box '
         'and menu calls (x86 +0x289/+0x2CF/+0x32A), every one of them counted '
         'out of the binary at install time')
+    log('  Fort Condor: %s' % (
+        'the minigame follows the clock (always outdoors); the map pages and '
+        'units are tinted, the sprite lists -- gauges, cursor, text, banner '
+        '-- are not (BUILD 572)' if report.get('condor')
+        else 'not tinted (%s=0)' % ff7nx_daynight.CONDOR_ENV))
     _dn_night = ff7nx_daynight.as_the_shader_multiplies(
         ff7nx_daynight.NIGHT_RGB, report['strength'])
     log('  strength: %d%%%s -- night multiplies by %s (FFNx\'s own 100%% is '
@@ -14282,6 +15174,7 @@ BATTLE_WIDE_ENV = ff7nx_battlewide.BATTLEWIDE_ENV
 SWIRL_SCALE_ENV = ff7nx_swirlscale.SWIRLSCALE_ENV
 UI_CLIP_ENV = ff7nx_uiclip.UICLIP_ENV
 CREDITS_ENV = ff7nx_credits.CREDITS_ENV
+MINIFADE_ENV = ff7nx_minifade.MINIFADE_ENV
 
 
 def _ws_on():
@@ -14380,9 +15273,14 @@ def apply_field_frame(sdout, dump, log=lambda *_: None, produced=()):
     want_swirl = ff7nx_swirlscale.enabled()
     want_uiclip = ff7nx_uiclip.enabled()
     want_credits = ff7nx_credits.enabled()
+    want_minifade = ff7nx_minifade.enabled()
+    want_snowdraw = ff7nx_snowdraw.enabled()
+    want_deferredvt = ff7nx_deferredvt.enabled()
+    want_subgrid = ff7nx_subgrid.enabled()
     if not (want_frame or want_cull or want_movie or want_mcull
             or want_bars or want_clamp or want_battle or want_swirl
-            or want_uiclip or want_credits):
+            or want_uiclip or want_credits or want_minifade
+            or want_snowdraw or want_deferredvt or want_subgrid):
         # SAY SO. `ff7nx_ws.apply_module` learned this the expensive way and
         # wrote it down: "Silence here cost a whole build." A pass that is
         # gated OFF and prints nothing is indistinguishable in the log from a
@@ -14864,6 +15762,64 @@ def apply_field_frame(sdout, dump, log=lambda *_: None, produced=()):
         log('  credits fade quad: OFF -- the intro fade covers only the '
             'middle 4:3 and credit text smears in the side margins. '
             f'({CREDITS_ENV}={os.environ.get(CREDITS_ENV, "<unset>")!r})')
+    # BUILD 538/539. The minigame fades to black: the Chocobo Race's own
+    # submitter (x86 0x77B1CE) and the Highway's (0x659532), both 4:3. FFNx
+    # fixes them by name in src/ff7/widescreen.cpp ("// Chocobo fix",
+    # "// Highway fix"): x -> -107, width -> 854. Five in-place words, no
+    # cave, same 16:9 gate as the battle overlays. See ff7nx_minifade.
+    if want_minifade:
+        rc |= ff7nx_minifade.apply(dest, log=log)
+        # BUILD 540: the snowboard sky quad's x is an ff7_en .rdata float.
+        # Same freshness rule as the battle UI fade data above: patch only an
+        # ff7_en this build produced, else start one from the dump.
+        mf_exe = os.path.join(sdout, 'atmosphere', 'contents', TITLE_ID,
+                              ROMFS_FF7, EXE_REL)
+        mf_fresh = (battle_exe_created
+                    or os.path.normpath(os.path.abspath(mf_exe)) in fresh)
+        if not mf_fresh and dump is not None and dump.exe \
+                and os.path.exists(dump.exe):
+            os.makedirs(os.path.dirname(mf_exe), exist_ok=True)
+            shutil.copyfile(dump.exe, mf_exe)
+            battle_exe_created = True
+            mf_fresh = True
+        if mf_fresh and os.path.exists(mf_exe):
+            rc |= ff7nx_minifade.apply_exe(mf_exe, log=log)
+        else:
+            log('  ! snowboard sky quad x: no ff7_en to patch')
+            rc |= 1
+    else:
+        log('  minigame fades: OFF -- the Chocobo Race and Highway fades '
+            'cover only the middle 4:3. '
+            f'({MINIFADE_ENV}={os.environ.get(MINIFADE_ENV, "<unset>")!r})')
+    # BUILD 542. The Gold Saucer snowboard's draw distance: per-block
+    # lookahead bytes in ff7_en (budgeted against the game's unchecked
+    # render queue and object pool) plus the far plane, one in-place word.
+    # No cave. See ff7nx_snowdraw.
+    if want_snowdraw:
+        sd_exe = os.path.join(sdout, 'atmosphere', 'contents', TITLE_ID,
+                              ROMFS_FF7, EXE_REL)
+        sd_fresh = (battle_exe_created
+                    or os.path.normpath(os.path.abspath(sd_exe)) in fresh)
+        if not sd_fresh and dump is not None and dump.exe \
+                and os.path.exists(dump.exe):
+            os.makedirs(os.path.dirname(sd_exe), exist_ok=True)
+            shutil.copyfile(dump.exe, sd_exe)
+            battle_exe_created = True
+            sd_fresh = True
+        if sd_fresh and os.path.exists(sd_exe):
+            rc |= ff7nx_snowdraw.apply_exe(sd_exe, log=log)
+        rc |= ff7nx_snowdraw.apply_nso(dest, log=log)
+    else:
+        log('  snowboard draw distance: stock (%s=0)' % ff7nx_snowdraw.ENV)
+    # BUILD 550. gfx_drv_draw_deferred drew every deferred (alpha-blended)
+    # primitive as LVERTEX; the submarine's software-projected playfield,
+    # mines and grid are TLVERTEX. Runs regardless of the switch so that
+    # SEVENTH_NX_DEFERRED_VT=0 RESTORES the stock words. See ff7nx_deferredvt.
+    rc |= ff7nx_deferredvt.apply_nso(dest, log=log)
+    # BUILD 551. The submarine's PlayStation grid, hidden on PC behind the F2
+    # debug key. Runs regardless of the switch so SEVENTH_NX_SUB_GRID=0
+    # RESTORES the stock words. See ff7nx_subgrid.
+    rc |= ff7nx_subgrid.apply_nso(dest, log=log)
     # Build 208's post-translation UI-bottom experiment is migration-only.
     # Hardware proved that those two loads are not the visible lower fade
     # strip, while merely branching at them regresses world-map battle entry.
@@ -14883,7 +15839,8 @@ def apply_field_frame(sdout, dump, log=lambda *_: None, produced=()):
         'edges rather than appearing.')
     outputs = [dest] if not built else []
     if battle_exe_created:
-        outputs.append(battle_exe)
+        outputs.append(os.path.join(sdout, 'atmosphere', 'contents', TITLE_ID,
+                                    ROMFS_FF7, EXE_REL))
     return outputs
 
 

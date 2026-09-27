@@ -157,6 +157,10 @@ SEAM_BAND_MAX = 32
 #: enough of it is actually see-through to be a silhouette rather than noise.
 ALPHA_OPAQUE_FLOOR = 250
 ALPHA_CUT = 128
+# BUILD 541: with the area reduction the edge alpha is a true coverage, and
+# 192 trims the light speckle halo SYW's anti-aliased sticker edges leave
+# (measured on estamp1: 128/160 keep it, 192 removes it, outline intact).
+SMOOTH_ALPHA_CUT = 192
 ALPHA_MIN_SHARE = 0.005
 
 
@@ -489,13 +493,134 @@ def sprite_count(drawn, min_frac=0.0015):
 # --------------------------------------------------------------- decoding
 
 def _decode(dds_bytes):
-    """DDS -> (uint8 array [h, w, 4] RGBA, w, h)."""
+    """DDS -> (uint8 array [h, w, 4] RGBA, w, h).
+
+    BUILD 550: an already-decoded uint8 [h, w, 4] array is passed through --
+    see vanilla_palette_rgba, which fills palettes a mod did not ship."""
+    if isinstance(dds_bytes, np.ndarray):
+        a = np.ascontiguousarray(dds_bytes, dtype=np.uint8)
+        if a.ndim != 3 or a.shape[2] != 4:
+            raise ConvertError('pre-decoded palette image has shape %r'
+                               % (a.shape,))
+        return a, a.shape[1], a.shape[0]
     rgba, w, h = dds_decode.decode_dds(dds_bytes)
     a = np.frombuffer(rgba, dtype=np.uint8)
     if a.size != w * h * 4:
         raise ConvertError('DDS payload is %d bytes, expected %d'
                            % (a.size, w * h * 4))
     return a.reshape(h, w, 4), w, h
+
+
+def vanilla_palette_rgba(vanilla_tex, palette, width, height):
+    """BUILD 550. The vanilla TEX drawn through one of its palettes, as RGBA,
+    nearest-scaled to (width, height) -- a stand-in for a palette variant a
+    texture mod did not ship.
+
+    SYW ships the submarine HUD atlases (sub.lgp huda..hudd, texta..textd)
+    with only the palettes a sprite is actually drawn with -- huda 0,1,2,5,6
+    of 8, hudd 0,6,7 of 8. The converter needs every palette, so the whole
+    set was kept native and none of SYW's art reached the game. Filling the
+    missing ones from vanilla keeps every palette the game can select
+    exactly what it was, and lets the shipped ones through.
+
+    Transparent: a palette entry with alpha 0, or index 0 of a colour-keyed
+    TEX -- the same two rules convert_group honours.
+    """
+    t = tex.parse(vanilla_tex)
+    w, h, cpp = t['width'], t['height'], t['colors_per_palette']
+    pal = np.frombuffer(t['palette'], np.uint8).reshape(-1, cpp, 4)[palette]
+    idx = np.frombuffer(t['pixels'], np.uint8)[:w * h].reshape(h, w)
+    idx = np.minimum(idx, cpp - 1)
+    out = np.empty((h, w, 4), np.uint8)
+    out[:, :, 0] = pal[idx, 2]
+    out[:, :, 1] = pal[idx, 1]
+    out[:, :, 2] = pal[idx, 0]
+    clear = pal[:, 3] == 0
+    if struct.unpack_from('<I', vanilla_tex, tex.O_COLORKEY)[0] == 1:
+        clear = clear.copy()
+        clear[0] = True
+    out[:, :, 3] = np.where(clear[idx], 0, 255)
+    out[out[:, :, 3] == 0, :3] = 0
+    ys = (np.arange(height) * h // height)
+    xs = (np.arange(width) * w // width)
+    return np.ascontiguousarray(out[ys][:, xs])
+
+
+def recolour_palette(vanilla_tex, ref_rgba, palette, ref_palette=0):
+    """BUILD 552. A missing palette drawn as the MOD'S shape in vanilla's
+    colours for that palette.
+
+    Build 550 filled a palette SYW does not ship with the vanilla texture
+    nearest-scaled to the mod's canvas: correct colours, but 1-in-3 blocky
+    against the SYW art in every other palette. Here each texel of the
+    shipped reference frame (`ref_rgba`, the mod's palette 0) is matched to
+    the vanilla palette entry it is drawing -- chosen among the vanilla
+    indices of the 3x3 native texels around it, by nearest colour in the
+    vanilla REFERENCE palette -- and takes that entry's colour in `palette`.
+    HUD sprites are flat colours, so this is the mod's clean edge with the
+    game's own colour for that state. Alpha is the reference frame's.
+    """
+    t = tex.parse(vanilla_tex)
+    w, h, cpp = t['width'], t['height'], t['colors_per_palette']
+    pals = np.frombuffer(t['palette'], np.uint8).reshape(-1, cpp, 4)
+    ref = pals[ref_palette][:, [2, 1, 0]].astype(np.int32)
+    tgt = pals[palette][:, [2, 1, 0]]
+    idx = np.minimum(np.frombuffer(t['pixels'], np.uint8)[:w * h]
+                     .reshape(h, w), cpp - 1)
+    H, W = ref_rgba.shape[:2]
+    ys = np.arange(H) * h // H
+    xs = np.arange(W) * w // W
+    src = ref_rgba[:, :, :3].astype(np.int32)
+    best = None
+    bestd = None
+    for dy in (-1, 0, 1):
+        for dx in (-1, 0, 1):
+            yy = np.clip(ys + dy, 0, h - 1)
+            xx = np.clip(xs + dx, 0, w - 1)
+            cand = idx[yy][:, xx]
+            d = ((ref[cand] - src) ** 2).sum(axis=2)
+            if dy or dx:
+                d = d + 1          # ties go to the texel's own index
+            if best is None:
+                best, bestd = cand.copy(), d
+            else:
+                take = d < bestd
+                best[take] = cand[take]
+                bestd[take] = d[take]
+    out = np.empty((H, W, 4), np.uint8)
+    out[:, :, :3] = tgt[best]
+    out[:, :, 3] = ref_rgba[:, :, 3]
+    return out
+
+
+def reconcile_to_reference(vanilla_tex, ref_rgba, img, palette, radius=12):
+    """BUILD 552. Where a shipped palette draws a DIFFERENT SHAPE from the
+    reference frame, draw the reference shape recoloured instead.
+
+    One index map serves every palette, so a palette can only ever show the
+    reference frame's shapes. SYW's `hudb` palettes 1-3 have "ASSIST" where
+    the game (and SYW's palette 0) has "TRIM"; whatever the converter does,
+    those palettes can only draw TRIM-shaped texels in ASSIST colours --
+    broken letters. So wherever the opaque silhouettes disagree (dilated by
+    `radius` source texels to take the whole word), this palette's pixels
+    are replaced by `recolour_palette` for it. Everywhere the shapes agree
+    the mod's own art is kept untouched.
+    """
+    from PIL import Image, ImageFilter
+    ref = np.asarray(ref_rgba)
+    im = np.asarray(img)
+    if ref.shape != im.shape:
+        return im
+    diff = (ref[:, :, 3] >= 128) != (im[:, :, 3] >= 128)
+    if not diff.any():
+        return im
+    size = 2 * radius + 1
+    grown = np.asarray(Image.fromarray((diff * 255).astype(np.uint8))
+                       .filter(ImageFilter.MaxFilter(size))) > 0
+    out = im.copy()
+    fill = recolour_palette(vanilla_tex, ref, palette)
+    out[grown] = fill[grown]
+    return out
 
 
 def _premultiply(rgba, alpha):
@@ -523,6 +648,39 @@ def _resample(img, tw, th):
     ys = (np.arange(th) * h) // th
     xs = (np.arange(tw) * w) // tw
     return img[ys[:, None], xs[None, :]]
+
+
+def _resample_area(img, tw, th):
+    """BUILD 541. Area (box) reduction for a DOWNscale, alpha-weighted for
+    RGBA so a transparent texel's colour never bleeds into its neighbour.
+    Nearest keeps 3 of every 4 source rows at 4x -> 3x, which is the
+    stair-stepped, speckled edge the snowboard result stamps showed. Upscales
+    and same-size calls fall back to `_resample` exactly."""
+    h, w = img.shape[:2]
+    if tw >= w and th >= h:
+        return _resample(img, tw, th)
+    from PIL import Image as _Im
+
+    def box(ch):
+        return np.asarray(_Im.fromarray(ch.astype(np.float32), 'F')
+                          .resize((tw, th), _Im.BOX), dtype=np.float64)
+    if img.dtype == bool:
+        return box(img.astype(np.float32)) >= 0.5
+    if img.ndim == 3 and img.shape[2] == 4:
+        a = img[:, :, 3].astype(np.float64)
+        aw = box(a)
+        out = np.empty((th, tw, 4), dtype=np.uint8)
+        for ch in range(3):
+            num = box(img[:, :, ch].astype(np.float64) * a)
+            plain = box(img[:, :, ch].astype(np.float64))
+            col = np.where(aw > 0, num / np.maximum(aw, 1e-9), plain)
+            out[:, :, ch] = np.clip(np.rint(col), 0, 255)
+        out[:, :, 3] = np.clip(np.rint(aw), 0, 255)
+        return out
+    if img.ndim == 3:
+        return np.stack([np.clip(np.rint(box(img[:, :, c])), 0, 255)
+                         .astype(img.dtype) for c in range(img.shape[2])], 2)
+    return np.clip(np.rint(box(img)), 0, 255).astype(img.dtype)
 
 
 # ------------------------------------------------------------ the palette
@@ -697,6 +855,80 @@ def _quantise(rgba, n_colors, opaque):
     return palette, idx.reshape(rgba.shape[:2])
 
 
+def _quantise_joint(imgs, n_colors, opaque, iters=3):
+    """BUILD 552. ONE index partition cut from EVERY palette at once.
+
+    The single-reference partition (`_quantise` on one palette) assumes each
+    palette is the same picture in another colour. SYW's submarine HUD
+    breaks that: `hudb` palettes 1-3 carry "ASSIST" where 0, 6 and 7 carry
+    "TRIM" (and 4-5 are vanilla fill). Cut from the richest frame -- an
+    ASSIST one -- the TRIM palettes were averaged over ASSIST-shaped slots
+    and came out as speckled, hole-ridden letters on hardware.
+
+    Here each texel's key is its colour in ALL palettes (5 bits a channel),
+    so two texels share a slot only if they agree in every palette. Median
+    cut over those keys (weighted by texel count), then a few k-means
+    passes. Colours are still recomputed per palette at full precision by
+    `_mean_by_index`; this only decides the grouping.
+
+    Returns (n_slots, index array [h, w]); masked-out texels get -1.
+    """
+    h, w = opaque.shape
+    m = opaque.reshape(-1)
+    feats = np.concatenate([im[:, :, :3].reshape(-1, 3) for im in imgs],
+                           axis=1)[m] >> 3
+    if not feats.size:
+        raise ConvertError('every pixel is transparent in every palette')
+    feats = np.ascontiguousarray(feats.astype(np.uint8))
+    view = feats.view(np.dtype((np.void, feats.shape[1])))[:, 0]
+    _u, first, inv, cnt = np.unique(view, return_index=True,
+                                    return_inverse=True, return_counts=True)
+    keys = feats[first].astype(np.float64)
+    wts = cnt.astype(np.float64)
+    boxes = [np.arange(len(keys))]
+    while len(boxes) < n_colors:
+        best, bscore = None, 0.0
+        for bi, bx in enumerate(boxes):
+            if len(bx) < 2:
+                continue
+            k = keys[bx]
+            rng = k.max(axis=0) - k.min(axis=0)
+            score = float(rng.max()) * float(wts[bx].sum())
+            if score > bscore:
+                best, bscore = bi, score
+        if best is None:
+            break
+        bx = boxes.pop(best)
+        k = keys[bx]
+        dim = int((k.max(axis=0) - k.min(axis=0)).argmax())
+        order = np.argsort(k[:, dim], kind='stable')
+        cw = np.cumsum(wts[bx][order])
+        cut = int(np.searchsorted(cw, cw[-1] / 2.0))
+        cut = min(max(cut, 1), len(bx) - 1)
+        boxes += [bx[order[:cut]], bx[order[cut:]]]
+    lab = np.empty(len(keys), dtype=np.int32)
+    for bi, bx in enumerate(boxes):
+        lab[bx] = bi
+    n = len(boxes)
+    for _ in range(iters):
+        sums = np.zeros((n, keys.shape[1]))
+        np.add.at(sums, lab, keys * wts[:, None])
+        tot = np.bincount(lab, weights=wts, minlength=n)
+        live = tot > 0
+        cent = sums[live] / tot[live][:, None]
+        new = np.empty(len(keys), dtype=np.int32)
+        for s0 in range(0, len(keys), 2048):
+            d = keys[s0:s0 + 2048, None, :] - cent[None, :, :]
+            new[s0:s0 + 2048] = (d * d).sum(axis=2).argmin(axis=1)
+        remap = np.flatnonzero(live)
+        lab = remap[new].astype(np.int32)
+    # compact
+    used, lab = np.unique(lab, return_inverse=True)
+    idx = np.full(h * w, -1, dtype=np.int16)
+    idx[m] = lab[inv.reshape(-1)].astype(np.int16)
+    return len(used), idx.reshape(h, w)
+
+
 def _mean_by_index(rgba, idx, n_slots):
     """Mean RGB of `rgba` over the pixels holding each index slot.
 
@@ -742,7 +974,9 @@ def boundary_connected_black(rgba):
 # ------------------------------------------------------------- the driver
 
 def convert_group(vanilla_tex, dds_by_palette, scale=1,
-                  tables_handled=False, texture_name=None):
+                  tables_handled=False, texture_name=None,
+                  smooth_downscale=False, preprocess=None,
+                  keep_palette=False, joint_partition=False):
     """Rebuild one TEX from its FFNx DDS set.
 
     `vanilla_tex`     the entry's current bytes -- the structural template.
@@ -752,6 +986,7 @@ def convert_group(vanilla_tex, dds_by_palette, scale=1,
     Returns (tex_bytes, note). Raises ConvertError and changes nothing if the
     group cannot be rebuilt exactly.
     """
+    _rs = _resample_area if smooth_downscale else _resample
     van = tex.parse(vanilla_tex)
     if van is None:
         raise ConvertError('vanilla entry is not a TEX')
@@ -840,7 +1075,7 @@ def convert_group(vanilla_tex, dds_by_palette, scale=1,
     decoded = {}
     for _p in sorted(dds_by_palette):
         _img, _w, _h = _decode(dds_by_palette[_p])
-        decoded[_p] = _img
+        decoded[_p] = preprocess(_img) if preprocess else _img
     # ---- RESTORE A WRAP THE REPLACEMENT BROKE ----------------------------
     #
     # Decided against VANILLA, which is the only evidence available that the
@@ -904,7 +1139,7 @@ def convert_group(vanilla_tex, dds_by_palette, scale=1,
     _ref = 0
     base = decoded[0]
     bw, bh = base.shape[1], base.shape[0]
-    if len(decoded) > 1:
+    if len(decoded) > 1 and not joint_partition:
         def _variety(im):
             f = im[:, :, :3].reshape(-1, 3)
             lit = f.max(axis=1) > DARK_LEVEL
@@ -975,7 +1210,7 @@ def convert_group(vanilla_tex, dds_by_palette, scale=1,
     # Keep the reference at its SOURCE resolution: `alpha_is_meaningful` has
     # to see the art the mod shipped, not a resampled copy of it.
     base_src = base
-    base = _resample(base, tw, th)
+    base = _rs(base, tw, th)
 
     # ---- TRANSPARENCY COMES FROM VANILLA, NOT FROM THE DDS ALPHA ----------
     #
@@ -1007,7 +1242,7 @@ def convert_group(vanilla_tex, dds_by_palette, scale=1,
     # texture changes: same num_palettes, same 8-bit indices, same one byte
     # per texel, same colour key.
     widened = 0
-    if wide_palette() and cpp < 256:
+    if wide_palette() and cpp < 256 and not keep_palette:
         widened = cpp
         rgb2 = np.zeros((n_pal, 256, 3), dtype=np.uint8)
         rgb2[:, :cpp] = van_rgb
@@ -1025,6 +1260,14 @@ def convert_group(vanilla_tex, dds_by_palette, scale=1,
         van_alpha = np.zeros((1, 256), dtype=np.uint8)
         van_alpha[0][1:] = 255
     pool = [k for k in range(cpp) if k not in clear]
+    if joint_partition and n_pal > 1:
+        # BUILD 552. An entry vanilla keys out in ANY palette (hudc p3:
+        # entries 11-14, alpha 0) must not carry art: a slot landing on it
+        # punched holes in the red WARNING/ALERT on hardware. The widened
+        # entries (16..255) are opaque in every palette, so there is room.
+        _all = [k for k in pool if (van_alpha[:, k] > 0).all()]
+        if len(_all) >= 16:
+            pool = _all
     if not pool:
         raise ConvertError('vanilla palette 0 has no opaque entries')
     clear_index = clear[0] if clear else None
@@ -1047,7 +1290,7 @@ def convert_group(vanilla_tex, dds_by_palette, scale=1,
     #                          sheets are drawn with, and partial alpha dims
     #                          in proportion. That is what the artist drew.
     use_alpha = dds_alpha() and alpha_is_meaningful(base_src)
-    src_alpha = (_resample(base_src[:, :, 3:4], tw, th)[:, :, 0]
+    src_alpha = (_rs(base_src[:, :, 3:4], tw, th)[:, :, 0]
                  if use_alpha else None)
     premultiply = use_alpha and clear_index is None
     if premultiply:
@@ -1056,7 +1299,8 @@ def convert_group(vanilla_tex, dds_by_palette, scale=1,
     if clear_index is None:
         opaque = np.ones((th, tw), dtype=bool)
     elif use_alpha:
-        opaque = src_alpha >= ALPHA_CUT
+        opaque = src_alpha >= (SMOOTH_ALPHA_CUT if smooth_downscale
+                                else ALPHA_CUT)
         if not opaque.any():
             raise ConvertError('replacement art is entirely transparent')
     else:
@@ -1064,7 +1308,7 @@ def convert_group(vanilla_tex, dds_by_palette, scale=1,
         # spell art stores transparency as exact RGB zero. Flood only from the
         # boundary so a black pupil, hole, or interior shadow remains colour.
         keyed = boundary_connected_black(base_src)
-        opaque = ~_resample(keyed[:, :, None], tw, th)[:, :, 0]
+        opaque = ~_rs(keyed[:, :, None], tw, th)[:, :, 0]
         if not opaque.any():
             raise ConvertError('replacement keyed canvas is entirely clear')
 
@@ -1091,7 +1335,29 @@ def convert_group(vanilla_tex, dds_by_palette, scale=1,
     # colours to cut. A frame that is genuinely all black falls through to
     # the plain branch, which produces a one-colour black palette rather
     # than an exception.
-    if dark.any() and (opaque & ~dark).any() and len(pool) > 1:
+    joint = joint_partition and n_pal > 1 and not keep_palette
+    if joint:
+        # BUILD 552: the partition is cut from every palette together; see
+        # _quantise_joint. A texel is "dark" only if it is dark in all.
+        _jimgs = []
+        for _p in range(n_pal):
+            _im = _rs(decoded[_p], tw, th)
+            if premultiply:
+                _im = _premultiply(_im, _im[:, :, 3])
+            _jimgs.append(_im)
+        lum = np.max([_im[:, :, :3].max(axis=2) for _im in _jimgs], axis=0)
+        dark = opaque & (lum <= DARK)
+    if joint and dark.any() and (opaque & ~dark).any() and len(pool) > 1:
+        _n, slot_idx = _quantise_joint(_jimgs, len(pool) - 1, opaque & ~dark)
+        palette = [None] * _n
+        black_slot = len(palette)
+        palette = list(palette) + [(0, 0, 0, 255)]
+        slot_idx = np.where(dark, black_slot, slot_idx)
+    elif joint:
+        black_slot = None
+        _n, slot_idx = _quantise_joint(_jimgs, len(pool), opaque)
+        palette = [None] * _n
+    elif dark.any() and (opaque & ~dark).any() and len(pool) > 1:
         palette, slot_idx = _quantise(base, len(pool) - 1, opaque & ~dark)
         black_slot = len(palette)
         palette = list(palette) + [(0, 0, 0, 255)]
@@ -1114,7 +1380,7 @@ def convert_group(vanilla_tex, dds_by_palette, scale=1,
     out_rgb = van_rgb.copy()
     empty_slots = 0
     for p in range(n_pal):
-        img = _resample(decoded[p], tw, th)
+        img = _rs(decoded[p], tw, th)
         if img.shape[:2] != (th, tw):
             raise ConvertError('palette %d resampled to %r, expected %r'
                                % (p, img.shape[:2], (th, tw)))
@@ -1223,6 +1489,193 @@ def convert_group(vanilla_tex, dds_by_palette, scale=1,
     if (bw, bh) != (tw, th):
         note += ' (source %dx%d)' % (bw, bh)
     return out, note
+
+
+
+def _sticker_smooth(mask, radius, cut=128):
+    from PIL import Image, ImageFilter
+    im = Image.fromarray((mask * 255).astype(np.uint8))
+    return np.asarray(im.filter(ImageFilter.GaussianBlur(radius)),
+                      dtype=np.float32) >= cut
+
+def _sticker_morph(mask, size, op):
+    from PIL import Image, ImageFilter
+    im = Image.fromarray((mask * 255).astype(np.uint8))
+    f = ImageFilter.MinFilter if op == 'min' else ImageFilter.MaxFilter
+    return np.asarray(im.filter(f(size))) > 0
+
+def _sticker_box(x, r, axis):
+    r = int(r)
+    pad = [(r + 1, r) if a == axis else (0, 0) for a in range(2)]
+    c = np.cumsum(np.pad(x, pad, mode='edge'), axis=axis)
+    n = x.shape[axis]
+    return (np.take(c, np.arange(2 * r + 1, 2 * r + 1 + n), axis=axis)
+            - np.take(c, np.arange(0, n), axis=axis)) / (2 * r + 1)
+
+
+def _sticker_blur(x, r):
+    x = x.astype(np.float64)
+    r = max(1, int(round(r)))
+    for _ in range(2):                  # two box passes ~ a Gaussian
+        x = _sticker_box(_sticker_box(x, r, 0), r, 1)
+    return x
+
+
+def _sticker_sizes(mask):
+    """Per-pixel size of its 4-connected component (0 outside the mask)."""
+    h, w = mask.shape
+    lab = np.zeros((h, w), np.int32)
+    sizes = [0]
+    ys, xs = np.nonzero(mask)
+    for y, x in zip(ys.tolist(), xs.tolist()):
+        if lab[y, x]:
+            continue
+        n = len(sizes)
+        lab[y, x] = n
+        stack, count = [(y, x)], 0
+        while stack:
+            cy, cx = stack.pop()
+            count += 1
+            for ny, nx in ((cy + 1, cx), (cy - 1, cx), (cy, cx + 1),
+                           (cy, cx - 1)):
+                if 0 <= ny < h and 0 <= nx < w and mask[ny, nx] \
+                        and not lab[ny, nx]:
+                    lab[ny, nx] = n
+                    stack.append((ny, nx))
+        sizes.append(count)
+    return np.asarray(sizes)[lab]
+
+
+def stretch_to_region(rgba, region=(56, 48), native=(64, 64)):
+    """BUILD 548. The port samples some minigame textures through the game's
+    VRAM table region, not the TEX size: x86 0x732B49 computes
+    u_norm = (u - u0) / region_w and v_norm = (v - v0) / region_h, then samples
+    the WHOLE uploaded TEX at u_norm, v_norm. For snowboard eyes.tex the
+    table region is 56x48 but the TEX is 64x64, so every texel lands at
+    x 64/56 and y 64/48 of where the model asks for it. The art is pulled
+    toward the top-left: Cloud's eyes came out smaller, higher, and toward
+    the sides of his face. Vanilla on this port too.
+
+    Undo it in the data: the region's art (0..56, 0..48 logical) is
+    stretched to fill the whole TEX, so the port's squeeze puts every texel
+    back where the PlayStation drew it. Worked at the SOURCE resolution
+    (premultiplied Lanczos, then the hard 1-bit key back), before the native
+    reduction.
+    """
+    from PIL import Image
+    h, w = rgba.shape[:2]
+    sx = w / float(native[0])
+    sy = h / float(native[1])
+    cw = int(round(region[0] * sx))
+    ch = int(round(region[1] * sy))
+    crop = rgba[:ch, :cw].astype(np.float64)
+    a = crop[:, :, 3:4] / 255.0
+    pre = np.concatenate([crop[:, :, :3] * a, crop[:, :, 3:4]], axis=2)
+    chans = [np.asarray(Image.fromarray(pre[:, :, c].astype(np.float32), 'F')
+                        .resize((w, h), Image.LANCZOS), dtype=np.float64)
+             for c in range(4)]
+    big_a = np.clip(chans[3], 0, 255)
+    out = np.zeros((h, w, 4), np.uint8)
+    for c in range(3):
+        out[:, :, c] = np.clip(np.where(big_a > 0, chans[c] / np.maximum(
+            big_a / 255.0, 1e-6), 0), 0, 255)
+    out[:, :, 3] = np.where(big_a >= 128, 255, 0)
+    out[out[:, :, 3] == 0] = 0
+    return out
+
+
+def clean_sticker(rgba, cut=192, rim=3, pale=30):
+    """BUILD 543. Clean the edge of a keyed "sticker" (the snowboard result
+    stamps) WITHOUT changing its shape, colours or holes.
+
+    SYW's stamps are AI-upscaled art. Keyed at 1 bit (the PSX path), their
+    soft edge left a pale/white rim along the blue and stray dark and light
+    specks floating beside it. Only those pixels are removed:
+
+      * the shape is the build-542 cut (alpha >= 192) -- nothing is grown,
+        eroded wholesale, filled or smoothed;
+      * PALE RIM: an edge pixel within `rim` pixels of the contour is
+        dropped when it is more than `pale` levels brighter than the
+        artwork just inside it (a masked local average of the interior);
+      * SPECKS: connected islands smaller than one native texel squared
+        (scale^2 x 4 pixels) are dropped.
+    numpy + PIL only.
+    """
+    h, w = rgba.shape[:2]
+    s = max(1, w // 256)
+    m = rgba[:, :, 3] >= cut
+    lum = rgba[:, :, :3].astype(np.float64).mean(axis=2)
+    inner = m
+    for _ in range(rim):
+        inner = _sticker_morph(inner, 3, 'min')
+    wsum = _sticker_blur(inner, 2.5 * s)
+    ilum = _sticker_blur(np.where(inner, lum, 0), 2.5 * s) / np.maximum(
+        wsum, 1e-6)
+    m = m & ~((m & ~inner) & (wsum > 1e-3) & (lum - ilum > pale))
+    m = m & (_sticker_sizes(m) >= s * s * 4)
+    out = rgba.copy()
+    out[:, :, 3] = np.where(m, 255, 0)
+    return out
+
+
+def enlarge_cloud_eye(rgba, factor=1.35, shift=(-3.0, 1.0)):
+    """BUILD 545. Cloud's snowboard eye (tifaeye.tex, RIGHT half -- TMD
+    object 279 maps u 60..118, v 2..61 of it onto his face) is drawn in the
+    stock art small and high inside that patch: 27x22 logical texels
+    centred at y 32, against the other face's eye (left half) at 31x25
+    centred at y 35.5. Enlarge it `factor` times about its own centre and
+    lower that centre to the left eye's, so it fills the patch the way the
+    reference footage shows. The left half is not touched. Resampled at the
+    SOURCE resolution (Lanczos on premultiplied RGBA), before the native
+    reduction, so the result stays as clean as the art.
+
+    BUILD 546: `shift` (logical texels, +x = outward, +y = down) then moves
+    it 3 texels toward the nose and 1 down -- about 0.6 model units closer
+    together, measured through object 279's own triangles, with every eye
+    texel still inside the decal (none lost off its edge). What made the
+    545 eye look high and lopsided was not the art: the decal's lower half
+    was behind his face. See ff7nx_snowface.
+    """
+    from PIL import Image
+    h, w = rgba.shape[:2]
+    s = w / 128.0                                   # source texels per texel
+    half = w // 2
+    opaque = (rgba[:, :, 3] > 0) & (rgba[:, :, :3].max(axis=2) > 0)
+    ys, xs = np.nonzero(opaque[:, half:])
+    ls, lx = np.nonzero(opaque[:, :half])
+    if not len(xs) or not len(ls):
+        return rgba
+    x0, x1 = xs.min() + half, xs.max() + half + 1
+    y0, y1 = ys.min(), ys.max() + 1
+    cx = (x0 + x1) / 2.0
+    cy_target = (ls.min() + ls.max() + 1) / 2.0     # the left eye's centre
+    crop = rgba[y0:y1, x0:x1].astype(np.float64)
+    a = crop[:, :, 3:4] / 255.0
+    pre = np.concatenate([crop[:, :, :3] * a, crop[:, :, 3:4]], axis=2)
+    nw = int(round((x1 - x0) * factor))
+    nh = int(round((y1 - y0) * factor))
+    chans = [np.asarray(Image.fromarray(pre[:, :, c].astype(np.float32), 'F')
+                        .resize((nw, nh), Image.LANCZOS), dtype=np.float64)
+             for c in range(4)]
+    big_a = np.clip(chans[3], 0, 255)
+    big = np.zeros((nh, nw, 4), np.uint8)
+    for c in range(3):
+        big[:, :, c] = np.clip(np.where(big_a > 0, chans[c] / np.maximum(
+            big_a / 255.0, 1e-6), 0), 0, 255)
+    big[:, :, 3] = np.where(big_a >= 128, 255, 0)
+    # the patch the face samples: u 60..118, v 2..61 (logical)
+    px0, px1 = int(60 * s), int(118 * s)
+    py0, py1 = int(2 * s), int(61 * s)
+    out = rgba.copy()
+    out[:, half:][opaque[:, half:]] = 0              # clear the old eye
+    tx0 = int(round(cx - nw / 2.0 + shift[0] * s))
+    ty0 = int(round(cy_target - nh / 2.0 + shift[1] * s))
+    tx0 = min(max(tx0, px0), px1 - nw)
+    ty0 = min(max(ty0, py0), py1 - nh)
+    region = out[ty0:ty0 + nh, tx0:tx0 + nw]
+    keep = big[:, :, 3] > 0
+    region[keep] = big[keep]
+    return out
 
 
 def max_scale(vanilla_tex, cap):

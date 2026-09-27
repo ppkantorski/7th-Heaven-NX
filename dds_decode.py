@@ -1,5 +1,8 @@
 import struct
-import texture2ddecoder as t2d
+try:
+    import texture2ddecoder as t2d
+except ImportError:  # Pillow also decodes the BC1/BC3/BC7 DDS art we ship
+    t2d = None
 
 DX10_FORMATS = {
     98: 'BC7',    # DXGI_FORMAT_BC7_UNORM
@@ -39,6 +42,14 @@ def decode_dds(data):
         raise ValueError('unsupported fourcc %r' % fourcc)
 
     payload = data[hdr_len:]
+    if t2d is None:
+        from io import BytesIO
+        from PIL import Image
+        with Image.open(BytesIO(data)) as im:
+            rgba = im.convert('RGBA')
+            if rgba.size != (width, height):
+                raise ValueError('DDS canvas does not match its header')
+            return rgba.tobytes(), width, height
     if kind == 'BC7':
         out = t2d.decode_bc7(payload, width, height)
     elif kind == 'BC1':

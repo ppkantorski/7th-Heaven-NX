@@ -13,7 +13,19 @@ It is split so a shipping pass and the diagnostic probe can never collide:
 
     [lo + 0x40,    lo + 0x800)  'ship': ff7nx_campreserve
     [lo + 0x800,   lo + SHIP)   'pace': ff7nx_fieldpace's late gates
-    [lo + SHIP,    hi)          ff7nx_frameprobe, diagnostic builds only
+    [lo + SHIP,    lo + 0x1800) 'sub':  ff7nx_sublines (BUILD 557) -- the
+                                submarine limiter, line pen and depth pull;
+                                the padding pool has no multi-word hole
+                                left by the time that pass runs
+    [lo + 0x1800,  lo + 0x2000) 'coaster': ff7nx_coaster (BUILD 561) -- the
+                                Gold Saucer coaster's analogue aim
+    [lo + 0x2000,  lo + 0x2400) 'condor': ff7nx_condor (BUILD 565) -- the
+                                Fort Condor map-window cave
+    [lo + 0x2400,  lo + 0x2600) 'zoom': ff7nx_fieldzoom (BUILD 567) -- the
+                                per-field 4:3 zoom (convil_2's window view)
+    [lo + 0x2600,  lo + 0x2A00) 'condorpad': ff7nx_condorpad (BUILD 569) --
+                                Fort Condor's 360-degree, slower cursor
+    [lo + 0x2A00,  hi)          ff7nx_frameprobe, diagnostic builds only
 
 Each owner checks that ITS part is still the stock bytes before writing, so
 a second writer to the same part is refused rather than silently merged.
@@ -27,6 +39,12 @@ DEAD_BODY = 0x623D28
 SHIP_BYTES = 0x1000
 ENTRY_GUARD = 0x40
 PACE_AT = 0x800
+SUB_AT = 0x1000
+COASTER_AT = 0x1800
+CONDOR_AT = 0x2000
+ZOOM_AT = 0x2400
+PAD_AT = 0x2600
+PROBE_AT = 0x2A00
 
 
 def region(src, stock=None):
@@ -52,8 +70,18 @@ def part(src, which, stock=None):
         p = (lo + ENTRY_GUARD, lo + PACE_AT)
     elif which == 'pace':
         p = (lo + PACE_AT, lo + SHIP_BYTES)
+    elif which == 'sub':
+        p = (lo + SUB_AT, lo + COASTER_AT)
+    elif which == 'coaster':
+        p = (lo + COASTER_AT, lo + CONDOR_AT)
+    elif which == 'condor':
+        p = (lo + CONDOR_AT, lo + ZOOM_AT)
+    elif which == 'zoom':
+        p = (lo + ZOOM_AT, lo + PAD_AT)
+    elif which == 'condorpad':
+        p = (lo + PAD_AT, lo + PROBE_AT)
     elif which == 'probe':
-        p = (lo + SHIP_BYTES, hi)
+        p = (lo + PROBE_AT, hi)
     else:
         raise ValueError(which)
     if stock is not None:

@@ -120,6 +120,11 @@ STOCK_DIALOGUE_OVERRIDES = {}
 # code.
 PC_BUTTON_GLYPH_BYTES = frozenset(
     list(range(0x90, 0x9C)) + [0xBE, 0xBF])
+# BUILD 558. Three more PC button glyphs, only ever seen directly in front
+# of a bracketed name: 81 (ASSIST) x8, 82 (START) x14, 9C (TARGET) x1. They
+# are ordinary characters elsewhere, so they only count as a glyph when a
+# bracketed name follows.
+PC_BUTTON_GLYPH_BYTES_NAMED_ONLY = frozenset((0x81, 0x82, 0x9C))
 PC_BUTTON_OPEN = 0x08
 PC_BUTTON_CLOSE = 0x09
 # Keyed on the UPPER-CASED name, because Echo-S writes both `(CANCEL)` and
@@ -257,6 +262,13 @@ def strip_pc_speaker_prefixes(script_section: bytes):
     return bytes(rebuilt), removed
 
 
+# BUILD 558. Echo-S ends flirtatious lines with a purple PC heart,
+# ``FE D5 80 FE D9`` (58 times: blin61, onna_2, ...). The Switch dialogue
+# never had one, and 80 is an accented letter in this port's font.
+PC_HEART = b'\xfe\xd5\x80\xfe\xd9'
+HEARTS_REMOVED = 0
+
+
 def _strip_pc_field_markup(part: bytes):
     """Return one complete string record without incompatible PC markup.
 
@@ -268,6 +280,20 @@ def _strip_pc_field_markup(part: bytes):
     changed = 0
     part, retargeted = _retarget_pc_button_glyphs(part)
     changed += retargeted
+    # BUILD 558: item icons wherever they stand (lists, prose, "Obtained
+    # prize: {icon}...", "Obtained 3 {icon}..."). An icon right after
+    # "Obtained " goes here too; the older rule below then finds a letter
+    # at that position and leaves it, and still unwraps a colour.
+    part, removed_icons = _strip_pc_item_icons(part)
+    changed += removed_icons
+    end = part.find(b'\xff')
+    hearts = part.count(PC_HEART, 0, end if end >= 0 else len(part))
+    if hearts:
+        head = part[:end] if end >= 0 else part
+        part = head.replace(PC_HEART, b'') + (part[end:] if end >= 0 else b'')
+        changed += hearts
+        global HEARTS_REMOVED
+        HEARTS_REMOVED += hearts
     if (len(part) >= 5 and part.startswith(PC_SPEAKER_PREFIX)
             and part[3:5] == PC_SPEAKER_SUFFIX):
         part = part[5:]
@@ -304,17 +330,39 @@ def _strip_pc_field_markup(part: bytes):
     return part, changed
 
 
+# Two-byte FE codes that carry argument bytes after them. Their arguments are
+# data (a wait count, a memory offset/length), never characters, and must be
+# stepped over whole when scanning a string for PC markup.
+FE_ARG_BYTES = {0xDD: 2, 0xE2: 4}
+
+
+def _fe_span(part: bytes, index: int) -> int:
+    """Length of the FE control starting at ``index`` (FE, code, args)."""
+    if index + 1 >= len(part):
+        return 1
+    return 2 + FE_ARG_BYTES.get(part[index + 1], 0)
+
+
 def _retarget_pc_button_glyphs(part: bytes):
     """Replace Echo-S's PC button markup with what this port can draw.
 
-    Rewrites `<glyph bytes> ( NAME )` to this port's glyph when `NAME` is one
-    we have evidence for, and otherwise to `NAME` alone -- see the table above
-    for why the fallback is words rather than a guessed icon.
+    Forms handled (BUILD 558 added the last three, found across the release
+    once every glyph run was classified by what follows it):
 
-    Only runs that are entirely glyph bytes, then `08`, then printable name
-    bytes, then `09`, and that lie before the record's terminator, are
-    touched. Anything else is left byte-exact: the parenthesis codes are
-    ordinary punctuation elsewhere in the script and must not be disturbed.
+      <glyph bytes> ( NAME )                 258  the original form
+      <glyph bytes> [ NAME ]                   3  mds7_w2's battle tutorial
+      <glyph bytes> FE Dx ( NAME )             2  blin61, subin_1b
+      <glyph bytes> <plain text>               2  games_2, crcin_1:
+                                                  "{d-pad glyphs}Direction Pad"
+
+    A named form becomes this port's glyph when `NAME` is one we have
+    evidence for, and otherwise `NAME` alone -- see the table above for why
+    the fallback is words rather than a guessed icon. A glyph run directly
+    followed by a word is dropped: the word is already there.
+
+    Only runs that lie before the record's terminator are touched, FE codes
+    and their argument bytes are stepped over whole, and a glyph run followed
+    by anything else is left byte-exact.
     """
     end = part.find(b'\xff')
     if end < 0:
@@ -324,33 +372,160 @@ def _retarget_pc_button_glyphs(part: bytes):
     changed = 0
     while index < end:
         byte = part[index]
-        if byte not in PC_BUTTON_GLYPH_BYTES:
+        if byte == 0xFE:
+            span = _fe_span(part, index)
+            out.extend(part[index:index + span])
+            index += span
+            continue
+        run_bytes = PC_BUTTON_GLYPH_BYTES | PC_BUTTON_GLYPH_BYTES_NAMED_ONLY
+        if byte not in run_bytes:
             out.append(byte)
             index += 1
             continue
         cursor = index
-        while cursor < end and part[cursor] in PC_BUTTON_GLYPH_BYTES:
+        while cursor < end and part[cursor] in run_bytes:
             cursor += 1
-        if cursor >= end or part[cursor] != PC_BUTTON_OPEN:
-            # A glyph byte that is not introducing a button name. Leave it:
-            # this range also carries ordinary punctuation.
-            out.extend(part[index:cursor])
-            index = cursor
+        named_only = any(b not in PC_BUTTON_GLYPH_BYTES
+                         for b in part[index:cursor])
+        colour = b''
+        if (cursor + 2 < end and part[cursor] == 0xFE
+                and part[cursor + 1] in PC_COLOUR_OPENERS
+                and part[cursor + 2] in (PC_BUTTON_OPEN, 0x3B)):
+            colour = bytes(part[cursor:cursor + 2])
+            cursor += 2
+        opener = part[cursor] if cursor < end else None
+        if opener in (PC_BUTTON_OPEN, 0x3B):
+            closer = PC_BUTTON_CLOSE if opener == PC_BUTTON_OPEN else 0x3D
+            close = part.find(bytes([closer]), cursor + 1, end)
+            if close < 0:
+                out.extend(part[index:cursor])
+                index = cursor
+                continue
+            name = bytes(part[cursor + 1:close])
+            out.extend(colour)
+            out.extend(PC_BUTTON_GLYPHS.get(_upper_name(name), name))
+            index = close + 1
+            changed += 1
             continue
-        close = part.find(bytes([PC_BUTTON_CLOSE]), cursor + 1, end)
-        if close < 0:
-            out.extend(part[index:cursor])
+        if not colour and not named_only and opener is not None and (
+                0x21 <= opener <= 0x3A or 0x41 <= opener <= 0x5A):
+            # "{glyphs}Direction Pad": the words are the label already.
             index = cursor
+            changed += 1
             continue
-        name = bytes(part[cursor + 1:close])
-        out.extend(PC_BUTTON_GLYPHS.get(_upper_name(name), name))
-        index = close + 1
-        changed += 1
+        # A glyph byte that is not introducing a button. Leave it: this range
+        # also carries ordinary punctuation.
+        out.extend(part[index:cursor])
+        index = cursor
     out.extend(part[end:])
     if changed:
         global BUTTON_GLYPHS_RETARGETED
         BUTTON_GLYPHS_RETARGETED += changed
     return bytes(out), changed
+
+
+# BUILD 558. Echo-S's PC item-category icons, measured from the byte that
+# follows "Obtained " / "Lost " across the whole release: weapons 61-68 and
+# 74, armour 75, accessories 76 and B9, items 77-7D, 8E, 9F, key items B8,
+# materia C8-CC, and the chocobo nuts and greens CE-CF. On PC FFNx draws
+# them as icons; in this port's font they are ordinary accented letters,
+# which is the "óPotion / òEther" in the Gold Saucer prize list.
+#
+# The acquisition strings were already cleaned (`_acquisition_name_start`).
+# The same icons also sit in front of item names in LISTS and prose -- the
+# GP exchange (games_1), the battle-square BP exchange (coloin1), the
+# chocobo-nut shop (frcyo), prize text (jetin1, blin63_1, convil_2,
+# games_2 "3 {9F}Speed Sources"). There an icon is recognised by where it
+# stands, not by a name list:
+#
+#   * after a separator -- string start, space, choice/tab E0/E1, new line
+#     E7, a closing FE code (e.g. FE E9), or "N " counts;
+#   * and before the name -- an upper-case letter, a digit ("1/35 Soldier"),
+#     or a colour/effect opener FE D2..DB that wraps the name (materia, and
+#     the rainbow-wrapped "Omnislash" in coloin1).
+#
+# English text has no accented capital at a word start in this range, and
+# every match over the release was checked to be an item name.
+PC_ITEM_ICONS = frozenset(list(range(0x61, 0x69)) + list(range(0x74, 0x7E))
+                          + [0x8E, 0x9F, 0xB8, 0xB9]
+                          + list(range(0xC8, 0xD0)))
+ITEM_ICONS_REMOVED = 0
+
+
+def _strip_pc_item_icons(part: bytes):
+    """Remove PC item-category icons in front of item names (see above)."""
+    end = part.find(b'\xff')
+    if end < 0:
+        end = len(part)
+    out = bytearray()
+    index = 0
+    changed = 0
+    prev_sep = True
+    spaced = False          # inside FE E9 ... FE E9 (fixed-pitch letters)
+    spaced_cuts = []        # out positions of icons removed while spaced
+    while index < end:
+        byte = part[index]
+        if byte == 0xFE:
+            span = _fe_span(part, index)
+            if index + 1 < end and part[index + 1] == 0xE9:
+                spaced = not spaced
+            out.extend(part[index:index + span])
+            index += span
+            prev_sep = True
+            continue
+        if byte in PC_ITEM_ICONS and prev_sep and index + 1 < end:
+            nxt = part[index + 1]
+            name_follows = (0x21 <= nxt <= 0x3A or 0x10 <= nxt <= 0x19 or
+                            (nxt == 0xFE and index + 2 < end and
+                             0xD2 <= part[index + 2] <= 0xDB))
+            if name_follows:
+                if spaced:
+                    spaced_cuts.append(len(out))
+                index += 1
+                changed += 1
+                prev_sep = False
+                continue
+        out.append(byte)
+        prev_sep = byte in (0x00, 0xE0, 0xE1, 0xE7, 0xE8)
+        index += 1
+    for cut in reversed(spaced_cuts):
+        _keep_spaced_column(out, cut)
+    out.extend(part[end:])
+    if changed:
+        global ITEM_ICONS_REMOVED
+        ITEM_ICONS_REMOVED += changed
+    return bytes(out), changed
+
+
+# BUILD 560. In FE E9 spaced mode every character takes one fixed cell; that
+# is how games_1 lays out its GP table ("Potion        1GP" over "Gold
+# Ticket  300GP"). Echo-S's icon took a cell, so removing it pulled that
+# row's price one cell left. The cell is given back in the gap in front of
+# the right-hand column (the last run of spaces before a digit on the line),
+# so the name stays left-aligned and the price stays right-aligned. A line
+# with no such column (nothing to its right) needs nothing.
+def _keep_spaced_column(out: bytearray, cut: int) -> None:
+    index = cut
+    gap = None
+    while index < len(out):
+        byte = out[index]
+        if byte in (0xE0, 0xE1, 0xE7, 0xE8, 0xFF):
+            break
+        if byte == 0xFE:
+            if index + 1 < len(out) and out[index + 1] == 0xE9:
+                break
+            index += _fe_span(out, index)
+            continue
+        if byte == 0x00:
+            run = index
+            while index < len(out) and out[index] == 0x00:
+                index += 1
+            if index < len(out) and 0x10 <= out[index] <= 0x19:
+                gap = run
+            continue
+        index += 1
+    if gap is not None:
+        out.insert(gap, 0x00)
 
 
 def _acquisition_name_start(part: bytes):
@@ -920,6 +1095,168 @@ def retire_endless_mvief_waits(script_section: bytes, stock_section=None,
     return bytes(result), changed
 
 
+# --------------------------------------------------- unpaced hour pickers
+# BUILD 574. Echo-S's inns ask how many hours to sleep with a picker in the
+# `Sleep` actor:
+#
+#     key!   Right      -> inc2 hours ; wait 3 ; wrap 11 -> 1
+#     key!   Left       -> dec2 hours ; wait 3 ; wrap 0 -> 10
+#     keyon  OK         -> close, bank1[0x0F] += hours
+#     back              ; loop
+#
+# `key!` (0x30) is "held", so the WAIT is what paces a held direction: one
+# hour per WAIT 3, which the 60 FPS field-wait cave doubles to the same 0.1 s
+# a PC gets. THREE of Echo-S's pickers were written without the WAIT --
+# blin64, convil_1 (Fort Condor) and frmin -- so a held direction steps once
+# per field TICK: 30 hours a second on a 30 FPS PC, 60 on this port's 60 Hz
+# field loop. A tap of any real length runs through the whole 1..10 range.
+#
+# Inserting the missing WAIT would move every later byte of section 1. In
+# place, the opcode byte alone turns "held" into "pressed this tick"
+# (`keyon`, 0x31, same operands, same length): one hour per tap, exactly.
+# Holding no longer repeats, and the range is ten.
+#
+# Scoped by shape, not by name: actor `Sleep`, a `key!` on Right or Left
+# alone, immediately followed by `inc2`/`dec2`, with no WAIT before the next
+# key test. The paced pickers (WAIT 3) never match and stay byte-identical.
+OP_KEY_HELD, OP_KEY_ON, OP_WAIT = 0x30, 0x31, 0x24
+OP_INC2, OP_DEC2 = 0x96, 0x98
+PACED_PICKERS = []
+
+
+def pace_unpaced_hour_pickers(script_section: bytes, field_name=None):
+    """``(section, n_changed)`` -- see the block above."""
+    actor_count = script_section[2]
+    akao_count = struct.unpack_from('<H', script_section, 6)[0]
+    names = [script_section[_SECTION1_FIXED_HEADER + i * 8:
+                            _SECTION1_FIXED_HEADER + (i + 1) * 8]
+             .rstrip(b'\0') for i in range(actor_count)]
+    table = _SECTION1_FIXED_HEADER + actor_count * 8 + akao_count * 4
+    owner = {}
+    for index in range(actor_count * _SECTION1_ROUTINES_PER_ACTOR):
+        at = table + index * 2
+        if at + 2 > len(script_section):
+            break
+        owner.setdefault(struct.unpack_from('<H', script_section, at)[0],
+                         index // _SECTION1_ROUTINES_PER_ACTOR)
+    out = bytearray(script_section)
+    changed = 0
+    for start, end in _routine_blocks(script_section):
+        actor = owner.get(start)
+        if actor is None or names[actor] != b'Sleep':
+            continue
+        stream, _truncated = _decode_block(script_section, start, end)
+        for i, (off, op, size) in enumerate(stream):
+            if op != OP_KEY_HELD or size != 4:
+                continue
+            mask = struct.unpack_from('<H', script_section, off + 1)[0]
+            if mask not in (0x2000, 0x8000):
+                continue
+            if i + 1 >= len(stream) or stream[i + 1][1] not in (OP_INC2,
+                                                                 OP_DEC2):
+                continue
+            paced = False
+            for _o, nop, _s in stream[i + 2:i + 6]:
+                if nop == OP_WAIT:
+                    paced = True
+                    break
+                if nop in (OP_KEY_HELD, OP_KEY_ON):
+                    break
+            if paced:
+                continue
+            out[off] = OP_KEY_ON
+            changed += 1
+    if changed and field_name and field_name not in PACED_PICKERS:
+        PACED_PICKERS.append(field_name)
+    return bytes(out), changed
+
+
+# --------------------------------------------------- 12-hour pickers
+# BUILD 576. Every `Sleep` picker wraps its hour count the same way, right
+# after the step:
+#
+#     inc2 v            ; [wait 3] ; if v == 11 (IFUB 14 BB vv 0B 00 jj)
+#                                        set v = 1  (SETBYTE 80 BB vv 01)
+#     dec2 v            ; [wait 3] ; if v == 0  (IFUB 14 BB vv 00 00 jj)
+#                                        set v = 10 (SETBYTE 80 BB vv 0A)
+#
+# so the range is 1..10. Up to 12 is two value bytes per picker: the upper
+# test becomes `v == 13` and the lower wrap sets 12. Same opcodes, same
+# lengths, every jump untouched. The window is already two digits wide
+# (WNUMB ... 02), and bank1[0x0F] += v is a bare byte add the day/night
+# clock carries (23 + 12 = 35 -> 11 the next day, one carry step).
+#
+# Scoped by shape: actor `Sleep`, a WNUMB in the routine, and the exact
+# IFUB-then-SETBYTE pairs on the variable the routine's inc2/dec2 steps.
+HOUR_PICKER_MAX = 12
+STOCK_HOUR_PICKER_MAX = 10
+OP_IFUB, OP_SETBYTE, OP_WNUMB = 0x14, 0x80, 0x37
+EXTENDED_PICKERS = []
+
+
+def extend_hour_pickers(script_section: bytes, field_name=None,
+                        top=HOUR_PICKER_MAX):
+    """``(section, n_pickers)``: each Sleep picker wraps at ``top``."""
+    if top == STOCK_HOUR_PICKER_MAX:
+        return bytes(script_section), 0
+    if not 2 <= top <= 99:
+        raise ValueError('hour picker top %d' % top)
+    actor_count = script_section[2]
+    akao_count = struct.unpack_from('<H', script_section, 6)[0]
+    names = [script_section[_SECTION1_FIXED_HEADER + i * 8:
+                            _SECTION1_FIXED_HEADER + (i + 1) * 8]
+             .rstrip(b'\0') for i in range(actor_count)]
+    table = _SECTION1_FIXED_HEADER + actor_count * 8 + akao_count * 4
+    owner = {}
+    for index in range(actor_count * _SECTION1_ROUTINES_PER_ACTOR):
+        at = table + index * 2
+        if at + 2 > len(script_section):
+            break
+        owner.setdefault(struct.unpack_from('<H', script_section, at)[0],
+                         index // _SECTION1_ROUTINES_PER_ACTOR)
+    out = bytearray(script_section)
+    pickers = 0
+    for start, end in _routine_blocks(script_section):
+        actor = owner.get(start)
+        if actor is None or names[actor] != b'Sleep':
+            continue
+        stream, _truncated = _decode_block(script_section, start, end)
+        if not any(op == OP_WNUMB for _o, op, _s in stream):
+            continue
+        steps = {(script_section[o + 1] & 0xF, script_section[o + 2])
+                 for o, op, sz in stream if op in (OP_INC2, OP_DEC2)
+                 and sz == 3}
+        if len(steps) != 1:
+            continue
+        bank, var = steps.pop()
+        up = down = None
+        for i in range(len(stream) - 1):
+            o, op, sz = stream[i]
+            o2, op2, sz2 = stream[i + 1]
+            if op != OP_IFUB or sz != 6 or op2 != OP_SETBYTE or sz2 != 4:
+                continue
+            b = script_section[o + 1]
+            if (b >> 4, b & 0xF, script_section[o + 2],
+                    script_section[o + 4]) != (bank, 0, var, 0):
+                continue
+            b2 = script_section[o2 + 1]
+            if (b2 >> 4, script_section[o2 + 2]) != (bank, var):
+                continue
+            pair = (script_section[o + 3], script_section[o2 + 3])
+            if pair == (STOCK_HOUR_PICKER_MAX + 1, 1):
+                up = o + 3
+            elif pair == (0, STOCK_HOUR_PICKER_MAX):
+                down = o2 + 3
+        if up is None or down is None:
+            continue
+        out[up] = top + 1
+        out[down] = top
+        pickers += 1
+    if pickers and field_name and field_name not in EXTENDED_PICKERS:
+        EXTENDED_PICKERS.append(field_name)
+    return bytes(out), pickers
+
+
 def model_loader_names(section3: bytes):
     """The model names of a field's section 3, in the index order scripts use.
 
@@ -1122,6 +1459,14 @@ def merge_field_payload(stock_payload: bytes, echo_payload: bytes,
     # the bugin1c black-screen hang, measured.
     echo_sections[0], _retired_waits = retire_endless_mvief_waits(
         echo_sections[0], stock_sections[0], field_name)
+    # BUILD 574: three inns' hour pickers have no WAIT; see the block above
+    # `pace_unpaced_hour_pickers`.
+    echo_sections[0], _paced = pace_unpaced_hour_pickers(
+        echo_sections[0], field_name)
+    # BUILD 576: every Sleep picker offers 1..12 hours; see the block above
+    # `extend_hour_pickers`.
+    echo_sections[0], _extended = extend_hour_pickers(
+        echo_sections[0], field_name)
     validate_akao_offsets(echo_sections[0])
     # Section 3 travels with section 1 when it can: they are one unit, because
     # a script binds an entity to a model by INDEX into this list.

@@ -847,6 +847,12 @@ def _flevel_archive_mode(text):
         return 'built'
     if re.search(r'^\s*flevel\.lgp: FAST REUSE enabled', text, re.M):
         return 'reused'
+    # BUILD 577: the archive cache keeping an unchanged flevel is a reuse
+    # too -- the field pipeline does not run, so its counters are absent for
+    # the same reason. Missing this made log 374 print 21 false alarms.
+    if re.search(r'^\s*flevel\.lgp: unchanged since the last build, kept',
+                 text, re.M):
+        return 'reused'
     return None
 
 

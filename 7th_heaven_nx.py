@@ -163,6 +163,18 @@ SPELL_TEX_CAP_CHOICES = [
     (0, 'Vanilla size \u2014 no upscaling'),
 ]
 
+# SYW minigame DDS conversion has its own native TEX path. Keep its cap
+# separate from field, world and spell art so changing one does not rebuild
+# unrelated archives. This is an upper bound on each integer upscale, not a
+# promise to enlarge every texture to the selected dimension.
+MINIGAME_TEX_CAP_CHOICES = [
+    (256, '256px — conservative default'),
+    (512, '512px'),
+    (768, '768px'),
+    (1024, '1024px'),
+    (0, 'Native size — no upscaling'),
+]
+
 # Retained only so older settings.json files load. V37 uses the single spell
 # cap above for every mapped TEX; the per-TEX runtime marker replaces this
 # split. Production conversion ignores the old value.
@@ -1440,8 +1452,10 @@ def run_build(mods, enabled, settings_by_mod, log, progress,
     # .s tables and on-screen quad extents remain stock.
     produced += build.apply_spelluv(
         SDOUT_DIR, DUMP, log, produced,
-        needed=bool(plan.spell_dds
-                    and build.ff7nx_spelltex.uniform_scale() > 1))
+        needed=bool((plan.spell_dds
+                     and build.ff7nx_spelltex.uniform_scale() > 1)
+                    or (plan.minigame_dds
+                        and build.ff7nx_minigametex.cap() > 0)))
     # The framebuffer-texture capture rect. The floor-warp summons snapshot
     # the frame and map it onto their mesh; the capture converts the rect to
     # staging-surface columns with a hardcoded identity that assumes a 640
@@ -1543,6 +1557,20 @@ def run_build(mods, enabled, settings_by_mod, log, progress,
     produced += build.apply_field_pacing(SDOUT_DIR, DUMP, plan, log, produced)
     # BUILD 533. The zero-travel SCR2D rule; see ff7nx_campreserve.
     produced += build.apply_cam_preserve(SDOUT_DIR, DUMP, plan, log, produced)
+    # BUILD 537. The sound-buffer pool: 32 MB static -> heap, so Cosmo
+    # Memory's long SFX loops cannot close the game (Chocobo Race). Last of
+    # the cave passes so no shipping cave moves. See ff7nx_audiopool.
+    produced += build.apply_audio_pool(SDOUT_DIR, DUMP, log, produced)
+    # BUILD 552. GL_LINES 2 px wide (submarine grid). After the audio pool so
+    # no shipping cave moves. See ff7nx_sublines.
+    produced += build.apply_line_width(SDOUT_DIR, DUMP, log, produced)
+    # BUILD 561. Coaster 360 aim. See ff7nx_coaster.
+    produced += build.apply_coaster(SDOUT_DIR, DUMP, log, produced)
+    # BUILD 565. Fort Condor at 16:9. See ff7nx_condor.
+    produced += build.apply_condor(SDOUT_DIR, DUMP, log, produced)
+    # BUILD 567. Per-field 4:3 zoom (convil_2). See ff7nx_fieldzoom.
+    produced += build.apply_field_zoom(SDOUT_DIR, DUMP, log, produced)
+    produced += build.apply_condorpad(SDOUT_DIR, DUMP, log, produced)
     # BUILD 528. Diagnostic frame probe, off unless SEVENTH_NX_FRAME_PROBE=1.
     # Must be the last module pass. See ff7nx_frameprobe.
     produced += build.apply_frame_probe(SDOUT_DIR, DUMP, plan, log, produced)
@@ -1644,6 +1672,13 @@ def launch_ui():
     initial_spell_cap_value = global_saved.get('spell_tex_cap', 512)
     if initial_spell_cap_value not in spell_cap_label_by_value:
         initial_spell_cap_value = 512
+
+    mini_cap_label_by_value = dict(MINIGAME_TEX_CAP_CHOICES)
+    mini_value_by_cap_label = {v: k for k, v in MINIGAME_TEX_CAP_CHOICES}
+    initial_mini_cap_value = global_saved.get(
+        'minigame_tex_cap', build.ff7nx_minigametex.DEFAULT_CAP)
+    if initial_mini_cap_value not in mini_cap_label_by_value:
+        initial_mini_cap_value = build.ff7nx_minigametex.DEFAULT_CAP
 
     fbg_label_by_value = dict(FIELD_BG_PAGE_PX_CHOICES)
     fbg_value_by_label = {v: k for k, v in FIELD_BG_PAGE_PX_CHOICES}
@@ -1931,6 +1966,13 @@ def launch_ui():
 
     def current_spell_tex_cap():
         return spell_value_by_cap_label.get(spell_cap_var.get(), 512)
+
+    mini_cap_var = tk.StringVar(
+        value=mini_cap_label_by_value[initial_mini_cap_value])
+
+    def current_minigame_tex_cap():
+        return mini_value_by_cap_label.get(
+            mini_cap_var.get(), build.ff7nx_minigametex.DEFAULT_CAP)
 
     fbg_var = tk.StringVar(value=fbg_label_by_value[initial_fbg_value])
 
@@ -2782,6 +2824,14 @@ def launch_ui():
              'its available integer scale. Animation .s files remain '
              'byte-identical.',
              False),
+            ('combo', 'Minigame texture cap (SYW Unified Minigames)',
+             mini_cap_var, [l for _, l in MINIGAME_TEX_CAP_CHOICES],
+             'Applies only to native minigame TEX rebuilt from the enabled '
+             'SYW Unified Minigames DDS set. The cap chooses the largest '
+             'whole-number upscale within that dimension and the source '
+             'resolution. Native size still applies the art without '
+             'enlarging it. Larger sizes use more decoded texture memory; '
+             'resized TEX reuses the existing logical-UV patch.', False),
         ]),
         ('Movies', [
             ('combo', 'Video quality', movie_var,
@@ -3007,6 +3057,8 @@ def launch_ui():
                                  'world_tex_cap': current_world_tex_cap(),
                                  'battle_bg_tex_cap': current_battle_bg_tex_cap(),
                                  'spell_tex_cap': current_spell_tex_cap(),
+                                 'minigame_tex_cap':
+                                     current_minigame_tex_cap(),
                                  'spell_fx_cap': current_spell_fx_cap(),
                                  'field_bg_page_px':
                                      current_field_bg_page_px(),
@@ -3135,6 +3187,7 @@ def launch_ui():
     cap_var.trace_add('write', save_settings_now)
     world_cap_var.trace_add('write', save_settings_now)
     bg_cap_var.trace_add('write', save_settings_now)
+    mini_cap_var.trace_add('write', save_settings_now)
     fbg_var.trace_add('write', save_settings_now)
     fbud_var.trace_add('write', save_settings_now)
     ftc_var.trace_add('write', save_settings_now)
@@ -3835,6 +3888,7 @@ def launch_ui():
         world_cap_value = current_world_tex_cap()
         bg_cap_value = current_battle_bg_tex_cap()
         spell_cap_value = current_spell_tex_cap()
+        mini_cap_value = current_minigame_tex_cap()
         spell_fx_value = current_spell_fx_cap()
         fbg_px_value = current_field_bg_page_px()
         # DEPTH-1 PAGE SIZE -- NOW A DIALOG CONTROL. FINDINGS-223, 225.
@@ -4017,6 +4071,11 @@ def launch_ui():
                       'the proven 256px)')
         os.environ[build.ff7nx_spelltex.CAP_ENV] = str(spell_cap_value)
         os.environ[build.ff7nx_spelltex.FX_CAP_ENV] = '0'
+        os.environ[build.ff7nx_minigametex.CAP_ENV] = str(mini_cap_value)
+        if mini_cap_value:
+            log_write(f'SYW minigame texture cap: {mini_cap_value}px')
+        else:
+            log_write('SYW minigame textures: native size (no upscaling)')
         if spell_cap_value:
             log_write(f'spell texture cap: {spell_cap_value}px '
                       f'({spell_cap_value // 256}x vanilla for a 256px slot; '
@@ -4120,6 +4179,10 @@ def main():
         if build.ff7nx_spelltex.CAP_ENV not in os.environ:
             os.environ[build.ff7nx_spelltex.CAP_ENV] = str(
                 saved.get('__global__', {}).get('spell_tex_cap', 512))
+        if build.ff7nx_minigametex.CAP_ENV not in os.environ:
+            os.environ[build.ff7nx_minigametex.CAP_ENV] = str(
+                saved.get('__global__', {}).get(
+                    'minigame_tex_cap', build.ff7nx_minigametex.DEFAULT_CAP))
         if build.ff7nx_fieldbg.PAGE_PX_ENV not in os.environ:
             _g = saved.get('__global__', {})
             _px = _g.get('field_bg_page_px', build.ff7nx_fieldbg.OFF_PAGE_PX)

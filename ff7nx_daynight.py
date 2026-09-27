@@ -327,6 +327,11 @@ MODE_CASES = 15
 DRIVER_FIELD = 2
 DRIVER_BATTLE = 3
 DRIVER_WORLD = 4
+DRIVER_CONDOR = 13                    # BUILD 572: Fort Condor, measured --
+                                      # set_driver_mode stores its w0 at
+                                      # [0x12CE1F8] (+0x10F3E70), and
+                                      # ff7nx_condor's mode-13 projection
+                                      # fix is keyed on that same value.
 DRIVER_TICKING = 3                    # FIELD..WORLDMAP, the three FFNx ticks
 
 
@@ -394,6 +399,45 @@ BATTLE_MENU_HOOK = 0x90ACC            # x86 battle_main_loop + 0x32A
 BATTLE_BL_ORIG = {BATTLE_TEXT_HOOK: 0x94000DB3,
                   BATTLE_BOX_HOOK: 0x94000D63,
                   BATTLE_MENU_HOOK: 0x9431F395}
+
+# BUILD 572. FORT CONDOR -- the minigame itself follows the clock, the
+# interface does not.
+#
+# FFNx never tints this mode, so there is no FFNx point to copy; the split is
+# read out of the minigame's own frame. x86 0x5F5828 (ARM +0x8C34E0) draws
+# the scene in this order:
+#
+#     0x660EC0      set-up for the frame's objects
+#     0x66E641 x8   the eight battlefield map pages ([0xC6073C], the pages
+#                   0x60A160 fills -- map0..7)
+#     0x6019E7      the units (the 3D transform chain 0x662xxx/0x663xxx)
+#     0x60218E      the enemy units, same chain
+#     0x660E6A ...  the sprite lists [0xC60550] and [0xC60780] -- the ones
+#                   0x607CC5 and friends fill: gauges, cursor, text, banner
+#
+# So the tint goes ON immediately before the 0x660EC0 call and OFF
+# immediately after 0x60218E returns, and everything the sprite lists draw
+# (the whole UI layer) is white. Both points are ordinary `build_ui_cave`
+# sites, the same mechanism as the world map's and battle's.
+#
+# The flip cave treats this mode like the world map -- there is no indoor
+# Fort Condor -- ticks the clock, and decides the colour into BSS_ARMED_INV
+# ONLY. BSS_TINT_INV stays white, so a condor draw outside the bracket
+# (0x5F4971's end screens, a fade) can never pick the tint up.
+CONDOR_ON_HOOK = 0x8C35E8             # bl x86 0x660EC0
+CONDOR_OFF_HOOK = 0x8C39BC            # bl x86 0x60218E
+CONDOR_BL_ORIG = {CONDOR_ON_HOOK: 0x94071106,
+                  CONDOR_OFF_HOOK: 0x9400DF05}
+CONDOR_ON_CALLEE = 0xA87A00           # x86 0x660EC0
+CONDOR_OFF_CALLEE = 0x8FB5D0          # x86 0x60218E
+CONDOR_ENV = 'SEVENTH_NX_DAYNIGHT_CONDOR'
+
+
+def condor_enabled(env=None):
+    e = os.environ if env is None else env
+    return e.get(CONDOR_ENV, '').strip().lower() not in ('0', 'off', 'no',
+                                                        'false')
+
 
 UI_SCRATCH = (16, 17)                 # x16/x17, saved and restored anyway
 
@@ -739,7 +783,31 @@ def read_maplist(flevel_path):
     return out
 
 
-def outdoor_bitmap(maplist, field_paths, log=lambda *_: None):
+# BUILD 572. Fields treated as OUTDOOR whatever their `Time` actor says.
+#
+# convil_2 is Fort Condor's upper room, and the view out of its window of the
+# condor on the reactor is the same field (layer-2 state (2,2) over the room;
+# ff7nx_fieldzoom's field #356). Echo-S's Time actor marks it INDOOR
+# (BITOFF bank1[0x0A] bit 2), so the sky out of that window was noon at
+# midnight. Listed here it gets the outdoor bit, which is all the tick reads.
+# `SEVENTH_NX_DAYNIGHT_OUTDOOR=convil_2,...` replaces the list; `=none`
+# empties it.
+FORCE_OUTDOOR = ('convil_2',)
+FORCE_OUTDOOR_ENV = 'SEVENTH_NX_DAYNIGHT_OUTDOOR'
+
+
+def force_outdoor(env=None):
+    e = os.environ if env is None else env
+    raw = e.get(FORCE_OUTDOOR_ENV, '').strip().lower()
+    if not raw:
+        return FORCE_OUTDOOR
+    if raw in ('none', '0', 'off'):
+        return ()
+    return tuple(n.strip() for n in raw.split(',') if n.strip())
+
+
+def outdoor_bitmap(maplist, field_paths, log=lambda *_: None,
+                   force=None):
     """
     A bit per field id: 1 outdoor, 0 indoor.
 
@@ -785,9 +853,20 @@ def outdoor_bitmap(maplist, field_paths, log=lambda *_: None):
             outdoor += 1
         else:
             indoor += 1
-    log('  outdoor bitmap: %d outdoor, %d indoor, %d with no Time actor, '
+    forced = []
+    for name in (force_outdoor() if force is None else force):
+        if name in maplist:
+            field_id = maplist.index(name)
+            if not bits[field_id >> 3] & (1 << (field_id & 7)):
+                bits[field_id >> 3] |= 1 << (field_id & 7)
+                forced.append('%s #%d' % (name, field_id))
+                outdoor += 1
+        log('  outdoor bitmap: %d outdoor, %d indoor, %d with no Time actor, '
         '%d maplist name(s) not in the mod (%d bytes)'
         % (outdoor, indoor, silent, missing, len(bits)))
+    if forced:
+        log('  outdoor bitmap: forced outdoor (BUILD 572): %s'
+            % ', '.join(forced))
     if not outdoor:
         raise ValueError('not one field is marked outdoor -- either the Time '
                          'actor is gone from this mod or its shape changed, '
@@ -1236,7 +1315,8 @@ def _emit_clock(a, frames_per_minute, seed_hour, force_on, bss_reg=20):
 
 
 def build_flip_cave(cave, addr, bss, frames_per_minute, phase_table_addr,
-                    gamma_table_addr, force_on=True, seed_hour=8):
+                    gamma_table_addr, force_on=True, seed_hour=8,
+                    condor=True):
     """
     The once-a-frame half: tick the clock outside the field, and arm the tint
     for the two modes that have no draw entry of their own.
@@ -1273,6 +1353,9 @@ def build_flip_cave(cave, addr, bss, frames_per_minute, phase_table_addr,
     # only the three modes FFNx ticks in. FIELD is 2, so this is
     # `2 <= mode <= 4` as one unsigned compare.
     a.emit(A.ldr(9, 20, BSS_MODE))
+    if condor:
+        a.emit(A.cmp_imm(9, DRIVER_CONDOR))    # BUILD 572: Fort Condor ticks
+        a.bcond('clock', EQ)
     a.emit(A.sub_imm(9, 9, DRIVER_FIELD))
     a.emit(A.cmp_imm(9, DRIVER_TICKING))
     a.bcond('white', HS)
@@ -1281,7 +1364,13 @@ def build_flip_cave(cave, addr, bss, frames_per_minute, phase_table_addr,
     a.emit(A.ldr(9, 20, BSS_TICKED))
     a.cbnz(9, 'white')
 
+    a.label('clock')
     _emit_clock(a, frames_per_minute, seed_hour, force_on)
+    if condor:
+        # Fort Condor takes the world map's rule: no outdoor bit.
+        a.emit(A.ldr(9, 20, BSS_MODE))
+        a.emit(A.cmp_imm(9, DRIVER_CONDOR))
+        a.bcond('colour', EQ)
 
     # WHICH SCENE'S RULE APPLIES -- and BUILD 481 is why this is not just
     # `mode == WORLDMAP`.
@@ -1312,6 +1401,17 @@ def build_flip_cave(cave, addr, bss, frames_per_minute, phase_table_addr,
     a.cbz(9, 'white')
     a.label('colour')
     _emit_colour(a, phase_table_addr, gamma_table_addr)
+    if condor:
+        # BUILD 572: decided, not applied. Only the scene bracket inside
+        # 0x5F5828 (CONDOR_ON_HOOK .. CONDOR_OFF_HOOK) copies it into the
+        # slot the draws read; every other condor draw stays white. ONE
+        # colour computation serves both rules (BUILD 573: the first cut
+        # emitted a second copy of it and the padding pool ran 24 words
+        # short for the menu calendar).
+        a.emit(A.ldr(9, 20, BSS_MODE))
+        a.emit(A.cmp_imm(9, DRIVER_CONDOR))
+        a.bcond('done', NE)
+        a.emit(A.str_(31, 20, BSS_TINT_INV))
     a.b('done')
 
     a.label('white')
@@ -1632,6 +1732,12 @@ SITES = (
     ('battle_menu', BATTLE_MENU_HOOK, BATTLE_BL_ORIG[BATTLE_MENU_HOOK],
      'the battle menu marker'),
 )
+CONDOR_SITES = (
+    ('condor_on', CONDOR_ON_HOOK, CONDOR_BL_ORIG[CONDOR_ON_HOOK],
+     'Fort Condor: before the map pages and units'),
+    ('condor_off', CONDOR_OFF_HOOK, CONDOR_BL_ORIG[CONDOR_OFF_HOOK],
+     'Fort Condor: after the units, before the sprite (UI) lists'),
+)
 
 # (name, hook, displaced word, before the call, after it). `False` is FFNx's
 # setTimeFilterEnabled(false), `True` its (true), `None` leave it alone.
@@ -1653,6 +1759,19 @@ UI_SITES = (
     ('battle_menu', BATTLE_MENU_HOOK, BATTLE_BL_ORIG[BATTLE_MENU_HOOK],
      False, None),
 )
+CONDOR_UI_SITES = (
+    ('condor_on', CONDOR_ON_HOOK, CONDOR_BL_ORIG[CONDOR_ON_HOOK], True, None),
+    ('condor_off', CONDOR_OFF_HOOK, CONDOR_BL_ORIG[CONDOR_OFF_HOOK],
+     None, False),
+)
+
+
+def all_sites(condor=True):
+    return SITES + (CONDOR_SITES if condor else ())
+
+
+def all_ui_sites(condor=True):
+    return UI_SITES + (CONDOR_UI_SITES if condor else ())
 
 # `tick` is not here: it is the only cave that needs the two tables, so
 # `build_all` places it by hand. These three take nothing but the BSS base.
@@ -1811,7 +1930,8 @@ def check_sky_page_site(text):
 
 
 def build_all(pool, space, bss, bitmap, frames_per_minute, force_on=True,
-              freeze_hour=None, strength=DEFAULT_STRENGTH, sky_rows=()):
+              freeze_hour=None, strength=DEFAULT_STRENGTH, sky_rows=(),
+              condor=True):
     """Place the three tables and runtime caves. Returns entries and patches."""
     outdoor_at = space.place('daynight-outdoor', bitmap, align=4)
     phase_at = space.place('daynight-phase', phase_table(), align=4)
@@ -1827,7 +1947,8 @@ def build_all(pool, space, bss, bitmap, frames_per_minute, force_on=True,
         pool, lambda cave, addr: build_flip_cave(
             cave, addr, bss, frames_per_minute, phase_at, gamma_at,
             force_on=force_on,
-            seed_hour=None if freeze_hour is not None else 8))
+            seed_hour=None if freeze_hour is not None else 8,
+            condor=condor))
     placed.update(words)
     entries['sky_page'], words = ff7nx_cave.emit_laid_out(
         pool, lambda cave, addr: build_sky_page_cave(cave, addr, bss))
@@ -1836,12 +1957,12 @@ def build_all(pool, space, bss, bitmap, frames_per_minute, force_on=True,
         entries[name], words = ff7nx_cave.emit_laid_out(
             pool, lambda cave, addr, _b=builder: _b(cave, addr, bss))
         placed.update(words)
-    for name, hook, orig, before, after in UI_SITES:
+    for name, hook, orig, before, after in all_ui_sites(condor):
         entries[name], words = ff7nx_cave.emit_laid_out(
             pool, lambda cave, addr, _h=hook, _o=orig, _b=before, _a=after:
             build_ui_cave(cave, addr, bss, _h, _o, _b, _a))
         placed.update(words)
-    for name, site, _orig, _what in SITES:
+    for name, site, _orig, _what in all_sites(condor):
         placed[site] = A.b(site, entries[name])
     return entries, placed, outdoor_at, phase_at, gamma_at, sky_at
 
@@ -1872,7 +1993,7 @@ def freeze_hour_from_env():
 
 def apply_to_nso(src, dest, bitmap, space=None, fps=60,
                  force_on=True, freeze_hour=None, strength=DEFAULT_STRENGTH,
-                 sky_rows=()):
+                 sky_rows=(), condor=None):
     """
     Install the day/night runtime, patching `src` into `dest`.
 
@@ -1894,7 +2015,8 @@ def apply_to_nso(src, dest, bitmap, space=None, fps=60,
     segs, raw, own = ff7nx_tables.open_module(blob)
     space = own if space is None else space
     text = space.text
-    for _name, site, orig, what in SITES:
+    condor = condor_enabled() if condor is None else condor
+    for _name, site, orig, what in all_sites(condor):
         AC.expect_word(text, site, orig, 'daynight: %s' % what)
     check_block_shape(text)
     check_sky_page_site(text)
@@ -1919,13 +2041,14 @@ def apply_to_nso(src, dest, bitmap, space=None, fps=60,
     pool = ff7nx_cave.HolePool(text, starts=set(nxmap.Main(src).arm_starts))
     entries, placed, outdoor_at, phase_at, gamma_at, sky_at = build_all(
         pool, space, bss, bitmap, frames, force_on=force_on,
-        freeze_hour=freeze_hour, strength=strength, sky_rows=sky_rows)
+        freeze_hour=freeze_hour, strength=strength, sky_rows=sky_rows,
+        condor=condor)
     for where, word in placed.items():
         struct.pack_into('<I', text, where, word)
 
     out = AC.pack(blob, space.commit(), BSS_BYTES)
     _segs, check_raw = AC.segments(out)
-    for name, site, _orig, _what in SITES:
+    for name, site, _orig, _what in all_sites(condor):
         got = struct.unpack_from('<I', check_raw[0], site)[0]
         if got != A.b(site, entries[name]):
             raise ValueError('daynight: the %s hook did not survive the '
@@ -1939,7 +2062,8 @@ def apply_to_nso(src, dest, bitmap, space=None, fps=60,
         handle.write(out)
     minutes_per_day = DAY_MINUTES * frames / float(fps) / 60.0
     return {'bss_bytes': BSS_BYTES, 'bss_base': bss, 'entries': entries,
-            'cave_words': len(placed) - len(SITES),
+            'cave_words': len(placed) - len(all_sites(condor)),
+            'condor': condor,
             'table_bytes': (len(bitmap) + len(phase_table()) + len(GAMMA_LUT)
                             + len(sky_table(sky_rows))),
             'strength': strength,

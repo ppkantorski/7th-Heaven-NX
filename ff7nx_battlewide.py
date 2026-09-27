@@ -716,6 +716,7 @@ ENGINE_FADE_X = 0x00A3F118
 ENGINE_FADE_W_STOCK = 0x52805008       # mov w8, #0x280   (640)
 ENGINE_FADE_W_WIDE = 0x52806AC8        # mov w8, #0x356   (854)
 ENGINE_FADE_X_STOCK = 0xB900001F       # str wzr, [x0]
+ENGINE_FADE_X_MINIFADE = 0xB900000B   # str w11, [x0] -- ff7nx_minifade
 ENGINE_FADE_ANCHORS = {
     0x00A3F0D4: 0x321B0FE8,   # mov w8, #0x1e0    h = 480, already correct
     0x00A3F0D8: 0xB9000008,   # str w8, [x0]
@@ -1738,6 +1739,14 @@ def engine_fade_plan(m, revert=False):
 
     img = m.img
     ps, notes, problems = [], [], []
+
+    # BUILD 539. This function IS the highway fade, and ff7nx_minifade now
+    # owns FFNx's "Highway fix" on it, in place (x via `str w11, [x0]`, no
+    # cave). That is not a build-204 output: leave it to its owner rather
+    # than half-reverting its width and reporting its x store as unknown.
+    if _word(img, ENGINE_FADE_X) == ENGINE_FADE_X_MINIFADE:
+        notes.append('    highway fade: owned by ff7nx_minifade; left alone')
+        return ps, notes, problems
 
     for va, expected in sorted(ENGINE_FADE_ANCHORS.items()):
         have = _word(img, va)

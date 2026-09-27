@@ -314,6 +314,15 @@ class Cpu:
             a = self._addr(rn, ((w >> 10) & 0xFFF) * 4)
             self.mem.setu(a, self.fp[rd], 4)
             return None
+        if (w & 0xFFFFFC00) == 0x1E21C000:                    # fsqrt Sd,Sn
+            # BUILD 561 (ff7nx_coaster aim). IEEE single sqrt, correctly
+            # rounded: Python's double sqrt of a float32 value rounded back to
+            # float32 is exact for this (a double carries > 2*24+2 bits).
+            import math
+            x = struct.unpack('<f', struct.pack('<I', self.fp[rn]))[0]
+            r = math.sqrt(x) if x >= 0 else float('nan')
+            self.fp[rd] = struct.unpack('<I', struct.pack('<f', r))[0]
+            return None
         if (w & 0xFFE01FE0) == 0x1E201000:                    # fmov Sd,#imm
             # The 8-bit immediate expands as ARM defines it:
             #   a : ~b : Replicate(b,5) : c : d : e : f : g : h : Zeros(19)
@@ -506,8 +515,11 @@ class Cpu:
             if imm7 & 0x40:
                 imm7 -= 0x80
             a = self._rd64(rn) + imm7 * 4
-            self.mem.setu(a, g(rd, True), 4)
-            self.mem.setu(a + 4, g((w >> 10) & 0x1F, True), 4)
+            # data registers: 31 is wzr, not sp (BUILD 565 -- the condor
+            # cull's `stp w8, wzr, [x22, #4]` zeroes edx)
+            rt2 = (w >> 10) & 0x1F
+            self.mem.setu(a, 0 if rd == 31 else g(rd, True), 4)
+            self.mem.setu(a + 4, 0 if rt2 == 31 else g(rt2, True), 4)
             return None
         if (w & 0xFFE00C00) == 0x1A800000:                    # csel Wd,Wn,Wm,c
             return s(rd, gz(rn) if self.cond((w >> 12) & 0xF) else gz(rm), True)
