@@ -68,6 +68,7 @@ import ff7nx_fieldpace
 import ff7nx_frameprobe
 import ff7nx_campreserve
 import ff7nx_campos
+import ff7nx_pointers
 import ff7nx_moviecull
 import ff7nx_moviebars
 import ff7nx_camclamp
@@ -11552,11 +11553,15 @@ MOVIECAM_ONLY_ENV = frozenset((MOVIECAM_INTERP_ENV,
                                # BUILD 610: exefs/main only.
                                ff7nx_campos.ENV,
                                ff7nx_campos.WALK_ENV,
-                               ff7nx_campos.FACE_ENV))
+                               ff7nx_campos.FACE_ENV,
+                               # BUILD 611: exefs/main only (the arrow table
+                               # is READ from the built flevel).
+                               *ff7nx_pointers.ENVS))
 MOVIECAM_ONLY_MODULES = frozenset(('ff7nx_moviecam.py',
                                    'ff7nx_frameprobe.py',
                                    'ff7nx_campreserve.py',
                                    'ff7nx_campos.py',
+                                   'ff7nx_pointers.py',
                                    'ff7nx_deadspace.py'))
 
 # This setting changes only SYW minigame TEX. Its value is included in the
@@ -13747,6 +13752,64 @@ def apply_campos(sdout, dump, plan, log=lambda *_: None, produced=()):
                ff7nx_campos.FACE_ENV))
     else:
         log('  wall facing: stock (%s=0)' % ff7nx_campos.FACE_ENV)
+    log('  %d words in dead space' % rep['words'])
+    return [dest] if not built else []
+
+
+def apply_pointers(sdout, dump, plan, log=lambda *_: None, produced=()):
+    """BUILD 611: the pointer hand and the exit arrows. See ff7nx_pointers.
+
+    * the hand moves with Cloud's real screen position (the float remainder
+      of its projection added to its vertices, FFNx's cursor fix);
+    * the hand is clamped to the 16:9 frame, not the 4:3 one;
+    * a gateway's red arrow is hidden where an explicit red arrow marks the
+      same exit (table from the built flevel's sections 2 and 8).
+    """
+    P = ff7nx_pointers
+    smooth, wide, arrow = (P._on(P.ENV_SMOOTH), P._on(P.ENV_WIDE),
+                           P._on(P.ENV_ARROW))
+    if not (smooth or wide or arrow):
+        log('')
+        log('pointer hand / exit arrows: stock (%s)' % ', '.join(
+            '%s=0' % e for e in P.ENVS))
+        return []
+    src, built = _audio_bridge_base(sdout, dump, log, produced,
+                                    'pointer hand / exit arrows')
+    if src is None:
+        return []
+    dest = os.path.join(sdout, 'atmosphere', 'contents', TITLE_ID, 'exefs',
+                        'main')
+    flevel = os.path.join(sdout, 'atmosphere', 'contents', TITLE_ID, ROMFS,
+                          ARCHIVES['flevel.lgp'])
+    if not os.path.exists(flevel):
+        flevel = os.path.join(HERE, 'game_data_files', 'field', 'flevel.lgp')
+    if not os.path.exists(flevel):
+        flevel = None
+    log('')
+    log('pointer hand / exit arrows ...')
+    tmp = dest + '.pointers-tmp'
+    try:
+        rep = P.apply_to_nso(src, tmp, dump.nso, flevel, smooth, wide, arrow)
+    except Exception as exc:                                   # noqa: BLE001
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        log('! pointer hand / exit arrows: %s: %s -- NOT INSTALLED'
+            % (type(exc).__name__, exc))
+        return []
+    os.replace(tmp, dest)
+    log('  hand: %s; %s'
+        % ('follows the real screen position (x87 remainder -> vertices)'
+           if rep['smooth'] else 'whole units (%s=0)' % P.ENV_SMOOTH,
+           'clamped to the 16:9 frame' if rep['wide']
+           else '4:3 clamp (%s=0)' % P.ENV_WIDE))
+    if rep['arrow']:
+        fields = rep.get('fields') or {}
+        log('  exit arrows: %d gateway arrow(s) hidden in %d field(s) where an '
+            'explicit red arrow marks the same exit (e.g. %s). %s=0 shows '
+            'them all' % (sum(len(v) for v in fields.values()), len(fields),
+                          ', '.join(sorted(fields)[:6]), P.ENV_ARROW))
+    else:
+        log('  exit arrows: stock (%s=0 or no flevel)' % P.ENV_ARROW)
     log('  %d words in dead space' % rep['words'])
     return [dest] if not built else []
 

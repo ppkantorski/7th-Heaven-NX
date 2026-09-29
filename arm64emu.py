@@ -334,6 +334,23 @@ class Cpu:
                            | ((0x1F if b else 0) << 25)
                            | ((imm8 & 0x3F) << 19))
             return None
+        if (w & 0xFFC00000) == 0xFD400000:                    # ldr Dt,[Xn,#i]
+            # BUILD 611 (ff7nx_pointers): the x87 stack slot, a double.
+            a = self._addr(rn, ((w >> 10) & 0xFFF) * 8)
+            self.fp[rd] = self.mem.u(a, 8)
+            return None
+        if (w & 0xFFFFFC00) == 0x1E624000:                    # fcvt Sd,Dn
+            x = struct.unpack('<d', struct.pack('<Q', self.fp[rn] & M64))[0]
+            self.fp[rd] = struct.unpack('<I', struct.pack('<f', x))[0]
+            return None
+        if (w & 0xFFFFFC00) == 0x1E380000:                    # fcvtzs Wd,Sn
+            import math
+            x = struct.unpack('<f', struct.pack('<I', self.fp[rn] & M32))[0]
+            if math.isnan(x):
+                v = 0
+            else:
+                v = max(-(1 << 31), min((1 << 31) - 1, int(x)))
+            return s(rd, v & M32, True)
         if (w & 0xFFFFFC00) == 0x1E220000:                    # scvtf Sd,Wn
             # BUILD 610 (ff7nx_campos). Signed; exact in a double, then one
             # rounding to single, as the hardware does.

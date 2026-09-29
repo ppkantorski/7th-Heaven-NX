@@ -1569,6 +1569,8 @@ def run_build(mods, enabled, settings_by_mod, log, progress,
     produced += build.apply_cam_preserve(SDOUT_DIR, DUMP, plan, log, produced)
     # BUILD 610. The camera follows the unfloored position; see ff7nx_campos.
     produced += build.apply_campos(SDOUT_DIR, DUMP, plan, log, produced)
+    # BUILD 611. Pointer hand and exit arrows; see ff7nx_pointers.
+    produced += build.apply_pointers(SDOUT_DIR, DUMP, plan, log, produced)
     # BUILD 537. The sound-buffer pool: 32 MB static -> heap, so Cosmo
     # Memory's long SFX loops cannot close the game (Chocobo Race). Last of
     # the cave passes so no shipping cave moves. See ff7nx_audiopool.
