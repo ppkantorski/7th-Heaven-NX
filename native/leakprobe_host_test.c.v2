@@ -1,0 +1,96 @@
+/* Host test for leakprobe.c: a fake texture manager and guest heap. */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#define LP_HOST
+#include "leakprobe.c"
+
+static u8 *mem;
+static u8 *g2h(u32 g) { return mem + g; }
+static void w32(u32 g, u32 v) { memcpy(mem + g, &v, 4); }
+static u64 mgr[0x2090 / 8];
+static u64 *rendp = mgr;
+static u32 mode_word;
+static u32 *mode_host = &mode_word;
+static int errors;
+static int gl_queue[64], gl_n;           /* errors the fake GL will report */
+static u32 fake_glerr(void) { return gl_n ? (u32)gl_queue[--gl_n] : 0; }
+
+/* heap: blocks at guest 0x02001000 + 0x10000*i, payload = hdr + 0x34 */
+static void make_heap(int nblk, const u32 *sizes, const u32 *used)
+{
+    w32(HEAP_DESC + 0, 0x04000000);
+    w32(HEAP_DESC + 4, 0);
+    u32 first = 0;
+    for (int i = nblk - 1; i >= 0; i--) {
+        u32 h = 0x02001000u + 0x10000u * (u32)i;
+        w32(h + BLK_SIZE, sizes[i]);
+        w32(h + BLK_USED, used[i]);
+        w32(h + BLK_NEXT, first);
+        first = h + BLK_HDR;
+    }
+    w32(HEAP_DESC + 8, first);
+}
+static void set_tex(u32 n) { for (u32 i = 0; i < MGR_NTEX; i++) mgr[i] = i < n ? 0x1000 + i : 0; }
+static void visit(State *st, u32 mode, u32 field, u32 frames, u32 tex)
+{
+    mode_word = mode;
+    mem[G_FIELD_ID] = (u8)field; mem[G_FIELD_ID + 1] = (u8)(field >> 8);
+    set_tex(tex);
+    if (mode == 4) {                     /* the player entity: fly at 20000, come back at 4000 */
+        static int wv; wv++;
+        memcpy(mem + G_PLAYER_ENT, &(u32){ 0x02F00000u }, 4);
+        u32 y = wv == 1 ? 20000 : 4000;
+        memcpy(mem + 0x02F00000u + 0x10, &y, 4);
+        memcpy(mem + 0x02F00000u + 0xC, &(u32){ 5000 }, 4);
+        memcpy(mem + G_VIEW_TYPE, &(u32){ 3 }, 4);
+    }
+    for (u32 f = 0; f < frames; f++) lp_frame(st, g2h, 0, (u32 *)(void *)&mode_host, (u64 **)(void *)&rendp, fake_glerr);
+}
+#define CHECK(c, w) do { if (!(c)) { printf("  FAIL: %s\n", w); errors++; } } while (0)
+
+int main(void)
+{
+    mem = calloc(1, 0x3000000);
+    State *st = calloc(1, sizeof(State));
+    u32 sz[4] = { 0x1000, 0x200000, 0x5000, 0x80000 }, us[4] = { 1, 0, 0, 1 };
+    make_heap(4, sz, us);
+    mgr[MGR_PARKED / 8] = 7;
+    /* field, world, field, world, field: the world visit leaks 10 each */
+    visit(st, 2, 72, 100, 90);
+    visit(st, 4, 72, 100, 300);
+    visit(st, 2, 72, 100, 100);
+    visit(st, 4, 72, 100, 310);
+    gl_queue[gl_n++] = 0x505; gl_queue[gl_n++] = 0x505; gl_queue[gl_n++] = 0x502;   /* 0x502 first */
+    visit(st, 2, 72, 50, 110);
+    V out[NV]; u64 regs[10];
+    lp_collect(st, g2h, (u64 **)(void *)&rendp, out, regs);
+    int nv = 0; while (nv < NV && out[nv].key) nv++;
+    for (int i = 0; i < nv; i++)
+        printf("  #%u key %u/%u frames %u tex %u->%u peak %u parked %u free %u gl %u (oom %u) first %x last %x in %u frame(s)\n",
+               out[i].seq, out[i].key >> 16, out[i].key & 0xFFFF, out[i].frames, out[i].tex_start,
+               out[i].tex_end, out[i].tex_peak, out[i].parked, out[i].free_end, out[i].nerr,
+               out[i].noom, out[i].first, out[i].last, out[i].errframes);
+    CHECK((regs[0] >> 32) == MAGIC && (u32)regs[0] == 0x20048, "magic/key");
+    CHECK(nv == 5, "five visits");
+    CHECK(out[0].seq == 1 && out[4].seq == 5, "oldest first, current last");
+    CHECK(out[1].tex_peak == 300 && out[3].tex_peak == 310, "world peaks");
+    CHECK(out[4].tex_end == 110 && out[4].frames == 50, "current visit partial");
+    CHECK(out[0].free_end == 0x205000, "heap walk");
+    CHECK(out[4].nerr == 3 && out[4].noom == 2 && out[4].first == 0x502 && out[4].last == 0x505
+          && out[4].errframes == 1, "GL errors of the current visit");
+    CHECK(out[3].nerr == 0, "no GL errors elsewhere");
+    CHECK((regs[3] >> 32) == 3 && (u32)regs[3] == 2, "GL totals");
+    /* the two world visits, as seen from fship: 20000 then back at 4000 */
+    CHECK((s16)(regs[5] >> 32) == 20000 && (s16)regs[6] == 4000 && (s16)(regs[6] >> 16) == 4000,
+          "Highwind altitude trace");
+    CHECK((u32)regs[7] == 1 && (regs[8] >> 32) == 5000, "first Highwind frame, x");
+    CHECK(out[0].parked == 7, "parked");
+    /* ring wraps past 16 */
+    for (int i = 0; i < 20; i++) visit(st, (i & 1) ? 4 : 2, 72, 3, 50 + i);
+    lp_collect(st, g2h, (u64 **)(void *)&rendp, out, regs);
+    CHECK(out[NV - 1].seq == st->seq && out[0].seq == st->seq - 15, "ring keeps the last 16 in order");
+    printf("sizeof(State) %zu\n", sizeof(State));
+    printf("leakprobe host test: %d error(s)\n", errors);
+    return errors ? 1 : 0;
+}

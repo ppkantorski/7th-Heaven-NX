@@ -1,0 +1,2255 @@
+/*
+ * worldfar.c -- the world map's spherical terrain and far field.
+ * BUILD 585 (far field), 586 (CPU bend, tilt), 587 (this rewrite).
+ *
+ * Entry points (each reached through a small hook stub in ff7nx_worldfar):
+ *
+ *  worldfar_bend    after EVERY call of the port's terrain transform
+ *                   0x10F28B0 -- the two inlined calls inside world_sub_751EFC
+ *                   (the 5x5 window) and the one in the 0x75F0AD thunk.
+ *                   BUILD 586 hooked only the thunk, which the window never
+ *                   uses: the window stayed flat while models and the far
+ *                   field were bent, which is the "square", the sky-coloured
+ *                   strips at its edges and the characters sinking into the
+ *                   ground when zoomed out. It drops the transformed
+ *                   vertices onto the planet (BUILD 591: depth is the
+ *                   shaders' job now), and records the translation of
+ *                   every native mesh so the far field knows which cells the
+ *                   game really drew this frame.
+ *  worldfar_draw    after world_sub_751EFC: everything the window does not
+ *                   cover, out to the horizon, in three levels --
+ *                     N  the game's own full-detail mesh, read on demand from
+ *                        wm0.map into a cache, for the ring around the window
+ *                        (and any window cell the game skipped), so the
+ *                        ground at the window's edge is the same ground;
+ *                     S  a 5x5-lattice copy of each mesh (wm0.far);
+ *                     L2 a 9x9 copy of each 4x4-mesh sector (wm0.far).
+ *                   The model->clip matrix of any tile is derived from four
+ *                   calibration transforms per frame (it is affine in the GTE
+ *                   translation), so no per-tile or per-triangle game call is
+ *                   made except the shape allocation, which is batched.
+ *  worldfar_camera  after the camera update 0x74E8CE: ZL/ZR zoom (FFNx up to
+ *                   35000), right stick up/down tilt (FFNx 5..85 degrees).
+ *  worldfar_input   around world_update_player 0x74EA48: right stick
+ *                   left/right turns the camera; on foot the stock camera
+ *                   spin from left/right is taken back out (FFNx analogue
+ *                   behaviour: you walk where you point).
+ *
+ * All the far-field DATA lives in this module's BSS (State), not in the
+ * guest heap: the world allocation only grows by a 32 KB file-read bounce
+ * buffer. Compiled position-independent; HOST_TEST builds it against a fake
+ * guest (native/worldfar_host_test.c).
+ */
+#include <stdint.h>
+#ifdef HOST_TEST
+static void host_tile(int level, int id, int px, int pz);
+#define HOST_TILE(l, i, x, z) host_tile(l, i, x, z)
+static void host_l2(int drawn, int wanted);
+#define HOST_L2(d, w) host_l2(d, w)
+#else
+#define HOST_TILE(l, i, x, z) ((void)0)
+#define HOST_L2(d, w) ((void)0)
+#endif
+
+typedef uint8_t u8;
+typedef int8_t s8;
+typedef int16_t s16;
+typedef uint16_t u16;
+typedef int32_t s32;
+typedef uint32_t u32;
+typedef int64_t s64;
+typedef uint64_t u64;
+
+typedef u8 *(*g2h_fn)(u32 guest);
+typedef u32 (*callx_fn)(u32 x86, u32 nargs, ...);
+
+/* ---- guest globals (x86 VAs, ff7_en 1.02) ---- */
+#define G_MAP_TYPE      0xE045E8u   /* 0 = overworld */
+#define G_PLAYER_POS    0xE04918u   /* int x, y, z */
+#define G_CAM_ROT       0xDFC448u   /* s16[9] */
+#define G_CAM_DELTA_Y   0xDE6A04u
+#define G_GTE           0x90AAF0u   /* -> state; translation int[3] at +0x22 */
+#define G_WORLD_BASE    0xE2D600u   /* the world map's one allocation */
+#define G_PLAYER_ENT    0xE3A7D0u   /* -> the player entity; x, y, z at +0xC */
+#define HW_VIEW         3u          /* G_VIEW_TYPE on the Highwind */
+#define HW_SPOT         2048        /* same place: |dx|, |dz| within this */
+#define G_HW_TAKEOFF    0xDF5420u   /* s32: the Highwind's take-off height (4000) */
+#define HW_FORGET       30u         /* world frames off the Highwind that forget */
+#define HW_JUMP         1000        /* saved vs now: a real difference */
+#define HW_SNAP         1000        /* one frame's change no pilot can make: the game set it */
+#define HW_WINDOW       240u        /* frames after a reload to restore in */
+#define G_ONSET         0xE045D8u
+#define G_MOVE_MULT     0xDFC480u   /* 1 or 2: logic steps per update */
+#define G_CAM_FRONT     0xDFC484u   /* camera heading target, 0..4095 */
+#define G_VIEW_TYPE     0xDFC4B4u   /* 3 = Highwind */
+#define G_CONTROL       0xDE6B5Cu   /* player control enabled */
+#define G_PROGRESS      0xE28CB4u   /* world progress: which sectors are swapped */
+#define G_SKY_DESC      0xE2A370u   /* the cloud strip's 3 quad records (0x30) */
+#define G_METEOR_DESC   0x969B98u   /* the meteor's quad record */
+/* BUILD 598: the LIVE sky objects. 0x75A5D5 creates them on every world
+   load and 0x75A921 frees them on every exit and zeroes these two words.
+   The records' +0x28 are only COPIES, made by 0x7543D3 during init and
+   never cleared -- after the exit they point at freed memory. */
+#define G_SKY_OBJ       0xE2C3ECu
+#define G_METEOR_OBJ    0xE2C3F0u
+#define G_TEX_COUNT     0xE2C420u   /* texture objects the world holds */
+#define G_METEOR_ON     0xE2AAE4u
+#define G_SKY_SCALE     0xDE69D8u   /* s16: 0x754493's unit -> TL pixels */
+
+#define F_RESET_GTE     0x74D3A7u   /* SetRot(DFC448), SetTrans(DE6A20) */
+#define F_APPLY         0x662ECCu   /* out = R*v + T (s16 v) */
+#define F_NAME          0x74CA00u   /* (kind, idx) -> "...wm/WM<idx><ext>" */
+#define F_READ          0x7593CDu   /* (name, offset, size, dest) -> 0 ok */
+#define F_TRANSFORM     0x75F0ADu
+#define F_ALLOC_SHAPES  0x66E272u   /* (n, graphics object) -> 0 if none */
+#define F_DRAW_ENABLED  0x74C969u   /* the world's own per-triangle gate */
+
+#define G_VERTS_F       0xE38338u   /* float x,y,z per vertex (0xC) */
+#define G_COMBINED      0xE39738u   /* model -> clip, row vectors, 4x4 */
+#define G_TEX_OBJS      0xE2BBD8u   /* graphics object per texture id */
+#define G_TEX_ORIGIN    0xE2D168u   /* -> u16 u, v origin per texture id */
+#define G_LIGHT         0xE360F4u   /* -> +0xF8 the 3x4 light matrix */
+#define G_VIEW_X        0xE2C424u
+#define G_VIEW_Y        0xE2C428u
+#define G_VIEW_W        0xDE68F8u
+#define G_VIEW_H        0xDE67E8u
+#define G_CAM_TRANS     (0xDE6A20u + 0x12u)
+#define G_CAM_TRANS_Z   (0xDE6A20u + 0x12u + 8u)
+#define TL_STRIDE       0x20u       /* x,y,z,rhw,colour,specular,u,v */
+
+/* ---- layout shared with ff7nx_worldfar.py (checked there) ---- */
+#ifndef PRIM_BYTES
+#define PRIM_BYTES      0x30000u
+#endif
+#define FAR_OFF         (0xA6800u + 2u * PRIM_BYTES)
+#define FAR_NAME        0x000u      /* "...WM0.FAR" */
+#define FAR_SCRATCH     0x100u      /* 0x40 for 0x662ECC */
+#define FAR_IO          0x200u
+#define FAR_IO_BYTES    0x8000u
+#define FAR_REGION      (FAR_IO + FAR_IO_BYTES)
+#ifndef FAR_MAX
+#define FAR_MAX         0x400000u   /* wm0.far, held in BSS */
+#endif
+
+#define MX 36
+#define MZ 28
+#define SX 9
+#define SZ 7
+#define N1B (MX * MZ)
+#define N2B (SX * SZ)
+#define NALT 6                      /* story variants (x86 0x750F54) */
+#define N1 (N1B + 16 * NALT)        /* L1 tiles / full meshes in wm0.far */
+#define N2 (N2B + NALT)             /* L2 tiles */
+#define MESH 8192
+#define WRAP_X 0x48000
+#define WRAP_Z 0x38000
+#define SECTOR_BYTES 0xB800
+
+#ifndef NEAR_RING
+#define NEAR_RING       8           /* sectors holding ring <= 8 use S/N */
+#endif
+#define GRID            (NEAR_RING + 3) /* a near sector's cells */
+#ifndef LOD_N
+#define LOD_N           0.055f      /* a cell this wide on screen (of the
+                                       viewport width) gets the game's own
+                                       full-detail mesh; smaller, the S tile */
+#define LOD_KEEP        0.04f       /* ... and keeps (or fetches) it until
+                                       it is this small */
+#endif
+#ifndef N_RESERVE
+#define N_RESERVE       3000        /* triangles kept back for S (plus the L2 need) */
+#endif
+#ifndef NWANT
+#define NWANT           544         /* BUILD 605: every near cell may want N */
+#endif
+#define GW              (2 * GRID + 1)
+#define NAT_MAX         64
+#define SKY_GRID        160         /* cloud columns per full turn */
+#define SKY_TILES       8           /* cloud texture repeats per full turn */
+#define SKY_SPAN        1.75        /* columns tried either side of the view */
+#define SKY_RHW         1.0e-6f     /* depth: behind every piece of ground */
+#ifndef NSLOT
+#define NSLOT           544         /* BUILD 605: >= GW*GW (529): the cache never thrashes */
+#endif
+#define SLOT_TRIS       256
+#define SLOT_VERTS      128
+#define LZ_BYTES        8192
+#ifndef LOADS_PER_FRAME
+#define LOADS_PER_FRAME 16
+#endif
+#ifndef MAX_TRIS_FRAME
+#define MAX_TRIS_FRAME  48000       /* BUILD 606: hardware 39.5k looking down + the window (605: 40000) */
+#endif
+#ifndef OWN_WINDOW
+#define OWN_WINDOW      1           /* BUILD 606: draw the game's window ourselves */
+#endif
+#ifndef LOD_RULE
+#define LOD_RULE        1           /* BUILD 605: every visible near cell is N;
+                                       0: by footprint (590..604) */
+#endif
+#define MAX_TRIS_TILE   512
+#define MAX_VERTS_TILE  120         /* wm0.far tiles (ff7nx_worldfar_data MAX_VERTS) */
+
+#define ZOOM_MAX_DIST   35000.0f    /* FFNx getMaxZoomDist */
+#define ZOOM_STEP       125.0f      /* per logic step (x movement mult) */
+#define STICK_DEADZONE  0.2f
+#define TILT_STEP       0.01745f    /* 1 degree per logic step, FFNx */
+#define YAW_STEP        11.4f       /* 1 degree (of 4096) per logic step */
+#define TILT_MIN        0.0873f     /* 5 degrees below horizontal (FFNx -95) */
+#define TILT_MAX        1.4835f     /* 85 degrees (FFNx -175) */
+#define SINK_TRACK_RET  0xF65BC0u   /* 0x75692A's sink call + 4 (module VA) */
+#define SPHERE_R        250000.0f
+#define MOUNTAIN        4000.0f
+#define BTN_ZL          (1ull << 8)
+#define BTN_ZR          (1ull << 9)
+#define BTN_R3          ((1ull << 5) | (1ull << 62))  /* 62: where the
+                                       no-cheats cave moves StickR */
+
+typedef struct {
+    u32 tris, verts, norms;         /* offsets into data */
+    u16 ntri;
+    u16 sk_first[4];
+    u8  sk_n[4];
+    u8  nverts, flags;
+    s16 ymin, ymax;
+} Entry;                             /* == ENTRY_FMT, 32 bytes */
+
+typedef struct {
+    s16 cell;                        /* mz * MX + mx, -1 empty */
+    u16 ntri, nv, pad;
+    u32 used;                        /* frame last wanted */
+    u8  tris[SLOT_TRIS * 12];
+    s16 v[SLOT_VERTS * 4];
+    s16 n[SLOT_VERTS * 4];
+    u32 lgen;                        /* BUILD 605: col[] is for this light */
+    u32 col[SLOT_VERTS];             /* ... the lit vertex colours */
+} Slot;
+
+/* BUILD 592: one staged far-field triangle. BUILD 605: already in the
+   engine's TL layout (3 x x,y,z,rhw,colour,specular,u,v), so flush() copies
+   it as it stands. */
+#define STRI_WORDS 24
+
+typedef struct {                     /* BUILD 605: one texture's UV mapping */
+    float su, sv;
+    s32 ou, ov;
+    u32 state;                       /* 0 not looked up, 1 live, 2 no object */
+} TexP;
+
+#define SKY_QMAX        160         /* cloud columns + meteor per frame */
+typedef struct { float xy[8], uv[8]; } SkyQ;
+
+#define BATCH_MAX       512         /* shapes per chunk: the engine's shared
+                                       index buffer (0x66E272, n <= 0x200) */
+
+typedef struct {
+    u32 magic;                       /* 0x00 'WFAR' once loaded */
+    u32 base;                        /* 0x04 world allocation it was loaded into */
+    u32 failed_base;                 /* 0x08 do not retry a failed load there */
+    u32 refs;                        /* 0x0C offset of the mesh refs in data */
+    u32 frames;                      /* 0x10 */
+    u32 last_tris;                   /* 0x14 diagnostics */
+    u32 last_tiles;                  /* 0x18 */
+    float zoom;                      /* 0x1C extra camera distance */
+    float tilt;                      /* 0x20 camera pitch offset, radians */
+    u32 busy;                        /* 0x24 calibrating: bend stays out */
+    u32 nnat;                        /* 0x28 native meshes this frame */
+    s32 front_saved;                 /* 0x2C camera front before the update */
+    u32 saved_ok;                    /* 0x30 */
+    u32 calib_bad;                   /* 0x34 frames the matrix check failed */
+    u32 loads;                       /* 0x38 meshes read from wm0.map */
+    u32 load_fail;                   /* 0x3C */
+    u32 sky_frame;                   /* 0x40 frame the sky was last drawn */
+    u32 keys_added;                  /* 0x44 PSX keys R3 put in this update */
+    u32 sky_quads;                   /* 0x48 diagnostics */
+    s32 rot_saved;                   /* 0x4C 0xDFC474 before the player update */
+    s32 facing;                      /* 0x50 the stick's facing this update */
+    u32 facing_ok;                   /* 0x54 */
+    u32 r3_prev;                     /* 0x58 R3 held at the last update */
+    u32 r3_click;                    /* 0x5C a new R3 press, for the camera */
+    u64 got;                         /* 0x60 the input GOT slot */
+    s32 nat[NAT_MAX][3];             /* 0x68 */
+    Entry e[N1 + N2];
+    u8 cls[N2B];
+    u8 pad_[1];
+    u8 bad[N1];                      /* meshes wm0.map could not give */
+    s16 slot_of[N1];                 /* BUILD 596: cell -> slot, -1 none */
+    Slot slot[NSLOT];
+    /* BUILD 605: lit colours of the wm0.far tiles' vertices, per light */
+    u32 lgen;                        /* current light generation (never 0) */
+    float lkey[12];                  /* the light matrix it was made for */
+    u32 ecol_gen[N1 + N2];
+    u32 ecol[N1 + N2][MAX_VERTS_TILE];
+    TexP tp[512];                    /* each texture's UV mapping this frame */
+    u32 own_streak;                  /* BUILD 606: frames the window's cells were all cached */
+    u32 own_frames, own_pad[2];      /* diagnostics: frames drawn with our window */
+    u8 lz[LZ_BYTES];
+    u32 nstage;                      /* BUILD 592: triangles staged this frame */
+    u32 draws;                       /* diagnostics: chunks submitted */
+    u32 hvalid;                      /* BUILD 593: G_VERTS_F holds the last */
+    float hpx, hpz;                  /* bent mesh, offset (hpx, hpz) from the
+                                        player: see worldfar_height */
+    u32 stage[MAX_TRIS_FRAME][STRI_WORDS];
+    u16 stex[MAX_TRIS_FRAME];        /* each staged triangle's texture */
+    u16 order[MAX_TRIS_FRAME];       /* staged triangles sorted by texture */
+    u8 batch[BATCH_MAX * 0x80] __attribute__((aligned(16)));
+    SkyQ skyq[SKY_QMAX];
+    u8 data[FAR_MAX];
+    /* BUILD 605: timestamps for leakprobe's world-map frame timing (the
+       48 bytes before the Highwind block; leakprobe reads them at
+       state + STATE_BYTES - HW_TAIL - PERF_TAIL) */
+    u64 pf_bend0;                    /* first terrain transform of the frame */
+    u64 pf_draw0, pf_draw1;          /* worldfar_draw entry / exit */
+    u32 pf_frame;                    /* frames drawn (== frames) */
+    u32 pf_tris, pf_draws;           /* far-field triangles / chunks */
+    u32 pf_armed;                    /* the next bend is the frame's first */
+    float pf_zoom;                   /* extra camera distance */
+    u32 own_window;                  /* BUILD 606: the game skips its window's
+                                        projection + submit this frame (read by
+                                        ff7nx_worldfar's caves at
+                                        state + STATE_BYTES - HW_TAIL - 4) */
+    /* BUILD 601: the Highwind's altitude across a trip into fship_* */
+    u32 hw_ok;                       /* 1: hw_* is the last Highwind flight frame */
+    s32 hw_x, hw_y, hw_z;            /* the player entity's position then */
+    u32 hw_pending;                  /* frames left to restore after a reload */
+    u32 hw_off;                      /* 602: consecutive world frames off the Highwind */
+    u32 hw_lost;                     /* 603: control was taken away since the last record */
+    u32 hw_restores;                 /* diagnostics */
+    s32 hw_prev;                     /* 603c: y on the previous Highwind-view frame */
+    u32 hw_pad2[3];                  /* [0]: 606 window caves present (they set it); pad */
+} State;
+
+_Static_assert(__builtin_offsetof(State, got) == 0x60, "State.got");
+_Static_assert(__builtin_offsetof(State, nat) == 0x68, "State.nat");
+_Static_assert(sizeof(Entry) == 32, "Entry");
+_Static_assert(__builtin_offsetof(State, own_window) == sizeof(State) - 52, "State.own_window (ff7nx_worldfar.window_words)");
+_Static_assert(__builtin_offsetof(State, hw_pad2) == sizeof(State) - 12, "State.hw_pad2 (window caves present)");
+
+#define CLS_L2 0
+#define CLS_NEAR 1
+
+/* BUILD 591: the sectors the game swaps as the story moves on, exactly as
+   x86 0x750F54 does for the 5x5 window (world progress [0xE28CB4]): the
+   Northern Crater, Junon, Mideel and the Temple area. -1, or which of the
+   six replacements (wm0.map sectors 63..68) stands in for `sector`. */
+static int alt_of(int sector, s32 prog)
+{
+    if (sector == 50 && prog > 0) return 0;
+    if (sector == 41 && prog > 1) return 1;
+    if (sector == 42 && prog > 1) return 2;
+    if (sector == 60 && prog > 2) return 3;
+    if (sector == 47 && prog > 3) return 4;
+    if (sector == 48 && prog > 3) return 5;
+    return -1;
+}
+
+/* the L1 tile / full mesh (entry and mesh-ref index) of map mesh (mx, mz) */
+static int l1_index(int mx, int mz, s32 prog)
+{
+    int a = alt_of((mz >> 2) * SX + (mx >> 2), prog);
+    if (a < 0) return mz * MX + mx;
+    return N1B + 16 * a + (mz & 3) * 4 + (mx & 3);
+}
+
+/* the entry of sector s's L2 tile */
+static int l2_index(int s, s32 prog)
+{
+    int a = alt_of(s, prog);
+    return N1 + (a < 0 ? s : N2B + a);
+}
+
+typedef struct {
+    g2h_fn g2h;
+    callx_fn call;
+    State *st;
+} Env;
+
+/* ------------------------------------------------------------ memory */
+static u32 ld32(const u8 *p) { return (u32)p[0] | ((u32)p[1] << 8) | ((u32)p[2] << 16) | ((u32)p[3] << 24); }
+static s16 ld16(const u8 *p) { return (s16)((u16)p[0] | ((u16)p[1] << 8)); }
+
+/* The port translates guest addresses page by page (4 KB). */
+static u8 rd8(Env *v, u32 g) { return *v->g2h(g); }
+static u32 rd32(Env *v, u32 g)
+{
+    if ((g & 0xFFFu) <= 0xFFCu)
+        return ld32(v->g2h(g));
+    return (u32)rd8(v, g) | ((u32)rd8(v, g + 1) << 8)
+         | ((u32)rd8(v, g + 2) << 16) | ((u32)rd8(v, g + 3) << 24);
+}
+static s16 rds16(Env *v, u32 g)
+{
+    return (s16)((u16)rd8(v, g) | ((u16)rd8(v, g + 1) << 8));
+}
+static void wr8(Env *v, u32 g, u8 x) { *v->g2h(g) = x; }
+static void st32(u8 *p, u32 x) { p[0] = (u8)x; p[1] = (u8)(x >> 8); p[2] = (u8)(x >> 16); p[3] = (u8)(x >> 24); }
+static void wr32(Env *v, u32 g, u32 x)
+{
+    if ((g & 0xFFFu) <= 0xFFCu) { st32(v->g2h(g), x); return; }
+    wr8(v, g, (u8)x); wr8(v, g + 1, (u8)(x >> 8));
+    wr8(v, g + 2, (u8)(x >> 16)); wr8(v, g + 3, (u8)(x >> 24));
+}
+static void wr16(Env *v, u32 g, u16 x) { wr8(v, g, (u8)x); wr8(v, g + 1, (u8)(x >> 8)); }
+
+/* BUILD 592: 16 bytes at a time when both ends allow it (the build is
+   -mstrict-align, so wide accesses only on aligned addresses); this is the
+   bulk path of every guest read/write */
+static void copy(u8 *d, const u8 *s, u32 n)
+{
+    if (!(((unsigned long)d | (unsigned long)s) & 7u)) {
+        u64 *dq = (u64 *)(void *)d;
+        const u64 *sq = (const u64 *)(const void *)s;
+        u32 q = n >> 4;
+        for (u32 i = 0; i < q; i++) {
+            u64 a = sq[2 * i], b = sq[2 * i + 1];
+            dq[2 * i] = a;
+            dq[2 * i + 1] = b;
+        }
+        d += q << 4; s += q << 4; n &= 15u;
+    }
+    for (u32 i = 0; i < n; i++) d[i] = s[i];
+}
+/* bulk guest <-> host, one translation per page */
+static void gread(Env *v, u32 g, void *dst, u32 n)
+{
+    u8 *d = (u8 *)dst;
+    while (n) {
+        u32 room = 0x1000u - (g & 0xFFFu);
+        u32 k = n < room ? n : room;
+        copy(d, v->g2h(g), k);
+        d += k; g += k; n -= k;
+    }
+}
+static void gwrite(Env *v, u32 g, const void *src, u32 n)
+{
+    const u8 *s = (const u8 *)src;
+    while (n) {
+        u32 room = 0x1000u - (g & 0xFFFu);
+        u32 k = n < room ? n : room;
+        copy(v->g2h(g), s, k);
+        s += k; g += k; n -= k;
+    }
+}
+
+/* BUILD 605: the hardware counter (19.2 MHz on the Switch, the clock
+   nn::os::GetSystemTick reads; frameprobe uses the same) */
+static u64 ticks(void)
+{
+    u64 t;
+#if defined(__aarch64__) && !defined(HOST_TEST)
+    __asm__ volatile("mrs %0, cntpct_el0" : "=r"(t));
+#elif defined(__aarch64__)
+    __asm__ volatile("mrs %0, cntvct_el0" : "=r"(t));
+#else
+    t = 0;
+#endif
+    return t;
+}
+
+static float f_of(u32 b) { float f; __builtin_memcpy(&f, &b, 4); return f; }
+static u32 b_of(float f) { u32 b; __builtin_memcpy(&b, &f, 4); return b; }
+static float rdf(Env *v, u32 g) { return f_of(rd32(v, g)); }
+
+static float fsqrt(float x)
+{
+#ifdef HOST_TEST
+    return __builtin_sqrtf(x);
+#else
+    float r;
+    __asm__("fsqrt %s0, %s1" : "=w"(r) : "w"(x));
+    return r;
+#endif
+}
+static float fabs_(float x) { return x < 0 ? -x : x; }
+static double dabs(double x) { return x < 0 ? -x : x; }
+
+static int wrapi(int d, int period)
+{
+    int h = period / 2;
+    while (d >= h) d -= period;
+    while (d < -h) d += period;
+    return d;
+}
+
+/* ------------------------------------------------------------ series */
+static void dsincos(double x, double *s, double *c)
+{
+    double x2 = x * x, t = x, ss = x, cc = 1.0, u = 1.0;
+    for (int k = 1; k < 9; k++) {
+        t *= -x2 / (double)((2 * k) * (2 * k + 1));
+        ss += t;
+        u *= -x2 / (double)((2 * k - 1) * (2 * k));
+        cc += u;
+    }
+    *s = ss;
+    *c = cc;
+}
+
+/* ------------------------------------------------------------ matrices */
+typedef struct { double m[16]; } M4;
+
+static void read_m4(Env *v, u32 g, M4 *o)
+{
+    u8 b[64];
+    gread(v, g, b, 64);
+    for (int i = 0; i < 16; i++) o->m[i] = f_of(ld32(b + 4 * i));
+}
+
+
+
+/* ------------------------------------------------------------ the planet
+ * BUILD 588. The world map is drawn on a planet that is fixed to the WORLD:
+ * every point drops by d^2 / 2R, d being its horizontal distance from the
+ * player (the focus the game draws the whole world map about), R = 250000.
+ *
+ * BUILD 584-587 used FFNx's ApplySphericalWorld, which bends in VIEW space
+ * -- about the camera, along the camera's own up axis. The camera orbits the
+ * player, so that "planet" turned and slid with every change of zoom, yaw or
+ * tilt: terrain crept under the horizon and back as you rotated, models
+ * moved against the ground, and with the Highwind's camera pitched past
+ * vertical the curve even bent upward. A drop that depends only on world
+ * position is rigid under any camera move, and it is one subtraction in
+ * model space -- for the terrain here, and for every model, shadow, effect
+ * and the Zolom through world_sub_762F9A (worldfar_sink), which is exactly
+ * the vertical drop the game already applies to those.
+ *
+ * The horizon it gives is the sphere's: from height H it is sqrt(2 R H) away.
+ */
+static double drop_d(double x, double z)
+{
+    return (x * x + z * z) * (0.5 / (double)SPHERE_R);
+}
+
+/* clip.z = za * clip.w + zb for the perspective part of a combined matrix */
+typedef struct { double za, zb, knee; int ok; } Zmap;
+
+static void zmap_of(const M4 *a, Zmap *z)
+{
+    const double *m = a->m;
+    double n3 = m[3] * m[3] + m[7] * m[7] + m[11] * m[11];
+    z->ok = 0;
+    z->knee = 1e30;
+    if (n3 < 1e-20) return;
+    z->za = (m[2] * m[3] + m[6] * m[7] + m[10] * m[11]) / n3;
+    z->zb = m[14] - z->za * m[15];
+    z->ok = 1;
+    double den = 1.0 - z->za;
+    if (den > 1e-12 || den < -1e-12) {
+        double zf = z->zb / den;
+        if (zf > 0.0) z->knee = 0.5 * zf;
+    }
+}
+
+
+/* ------------------------------------------------------------ bend */
+/* After the port's terrain transform: the transformed vertices are in the
+   mesh's model space and the GTE holds the mesh's view translation, from
+   which its offset from the player comes back through the camera rotation.
+   Each vertex drops onto the planet. BUILD 591: nothing else -- depth is no
+   longer squeezed here; the shaders give every world draw the same depth
+   from its true view distance (see lmain_vv / tlmain_vv). */
+__attribute__((section(".text.worldfar_bend")))
+void worldfar_bend(State *st, g2h_fn g2h, callx_fn call)
+{
+    Env env = { g2h, call, st };
+    Env *v = &env;
+    st->hvalid = 0;
+    if (st->busy)
+        return;                      /* the far field's own calibration */
+    if (st->pf_armed) {              /* BUILD 605: the window's first mesh */
+        st->pf_bend0 = ticks();
+        st->pf_armed = 0;
+    }
+    u32 gte = rd32(v, G_GTE);
+    if (!gte)
+        return;
+    s32 t[3];
+    for (int i = 0; i < 3; i++) t[i] = (s32)rd32(v, gte + 0x22 + 4 * i);
+    if (st->nnat < NAT_MAX) {
+        s32 *r = st->nat[st->nnat++];
+        r[0] = t[0]; r[1] = t[1]; r[2] = t[2];
+    }
+    double R[3][3], d[3];
+    for (int i = 0; i < 3; i++) {
+        for (int j = 0; j < 3; j++)
+            R[i][j] = (double)rds16(v, gte + 0x10 + 2 * (3 * i + j)) / 4096.0;
+        d[i] = (double)t[i] - (double)(s32)rd32(v, G_CAM_TRANS + 4 * i);
+    }
+    double px = R[0][0] * d[0] + R[1][0] * d[1] + R[2][0] * d[2];
+    double pz = R[0][2] * d[0] + R[1][2] * d[1] + R[2][2] * d[2];
+    u8 buf[122 * 12];
+    gread(v, G_VERTS_F, buf, sizeof buf);
+    for (u32 i = 0; i < 122; i++) {
+        u8 *q = buf + 12 * i;
+        float x = f_of(ld32(q)), y = f_of(ld32(q + 4)), z = f_of(ld32(q + 8));
+        y -= (float)drop_d(px + (double)x, pz + (double)z);
+        st32(q + 4, b_of(y));
+    }
+    gwrite(v, G_VERTS_F, buf, sizeof buf);
+    st->hpx = (float)px;
+    st->hpz = (float)pz;
+    st->hvalid = 1;
+}
+
+/* ------------------------------------------------------------ height
+ * BUILD 593. The game finds the ground height under every entity, vehicle,
+ * effect and track (x86 0x762D74 -> 0x74CC07 -> 0x76085F) from the mesh
+ * vertices in G_VERTS_F -- the ones worldfar_bend has just lowered onto the
+ * planet. So those heights already carried the drop, and worldfar_sink then
+ * lowered the object a second time: things on the ground sank by d^2/2R more
+ * than the ground, more the further they were from the player.
+ * After each call of 0x76085F (its two calls in 0x74CC07) this adds the drop
+ * at the queried point back to the height it wrote, so the height is the
+ * flat world's again and worldfar_sink drops the object exactly once.
+ * 0x76085F(tri, s16 pos[3] in mesh space, s32 *out) -> eax 1 when it wrote
+ * *out. The call has returned, so its arguments are at esp+0, +4, +8. */
+__attribute__((section(".text.worldfar_height")))
+void worldfar_height(State *st, g2h_fn g2h, callx_fn call, u8 *ctx)
+{
+    Env env = { g2h, call, st };
+    Env *v = &env;
+    if (!st->hvalid || ld32(ctx) != 1)
+        return;
+    u32 esp = ld32(ctx + 0x10);
+    u32 pos = rd32(v, esp + 4), out = rd32(v, esp + 8);
+    if (!pos || !out)
+        return;
+    double x = (double)st->hpx + (double)rds16(v, pos);
+    double z = (double)st->hpz + (double)rds16(v, pos + 4);
+    double dd = drop_d(x, z);
+    if (dd > 1e6) dd = 1e6;
+    wr32(v, out, (u32)((s32)rd32(v, out) + (s32)(dd + 0.5)));
+}
+
+/* ------------------------------------------------------------ sink
+ * world_sub_762F9A(dx, dz) -> how far a model, its shadow, an effect or the
+ * Zolom drops below its true height (dx, dz from the player). The stock
+ * routine is the old screen-space sink; all three of its callers land here
+ * instead, so everything drops exactly as the terrain under it does. Called
+ * in the recompiler's convention: args on the guest stack, eax out, the
+ * callee pops the return address. */
+__attribute__((section(".text.worldfar_sink")))
+void worldfar_sink(State *st, g2h_fn g2h, callx_fn call, u8 *ctx, u64 ret)
+{
+    Env env = { g2h, call, st };
+    Env *v = &env;
+    u32 esp = ld32(ctx + 0x10);
+    s32 x = (s32)rd32(v, esp + 4), z = (s32)rd32(v, esp + 8);
+    double dd = drop_d((double)x, (double)z);
+    if (dd > 1e6) dd = 1e6;
+    /* BUILD 592: the track/footprint caller (0x75692A) subtracts 4x what
+       it gets back (x86 0x756A73 shl eax, 2); the others subtract it as is */
+    if (ret == SINK_TRACK_RET) dd *= 0.25;   /* ret: the ARM call site + 4 */
+    st32(ctx, (u32)(s32)(dd + 0.5));
+    st32(ctx + 0x10, esp + 4);
+}
+
+/* ------------------------------------------------------------ loading */
+static int name_copy(Env *v, u32 from, u32 to, int far_ext)
+{
+    u32 i = 0, dot = 0;
+    for (; i < 120; i++) {
+        u8 c = rd8(v, from + i);
+        wr8(v, to + i, c);
+        if (c == '.') dot = i;
+        if (!c) break;
+    }
+    if (i >= 120 || !dot)
+        return 0;
+    if (far_ext) {
+        wr8(v, to + dot + 1, 'F'); wr8(v, to + dot + 2, 'A');
+        wr8(v, to + dot + 3, 'R'); wr8(v, to + dot + 4, 0);
+    }
+    return 1;
+}
+
+static int load(Env *v, u32 base)
+{
+    State *st = v->st;
+    u32 far = base + FAR_OFF;
+    u32 io = far + FAR_IO;
+    u32 name = v->call(F_NAME, 2, 0, 0);
+    if (!name)
+        return 0;
+    if (!name_copy(v, name, far + FAR_NAME, 1))
+        return 0;
+    if (v->call(F_READ, 4, far + FAR_NAME, 0, 32, io) != 0)
+        return 0;
+    u8 h[32];
+    gread(v, io, h, 32);
+    if (ld32(h) != 0x52414657u /* 'WFAR' */ || ld32(h + 4) != 4
+        || ld32(h + 8) != N1 || ld32(h + 12) != N2 || ld32(h + 24) != 32)
+        return 0;
+    u32 total = ld32(h + 20), refs = ld32(h + 28);
+    if (total < 32u + 32u * (N1 + N2) || total > FAR_MAX
+        || refs > total || total - refs < 8u * N1)
+        return 0;
+    for (u32 at = 0; at < total; at += FAR_IO_BYTES) {
+        u32 n = total - at < FAR_IO_BYTES ? total - at : FAR_IO_BYTES;
+        if (v->call(F_READ, 4, far + FAR_NAME, at, n, io) != 0)
+            return 0;
+        gread(v, io, st->data + at, n);
+    }
+    if (ld32(st->data) != 0x52414657u)
+        return 0;
+    const u8 *p = st->data + 32;
+    for (u32 k = 0; k < N1 + N2; k++, p += 32) {
+        Entry *e = &st->e[k];
+        e->tris = ld32(p);
+        e->verts = ld32(p + 4);
+        e->norms = ld32(p + 8);
+        e->ntri = (u16)ld16(p + 12);
+        u32 ntot = e->ntri;
+        for (int j = 0; j < 4; j++) e->sk_first[j] = (u16)ld16(p + 14 + 2 * j);
+        for (int j = 0; j < 4; j++) { e->sk_n[j] = p[22 + j]; ntot += e->sk_n[j]; }
+        e->nverts = p[26];
+        e->flags = p[27];
+        e->ymin = ld16(p + 28);
+        e->ymax = ld16(p + 30);
+        if (e->nverts > 120 || ntot > MAX_TRIS_TILE
+            || e->tris > total || (total - e->tris) / 12u < ntot
+            || e->verts > total || (total - e->verts) / 6u < e->nverts
+            || e->norms > total || (total - e->norms) / 3u < e->nverts)
+            return 0;
+        for (int j = 0; j < 4; j++)
+            if ((u32)e->sk_first[j] + e->sk_n[j] > ntot)
+                return 0;
+    }
+    for (u32 k = 0; k < N1; k++) {
+        const u8 *r = st->data + refs + 8u * k;
+        u32 off = ld32(r), len = ld32(r + 4);
+        if (off > total || total - off < len || len > LZ_BYTES)
+            return 0;
+    }
+    st->refs = refs;
+    for (int s = 0; s < NSLOT; s++) { st->slot[s].cell = -1; st->slot[s].used = 0; st->slot[s].pad = 0; }
+    for (int k = 0; k < N1 + N2; k++) st->ecol_gen[k] = 0;   /* BUILD 605: new data, new colours */
+    for (int k = 0; k < N1; k++) { st->bad[k] = 0; st->slot_of[k] = -1; }
+    return 1;
+}
+
+/* FF7's LZSS (lgp.lzs_decompress): out is at most `cap` bytes */
+static u32 lzs(const u8 *in, u32 n, u8 *out, u32 cap)
+{
+    u32 i = 0, o = 0;
+    while (i < n) {
+        u8 ctrl = in[i++];
+        for (int bit = 0; bit < 8 && i < n; bit++) {
+            if (ctrl & (1u << bit)) {
+                if (o >= cap) return o;
+                out[o++] = in[i++];
+            } else {
+                if (i + 1 >= n) return o;
+                u32 b1 = in[i], b2 = in[i + 1];
+                i += 2;
+                u32 off = b1 | ((b2 & 0xF0u) << 4);
+                u32 len = (b2 & 0x0Fu) + 3;
+                u32 d = (o - 18 - off) & 0xFFFu;
+                for (u32 k = 0; k < len; k++) {
+                    if (o >= cap) return o;
+                    s32 p = (s32)(o - d);
+                    out[o] = (d == 0 || p < 0) ? 0 : out[p];
+                    o++;
+                }
+            }
+        }
+    }
+    return o;
+}
+
+/* one full-detail mesh: the game's own LZS block from wm0.map, carried in
+   wm0.far (BSS), decoded into a cache slot. No file access after load. */
+static int load_mesh(State *st, int cell, Slot *sl)
+{
+    const u8 *r = st->data + st->refs + 8u * (u32)cell;
+    u32 off = ld32(r), len = ld32(r + 4);
+    if (sl->cell >= 0 && sl->cell < N1 && st->slot_of[sl->cell] == (s16)(sl - st->slot))
+        st->slot_of[sl->cell] = -1;
+    sl->cell = -1;
+    if (!len || len > LZ_BYTES)
+        return 0;
+    u32 n = lzs(st->data + off, len, st->lz, LZ_BYTES);
+    if (n < 4) return 0;
+    u32 nt = (u16)ld16(st->lz), nv = (u16)ld16(st->lz + 2);
+    if (nt > SLOT_TRIS || nv > 120 || 4 + nt * 12 + nv * 16 > n)
+        return 0;
+    const u8 *p = st->lz + 4;
+    copy(sl->tris, p, nt * 12);
+    p += nt * 12;
+    for (u32 i = 0; i < nv * 4; i++) sl->v[i] = ld16(p + 2 * i);
+    p += nv * 8;
+    for (u32 i = 0; i < nv * 4; i++) sl->n[i] = ld16(p + 2 * i);
+    for (u32 i = 0; i < nt; i++)
+        if (sl->tris[12 * i] >= nv || sl->tris[12 * i + 1] >= nv
+            || sl->tris[12 * i + 2] >= nv)
+            return 0;
+    sl->ntri = (u16)nt;
+    sl->nv = (u16)nv;
+    sl->lgen = 0;                        /* BUILD 605: colours not made yet */
+    sl->cell = (s16)cell;
+    st->slot_of[cell] = (s16)(sl - st->slot);
+    sl->pad = 0;
+    return 1;
+}
+
+static Slot *find_slot(State *st, int cell)
+{
+    if (cell < 0 || cell >= N1) return 0;
+    int s = st->slot_of[cell];
+    if (s < 0 || s >= NSLOT || st->slot[s].cell != cell) return 0;
+    return &st->slot[s];
+}
+
+static Slot *victim(State *st)
+{
+    Slot *best = 0;
+    for (int s = 0; s < NSLOT; s++) {
+        Slot *sl = &st->slot[s];
+        if (sl->cell < 0) return sl;
+        if (sl->used == st->frames) continue;
+        if (!best || sl->used < best->used) best = sl;
+    }
+    return best;
+}
+
+/* ------------------------------------------------------------ camera */
+typedef struct {
+    float cx[3], cy[3], cz[3];       /* columns of R, unit scale */
+    s32 t[3];
+    float dy;                        /* -[DE6A04], the y of every tile pos */
+    float horizon;                   /* draw radius about the focus */
+} Cam;
+
+static void apply(Env *v, u32 scratch, s16 x, s16 y, s16 z, s32 out[3])
+{
+    wr16(v, scratch, (u16)x); wr16(v, scratch + 2, (u16)y);
+    wr16(v, scratch + 4, (u16)z); wr16(v, scratch + 6, 0);
+    v->call(F_APPLY, 3, scratch, scratch + 0x10, scratch + 0x20);
+    out[0] = (s32)rd32(v, scratch + 0x10);
+    out[1] = (s32)rd32(v, scratch + 0x14);
+    out[2] = (s32)rd32(v, scratch + 0x18);
+}
+
+static void camera(Env *v, u32 scratch, Cam *c)
+{
+    s32 o[3], a[3];
+    v->call(F_RESET_GTE, 0);
+    apply(v, scratch, 0, 0, 0, o);
+    c->t[0] = o[0]; c->t[1] = o[1]; c->t[2] = o[2];
+    apply(v, scratch, 4096, 0, 0, a);
+    for (int i = 0; i < 3; i++) c->cx[i] = (float)(a[i] - o[i]) / 4096.0f;
+    apply(v, scratch, 0, 4096, 0, a);
+    for (int i = 0; i < 3; i++) c->cy[i] = (float)(a[i] - o[i]) / 4096.0f;
+    apply(v, scratch, 0, 0, 4096, a);
+    for (int i = 0; i < 3; i++) c->cz[i] = (float)(a[i] - o[i]) / 4096.0f;
+    c->dy = -(float)(s32)rd32(v, G_CAM_DELTA_Y);
+    float tx = (float)o[0], ty = (float)o[1], tz = (float)o[2];
+    float camy = -(c->cy[0] * tx + c->cy[1] * ty + c->cy[2] * tz);
+    float h = camy - c->dy;
+    if (h < 0) h = -h;
+    if (h < 500.0f) h = 500.0f;
+    float d = fsqrt(2.0f * SPHERE_R * h) + fsqrt(2.0f * SPHERE_R * MOUNTAIN)
+              + 16384.0f;
+    if (d > 200000.0f) d = 200000.0f;
+    c->horizon = d;
+}
+
+static void view(const Cam *c, float x, float y, float z, float out[3])
+{
+    for (int i = 0; i < 3; i++)
+        out[i] = (float)c->t[i] + c->cx[i] * x + c->cy[i] * y + c->cz[i] * z;
+}
+
+/* ------------------------------------------------------------ drawing */
+typedef struct {
+    Env *v;
+    Cam *c;
+    u32 gte;
+    int budget;
+    int tiles;
+    float light[12];                 /* the world's 3x4 light matrix */
+    float vx0, vy0, vx1, vy1;        /* viewport in TL pixels (with margin) */
+    float vw;                        /* viewport width in TL pixels */
+    u32 origin_tab;                  /* guest -> u16 u,v origin per tex */
+    float uvscale;                   /* Cosmos Gaia's terrain UV factor */
+    double m0[16];                   /* combined matrix at translation 0 */
+    double dm[3][4];                 /* d(row 3) / d(translation) */
+    u32 ntex;                        /* BUILD 598: G_TEX_COUNT this frame */
+    TexP *tp;                        /* BUILD 605: per texture, this frame (State) */
+} Ctx;
+
+typedef struct {
+    const u8 *tris;                  /* 12 bytes each */
+    int ranges[5][2], nr;
+    const u8 *v; u32 vstride;        /* s16 x,y,z at +0 */
+    const u8 *n; u32 nstride;        /* normal x,y,z: s8 (/127) or s16 (/4096) */
+    int n8;
+    u32 nv;
+    u32 *col, *cgen;                 /* BUILD 605: cached lit colours */
+} Mesh;
+
+/* ------------------------------------------------------------ horizon
+ * The curved horizon on screen, for the clouds and the meteor (BUILD 588).
+ * Along each of HZ_AZ ground directions from the player, the planet's sea
+ * level rises on screen until the line of sight grazes it and then falls
+ * again: the highest point is the horizon there. The same direction with no
+ * drop, at infinity, is the flat horizon the game builds its sky strip on.
+ * Their difference by screen x is how far down the strip has to go. */
+static void tile_matrix(const Ctx *x, s32 px, s32 pz, double mf[16])
+{
+    float w[3];
+    view(x->c, (float)px, x->c->dy, (float)pz, w);
+    double t[3] = { (double)(s32)w[0], (double)(s32)w[1], (double)(s32)w[2] };
+    for (int i = 0; i < 12; i++) mf[i] = x->m0[i];
+    for (int c = 0; c < 4; c++)
+        mf[12 + c] = x->m0[12 + c] + t[0] * x->dm[0][c]
+                   + t[1] * x->dm[1][c] + t[2] * x->dm[2][c];
+}
+
+static int proj(const double mf[16], double p0, double p1, double p2, float *sx, float *sy)
+{
+    double c0 = p0 * mf[0] + p1 * mf[4] + p2 * mf[8] + mf[12];
+    double c1 = p0 * mf[1] + p1 * mf[5] + p2 * mf[9] + mf[13];
+    double cw = p0 * mf[3] + p1 * mf[7] + p2 * mf[11] + mf[15];
+    if (!(cw > 1.0)) return 0;
+    *sx = (float)(c0 / cw);
+    *sy = (float)(c1 / cw);
+    return 1;
+}
+
+/* ------------------------------------------------------------ sky
+ * BUILD 591. The clouds and the meteor are drawn here, every frame, on the
+ * planet's own horizon -- not by moving the stock quads. 0x754493 built them
+ * as a flat screen strip on a flat horizon line and skipped them whenever
+ * that line left the screen, so they floated off the curve, warped when cut
+ * up and vanished when high up. Its calls now land on worldfar_sky, which
+ * draws nothing; the strip's texture, colour and graphics object are read
+ * from its own records (0xE2A370, 0x969B98), set up once by 0x7543D3.
+ *
+ * The horizon. The ground is y = -r^2 / 2R about the player; from the eye
+ * (horizontal offset E, height h above sea level) a line of sight grazes it
+ * at the horizontal distance s = sqrt(|E|^2 + 2 R h), the same in every
+ * direction. For world azimuth phi (x = sin phi, z = cos phi, the facing
+ * convention) the horizon point is E + s (sin phi, cos phi), projected with
+ * the same matrix as the ground.
+ *
+ *  clouds  a band of columns at FIXED world azimuths (SKY_GRID a turn), its
+ *          foot on the horizon at each column and a fixed pixel height as
+ *          the stock strip had; the texture is fixed to the azimuth too
+ *          (SKY_TILES repeats a turn, each column wholly inside one repeat),
+ *          so turning moves the sky with the world and nothing slides or
+ *          warps;
+ *  meteor  one rigid quad, stock size, standing on the horizon in the
+ *          direction the stock sky put it (straight ahead at camera heading
+ *          0: world -z, azimuth pi).
+ * Both are pushed behind every piece of ground (rhw SKY_RHW; tlmain_vv gives
+ * all world geometry its depth from the true distance), so mountains and the
+ * sea edge cover their feet. */
+static double dsq(double x)
+{
+    if (!(x > 0.0)) return 0.0;
+    double r = (double)fsqrt((float)x);
+    if (!(r > 0.0)) r = 1.0;
+    for (int i = 0; i < 3; i++) r = 0.5 * (r + x / r);
+    return r;
+}
+
+static double wrap_pi(double a)
+{
+    const double P = 3.14159265358979, T = 6.28318530717959;
+    for (int i = 0; i < 64 && a > P; i++) a -= T;
+    for (int i = 0; i < 64 && a <= -P; i++) a += T;
+    return a;
+}
+
+static float fatan2(float y, float x);
+
+typedef struct {
+    double mf[16];
+    double ex, ez, s;
+} Horizon;
+
+static int hz_point(const Horizon *h, double phi, float *sx, float *sy)
+{
+    double sp, cp;
+    dsincos(wrap_pi(phi), &sp, &cp);
+    double px = h->ex + h->s * sp, pz = h->ez + h->s * cp;
+    double py = -(px * px + pz * pz) * (0.5 / (double)SPHERE_R);
+    if (!proj(h->mf, px, py, pz, sx, sy)) return 0;
+    return *sx > -1e5f && *sx < 1e5f && *sy > -1e5f && *sy < 1e5f;
+}
+
+/* quad shapes on obj in ONE engine chunk (one draw), corners as 0x754493
+   lays them out: left-top, right-top, left-bottom, right-bottom */
+
+static u32 sky_submit(Env *v, State *st, u32 obj, const SkyQ *qs, u32 n, u32 col)
+{
+    if (!obj || !n) return 0;
+    if (n > SKY_QMAX) n = SKY_QMAX;
+    if (!v->call(F_ALLOC_SHAPES, 2, n, obj)) return 0;
+    u32 vp = rd32(v, obj + 0x70), stride = rd32(v, obj + 0x40);
+    if (!vp || stride != 0x80u) return 0;
+    for (u32 k = 0; k < n; k++)
+        for (int c = 0; c < 4; c++) {
+            u8 *o = st->batch + 0x80 * k + 0x20 * c;
+            st32(o, b_of(qs[k].xy[2 * c]));
+            st32(o + 4, b_of(qs[k].xy[2 * c + 1]));
+            st32(o + 8, b_of(0.9999f));
+            st32(o + 12, b_of(SKY_RHW));
+            st32(o + 16, col);
+            st32(o + 20, 0xFF000000u);
+            st32(o + 24, b_of(qs[k].uv[2 * c]));
+            st32(o + 28, b_of(qs[k].uv[2 * c + 1]));
+        }
+    gwrite(v, vp, st->batch, 0x80 * n);
+    st->draws++;
+    return n;
+}
+
+static void sky(Ctx *x, State *st)
+{
+    Env *v = x->v;
+    const Cam *c = x->c;
+    Horizon h;
+    st->sky_quads = 0;
+    tile_matrix(x, 0, 0, h.mf);
+    double t0 = c->t[0], t1 = c->t[1], t2 = c->t[2];
+    h.ex = -(c->cx[0] * t0 + c->cx[1] * t1 + c->cx[2] * t2);
+    h.ez = -(c->cz[0] * t0 + c->cz[1] * t1 + c->cz[2] * t2);
+    double ey = -(c->cy[0] * t0 + c->cy[1] * t1 + c->cy[2] * t2) - (double)c->dy;
+    if (!(ey > 50.0)) ey = 50.0;
+    h.s = dsq(h.ex * h.ex + h.ez * h.ez + 2.0 * (double)SPHERE_R * ey);
+    float fx = c->cx[2], fz = c->cz[2];
+    if (fx * fx + fz * fz < 1e-6f) return;           /* straight down */
+    double fwd = (double)fatan2(fx, fz);
+    s32 sc = (s32)rds16(v, G_SKY_SCALE);
+    float S = (sc >= 1 && sc <= 4) ? (float)sc : 2.0f;
+    float vx0 = x->vx0, vx1 = x->vx1, vy0 = x->vy0, vy1 = x->vy1;
+    st->sky_frame = st->frames;
+
+    /* the cloud band */
+    /* BUILD 598: only the live object -- the record's copy outlives the
+       world map (see G_SKY_OBJ). Writing through it after the exit put up
+       to 20 KB of cloud vertices into freed memory: the next field's model
+       textures (fship_2's crew and Cloud). */
+    u32 obj = rd32(v, G_SKY_OBJ);
+    if (obj != rd32(v, G_SKY_DESC + 0x28)) obj = 0;
+    if (obj) {
+        float su = rdf(v, obj + 0x24), sv = rdf(v, obj + 0x28);
+        u32 vt = rd8(v, G_SKY_DESC + 0x0D), vb = rd8(v, G_SKY_DESC + 0x1D);
+        if (vb <= vt) { vt = 0; vb = 0x3F; }
+        u32 col = rd32(v, G_SKY_DESC + 0x2C);
+        float below = 8.0f * S;                      /* hidden by the ground */
+        float above = (float)(vb - vt + 1) * S - below;
+        const double dphi = 6.28318530717959 / (double)SKY_GRID;
+        const int per = SKY_GRID / SKY_TILES;
+        s32 k0 = (s32)((fwd - SKY_SPAN) / dphi) - 1;
+        s32 k1 = (s32)((fwd + SKY_SPAN) / dphi) + 1;
+        SkyQ *qs = st->skyq;
+        u32 nq = 0;
+        float xa = 0, ya = 0;
+        int oka = hz_point(&h, (double)k0 * dphi, &xa, &ya);
+        for (s32 k = k0; k < k1; k++) {
+            float xb, yb;
+            int okb = hz_point(&h, (double)(k + 1) * dphi, &xb, &yb);
+            if (oka && okb) {
+                float lo = xa < xb ? xa : xb, hi = xa < xb ? xb : xa;
+                float ylo = ya < yb ? ya : yb, yhi = ya < yb ? yb : ya;
+                if (hi >= vx0 && lo <= vx1 && hi - lo < 0.5f * (vx1 - vx0)
+                    && yhi + below >= vy0 && ylo - above <= vy1) {
+                    s32 j = ((k % per) + per) % per;
+                    float ua = (float)j * (256.0f / (float)per) * su;
+                    float ub = (float)(j + 1) * (256.0f / (float)per) * su;
+                    float xl = xa, yl = ya, ul = ua, xr = xb, yr = yb, ur = ub;
+                    if (xb < xa) {
+                        xl = xb; yl = yb; ul = ub;
+                        xr = xa; yr = ya; ur = ua;
+                    }
+                    SkyQ *q = &qs[nq];
+                    float xy[8] = { xl, yl - above, xr, yr - above,
+                                    xl, yl + below, xr, yr + below };
+                    float uv[8] = { ul, (float)vt * sv, ur, (float)vt * sv,
+                                    ul, (float)vb * sv, ur, (float)vb * sv };
+                    for (int e = 0; e < 8; e++) { q->xy[e] = xy[e]; q->uv[e] = uv[e]; }
+                    if (++nq >= SKY_QMAX) break;
+                }
+            }
+            xa = xb; ya = yb; oka = okb;
+        }
+        st->sky_quads += sky_submit(v, st, obj, qs, nq, col);
+    }
+
+    /* the meteor */
+    u32 mobj = rd32(v, G_METEOR_OBJ);
+    if (mobj != rd32(v, G_METEOR_DESC + 0x28)) mobj = 0;
+    if (mobj && rd32(v, G_METEOR_ON)) {
+        const double az = 3.14159265358979;
+        double rel = wrap_pi(az - fwd);
+        float xm, ym;
+        if (rel > -SKY_SPAN && rel < SKY_SPAN && hz_point(&h, az, &xm, &ym)) {
+            float su = rdf(v, mobj + 0x24), sv = rdf(v, mobj + 0x28);
+            u32 u0 = rd8(v, G_METEOR_DESC + 0x0C), u1 = rd8(v, G_METEOR_DESC + 0x14);
+            u32 v0 = rd8(v, G_METEOR_DESC + 0x0D), v1 = rd8(v, G_METEOR_DESC + 0x1D);
+            if (u1 <= u0) { u0 = 0; u1 = 0x8F; }
+            if (v1 <= v0) { v0 = 0; v1 = 0x3F; }
+            u32 col = rd32(v, G_METEOR_DESC + 0x2C);
+            float w = (float)(u1 - u0 + 1) * S, hh = (float)(v1 - v0 + 1) * S;
+            float xl = xm - 0.5f * w, xr = xm + 0.5f * w;
+            float yb = ym + 2.0f * S, yt = yb - hh;
+            if (xr >= vx0 && xl <= vx1 && yb >= vy0 && yt <= vy1) {
+                SkyQ q = { { xl, yt, xr, yt, xl, yb, xr, yb },
+                           { (float)u0 * su, (float)v0 * sv, (float)u1 * su, (float)v0 * sv,
+                             (float)u0 * su, (float)v1 * sv, (float)u1 * su, (float)v1 * sv } };
+                st->sky_quads += sky_submit(v, st, mobj, &q, 1, col);
+            }
+        }
+    }
+}
+
+/* In place of 0x754493 (one stock sky quad): on the overworld nothing is
+   drawn -- sky() draws the sky; on the other world maps (underwater,
+   snowstorm) the stock quad routine runs as before. Recompiler convention:
+   [esp] is the return address, [esp+4] the quad record; the callee pops the
+   return address. */
+#define F_SKY_QUAD      0x754493u
+__attribute__((section(".text.worldfar_sky")))
+void worldfar_sky(State *st, g2h_fn g2h, callx_fn call, u8 *ctx)
+{
+    Env env = { g2h, call, st };
+    u32 esp = ld32(ctx + 0x10);
+    if (rd32(&env, G_MAP_TYPE) != 0) {
+        u32 desc = rd32(&env, esp + 4);
+        if (desc)
+            call(F_SKY_QUAD, 1, desc);
+    }
+    st32(ctx + 0x10, esp + 4);
+}
+
+/* How wide one cell at tile position (px, pz) looks on screen, as a
+   fraction of the viewport: its four corners at mid height, on the planet,
+   through the same matrix emit() uses. A corner behind the eye counts as
+   huge (the cell is right under or beside the camera). */
+static void tile_matrix(const Ctx *x, s32 px, s32 pz, double mf[16]);
+static int proj(const double mf[16], double p0, double p1, double p2, float *sx, float *sy);
+static float footprint(const Ctx *x, s32 px, s32 pz, float ymid)
+{
+    double mf[16];
+    tile_matrix(x, px, pz, mf);
+    const double k2 = 0.5 / (double)SPHERE_R;
+    float x0 = 1e30f, x1 = -1e30f, y0 = 1e30f, y1 = -1e30f;
+    for (int k = 0; k < 4; k++) {
+        double cx = (k & 1) ? MESH : 0, cz = (k & 2) ? MESH : 0;
+        double ax = px + cx, az = pz + cz;
+        float sx, sy;
+        if (!proj(mf, cx, ymid - (ax * ax + az * az) * k2, cz, &sx, &sy))
+            return 1.0f;
+        if (sx < x0) x0 = sx;
+        if (sx > x1) x1 = sx;
+        if (sy < y0) y0 = sy;
+        if (sy > y1) y1 = sy;
+    }
+    float w = x1 - x0, h = y1 - y0;
+    return (w > h ? w : h) / x->vw;
+}
+
+static int visible(Ctx *x, float px, float pz, float half, float ymin, float ymax)
+{
+    float ymid = 0.5f * (ymin + ymax);
+    float r = half * 1.4143f + 0.5f * (ymax - ymin) + 64.0f;
+    float w[3];
+    view(x->c, px, x->c->dy + ymid, pz, w);
+    if (w[2] + r < 0.0f)
+        return 0;
+    if (fabs_(w[0]) - r > 1.9f * (w[2] + r))
+        return 0;
+    return 1;
+}
+
+typedef struct { float x, y, z, rhw; u32 col; int ok; } TV;
+
+/* 0x68DAE1 with the base colour 0x75F68C uses (255,255,255, alpha 0xFF) */
+static u8 chan(float l)
+{
+    if (l < 0.0f) return 0;
+    float s = 255.0f * l;
+    if (s >= 255.0f) return 255;
+    return (u8)__builtin_rintf(s);
+}
+
+static u32 light(const Ctx *x, float nx, float ny, float nz)
+{
+    const float *m = x->light;
+    float lx = m[0] * nx + m[1] * ny + m[2] * nz + m[3];
+    float ly = m[4] * nx + m[5] * ny + m[6] * nz + m[7];
+    float lz = m[8] * nx + m[9] * ny + m[10] * nz + m[11];
+    return (u32)chan(lz) | ((u32)chan(ly) << 8) | ((u32)chan(lx) << 16)
+         | 0xFF000000u;
+}
+
+
+static void emit(Ctx *x, const Mesh *me, s32 px, s32 pz)
+{
+    Env *v = x->v;
+    State *st = v->st;
+    if (me->nv == 0 || me->nv > SLOT_VERTS || x->budget <= 0)
+        return;
+    float w[3];
+    view(x->c, (float)px, x->c->dy, (float)pz, w);
+    double t[3] = { (double)(s32)w[0], (double)(s32)w[1], (double)(s32)w[2] };
+    M4 m;
+    for (int i = 0; i < 12; i++) m.m[i] = x->m0[i];
+    for (int c = 0; c < 4; c++)
+        m.m[12 + c] = x->m0[12 + c] + t[0] * x->dm[0][c] + t[1] * x->dm[1][c]
+                    + t[2] * x->dm[2][c];
+    Zmap z;
+    zmap_of(&m, &z);
+    if (!z.ok) return;
+    const double *mf = m.m;
+    const double k2 = 0.5 / (double)SPHERE_R;
+    const double fpx = (double)px, fpz = (double)pz;
+
+    TV tv[SLOT_VERTS];
+    for (u32 i = 0; i < me->nv; i++) {
+        const u8 *pv = me->v + me->vstride * i;
+        double p0 = (double)ld16(pv), p1 = (double)ld16(pv + 2), p2 = (double)ld16(pv + 4);
+        double ax = fpx + p0, az = fpz + p2;
+        p1 -= (ax * ax + az * az) * k2;          /* the planet */
+        double c0 = p0 * mf[0] + p1 * mf[4] + p2 * mf[8] + mf[12];
+        double c1 = p0 * mf[1] + p1 * mf[5] + p2 * mf[9] + mf[13];
+        double cw = p0 * mf[3] + p1 * mf[7] + p2 * mf[11] + mf[15];
+        TV *o = &tv[i];
+        o->ok = cw > 1.0;
+        if (!o->ok) continue;
+        double rhw = 1.0 / cw;
+        o->x = (float)(c0 * rhw);
+        o->y = (float)(c1 * rhw);
+        o->rhw = (float)rhw;
+        {
+            double zz = z.za + z.zb * rhw;      /* the game's own depth */
+            o->z = (float)(zz < 0.0 ? 0.0 : (zz > 0.99999 ? 0.99999 : zz));
+        }
+    }
+    /* BUILD 605: a vertex's colour depends only on its normal and the
+       frame's light matrix -- lit once per light, not once per frame */
+    if (me->col && *me->cgen == st->lgen) {
+        for (u32 i = 0; i < me->nv; i++) tv[i].col = me->col[i];
+    } else {
+        for (u32 i = 0; i < me->nv; i++) {
+            const u8 *pn = me->n + me->nstride * i;
+            float nx, ny, nz;
+            if (me->n8) {
+                nx = (float)(s8)pn[0] * (1.0f / 127.0f);
+                ny = (float)(s8)pn[1] * (1.0f / 127.0f);
+                nz = (float)(s8)pn[2] * (1.0f / 127.0f);
+            } else {
+                nx = (float)ld16(pn) * (1.0f / 4096.0f);
+                ny = (float)ld16(pn + 2) * (1.0f / 4096.0f);
+                nz = (float)ld16(pn + 4) * (1.0f / 4096.0f);
+            }
+            tv[i].col = light(x, nx, ny, nz);
+            if (me->col) me->col[i] = tv[i].col;
+        }
+        if (me->col) *me->cgen = st->lgen;
+    }
+
+    /* accept, then group by texture so shapes are allocated in batches */
+    /* BUILD 605: no per-tile sort by texture -- flush() already groups the
+       whole frame by texture (a stable counting sort), so the staged order
+       within each texture is exactly what the 592 per-tile sort produced.
+       Each texture's UV scale and origin are looked up once per frame. */
+    int na = 0;
+    for (int r = 0; r < me->nr; r++)
+        for (int ti = me->ranges[r][0]; ti < me->ranges[r][0] + me->ranges[r][1]; ti++) {
+            const u8 *tb = me->tris + 12 * ti;
+            if (tb[0] >= me->nv || tb[1] >= me->nv || tb[2] >= me->nv) continue;
+            const TV *p0 = &tv[tb[0]], *p1 = &tv[tb[1]], *p2 = &tv[tb[2]];
+            if (!p0->ok || !p1->ok || !p2->ok) continue;
+            /* 0x760CC4, and 0x75F68C keeps area >= 0 after fistp */
+            float area = p0->x * p1->y + p1->x * p2->y + p2->x * p0->y
+                       - p0->x * p2->y - p1->x * p0->y - p2->x * p1->y;
+            if (__builtin_rintf(area) < 0.0f) continue;
+            if ((p0->x < x->vx0 && p1->x < x->vx0 && p2->x < x->vx0)
+                || (p0->x > x->vx1 && p1->x > x->vx1 && p2->x > x->vx1)
+                || (p0->y < x->vy0 && p1->y < x->vy0 && p2->y < x->vy0)
+                || (p0->y > x->vy1 && p1->y > x->vy1 && p2->y > x->vy1))
+                continue;
+            if (na >= MAX_TRIS_TILE || na >= x->budget) break;
+            na++;
+            u32 tex = ((u32)tb[10] | ((u32)tb[11] << 8)) & 0x1FF;
+            TexP *tp = &x->tp[tex];
+            if (!tp->state) {
+                u32 obj = tex < x->ntex ? rd32(v, G_TEX_OBJS + 4 * tex) : 0;
+                tp->state = obj ? 1 : 2;
+                if (obj) {
+                    tp->su = rdf(v, obj + 0x24) * x->uvscale;
+                    tp->sv = rdf(v, obj + 0x28) * x->uvscale;
+                    u32 og = rd32(v, x->origin_tab + 4 * tex);
+                    tp->ou = (s32)(og & 0xFFFF);
+                    tp->ov = (s32)(og >> 16);
+                }
+            }
+            if (tp->state != 1) continue;          /* no live object: not drawn */
+            if (st->nstage >= MAX_TRIS_FRAME) break;
+            st->stex[st->nstage] = (u16)tex;
+            u32 *q = st->stage[st->nstage++];
+            for (int c = 0; c < 3; c++, q += 8) {
+                const TV *p = &tv[tb[c]];
+                q[0] = b_of(p->x); q[1] = b_of(p->y);
+                q[2] = b_of(p->z); q[3] = b_of(p->rhw);
+                q[4] = p->col; q[5] = 0xFF000000u;
+                q[6] = b_of((float)((s32)tb[4 + 2 * c] - tp->ou) * tp->su);
+                q[7] = b_of((float)((s32)tb[5 + 2 * c] - tp->ov) * tp->sv);
+            }
+            x->budget--;
+            st->last_tris++;
+        }
+    x->tiles++;
+}
+
+/* at most this many triangles when drawn as an S / L2 tile (with skirts) */
+static int tri_cost(const Entry *e)
+{
+    return (int)e->ntri + e->sk_n[0] + e->sk_n[1] + e->sk_n[2] + e->sk_n[3];
+}
+
+static void mesh_s(State *st, const Entry *e, u8 skirts, Mesh *m)
+{
+    m->tris = st->data + e->tris;
+    m->nr = 0;
+    m->ranges[m->nr][0] = 0; m->ranges[m->nr][1] = e->ntri; m->nr++;
+    for (int k = 0; k < 4; k++)
+        if ((skirts & (1 << k)) && e->sk_n[k]) {
+            m->ranges[m->nr][0] = e->sk_first[k];
+            m->ranges[m->nr][1] = e->sk_n[k];
+            m->nr++;
+        }
+    m->v = st->data + e->verts; m->vstride = 6;
+    m->n = st->data + e->norms; m->nstride = 3; m->n8 = 1;
+    m->nv = e->nverts;
+    int k = (int)(e - st->e);
+    if (k >= 0 && k < N1 + N2 && e->nverts <= MAX_VERTS_TILE) {
+        m->col = (u32 *)st->ecol[k];
+        m->cgen = (u32 *)&st->ecol_gen[k];
+    } else {
+        m->col = 0; m->cgen = 0;
+    }
+}
+
+static void mesh_n(Slot *sl, Mesh *m)
+{
+    m->col = sl->col;
+    m->cgen = &sl->lgen;
+    m->tris = sl->tris;
+    m->nr = 1;
+    m->ranges[0][0] = 0; m->ranges[0][1] = sl->ntri;
+    m->v = (const u8 *)sl->v; m->vstride = 8;
+    m->n = (const u8 *)sl->n; m->nstride = 8; m->n8 = 0;
+    m->nv = sl->nv;
+}
+
+/* The combined matrix is world*view*projection with the GTE translation in
+   the view: row 3 is affine in that translation and rows 0..2 do not depend
+   on it. Four transforms give both; a fifth checks it. */
+static int calibrate(Env *v, Ctx *x, u32 io, u32 onset)
+{
+    State *st = v->st;
+    M4 m[5];
+    s32 T4[3] = { 12345, -6789, 23456 };
+    st->busy = 1;
+    for (int k = 0; k < 5; k++) {
+        for (int i = 0; i < 3; i++) {
+            s32 t = k == 4 ? T4[i] : (k == i + 1 ? 32768 : 0);
+            wr32(v, x->gte + 0x22 + 4 * i, (u32)t);
+        }
+        v->call(F_TRANSFORM, 2, io, onset);
+        read_m4(v, G_COMBINED, &m[k]);
+    }
+    st->busy = 0;
+    for (int i = 0; i < 16; i++) x->m0[i] = m[0].m[i];
+    for (int a = 0; a < 3; a++)
+        for (int c = 0; c < 4; c++)
+            x->dm[a][c] = (m[1 + a].m[12 + c] - m[0].m[12 + c]) / 32768.0;
+    for (int k = 1; k < 5; k++)
+        for (int i = 0; i < 12; i++) {
+            double d = m[k].m[i] - m[0].m[i];
+            if (dabs(d) > 1e-4 * (dabs(m[0].m[i]) + 1.0)) return 0;
+        }
+    for (int c = 0; c < 4; c++) {
+        double want = m[0].m[12 + c] + T4[0] * x->dm[0][c]
+                    + T4[1] * x->dm[1][c] + T4[2] * x->dm[2][c];
+        if (dabs(want - m[4].m[12 + c]) > 1e-3 * (dabs(want) + 100.0)) return 0;
+    }
+    return 1;
+}
+
+/* BUILD 592: the staged triangles, by texture, in as few engine chunks as
+   possible (one per texture up to BATCH_MAX). Each chunk's vertices are
+   read, filled and written back in one bulk copy. */
+static void flush(Env *v, State *st)
+{
+    u32 n = st->nstage;
+    st->nstage = 0;
+    if (!n) return;
+    u16 count[512], start[512];
+    for (int k = 0; k < 512; k++) count[k] = 0;
+    for (u32 i = 0; i < n; i++) count[st->stex[i] & 0x1FF]++;
+    u32 at = 0;
+    for (int k = 0; k < 512; k++) { start[k] = (u16)at; at += count[k]; }
+    for (u32 i = 0; i < n; i++) st->order[start[st->stex[i] & 0x1FF]++] = (u16)i;
+    u32 pos = 0;
+    u32 ntex = rd32(v, G_TEX_COUNT);    /* BUILD 598: only live objects */
+    for (u32 tex = 0; tex < 512; tex++) {
+        u32 left = count[tex];
+        if (!left) continue;
+        u32 first = pos;
+        pos += left;
+        u32 obj = tex < ntex ? rd32(v, G_TEX_OBJS + 4 * tex) : 0;
+        u32 i = first;
+        while (left && obj) {
+            u32 k = left < BATCH_MAX ? left : BATCH_MAX;
+            if (!v->call(F_ALLOC_SHAPES, 2, k, obj)) break;
+            u32 vp = rd32(v, obj + 0x70);
+            u32 stride = rd32(v, obj + 0x40);
+            if (!vp || stride < 0x60u || stride > 0x80u || (stride & 3u)) break;
+            /* BUILD 605: the staged triangle is already the TL layout.
+               Where the chunk is one run of host memory (it always is: the
+               engine's arena block), it is written in place; otherwise
+               through the batch, a page at a time, as before. Each shape's
+               bytes past the three vertices are zeroed as they always were. */
+            u32 bytes = k * stride;
+            u8 *h0 = v->g2h(vp), *h1 = v->g2h(vp + bytes - 1);
+            int direct = h0 && h1 && (u64)(h1 - h0) == (u64)(bytes - 1)
+                         && !((unsigned long)h0 & 3u);
+            u8 *dst = direct ? h0 : st->batch;
+            for (u32 s2 = 0; s2 < k; s2++, i++) {
+                u32 *q = (u32 *)(void *)(dst + stride * s2);
+                const u32 *t = st->stage[st->order[i]];
+                for (int w = 0; w < STRI_WORDS; w++) q[w] = t[w];
+                for (u32 w = STRI_WORDS; w < stride / 4u; w++) q[w] = 0;
+            }
+            if (!direct)
+                gwrite(v, vp, st->batch, bytes);
+            st->draws++;
+            left -= k;
+        }
+    }
+}
+
+static int ringof(int dx, int dz)
+{
+    int a = dx < 0 ? -dx : dx, b = dz < 0 ? -dz : dz;
+    return a > b ? a : b;
+}
+
+static void draw(Env *v, State *st, float uvscale, u32 own)
+{
+    if (rd32(v, G_MAP_TYPE) != 0)
+        return;
+    u32 base = rd32(v, G_WORLD_BASE);
+    if (!base)
+        return;
+    st->frames++;
+    st->last_tris = 0;
+    st->nstage = 0;
+    st->draws = 0;
+    st->last_tiles = 0;
+    if (!v->call(F_DRAW_ENABLED, 0))
+        return;
+
+    s32 fx = (s32)rd32(v, G_PLAYER_POS);
+    s32 fz = (s32)rd32(v, G_PLAYER_POS + 8);
+    fx = ((fx % WRAP_X) + WRAP_X) % WRAP_X;
+    fz = ((fz % WRAP_Z) + WRAP_Z) % WRAP_Z;
+    int cx = fx >> 13, cz = fz >> 13;
+    s32 lx = fx & 0x1FFF, lz = fz & 0x1FFF;
+
+    Cam cam;
+    u32 far = base + FAR_OFF;
+    camera(v, far + FAR_SCRATCH, &cam);
+    Ctx x;
+    x.v = v; x.c = &cam; x.tiles = 0;
+    x.gte = rd32(v, G_GTE);
+    x.budget = MAX_TRIS_FRAME;
+    x.uvscale = (uvscale >= 0.125f && uvscale <= 16.0f) ? uvscale : 1.0f;
+    if (!x.gte)
+        return;
+    u32 lg = rd32(v, G_LIGHT);
+    if (!lg)
+        return;
+    for (int i = 0; i < 12; i++) x.light[i] = rdf(v, lg + 0xF8 + 4 * i);
+    {                                    /* BUILD 605: the light's generation */
+        int same = st->lgen != 0;
+        for (int i = 0; i < 12 && same; i++)
+            same = b_of(st->lkey[i]) == b_of(x.light[i]);
+        if (!same) {
+            for (int i = 0; i < 12; i++) st->lkey[i] = x.light[i];
+            if (++st->lgen == 0) st->lgen = 1;
+        }
+    }
+    x.origin_tab = rd32(v, G_TEX_ORIGIN);
+    x.ntex = rd32(v, G_TEX_COUNT);
+    x.tp = st->tp;
+    for (int k = 0; k < 512; k++) x.tp[k].state = 0;
+    if (!x.ntex || x.ntex > 512)
+        return;                          /* BUILD 598: no live textures */
+    if (!x.origin_tab)
+        return;
+    x.vx0 = (float)(s32)rd32(v, G_VIEW_X);
+    x.vy0 = (float)(s32)rd32(v, G_VIEW_Y);
+    x.vx1 = x.vx0 + (float)(s32)rd32(v, G_VIEW_W);
+    x.vy1 = x.vy0 + (float)(s32)rd32(v, G_VIEW_H);
+    x.vw = x.vx1 - x.vx0;
+    if (!(x.vx1 > x.vx0 && x.vy1 > x.vy0)) {
+        x.vx0 = -1e9f; x.vy0 = -1e9f; x.vx1 = 1e9f; x.vy1 = 1e9f;
+        x.vw = 640.0f;
+    } else {
+        float mw = 0.5f * (x.vx1 - x.vx0), mh = 0.5f * (x.vy1 - x.vy0);
+        x.vx0 -= mw; x.vx1 += mw; x.vy0 -= mh; x.vy1 += mh;
+    }
+    if (!calibrate(v, &x, far + FAR_IO, rd32(v, G_ONSET))) {
+        st->calib_bad++;
+        return;
+    }
+
+    sky(&x, st);
+    if (st->magic != 0x52414657u)
+        return;                      /* worldfar_alloc loads it, once */
+    s32 prog = (s32)rd32(v, G_PROGRESS);
+
+    /* which cells the game drew itself this frame */
+    u8 detail[GW][GW];               /* 0 none, 1 S, 2 native / N */
+    u8 nat[GW][GW];
+    for (int j = 0; j < GW; j++) for (int i = 0; i < GW; i++) { detail[j][i] = 0; nat[j][i] = 0; }
+    for (u32 k = 0; k < st->nnat && k < NAT_MAX; k++) {
+        float d[3] = { (float)(st->nat[k][0] - cam.t[0]), (float)(st->nat[k][1] - cam.t[1]),
+                       (float)(st->nat[k][2] - cam.t[2]) };
+        float mxp = cam.cx[0] * d[0] + cam.cx[1] * d[1] + cam.cx[2] * d[2];
+        float mzp = cam.cz[0] * d[0] + cam.cz[1] * d[1] + cam.cz[2] * d[2];
+        float gx = (mxp + (float)lx) / (float)MESH, gz = (mzp + (float)lz) / (float)MESH;
+        int ix = (int)(gx + (gx < 0 ? -0.5f : 0.5f)), iz = (int)(gz + (gz < 0 ? -0.5f : 0.5f));
+        float ex = gx - (float)ix, ez = gz - (float)iz;
+        if (ex > 0.25f || ex < -0.25f || ez > 0.25f || ez < -0.25f) continue;
+        if (ix >= -GRID && ix <= GRID && iz >= -GRID && iz <= GRID)
+            nat[iz + GRID][ix + GRID] = 1;
+    }
+
+    for (int sz = 0; sz < SZ; sz++)
+        for (int sx = 0; sx < SX; sx++) {
+            int near = 0;
+            for (int k = 0; k < 16 && !near; k++) {
+                int dxm = wrapi(sx * 4 + (k & 3) - cx, MX);
+                int dzm = wrapi(sz * 4 + (k >> 2) - cz, MZ);
+                if (ringof(dxm, dzm) <= NEAR_RING) near = 1;
+            }
+            st->cls[sz * SX + sx] = near ? CLS_NEAR : CLS_L2;
+        }
+
+    /* decide every cell's level first (skirts depend on the neighbours).
+       BUILD 590: by how big the cell is on screen, not by its ring. Any cell
+       wider than LOD_N of the viewport is drawn with the game's own mesh,
+       however far away it is, so what you see in the distance is the same
+       ground you will fly over (the S tile's 2048-unit quads, one texture
+       each, were the squares and the "different" textures). */
+    int want[NWANT], nwant = 0;
+    Slot *nslot[GW][GW];
+    for (int dz = -GRID; dz <= GRID; dz++)
+        for (int dx = -GRID; dx <= GRID; dx++) {
+            int mx = ((cx + dx) % MX + MX) % MX, mz = ((cz + dz) % MZ + MZ) % MZ;
+            int cell = l1_index(mx, mz, prog);
+            int r = ringof(dx, dz);
+            nslot[dz + GRID][dx + GRID] = 0;
+            if (st->cls[(mz >> 2) * SX + (mx >> 2)] != CLS_NEAR) continue;
+            const Entry *e = &st->e[cell];
+            s32 px = dx * MESH - lx, pz = dz * MESH - lz;
+            float ymid = 0.5f * ((float)e->ymin + (float)e->ymax);
+            int vis = visible(&x, (float)(px + MESH / 2), (float)(pz + MESH / 2),
+                              MESH / 2, (float)e->ymin, (float)e->ymax);
+            float fp = !vis ? 0.0f : (r <= 1 || LOD_RULE ? 1.0f : footprint(&x, px, pz, ymid));
+
+            int prio = 255 - (fp >= 0.5f ? 255 : (int)(fp * 510.0f));
+            if (LOD_RULE) prio = r;          /* nearest ring first */
+            /* BUILD 606: when we own the window its cells are ordinary cells */
+            if (nat[dz + GRID][dx + GRID] && !own) {
+                detail[dz + GRID][dx + GRID] = 2;
+                /* the window's own edge becomes the ring as you move on */
+                if (r >= 1) {
+                    Slot *sl = find_slot(st, cell);
+                    if (sl) sl->used = st->frames;
+                    else if (!st->bad[cell] && nwant < NWANT) want[nwant++] = (prio << 16) | cell;
+                }
+                continue;
+            }
+            Slot *sl = find_slot(st, cell);
+            if (OWN_WINDOW && r <= 3 && fp < LOD_KEEP) {
+                /* BUILD 606: the window's neighbourhood stays cached even
+                   where it is out of view, so the window can be ours */
+                if (sl) sl->used = st->frames;
+                else if (!st->bad[cell] && nwant < NWANT) want[nwant++] = (r << 16) | cell;
+            }
+            if (fp >= LOD_KEEP) {
+                if (sl) sl->used = st->frames;
+                else if (!st->bad[cell] && nwant < NWANT) want[nwant++] = (prio << 16) | cell;
+            }
+            if (sl && (fp >= LOD_N || (fp >= LOD_KEEP && sl->pad))) {
+                sl->pad = 1;                     /* hysteresis: N sticks */
+                nslot[dz + GRID][dx + GRID] = sl;
+                detail[dz + GRID][dx + GRID] = 2;
+                continue;
+            }
+            if (sl) sl->pad = 0;
+            detail[dz + GRID][dx + GRID] = 1;
+        }
+
+    /* BUILD 594: the world wraps (WRAP_X x WRAP_Z), and from high up the
+       draw radius is past half of it (~115000 in z): the nearest copy of each
+       sector alone left a hard edge that slid around as you moved, and whole
+       sectors jumped from one side of the horizon to the other. Every copy
+       of a sector within the radius is drawn now -- the 3x3 wrapped grid
+       FFNx's renderer uses. The nearest copy of a near sector is the S/N
+       ground above; any other copy of it is an L2 tile like the rest. */
+    enum { NCAND = N2B * 9 };
+    s16 cs[NCAND]; s8 cox[NCAND], coz[NCAND];
+    float cd[NCAND];
+    s32 cpx[NCAND], cpz[NCAND];
+    int ord[NCAND], nord = 0;
+    for (int s = 0; s < N2B; s++) {
+        int sx = s % SX, sz = s / SX;
+        s32 rx0 = wrapi(sx * 4 * MESH + 2 * MESH - fx, WRAP_X);
+        s32 rz0 = wrapi(sz * 4 * MESH + 2 * MESH - fz, WRAP_Z);
+        const Entry *e = &st->e[l2_index(s, prog)];
+        for (int oz = -1; oz <= 1; oz++)
+            for (int ox = -1; ox <= 1; ox++) {
+                if (!ox && !oz && st->cls[s] != CLS_L2) continue;
+                s32 rx = rx0 + ox * WRAP_X, rz = rz0 + oz * WRAP_Z;
+                float ax = (float)(rx < 0 ? -rx : rx) - 2.0f * MESH;
+                float az = (float)(rz < 0 ? -rz : rz) - 2.0f * MESH;
+                if (ax < 0) ax = 0;
+                if (az < 0) az = 0;
+                float dn = fsqrt(ax * ax + az * az);
+                if (dn > cam.horizon) continue;
+                if (!visible(&x, (float)rx, (float)rz, 2.0f * MESH, (float)e->ymin, (float)e->ymax))
+                    continue;
+                int c = nord;
+                cs[c] = (s16)s; cox[c] = (s8)ox; coz[c] = (s8)oz;
+                cd[c] = dn; cpx[c] = rx; cpz[c] = rz;
+                int j = nord++;
+                while (j > 0 && cd[ord[j - 1]] > dn) {
+                    ord[j] = ord[j - 1];
+                    j--;
+                }
+                ord[j] = c;
+            }
+    }
+    /* BUILD 596: the horizon tiles (drawn last) keep what they need, so a
+       heavy near field can never leave far sectors missing. Only the L2
+       tiles are held back -- 595 also held back every S cell and that took
+       full detail away from most of the middle distance. tri_cost is an
+       upper bound (back faces and off-screen triangles are dropped in
+       emit()); about 5/8 of it is drawn. */
+    int l2need = 0;
+    for (int i = 0; i < nord; i++) {
+        const Entry *e = &st->e[l2_index(cs[ord[i]], prog)];
+        l2need += tri_cost(e);
+    }
+    l2need = l2need * 5 / 8;
+
+    for (int ring = 0; ring <= GRID && x.budget > 0; ring++)
+        for (int dz = -ring; dz <= ring; dz++)
+            for (int dx = -ring; dx <= ring; dx++) {
+                if (ringof(dx, dz) != ring) continue;
+                u8 lvl = detail[dz + GRID][dx + GRID];
+                if (lvl == 0 || (nat[dz + GRID][dx + GRID] && !own)) continue;
+                int mx = ((cx + dx) % MX + MX) % MX, mz = ((cz + dz) % MZ + MZ) % MZ;
+                const Entry *e = &st->e[l1_index(mx, mz, prog)];
+                s32 px = dx * MESH - lx, pz = dz * MESH - lz;
+                float ax = (float)(px > 0 ? px : (px + MESH < 0 ? -(px + MESH) : 0));
+                float az = (float)(pz > 0 ? pz : (pz + MESH < 0 ? -(pz + MESH) : 0));
+                if (fsqrt(ax * ax + az * az) > cam.horizon)
+                    continue;
+                if (!visible(&x, (float)(px + MESH / 2), (float)(pz + MESH / 2),
+                             MESH / 2, (float)e->ymin, (float)e->ymax))
+                    continue;
+                HOST_TILE(lvl, mz * MX + mx, px, pz);
+                Mesh me;
+                if (lvl == 2 && nslot[dz + GRID][dx + GRID]
+                    && x.budget - (int)nslot[dz + GRID][dx + GRID]->ntri
+                       < l2need + N_RESERVE
+                    && ring > (own ? 2 : 1))
+                    lvl = 1;                     /* out of budget: S */
+                if (lvl == 2) {
+                    mesh_n(nslot[dz + GRID][dx + GRID], &me);
+                } else {
+                    u8 sk = 0;
+                    int nb[4][2] = { { dx, dz - 1 }, { dx + 1, dz }, { dx, dz + 1 }, { dx - 1, dz } };
+                    for (int k = 0; k < 4; k++) {
+                        int ix = nb[k][0], iz = nb[k][1];
+                        if (ix < -GRID || ix > GRID || iz < -GRID || iz > GRID) continue;
+                        if (detail[iz + GRID][ix + GRID] == 2) sk |= (u8)(1 << k);
+                    }
+                    mesh_s(st, e, sk, &me);
+                }
+                emit(&x, &me, px, pz);
+            }
+
+    int l2i = 0;
+    for (; l2i < nord && x.budget > 0; l2i++) {
+        int i = l2i;
+        int c = ord[i], s = cs[c];
+        int sx = s % SX, sz = s / SX;
+        int copy = cox[c] || coz[c];
+        const Entry *e = &st->e[l2_index(s, prog)];
+        u8 sk = 0;
+        int nb[4][2] = { { sx, sz - 1 }, { sx + 1, sz }, { sx, sz + 1 }, { sx - 1, sz } };
+        for (int k = 0; k < 4; k++) {
+            int nx = (nb[k][0] + SX) % SX, nz = (nb[k][1] + SZ) % SZ;
+            int ns = nz * SX + nx;
+            if ((!copy && st->cls[ns] == CLS_NEAR)
+                || ((st->e[l2_index(ns, prog)].flags ^ e->flags) & 1))
+                sk |= (u8)(1 << k);
+        }
+        HOST_TILE(copy ? 4 : 3, s, cpx[c], cpz[c]);
+        Mesh me;
+        mesh_s(st, e, sk, &me);
+        emit(&x, &me, cpx[c], cpz[c]);
+    }
+    HOST_L2(l2i, nord);
+    st->last_tiles = (u32)x.tiles;
+    flush(v, st);
+
+    /* read the missing full-detail meshes, nearest first, a few per frame */
+    for (int a = 1; a < nwant; a++) {
+        int w = want[a], j = a;
+        while (j > 0 && want[j - 1] > w) { want[j] = want[j - 1]; j--; }
+        want[j] = w;
+    }
+    for (int a = 0, done = 0; a < nwant && done < LOADS_PER_FRAME; a++) {
+        Slot *sl = victim(st);
+        if (!sl) break;
+        done++;
+        if (load_mesh(st, want[a] & 0xFFFF, sl)) {
+            sl->used = st->frames;
+            st->loads++;
+        } else {
+            st->load_fail++;
+            st->bad[want[a] & 0xFFFF] = 1;   /* never again: S stands in */
+        }
+    }
+
+    /* BUILD 606: own the game's 5x5 window next frame when every cell within
+       ring 3 of the player is cached -- whichever cells the window draws
+       next frame (ring 2 about wherever the player is by then) are among
+       them. The window's per-triangle path (0x75F263 projection, 123
+       x87-emulated transforms a mesh, then 0x75F68C: three lighting calls
+       and a shape allocation per triangle) measured 9.7 ms a frame on
+       average and 15 ms looking down (leakprobe v4); here it is one more
+       set of N cells. */
+    if (own) st->own_frames++;
+    int all = OWN_WINDOW && st->hw_pad2[0];     /* the window caves are in this module */
+    for (int dz = -3; dz <= 3 && all; dz++)
+        for (int dx = -3; dx <= 3 && all; dx++) {
+            int mx = ((cx + dx) % MX + MX) % MX, mz = ((cz + dz) % MZ + MZ) % MZ;
+            int cell = l1_index(mx, mz, prog);
+            if (!find_slot(st, cell)) all = 0;
+        }
+    st->own_streak = all ? st->own_streak + 1 : 0;
+    st->own_window = st->own_streak >= 2;
+}
+
+/* After the world map's allocator 0x75AB50 (its only call). wm0.far is
+   static data in BSS, so it is read ONCE per session, here, while the world
+   map is still loading -- never while its block streamer is running, and
+   nothing reads a file per frame (BUILD 587 read wm0.map meshes on the fly,
+   which stalled the streamer: the Highwind stopped at unloaded blocks). */
+__attribute__((section(".text.worldfar_alloc")))
+void worldfar_alloc(State *st, g2h_fn g2h, callx_fn call)
+{
+    Env env = { g2h, call, st };
+    /* BUILD 595: zoom and tilt are kept across a world-map reload, so
+       leaving the Highwind's cockpit (fship_*) puts the camera back where it
+       was, as the game does with the ship itself. R3 still resets both. */
+    st->nnat = 0;
+    st->sky_frame = 0;
+    st->keys_added = 0;
+    st->r3_click = 0;
+    st->hw_pending = st->hw_ok ? HW_WINDOW : 0;
+    st->own_window = 0;              /* BUILD 606: a new world load draws its own first */
+    st->own_streak = 0;
+    if (st->magic == 0x52414657u || st->failed_base >= 3)
+        return;
+    u32 base = rd32(&env, G_WORLD_BASE);
+    if (!base)
+        return;
+    if (load(&env, base)) {
+        st->magic = 0x52414657u;
+    } else {
+        st->magic = 0;
+        st->failed_base++;
+    }
+}
+
+__attribute__((section(".text.worldfar_draw")))
+void worldfar_draw(State *st, g2h_fn g2h, callx_fn call, float uvscale)
+{
+    Env env = { g2h, call, st };
+    u64 t0 = ticks();
+    /* BUILD 606: whether the game skipped its own window this frame was
+       decided at the end of the last one; nothing is owned again unless
+       draw() gets all the way through and finds the window's cells cached */
+    u32 own = st->own_window;
+    st->own_window = 0;
+    draw(&env, st, uvscale, own);
+    st->nnat = 0;                    /* the next frame's window starts empty */
+    call(F_RESET_GTE, 0);
+    /* BUILD 605: for leakprobe's frame timing */
+    st->pf_draw0 = t0;
+    st->pf_draw1 = ticks();
+    st->pf_tris = st->last_tris;
+    st->pf_draws = st->draws;
+    st->pf_zoom = st->zoom;
+    st->pf_frame++;
+    st->pf_armed = 1;
+}
+
+/* ------------------------------------------------------------ input */
+static u8 *input_obj(u8 **got)
+{
+    if (!got) return 0;
+    u8 *p = *got;
+    if (!p) return 0;
+    p = *(u8 **)(p + 0);
+    if (!p) return 0;
+    p = *(u8 **)(p + 8);
+    if (!p) return 0;
+    p = *(u8 **)(p + 0);
+    if (!p) return 0;
+    return *(u8 **)(p + 0x88);
+}
+
+static float stick(float v)
+{
+    if (v > STICK_DEADZONE) return (v - STICK_DEADZONE) / (1.0f - STICK_DEADZONE);
+    if (v < -STICK_DEADZONE) return (v + STICK_DEADZONE) / (1.0f - STICK_DEADZONE);
+    return 0.0f;
+}
+
+static float mult(Env *v)
+{
+    s32 m = (s32)rd32(v, G_MOVE_MULT);
+    if (m < 1) m = 1;
+    if (m > 4) m = 4;
+    return (float)m;
+}
+
+/* ------------------------------------------------------------ Highwind
+ * BUILD 601. The world map is reloaded when you go into the Highwind's
+ * interior (fship_*) and come back, and the game puts the ship back at its
+ * take-off height ([0xDF5420], 4000) -- the altitude you climbed to (up to
+ * the 587 ceiling, 30767) is gone. Every world frame flown in the Highwind
+ * view keeps the player entity's x, y, z; any world frame NOT in that view
+ * forgets them (landed, on foot, another vehicle), so only a reload straight
+ * out of flight is ever restored. After the reload, the first frame in the
+ * Highwind view at the same x, z puts y back, once. The entity is the one
+ * world_copy_player_pos (x86 0x762798) reads: [0xE3A7D0] + 0xC/0x10/0x14,
+ * the y that world_add_y_pos_to_current_entity (0x761F22) moves. */
+static void highwind_keep(Env *v, State *st)
+{
+    u32 ent = rd32(v, G_PLAYER_ENT);
+    if (!ent) return;
+    u32 view = rd32(v, G_VIEW_TYPE);
+    u32 ctl = rd32(v, G_CONTROL);
+    s32 x = (s32)rd32(v, ent + 0xC), y = (s32)rd32(v, ent + 0x10);
+    s32 z = (s32)rd32(v, ent + 0x14);
+    if (view != HW_VIEW) {
+        /* a short transition must not forget it; landing and walking away
+           (30+ frames in another view) does */
+        if (st->hw_off < HW_FORGET) st->hw_off++;
+        else st->hw_ok = 0;
+        if (st->hw_pending) st->hw_pending--;
+        st->hw_prev = y;
+        return;
+    }
+    st->hw_off = 0;
+    /* BUILD 603c. Hardware: the game does not lower the ship, it SETS it --
+       to one fixed altitude, going into fship and again coming back,
+       whatever height the ship was at (from below too). That is a jump no
+       pilot makes in one frame; a player climbs or descends by at most
+       50 x the move multiplier. So: a jump is the game's, never recorded,
+       and it arms the restore; frames without control arm it too. */
+    s32 step = y - st->hw_prev;
+    if (step < 0) step = -step;
+    int snap = st->hw_ok && step > HW_SNAP;
+    st->hw_prev = y;
+    if (!ctl || snap) {
+        if (st->hw_ok) st->hw_lost = 1;
+        if (!ctl) return;
+    }
+    if (st->hw_ok && (st->hw_lost || st->hw_pending)) {
+        s32 dx = x - st->hw_x, dz = z - st->hw_z;
+        if (dx < 0) dx = -dx;
+        if (dz < 0) dz = -dz;
+        s32 gap = st->hw_y - y;
+        if (gap < 0) gap = -gap;
+        /* in control, at the same place, and not where the player left it
+           (higher OR lower): put it back */
+        if (dx <= HW_SPOT && dz <= HW_SPOT && gap > HW_JUMP) {
+            wr32(v, ent + 0x10, (u32)st->hw_y);
+            y = st->hw_y;
+            st->hw_prev = y;
+            st->hw_restores++;
+        }
+    }
+    st->hw_lost = 0;
+    st->hw_pending = 0;
+    st->hw_x = x; st->hw_y = y; st->hw_z = z;
+    st->hw_ok = 1;
+}
+
+/* ------------------------------------------------------------ camera
+ * FFNx's world camera (camera.cpp): pitch -95..-175 degrees, zoom up to
+ * 35000 on the triggers, right stick for the view.
+ *   ZL / ZR     zoom out / in (ZR in, as FFNx's right trigger)
+ *   up/down     tilt: up looks toward the horizon, down at the ground
+ *   (R3 is the stock L2/R2 view toggle now -- see worldfar_input)
+ * Runs right after the game's camera update 0x74E8CE, which rebuilds the
+ * camera rotation (0xDFC448) and position (0xDE6A20, t = (0,0,dist)) every
+ * frame from its own state, so these are pure offsets on top of it. */
+__attribute__((section(".text.worldfar_camera")))
+void worldfar_camera(State *st, g2h_fn g2h, callx_fn call, u8 **got)
+{
+    Env env = { g2h, call, st };
+    Env *v = &env;
+    if (rd32(v, G_MAP_TYPE) != 0)
+        return;
+    highwind_keep(v, st);
+    u8 *p = input_obj(got);
+    if (!p) return;
+    float ry = stick(*(float *)(p + 0x40) - *(float *)(p + 0x44));
+    unsigned long long buttons = *(unsigned long long *)(p + 0x20);
+    float mm = mult(v);
+    float zoom = st->zoom, tilt = st->tilt;
+    if (!(zoom >= 0.0f && zoom < 100000.0f)) zoom = 0.0f;
+    if (!(tilt > -3.2f && tilt < 3.2f)) tilt = 0.0f;
+    if (st->r3_click) {                  /* R3 (worldfar_input): reset both */
+        zoom = 0.0f;
+        tilt = 0.0f;
+        st->r3_click = 0;
+    }
+    /* BUILD 599: `zoom` is the distance the player ASKED for and is what
+       st->zoom keeps; what is applied is min(zoom, room) this frame. The
+       game's own distance can be large for a few frames after a reload
+       (leaving fship_*), and clamping the kept value to that room lost the
+       height for good. Pressing ZL/ZR starts from what is on screen. */
+    s32 base = (s32)rd32(v, G_CAM_TRANS_Z);
+    float room = ZOOM_MAX_DIST - (float)base;
+    if (room < 0.0f) room = 0.0f;
+    float applied = zoom < room ? zoom : room;
+    if (buttons & (BTN_ZL | BTN_ZR)) {
+        zoom = applied;
+        if (buttons & BTN_ZL) zoom += ZOOM_STEP * mm;
+        if (buttons & BTN_ZR) zoom -= ZOOM_STEP * mm;
+        if (zoom > room) zoom = room;
+        if (zoom < 0.0f) zoom = 0.0f;
+        applied = zoom;
+    }
+    if (zoom > ZOOM_MAX_DIST) zoom = ZOOM_MAX_DIST;
+    tilt -= TILT_STEP * mm * ry;
+    if (tilt == 0.0f) {
+        /* no offset: the game's own camera, whatever its pitch */
+        st->tilt = 0.0f;
+        goto zoom_only;
+    }
+
+zoom_only:;
+    /* zoom: add to the distance the game just wrote */
+    if (applied > 0.0f)
+        wr32(v, G_CAM_TRANS_Z, (u32)(base + (s32)applied));
+    st->zoom = zoom;
+    if (tilt == 0.0f)
+        return;
+
+    /* tilt: R' = Rx(delta) * R on the 3x3 the game just wrote. Row 2 is
+       the view axis in world space; asin(|y|) is how far it looks below
+       (or above) the horizontal, and the offset is added to that. */
+    double Rm[3][3];
+    for (int i = 0; i < 3; i++)
+        for (int j = 0; j < 3; j++)
+            Rm[i][j] = (double)rds16(v, G_CAM_ROT + 2 * (3 * i + j)) / 4096.0;
+    double fy = dabs(Rm[2][1]);
+    if (fy > 1.0) fy = 1.0;
+    double mag0 = fy;                          /* asin by Newton */
+    for (int it = 0; it < 30; it++) {
+        double s, c;
+        dsincos(mag0, &s, &c);
+        if (c < 1e-6) break;
+        mag0 -= (s - fy) / c;
+    }
+    double wantd = mag0 + (double)tilt;
+    if (wantd < TILT_MIN) wantd = TILT_MIN;
+    if (wantd > TILT_MAX) wantd = TILT_MAX;
+    tilt = (float)(wantd - mag0);
+    st->zoom = zoom;
+    st->tilt = tilt;
+    if (tilt == 0.0f)
+        return;
+    double sw, cw;
+    dsincos(wantd, &sw, &cw);
+    double best = 1e9, b1[3] = { 0 }, b2[3] = { 0 };
+    for (int attempt = 0; attempt < 2; attempt++) {
+        double d = attempt ? -(wantd - mag0) : (wantd - mag0);
+        double s, c;
+        dsincos(d, &s, &c);
+        double r1[3], r2[3];
+        for (int j = 0; j < 3; j++) {
+            r1[j] = c * Rm[1][j] - s * Rm[2][j];
+            r2[j] = s * Rm[1][j] + c * Rm[2][j];
+        }
+        double err = dabs(dabs(r2[1]) - sw);
+        if (err < best) {
+            best = err;
+            for (int j = 0; j < 3; j++) { b1[j] = r1[j]; b2[j] = r2[j]; }
+        }
+    }
+    for (int j = 0; j < 3; j++) {
+        s32 a1 = (s32)(b1[j] * 4096.0 + (b1[j] >= 0 ? 0.5 : -0.5));
+        s32 a2 = (s32)(b2[j] * 4096.0 + (b2[j] >= 0 ? 0.5 : -0.5));
+        wr16(v, G_CAM_ROT + 2 * (3 + j), (u16)(s16)a1);
+        wr16(v, G_CAM_ROT + 2 * (6 + j), (u16)(s16)a2);
+    }
+}
+
+/* ------------------------------------------------------------ input
+ * BUILD 588. On foot, the stock update moves the player along the WORLD axes
+ * from the arrow keys (0x74EC3F..0x74ED32: left -x, right +x, up -z, down
+ * +z, facing -1024/1024/2048/0), and spins the camera heading 0xDFC484 by a
+ * fixed step while left/right is held -- that is what ran Cloud in circles
+ * and why "up" was never quite into the screen.
+ *
+ *  worldfar_move   around the update's call of 0x762E87 (the move): with
+ *                  the left stick held, (dx, dz) becomes the stock speed in
+ *                  the stick's exact direction relative to the CAMERA, and
+ *                  the facing to match (360-degree analogue movement).
+ *  worldfar_input  around the whole update: the arrow keys' share of the
+ *                  stock spin is taken back out and the stick turns the
+ *                  heading instead, at the stock rate scaled by how far
+ *                  sideways it points (straight left = holding left), so
+ *                  the camera swings round with you as it did in the
+ *                  original; L1/R1 and the d-pad are untouched; the right
+ *                  stick turns it directly. The camera's smoothing of the heading
+ *                  (0xDFC474, done at the end of the update) is redone from
+ *                  the final heading so it answers the same frame.
+ *
+ * The Highwind (view 3), the front view (2), the Tiny Bronco, the buggy and
+ * the submarine keep their stock controls; only the right stick is added
+ * there. Out of player control nothing moves. */
+#define SPIN_STEP       8.0f         /* the stock turn: 8 x mult x (2 - up/down) */
+#define G_KEYS          0x9A85D4u    /* held PSX keys */
+#define F_PLAYER_MODEL  0x761735u    /* () -> the player's world model id */
+#define K_L2 0x0001u
+#define K_L1 0x0004u
+#define K_R1 0x0008u
+#define K_UP 0x1000u
+#define K_RIGHT 0x2000u
+#define K_DOWN 0x4000u
+#define K_LEFT 0x8000u
+#define MOVE_MIN        0.35f
+#define G_CAM_ROTY      0xDFC474u    /* smoothed heading the camera uses */
+#define G_ENTITY        0xE39AD8u    /* -> the current entity (the player here) */
+
+static float fatan2(float y, float x)
+{
+    float ax = fabs_(x), ay = fabs_(y);
+    if (ax < 1e-20f && ay < 1e-20f) return 0.0f;
+    float a = ax > ay ? ay / ax : ax / ay;
+    float s = a * a;
+    float r = ((-0.0464964749f * s + 0.15931422f) * s - 0.327622764f) * s * a + a;
+    if (ay > ax) r = 1.57079637f - r;
+    if (x < 0) r = 3.14159274f - r;
+    if (y < 0) r = -r;
+    return r;
+}
+
+static int on_foot(Env *v)
+{
+    u32 vt = rd32(v, G_VIEW_TYPE);
+    if (rd32(v, G_MAP_TYPE) != 0 || vt == 2 || vt == 3
+        || rd32(v, G_CONTROL) == 0)
+        return 0;
+    /* walkers only: Cloud, Tifa, Cid and the chocobos. The Tiny Bronco,
+       the buggy and the submarine keep their stock (vanilla) controls. */
+    u32 m = v->call(F_PLAYER_MODEL, 0);
+    return m <= 2 || m == 4 || m == 19 || m == 41 || m == 42;
+}
+
+/* The heading change 0x74EA48 makes from the keys (0x74EE.. two branches):
+   L1 and the left key turn it down, R1 and the right key up, each by
+   8 x mult x (2 - up/down held); with down held the arrow keys swap.
+   *total is the whole change, *arrows the arrow keys' share of it. */
+static void stock_spin(u32 keys, s32 m, s32 *total, s32 *arrows)
+{
+    s32 unit = 8 * m * ((keys & (K_UP | K_DOWN)) ? 1 : 2);
+    int down = (keys & K_DOWN) != 0;
+    s32 a = (keys & (down ? K_RIGHT : K_LEFT)) ? 1 : 0;
+    s32 b = (keys & (down ? K_LEFT : K_RIGHT)) ? 1 : 0;
+    s32 l1 = (keys & K_L1) ? 1 : 0, r1 = (keys & K_R1) ? 1 : 0;
+    *total = unit * ((r1 + b) - (l1 + a));
+    *arrows = unit * (b - a);
+}
+
+/* the left stick, in the world: unit (wx, wz) and its magnitude */
+static float stick_world(Env *v, u8 **got, float *wx, float *wz, float *side)
+{
+    u8 *p = input_obj(got);
+    if (!p) return 0.0f;
+    float sx = *(float *)(p + 0x38) - *(float *)(p + 0x3C);
+    float sy = *(float *)(p + 0x30) - *(float *)(p + 0x34);
+    float mag = fsqrt(sx * sx + sy * sy);
+    if (mag < MOVE_MIN) return 0.0f;
+    if (mag > 1.0f) mag = 1.0f;
+    /* camera right and forward on the ground, from its rotation rows */
+    float r0 = (float)rds16(v, G_CAM_ROT + 0) / 4096.0f;
+    float r2 = (float)rds16(v, G_CAM_ROT + 4) / 4096.0f;
+    float f0 = (float)rds16(v, G_CAM_ROT + 12) / 4096.0f;
+    float f2 = (float)rds16(v, G_CAM_ROT + 16) / 4096.0f;
+    float rl = fsqrt(r0 * r0 + r2 * r2), fl = fsqrt(f0 * f0 + f2 * f2);
+    if (rl < 1e-3f || fl < 1e-3f) return 0.0f;
+    r0 /= rl; r2 /= rl; f0 /= fl; f2 /= fl;
+    float x = r0 * sx + f0 * sy, z = r2 * sx + f2 * sy;
+    float l = fsqrt(x * x + z * z);
+    if (l < 1e-4f) return 0.0f;
+    *wx = x / l;
+    *wz = z / l;
+    *side = sx / mag;
+    return mag;
+}
+
+__attribute__((section(".text.worldfar_move")))
+void worldfar_move(State *st, g2h_fn g2h, callx_fn call, u8 *ctx, u32 phase)
+{
+    Env env = { g2h, call, st };
+    Env *v = &env;
+    if (phase != 0 || !on_foot(v))
+        return;
+    u8 **got = (u8 **)st->got;
+    float wx, wz, side;
+    if (stick_world(v, got, &wx, &wz, &side) <= 0.0f)
+        return;
+    u32 esp = ld32(ctx + 0x10);
+    s32 dx = (s32)rd32(v, esp + 4), dz = (s32)rd32(v, esp + 8);
+    if (!dx && !dz)
+        return;                              /* not moving (or blocked) */
+    s32 ax = dx < 0 ? -dx : dx, az = dz < 0 ? -dz : dz;
+    float speed = (float)(ax > az ? ax : az);
+    if (ax && az) speed *= 4.0f / 3.0f;      /* the diagonals are 3/4 each */
+    wr32(v, esp + 4, (u32)(s32)(wx * speed));
+    wr32(v, esp + 8, (u32)(s32)(wz * speed));
+    st->facing = (s32)(fatan2(wx, wz) * (2048.0f / 3.14159274f));
+    st->facing_ok = 1;
+}
+
+__attribute__((section(".text.worldfar_input")))
+void worldfar_input(State *st, g2h_fn g2h, callx_fn call, u8 **got, u32 phase)
+{
+    Env env = { g2h, call, st };
+    Env *v = &env;
+    st->got = (u64)(unsigned long)got;
+    if (phase != 0 && st->keys_added) {
+        wr32(v, G_KEYS, rd32(v, G_KEYS) & ~st->keys_added);
+        st->keys_added = 0;
+    }
+    if (rd32(v, G_MAP_TYPE) != 0) {
+        st->saved_ok = 0;
+        return;
+    }
+    if (phase == 0) {
+        /* BUILD 591: R3 is what ZL/ZR were in the stock game -- the PSX
+           L2/R2 view toggle (0x74EB89: a NEW press of L2 or R2 switches the
+           normal and the fixed-direction view, the next press switches
+           back). ZL/ZR zoom now, so a NEW R3 press puts L2 in the keys for
+           that one update only: one click toggles exactly once, however
+           long R3 is held. The bit is taken back out after the update. */
+        st->keys_added = 0;
+        u8 *pp = input_obj(got);
+        u32 r3 = pp && (*(unsigned long long *)(pp + 0x20) & BTN_R3) ? 1u : 0u;
+        u32 click = r3 && !st->r3_prev;
+        st->r3_prev = r3;
+        if (click)
+            st->r3_click = 1;            /* also: zoom, tilt and heading reset */
+        if (click) {
+            u32 k = rd32(v, G_KEYS);
+            if (!(k & K_L2)) {
+                wr32(v, G_KEYS, k | K_L2);
+                st->keys_added = K_L2;
+            }
+        }
+        st->front_saved = (s32)rd32(v, G_CAM_FRONT);
+        st->rot_saved = (s32)rd32(v, G_CAM_ROTY);
+        st->saved_ok = 1;
+        st->facing_ok = 0;
+        return;
+    }
+    if (!st->saved_ok)
+        return;
+    st->saved_ok = 0;
+    u8 *p = input_obj(got);
+    float rx = p ? stick(*(float *)(p + 0x48) - *(float *)(p + 0x4C)) : 0.0f;
+    s32 front = (s32)rd32(v, G_CAM_FRONT);
+    if (on_foot(v)) {
+        float wx, wz, side;
+        float mag = stick_world(v, got, &wx, &wz, &side);
+        if (mag > 0.0f) {
+            /* The stick drives the turn the arrow keys drove in the stock
+               game, in proportion: straight sideways turns exactly as fast
+               as holding left/right did (16 x mult), a diagonal half as
+               fast (the stock up/down halving), straight up not at all,
+               easing to nothing towards straight down so running at the
+               camera never whips it round. L1/R1 keep their stock turn.
+               A change the keys do not explain is left alone. */
+            s32 d = wrapi(front - st->front_saved, 4096);
+            s32 total, arrows;
+            stock_spin(rd32(v, G_KEYS) & 0xFFFFu, (s32)mult(v), &total, &arrows);
+            if (d == total) {
+                front = st->front_saved + (total - arrows);
+                if (rx == 0.0f) {
+                    float up = 1.0f;
+                    u8 *p = input_obj(got);
+                    if (p) {
+                        float sy = *(float *)(p + 0x30) - *(float *)(p + 0x34);
+                        float c = sy / mag;
+                        if (c < 0.0f) up = 1.0f + (c < -1.0f ? -1.0f : c);
+                    }
+                    float turn = 2.0f * SPIN_STEP * mult(v) * mag * side
+                               * fabs_(side) * up;
+                    front += (s32)(turn + (turn < 0.0f ? -0.5f : 0.5f));
+                }
+            }
+        }
+        if (st->facing_ok) {
+            u32 ent = rd32(v, G_ENTITY);
+            if (ent) {
+                wr16(v, ent + 0x40, (u16)(s16)st->facing);
+                wr16(v, ent + 0x4C, (u16)(s16)st->facing);
+            }
+        }
+    }
+    st->facing_ok = 0;
+    if (rd32(v, G_CONTROL) != 0)
+        front += (s32)(YAW_STEP * mult(v) * rx);
+    /* R3 click: back behind the player (FFNx's reset, front = 2048 -
+       facing) when the toggle left the normal view; the fixed view keeps
+       the direction the game gives it */
+    if (st->r3_click && rd32(v, G_VIEW_TYPE) == 0 && rd32(v, G_CONTROL) != 0) {
+        u32 ent = rd32(v, G_ENTITY);
+        if (ent)
+            front = 2048 - (s32)rds16(v, ent + 0x40);
+    }
+    front = ((front % 4096) + 4096) % 4096;
+    wr32(v, G_CAM_FRONT, (u32)front);
+    /* the heading smoothing the update did at its end (0x74F78D..0x74F873,
+       the branch it always takes), redone from the final heading */
+    s32 r = st->rot_saved;
+    if (r < front - 0x800) r += 0x1000;
+    else if (r > front + 0x800) r -= 0x1000;
+    if (rd32(v, G_MOVE_MULT) == 1) r = (r * 31 + front) >> 5;
+    else r = (r * 15 + front) >> 4;
+    wr32(v, G_CAM_ROTY, (u32)r);
+}

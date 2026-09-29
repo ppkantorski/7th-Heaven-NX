@@ -1,0 +1,843 @@
+/* Host harness for worldfar.c (BUILD 588): a fake guest, a fake GTE and
+ * transform, a fake native window and a recorder in place of the shape
+ * allocator. Checks: the world-fixed planet on the native window against
+ * the formula, and the far tiles against the window (the seam); the depth
+ * squeeze; the sink; the matrix calibration; placement, single coverage and
+ * no holes; the window fill and the full-detail cache (no file access after
+ * load); the horizon and the sky slices; 360-degree movement, camera follow,
+ * right-stick yaw; ZL/ZR zoom, tilt, R3.
+ *
+ *   worldfar_host_test <wm0.far>
+ */
+#define HOST_TEST 1
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdarg.h>
+#include <math.h>
+#include "worldfar.c"
+
+#define GMEM (48u << 20)
+static u8 *mem;
+static FILE *farf;
+static u32 world_base = 0x01000000u;
+static u32 gte_state = 0x00100000u;
+static int errors;
+#define SHAPE_BASE 0x01800000u
+#define SHAPE_END  0x02400000u
+static int alloc_mode;
+static int sky_quad_calls;
+static int max_alloc;
+static int test_model;
+static u32 shape_cur = SHAPE_BASE;
+static int nshapes, nallocs, nreads;
+static double bend_err, bend_n;
+static const double FOC = 500.0, CXP = 320.0, CYP = 240.0, ZN = 50.0, ZF = 60000.0;
+static const double RR = 250000.0;
+
+static u8 *g2h(u32 g)
+{
+    if (g >= GMEM) { fprintf(stderr, "guest OOB %08x\n", g); exit(2); }
+    return mem + g;
+}
+static s32 gi(u32 g) { s32 x; memcpy(&x, mem + g, 4); return x; }
+static void si(u32 g, s32 x) { memcpy(mem + g, &x, 4); }
+static s16 gs(u32 g) { s16 x; memcpy(&x, mem + g, 2); return x; }
+static void sf(u32 g, float x) { memcpy(mem + g, &x, 4); }
+
+static double Rf[3][3];
+static s32 T[3];
+static State st;
+static u32 callx(u32 fn, u32 n, ...);
+
+static int seen_l1[N1], seen_l2[N2], seen_lvl[N1];
+static int native_cell[N1];
+static double cur_px, cur_pz;        /* the fake window's mesh offset */
+
+static int wrap_copies;
+static long l2_wanted, l2_drawn; static int l2_short_frames;
+static void host_l2(int drawn, int wanted)
+{
+    l2_wanted += wanted; l2_drawn += drawn;
+    if (drawn < wanted) l2_short_frames++;
+}
+static void host_tile(int level, int id, int px, int pz)
+{
+    (void)px; (void)pz;
+    if (level == 4) {                    /* BUILD 594: a wrapped copy of a sector */
+        wrap_copies++;
+        /* only ever past the nearest copy: beyond half the world on one axis */
+        if (abs(px) < WRAP_X / 2 - 2 * MESH && abs(pz) < WRAP_Z / 2 - 2 * MESH) {
+            fprintf(stderr, "L2 copy %d at (%d, %d) inside the nearest copy\n", id, px, pz); errors++;
+        }
+        return;
+    }
+    if (level == 3) {
+        if (id < 0 || id >= N2 || seen_l2[id]++) { fprintf(stderr, "L2 %d twice\n", id); errors++; }
+    } else {
+        if (id < 0 || id >= N1 || seen_l1[id]++) { fprintf(stderr, "cell %d twice\n", id); errors++; }
+        if (id >= 0 && id < N1) seen_lvl[id] = level;
+        if (id >= 0 && id < N1 && native_cell[id]) { fprintf(stderr, "cell %d drawn over the native window\n", id); errors++; }
+    }
+}
+
+static void combined(const s32 t[3], double m[16])
+{
+    double R[3][3];
+    for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++)
+        R[i][j] = gs(gte_state + 0x10 + 2 * (3 * i + j)) / 4096.0;
+    double A = ZF / (ZF - ZN), B = -ZN * ZF / (ZF - ZN);
+    for (int r = 0; r < 4; r++) {
+        double vx = r < 3 ? R[0][r] : t[0];
+        double vy = r < 3 ? R[1][r] : t[1];
+        double vz = r < 3 ? R[2][r] : t[2];
+        m[r * 4 + 0] = FOC * vx + CXP * vz;
+        m[r * 4 + 1] = FOC * vy + CYP * vz;
+        m[r * 4 + 2] = A * vz + (r == 3 ? B : 0.0);
+        m[r * 4 + 3] = vz;
+    }
+}
+
+/* the port's 0x10F28B0 + the hooked bend, checked against the planet */
+static double height_worst; static int height_checks, height_bad;
+static void transform_emu(u32 verts)
+{
+    s32 t[3] = { gi(gte_state + 0x22), gi(gte_state + 0x26), gi(gte_state + 0x2a) };
+    double m[16];
+    combined(t, m);
+    for (int i = 0; i < 16; i++) sf(G_COMBINED + 4 * i, (float)m[i]);
+    double pv[122][3];
+    for (int i = 0; i < 122; i++) {
+        float p[3] = { gs(verts + 8 * i), gs(verts + 8 * i + 2), gs(verts + 8 * i + 4) };
+        memcpy(mem + G_VERTS_F + 12 * i, p, 12);
+        for (int k = 0; k < 3; k++) pv[i][k] = p[k];
+    }
+    int busy = st.busy;
+    worldfar_bend(&st, g2h, callx);                  /* the hook */
+    /* BUILD 593: the game's ground height (0x76085F) from the bent vertices,
+       then worldfar_height: every vertex's height is its flat one again */
+    for (u32 i = 0; i < 122; i += 7) {
+        float b[3]; memcpy(b, mem + G_VERTS_F + 12 * i, 12);
+        u8 cx[0x40] = { 0 };
+        u32 esp = 0x00381000, pos = 0x00381100, out = 0x00381200;
+        for (int k = 0; k < 3; k++) { s16 w = gs(verts + 8 * i + 2 * k); memcpy(mem + pos + 2 * k, &w, 2); }
+        si(esp, 0); si(esp + 4, pos); si(esp + 8, out);
+        si(out, (s32)lrint(b[1]));
+        st32(cx, 1); st32(cx + 0x10, esp);
+        worldfar_height(&st, g2h, callx, cx);
+        double want = busy ? lrint(b[1]) : pv[i][1];
+        double e = fabs((double)gi(out) - want);
+        if (e > height_worst) height_worst = e;
+        height_checks++;
+        st32(cx, 0); si(out, 12345);                 /* eax 0: *out untouched */
+        worldfar_height(&st, g2h, callx, cx);
+        if (gi(out) != 12345) height_bad++;
+    }
+    if (busy) return;
+    for (u32 i = 0; i < 122; i++) {
+        double ax = cur_px + pv[i][0], az = cur_pz + pv[i][2];
+        double q[3] = { pv[i][0], pv[i][1] - (ax * ax + az * az) / (2.0 * RR), pv[i][2] };
+        double c[4];
+        for (int cc = 0; cc < 4; cc++) c[cc] = q[0] * m[cc] + q[1] * m[4 + cc] + q[2] * m[8 + cc] + m[12 + cc];
+        if (c[3] < 100) continue;
+        double sx0 = c[0] / c[3], sy0 = c[1] / c[3];
+        if (fabs(sx0 - CXP) > 1200 || fabs(sy0 - CYP) > 1200) continue;
+        float b[3]; memcpy(b, mem + G_VERTS_F + 12 * i, 12);
+        double d[4];
+        for (int cc = 0; cc < 4; cc++) d[cc] = b[0] * m[cc] + b[1] * m[4 + cc] + b[2] * m[8 + cc] + m[12 + cc];
+        double err = fmax(fabs(d[0] / d[3] - sx0), fabs(d[1] / d[3] - sy0));
+        if (err > bend_err) { bend_err = err; if (err > 0.2) fprintf(stderr, "bend err %.3f at %d\n", err, i); }
+        bend_n++;
+        if (fabs(d[2] / d[3] - c[2] / c[3]) > 1e-4 * (1.0 + fabs(c[2] / c[3]))) { fprintf(stderr, "depth moved\n"); errors++; }
+    }
+}
+
+static void reset_gte(void)
+{
+    memcpy(mem + gte_state + 0x10, mem + G_CAM_ROT, 18);
+    memcpy(mem + gte_state + 0x22, mem + 0xDE6A20 + 0x12, 12);
+}
+
+static u32 callx(u32 fn, u32 n, ...)
+{
+    va_list ap; va_start(ap, n);
+    u32 a[8] = {0};
+    for (u32 i = 0; i < n; i++) a[i] = va_arg(ap, u32);
+    va_end(ap);
+    switch (fn) {
+    case F_RESET_GTE: reset_gte(); return 0;
+    case F_APPLY: {
+        double v[3] = { gs(a[0]), gs(a[0] + 2), gs(a[0] + 4) };
+        for (int i = 0; i < 3; i++) {
+            double r = 0;
+            for (int j = 0; j < 3; j++) r += gs(gte_state + 0x10 + 2 * (3 * i + j)) / 4096.0 * v[j];
+            si(a[1] + 4 * i, (s32)r + gi(gte_state + 0x22 + 4 * i));
+        }
+        si(a[2], 0);
+        return 0;
+    }
+    case F_NAME: strcpy((char *)mem + 0xDE6A48, "rom:/ff7/workingdir/data/wm/WM0.MAP"); return 0xDE6A48;
+    case F_READ: {
+        const char *nm = (const char *)mem + a[0];
+        nreads++;
+        if (!strstr(nm, "WM0.FAR")) { fprintf(stderr, "bad name %s\n", nm); errors++; return 1; }
+        if (a[2] > FAR_IO_BYTES) { fprintf(stderr, "read of %u bytes\n", a[2]); errors++; return 1; }
+        fseek(farf, a[1], SEEK_SET);
+        if (fread(mem + a[3], 1, a[2], farf) != a[2]) return 1;
+        return 0;
+    }
+    case F_TRANSFORM: transform_emu(a[0]); return 0;
+    case F_DRAW_ENABLED: return 1;
+    case F_SKY_QUAD: sky_quad_calls++; if (a[0] != 0x00231000u) errors++; return 0;
+    case F_PLAYER_MODEL: return (u32)test_model;
+    case F_ALLOC_SHAPES: {
+        u32 obj = a[1];
+        if (a[0] == 0 || a[0] > 512) { fprintf(stderr, "alloc of %u shapes\n", a[0]); errors++; }
+        max_alloc = a[0] > (u32)max_alloc ? (int)a[0] : max_alloc;
+        u32 stride = gi(obj + 0x40) ? (u32)gi(obj + 0x40) : 0x60;
+        u32 rem = gi(obj + 0x50);
+        if (rem < a[0]) rem = 32 > a[0] ? 32 : a[0];
+        if (shape_cur + a[0] * stride + 0x2000 > SHAPE_END) return 0;
+        if (alloc_mode == 2)             /* a new chunk, elsewhere */
+            shape_cur += 0x1000;
+        alloc_mode = 0;
+        si(obj + 0x70, shape_cur);
+        si(obj + 0x40, stride);
+        si(obj + 0x50, rem - a[0]);
+        shape_cur += a[0] * stride;
+        nshapes += a[0];
+        nallocs++;
+        return 1;
+    }
+    }
+    fprintf(stderr, "unexpected call %x\n", fn); errors++;
+    return 0;
+}
+
+/* a game-like camera: model +y up, view y down the screen, looking down by
+   `pitch` along heading `yaw`, `dist` from the focus */
+static void set_camera(double yaw, double pitch, double dist, s32 fx, s32 fz)
+{
+    double f[3] = { sin(yaw) * cos(pitch), -sin(pitch), cos(yaw) * cos(pitch) };
+    double r[3] = { cos(yaw), 0, -sin(yaw) };
+    double d[3] = { r[1] * f[2] - r[2] * f[1], r[2] * f[0] - r[0] * f[2], r[0] * f[1] - r[1] * f[0] };
+    double *rows[3] = { r, d, f };
+    for (int i = 0; i < 3; i++) for (int j = 0; j < 3; j++) {
+        s16 q = (s16)lrint(rows[i][j] * 4096.0);
+        memcpy(mem + G_CAM_ROT + 2 * (3 * i + j), &q, 2);
+        Rf[i][j] = q / 4096.0;
+    }
+    T[0] = 0; T[1] = 0; T[2] = (s32)dist;
+    for (int i = 0; i < 3; i++) si(0xDE6A20 + 0x12 + 4 * i, T[i]);
+    si(G_CAM_DELTA_Y, 500);
+    si(G_PLAYER_POS, fx); si(G_PLAYER_POS + 4, 0); si(G_PLAYER_POS + 8, fz);
+}
+
+static void gte_for(double px, double py, double pz)
+{
+    double pos[3] = { px, py, pz };
+    for (int i = 0; i < 3; i++) {
+        double r = 0;
+        for (int j = 0; j < 3; j++) r += Rf[i][j] * pos[j];
+        si(gte_state + 0x22 + 4 * i, (s32)r + T[i]);
+    }
+    cur_px = px; cur_pz = pz;
+}
+
+#define FAKE_VERTS 0x00300000u
+static void fake_window(s32 fx, s32 fz, int skip_mask)
+{
+    memset(native_cell, 0, sizeof native_cell);
+    reset_gte();
+    int cx = fx >> 13, cz = fz >> 13, lx = fx & 0x1FFF, lz = fz & 0x1FFF;
+    int k = 0;
+    for (int dz = -2; dz <= 2; dz++) for (int dx = -2; dx <= 2; dx++, k++) {
+        if (skip_mask & (1 << k)) continue;
+        gte_for(dx * MESH - lx, -500.0, dz * MESH - lz);
+        transform_emu(FAKE_VERTS);
+        int mx = ((cx + dx) % MX + MX) % MX, mz = ((cz + dz) % MZ + MZ) % MZ;
+        native_cell[mz * MX + mx] = 1;
+    }
+    reset_gte();
+}
+
+static int run(double yaw, double pitch, double dist, s32 fx, s32 fz, int skip, int verbose)
+{
+    memset(seen_l1, 0, sizeof seen_l1);
+    memset(seen_l2, 0, sizeof seen_l2);
+    memset(seen_lvl, 0, sizeof seen_lvl);
+    int e0 = errors;
+    set_camera(yaw, pitch, dist, fx, fz);
+    fake_window(fx, fz, skip);
+    shape_cur = SHAPE_BASE; nshapes = 0; nallocs = 0;
+    for (int k = 0; k < 512; k++) si(0x00220000 + 0x100 * k + 0x50, 0);
+    worldfar_draw(&st, g2h, callx, 1.0f);
+    if (st.nnat) { fprintf(stderr, "native records not cleared\n"); errors++; }
+    if ((u32)nshapes != st.last_tris + st.sky_quads) { fprintf(stderr, "shapes %d tris %u sky %u\n", nshapes, st.last_tris, st.sky_quads); errors++; }
+    for (u32 q = SHAPE_BASE; q < shape_cur; q += 0x20) {
+        float f[8]; memcpy(f, mem + q, 32);
+        if (!(f[3] > 0) || !(f[2] < 1.0f) || f[0] != f[0] || f[1] != f[1]) { fprintf(stderr, "bad TL vertex %g %g %g %g\n", f[0], f[1], f[2], f[3]); errors++; break; }
+    }
+    int l1 = 0, l2 = 0, nfine = 0;
+    for (int k = 0; k < N1; k++) if (seen_l1[k]) { l1++; if (seen_lvl[k] == 2) nfine++; }
+    for (int k = 0; k < N2; k++) if (seen_l2[k]) l2++;
+    int cx = fx >> 13, cz = fz >> 13;
+    for (int s = 0; s < N2; s++) if (seen_l2[s]) {
+        int sx = s % SX, sz = s / SX;
+        for (int k = 0; k < 16; k++) {
+            int mx = sx * 4 + (k & 3), mz = sz * 4 + (k >> 2);
+            if (native_cell[mz * MX + mx] || seen_l1[mz * MX + mx]) { fprintf(stderr, "L2 %d overlaps mesh %d,%d\n", s, mx, mz); errors++; }
+        }
+    }
+    for (int mz = 0; mz < MZ; mz++) for (int mx = 0; mx < MX; mx++) {
+        double cxw = wrapi(mx * MESH + MESH / 2 - fx, WRAP_X);
+        double czw = wrapi(mz * MESH + MESH / 2 - fz, WRAP_Z);
+        if (sqrt(cxw * cxw + czw * czw) > 45000) continue;
+        double vz = T[2] + Rf[2][0] * cxw + Rf[2][1] * -500.0 + Rf[2][2] * czw;
+        double vx = T[0] + Rf[0][0] * cxw + Rf[0][1] * -500.0 + Rf[0][2] * czw;
+        if (vz < 12000 || fabs(vx) > vz) continue;
+        int s = (mz >> 2) * SX + (mx >> 2);
+        if (native_cell[mz * MX + mx] || seen_l1[mz * MX + mx] || seen_l2[s]) continue;
+        fprintf(stderr, "hole at mesh %d,%d (d %d,%d)\n", mx, mz, wrapi(mx - cx, MX), wrapi(mz - cz, MZ));
+        errors++;
+    }
+    if (verbose)
+        printf("yaw %.2f pitch %.2f dist %.0f focus %d,%d skip %x: cells %d (full %d) L2 %d tris %u allocs %d errors %d\n",
+               yaw, pitch, dist, fx, fz, skip, l1, nfine, l2, st.last_tris, nallocs, errors - e0);
+    return errors - e0;
+}
+
+/* the far tiles' projection against the window's (bend) for the same
+   points: the seam between the game's cells and ours */
+static void test_seam(void)
+{
+    double worst = 0;
+    srand(11);
+    for (int it = 0; it < 300; it++) {
+        double yaw = (rand() % 6283) / 1000.0, pitch = 0.2 + (rand() % 1100) / 1000.0;
+        double dist = 3000 + rand() % 60000;
+        set_camera(yaw, pitch, dist, 100000, 100000);
+        reset_gte();
+        Ctx x;
+        Cam cam;
+        Env env = { g2h, callx, &st };
+        camera(&env, world_base + FAR_OFF + FAR_SCRATCH, &cam);
+        x.v = &env; x.c = &cam; x.gte = gte_state;
+        if (!calibrate(&env, &x, world_base + FAR_OFF + FAR_IO, 5000)) { fprintf(stderr, "calibration failed\n"); errors++; continue; }
+        s32 px = (rand() % 13 - 6) * MESH - 1234, pz = (rand() % 13 - 6) * MESH - 777;
+        double mf[16];
+        tile_matrix(&x, px, pz, mf);
+        reset_gte();
+        gte_for(px, -500.0, pz);
+        double m[16];
+        s32 t[3] = { gi(gte_state + 0x22), gi(gte_state + 0x26), gi(gte_state + 0x2a) };
+        transform_emu(FAKE_VERTS);
+        st.nnat = 0;
+        combined(t, m);
+        for (int i = 0; i < 122; i++) {
+            float b[3]; memcpy(b, mem + G_VERTS_F + 12 * i, 12);
+            double d[4];
+            for (int cc = 0; cc < 4; cc++) d[cc] = b[0] * m[cc] + b[1] * m[4 + cc] + b[2] * m[8 + cc] + m[12 + cc];
+            if (d[3] < 200) continue;
+            double sxA = d[0] / d[3], syA = d[1] / d[3];
+            if (fabs(sxA - CXP) > 1500 || fabs(syA - CYP) > 1500) continue;
+            float p0 = gs(FAKE_VERTS + 8 * i), p1 = gs(FAKE_VERTS + 8 * i + 2), p2 = gs(FAKE_VERTS + 8 * i + 4);
+            float ax = px + p0, az = pz + p2;
+            p1 -= (ax * ax + az * az) * (0.5f / SPHERE_R);
+            float sxB, syB;
+            if (!proj(mf, p0, p1, p2, &sxB, &syB)) continue;
+            double e = fmax(fabs(sxA - sxB), fabs(syA - syB));
+            if (e > worst) worst = e;
+        }
+    }
+    reset_gte();
+    printf("seam: far tiles within %.3f px of the window\n", worst);
+    if (worst > 0.75) errors++;          /* one unit of GTE translation rounding at 1000 units */
+}
+
+static void test_sink(void)
+{
+    u8 ctx[0x40] = { 0 };
+    u32 esp = 0x00380000;
+    si(esp, 0xDEAD); si(esp + 4, 30000); si(esp + 8, -40000);
+    st32(ctx + 0x10, esp);
+    worldfar_sink(&st, g2h, callx, ctx, 0xF93C8C);
+    s32 eax = (s32)ld32(ctx);
+    s32 want = (s32)lrint((30000.0 * 30000 + 40000.0 * 40000) / (2 * RR));
+    printf("sink: (30000, -40000) drops %d (want %d)\n", eax, want);
+    st32(ctx + 0x10, esp);
+    worldfar_sink(&st, g2h, callx, ctx, 0xF65BC0);
+    if ((s32)ld32(ctx) != (s32)lrint(want / 4.0)) { fprintf(stderr, "track sink %d\n", (s32)ld32(ctx)); errors++; }
+    if (eax != want || ld32(ctx + 0x10) != esp + 4) errors++;
+}
+
+/* BUILD 591: the sky drawn by sky() on the planet's horizon */
+#define SKY_OBJ 0x00232000u
+#define MET_OBJ 0x00233000u
+static void sky_setup(void)
+{
+    memset(mem + SKY_OBJ, 0, 0x100); memset(mem + MET_OBJ, 0, 0x100);
+    si(SKY_OBJ + 0x40, 0x80); si(MET_OBJ + 0x40, 0x80);
+    sf(SKY_OBJ + 0x24, 1.0f / 256); sf(SKY_OBJ + 0x28, 1.0f / 64);
+    sf(MET_OBJ + 0x24, 1.0f / 256); sf(MET_OBJ + 0x28, 1.0f / 128);
+    si(G_SKY_DESC + 0x28, SKY_OBJ);
+    si(G_SKY_OBJ, SKY_OBJ); si(G_METEOR_OBJ, MET_OBJ);   /* the live ones */
+    mem[G_SKY_DESC + 0x0D] = 0; mem[G_SKY_DESC + 0x1D] = 0x3F;
+    si(G_SKY_DESC + 0x2C, (s32)0x807F7F7F);
+    si(G_METEOR_DESC + 0x28, MET_OBJ);
+    mem[G_METEOR_DESC + 0x0C] = 0; mem[G_METEOR_DESC + 0x14] = 0x8F;
+    mem[G_METEOR_DESC + 0x0D] = 0; mem[G_METEOR_DESC + 0x1D] = 0x3F;
+    si(G_METEOR_DESC + 0x2C, (s32)0x80FFFFFF);
+    s16 two = 2; memcpy(mem + G_SKY_SCALE, &two, 2);
+}
+
+/* the true horizon on screen at screen column sx: scan the sea (y = -r^2/2R
+   about the player) along that column for the highest point */
+static double true_horizon(double sx)
+{
+    /* eye in world, relative to the player (focus at y = 500, set_camera) */
+    double e[3];
+    for (int j = 0; j < 3; j++) e[j] = -(Rf[0][j] * T[0] + Rf[1][j] * T[1] + Rf[2][j] * T[2]);
+    e[1] += 500.0;
+    double best = 1e30;
+    /* the viewing ray for (sx, sy): d = R^T ((sx-CXP)/FOC, (sy-CYP)/FOC, 1) */
+    double lo = -4000, hi = 4000;
+    for (int it = 0; it < 60; it++) {          /* bisect on sy: hits the sea? */
+        double sy = 0.5 * (lo + hi);
+        double v[3] = { (sx - CXP) / FOC, (sy - CYP) / FOC, 1.0 }, d[3];
+        for (int j = 0; j < 3; j++) d[j] = Rf[0][j] * v[0] + Rf[1][j] * v[1] + Rf[2][j] * v[2];
+        /* y(t) = e1 + t d1 vs sea -(x^2+z^2)/2R: a quadratic in t */
+        double A = (d[0] * d[0] + d[2] * d[2]) / (2 * RR);
+        double B = d[1] + (e[0] * d[0] + e[2] * d[2]) / RR;
+        double C = e[1] + (e[0] * e[0] + e[2] * e[2]) / (2 * RR);
+        double disc = B * B - 4 * A * C;
+        int hit = disc >= 0 && (-B + sqrt(disc)) > 0;
+        if (hit) hi = sy; else lo = sy;
+        best = hi;
+    }
+    return best;
+}
+
+/* BUILD 598: what 0x75A921 leaves behind when the world map exits (into
+   fship_2 and every other field): the live sky objects and every texture
+   object below the count are freed and ZEROED, but the cloud and meteor
+   records keep their copies. Nothing may be allocated on, or written
+   through, any of those. */
+static void frame_only(void)
+{
+    memset(seen_l1, 0, sizeof seen_l1); memset(seen_l2, 0, sizeof seen_l2);
+    memset(seen_lvl, 0, sizeof seen_lvl);
+    set_camera(0.5, 0.2, 30000, 150000, 120000);
+    fake_window(150000, 120000, 0);
+    shape_cur = SHAPE_BASE;
+    worldfar_draw(&st, g2h, callx, 1.0f);
+}
+
+static void test_after_exit(void)
+{
+    sky_setup();
+    si(G_METEOR_ON, 1);
+    frame_only();
+    int live_tris = (int)st.last_tris, live_sky = (int)st.sky_quads;
+    static u32 obj_save[0x11A];
+    for (int k = 0; k < 0x11A; k++) { obj_save[k] = (u32)gi(G_TEX_OBJS + 4 * k); si(G_TEX_OBJS + 4 * k, 0); }
+    si(G_SKY_OBJ, 0); si(G_METEOR_OBJ, 0);
+    u8 sky_before[0x100], met_before[0x100];
+    memcpy(sky_before, mem + SKY_OBJ, 0x100); memcpy(met_before, mem + MET_OBJ, 0x100);
+    int a0 = nallocs;
+    frame_only();
+    int b1 = (nallocs != a0), b2 = memcmp(sky_before, mem + SKY_OBJ, 0x100) || memcmp(met_before, mem + MET_OBJ, 0x100);
+    int b3 = st.sky_quads != 0, b4 = st.last_tris != 0;
+    /* the next load, before 0x7543D3 refreshes the records: the copies are
+       not the live objects, so the sky waits */
+    for (int k = 0; k < 0x11A; k++) si(G_TEX_OBJS + 4 * k, obj_save[k]);
+    si(G_SKY_OBJ, SKY_OBJ + 0x40000); si(G_METEOR_OBJ, MET_OBJ + 0x40000);
+    frame_only();
+    int b5 = st.sky_quads != 0 || memcmp(sky_before, mem + SKY_OBJ, 0x100);
+    int b6 = st.last_tris == 0;
+    /* no texture count, no texture objects looked up */
+    si(G_TEX_COUNT, 0);
+    frame_only();
+    int b7 = st.last_tris != 0;
+    si(G_TEX_COUNT, 0x11A);
+    sky_setup();
+    frame_only();
+    int b8 = !st.sky_quads || !st.last_tris;
+    int bad = b1 | b2 | b3 | b4 | b5 | b6 | b7 | b8;
+    printf("after the world exit: nothing allocated on or written through freed objects "
+           "(live frame %d tris %d sky quads): %s\n", live_tris, live_sky, bad ? "NO" : "yes");
+    if (bad) { fprintf(stderr, "after exit: %d%d%d%d%d%d%d%d\n", b1, b2, b3, b4, b5, b6, b7, b8); errors++; }
+}
+
+static void test_sky(void)
+{
+    sky_setup();
+    si(G_METEOR_ON, 1);
+    int worst_i = 0;
+    double worst = 0;
+    int cases = 0, bad_u = 0, quads = 0;
+    for (int c = 0; c < 6; c++) {
+        double yaw = c == 0 ? M_PI : 0.4 + c, pitch = 0.05 + 0.1 * c, dist = 4000 + 7000 * c;
+        run(yaw, pitch, dist, 150000, 120000, 0, 0);
+        if (st.sky_frame != st.frames || !st.sky_quads) { fprintf(stderr, "no sky (case %d)\n", c); errors++; continue; }
+        quads += st.sky_quads;
+        u32 vp = gi(SKY_OBJ + 0x70);
+        (void)vp;
+        /* every cloud quad: foot 8*S below the true horizon, width one column of u */
+        for (u32 q = SHAPE_BASE; q < shape_cur; q += 0x20) {
+            float f[8]; memcpy(f, mem + q, 32);
+            if (f[3] != SKY_RHW) continue;
+            /* a quad: 4 vertices from here */
+            float a[4][8];
+            for (int k = 0; k < 4; k++) memcpy(a[k], mem + q + 0x20 * k, 32);
+            q += 0x60;
+            if (a[0][7] == 0.0f && a[2][7] > 0.9f && fabsf(a[0][6] - a[1][6]) < 0.2f) {   /* cloud */
+                float du = fabsf(a[1][6] - a[0][6]) * 256.0f;
+                if (fabsf(du - 256.0f / (SKY_GRID / SKY_TILES)) > 0.01f) bad_u++;
+                for (int k = 2; k < 4; k++) {
+                    if (a[k][0] < 0 || a[k][0] > 640) continue;
+                    double want = true_horizon(a[k][0]) + 16.0;
+                    double e = fabs(a[k][1] - want);
+                    if (e > worst) { worst = e; worst_i = c; }
+                }
+            } else if (a[0][6] == 0.0f && fabsf(a[1][6] - 0x8F / 256.0f) < 1e-5f) {   /* meteor */
+                float xm = 0.5f * (a[0][0] + a[1][0]);
+                printf("meteor: case %d centre x %.1f (width %.0f), foot %.1f vs horizon %.1f\n",
+                       c, xm, a[1][0] - a[0][0], a[2][1], true_horizon(xm) + 4.0);
+                if (c == 0 && fabsf(xm - (float)CXP) > 1.0f) errors++;
+                if (fabs(a[2][1] - (true_horizon(xm) + 4.0)) > 1.5) errors++;
+            }
+        }
+        cases++;
+    }
+    printf("sky: %d views, %d quads, cloud foot within %.2f px of the true horizon (case %d), %d bad columns\n",
+           cases, quads, worst, worst_i, bad_u);
+    if (worst > 1.5 || bad_u) errors++;
+    /* the band is fixed to the world: turn a little, the same column keeps its u */
+    si(G_METEOR_ON, 0);
+    /* the stock quad routine is replaced: it pops its return address only */
+    u8 ctx[0x40] = { 0 };
+    u32 esp = 0x00380000;
+    st32(ctx + 0x10, esp);
+    int n0 = nshapes;
+    worldfar_sky(&st, g2h, callx, ctx);
+    if (ld32(ctx + 0x10) != esp + 4 || nshapes != n0) { fprintf(stderr, "stock sky stub\n"); errors++; }
+    /* on the other world maps the stock routine still runs */
+    si(esp + 4, 0x00231000); st32(ctx + 0x10, esp);
+    si(G_MAP_TYPE, 3);
+    worldfar_sky(&st, g2h, callx, ctx);
+    si(G_MAP_TYPE, 0);
+    printf("sky stub: overworld draws nothing, snowstorm calls the stock quad %d time(s)\n", sky_quad_calls);
+    if (sky_quad_calls != 1 || ld32(ctx + 0x10) != esp + 4) errors++;
+}
+
+/* BUILD 591: the story variants */
+static void test_variants(void)
+{
+    int bad = 0;
+    /* progress 0: every cell is its own; the crater sector (50) after */
+    for (int p = 0; p < 6; p++)
+        for (int s = 0; s < N2B; s++) {
+            int a = alt_of(s, p);
+            int want = -1;
+            if (s == 50 && p > 0) want = 0;
+            if (s == 41 && p > 1) want = 1;
+            if (s == 42 && p > 1) want = 2;
+            if (s == 60 && p > 2) want = 3;
+            if (s == 47 && p > 3) want = 4;
+            if (s == 48 && p > 3) want = 5;
+            if (a != want) bad++;
+        }
+    /* the variant tiles are in the file and differ from the base ones */
+    int differ = 0;
+    for (int a = 0; a < NALT; a++) {
+        int bs = a == 0 ? 50 : a == 1 ? 41 : a == 2 ? 42 : a == 3 ? 60 : a == 4 ? 47 : 48;
+        int mx = (bs % SX) * 4, mz = (bs / SX) * 4;
+        if (l1_index(mx, mz, 0) != mz * MX + mx || l1_index(mx, mz, 9) != N1B + 16 * a) bad++;
+        if (l2_index(bs, 9) != N1 + N2B + a || l2_index(bs, 0) != N1 + bs) bad++;
+        const u8 *r0 = st.data + st.refs + 8u * (u32)(mz * MX + mx);
+        const u8 *r1 = st.data + st.refs + 8u * (u32)(N1B + 16 * a);
+        if (ld32(r0) != ld32(r1)) differ++;
+    }
+    printf("variants: %d mapping errors, %d of %d replacement sectors carried\n", bad, differ, NALT);
+    if (bad || differ != NALT) errors++;
+    /* drawing with every variant on */
+    si(G_PROGRESS, 9);
+    int e0 = errors;
+    for (int i = 0; i < 20; i++) run(0.3 * i, 0.4, 20000, (i * 37000) % WRAP_X, (i * 23000) % WRAP_Z, 0, 0);
+    si(G_PROGRESS, 0);
+    printf("variants: 20 views with every replacement on, %d errors\n", errors - e0);
+}
+
+int main(int argc, char **argv)
+{
+    if (argc < 2) return 3;
+    mem = calloc(1, GMEM);
+    farf = fopen(argv[1], "rb");
+    if (!farf) return 3;
+    si(G_WORLD_BASE, world_base);
+    si(G_GTE, gte_state);
+    si(G_ONSET, 5000);
+    si(G_MAP_TYPE, 0);
+    si(G_MOVE_MULT, 2);
+    si(G_LIGHT, 0x00200000);
+    { float L[12] = { 0.2f, -0.6f, 0.1f, 0.3f,  0.1f, -0.7f, 0, 0.3f,  0, -0.8f, 0.1f, 0.3f };
+      memcpy(mem + 0x00200000 + 0xF8, L, 48); }
+    si(G_TEX_ORIGIN, 0x00210000);
+    for (int k = 0; k < 512; k++) si(G_TEX_OBJS + 4 * k, 0x00220000 + 0x100 * k);
+    si(G_TEX_COUNT, 0x11A);                  /* wm0's 282 texture objects */
+    for (int k = 0; k < 512; k++) { float s = 1.0f / 32; memcpy(mem + 0x00220000 + 0x100 * k + 0x24, &s, 4); memcpy(mem + 0x00220000 + 0x100 * k + 0x28, &s, 4); }
+    si(G_VIEW_X, 0); si(G_VIEW_Y, 0); si(G_VIEW_W, 640); si(G_VIEW_H, 480);
+    srand(3);
+    for (int i = 0; i < 122; i++) {
+        s16 v[4] = { (s16)(rand() % 8193), (s16)(rand() % 3000), (s16)(rand() % 8193), 0 };
+        memcpy(mem + FAKE_VERTS + 8 * i, v, 8);
+    }
+    worldfar_draw(&st, g2h, callx, 1.0f);
+    if (st.last_tris) { fprintf(stderr, "terrain drawn without data\n"); errors++; }   /* the sky may be */
+    worldfar_alloc(&st, g2h, callx);
+    if (st.magic != 0x52414657u) { fprintf(stderr, "load failed\n"); return 1; }
+    int load_reads = nreads;
+    worldfar_alloc(&st, g2h, callx);            /* a second world visit */
+    if (nreads != load_reads) { fprintf(stderr, "loaded twice\n"); errors++; }
+    printf("load: %d reads of wm0.far, once\n", load_reads);
+    test_seam();
+    test_sink();
+    int bad = 0;
+    srand(1);
+    for (int i = 0; i < 300; i++) {
+        double yaw = (rand() % 6283) / 1000.0;
+        double pitch = 0.3 + (rand() % 900) / 1000.0;
+        double dist = 3000 + rand() % 32000;
+        s32 fx = rand() % WRAP_X, fz = rand() % WRAP_Z;
+        int skip = (i % 3 == 0) ? (rand() & 0x1FFFFFF) : 0;
+        for (int f = 0; f < 3; f++) bad += run(yaw, pitch, dist, fx, fz, skip, i < 4 && f == 2);
+    }
+    {
+        int fine = 0;
+        for (int f = 0; f < 40; f++) run(0.5, 0.9, 9000, 150000, 120000, 0, 0);
+        for (int k = 0; k < N1; k++) if (seen_l1[k] && seen_lvl[k] == 2) fine++;
+        printf("after 40 frames: %d cells at full detail, %u meshes decoded, %u failed\n", fine, st.loads, st.load_fail);
+        if (st.load_fail) errors++;
+        if (fine < 10) { fprintf(stderr, "the cache never filled the ring\n"); errors++; }
+    }
+    if (nreads != load_reads) { fprintf(stderr, "a file was read while drawing\n"); errors++; }
+    printf("bend: %.0f vertices, worst %.4f px from the planet\n", bend_n, bend_err);
+    if (bend_err > 0.25) { errors++; bad++; }
+    if (st.calib_bad) { fprintf(stderr, "calibration failed %u times\n", st.calib_bad); errors++; }
+    test_sky();
+    test_after_exit();
+    test_variants();
+
+    /* controls */
+    {
+        static u8 obj[0x100], l3[0x100], l2[0x100], l1[0x100], holder[16];
+        u8 *pl1 = l1, *pl2 = l2, *pl3 = l3, *pobj = obj;
+        memcpy(holder + 0, &pl1, 8);
+        memcpy(l1 + 8, &pl2, 8);
+        memcpy(l2 + 0, &pl3, 8);
+        memcpy(l3 + 0x88, &pobj, 8);
+        u8 *hp = holder;
+        u8 **got = &hp;
+        float one = 1.0f, zero = 0.0f;
+        #define RSTICK(u, d, r, l) do { float _u = u, _d = d, _r = r, _l = l; \
+            memcpy(obj + 0x40, &_u, 4); memcpy(obj + 0x44, &_d, 4); \
+            memcpy(obj + 0x48, &_r, 4); memcpy(obj + 0x4C, &_l, 4); } while (0)
+        #define LSTICK(u, d, r, l) do { float _u = u, _d = d, _r = r, _l = l; \
+            memcpy(obj + 0x30, &_u, 4); memcpy(obj + 0x34, &_d, 4); \
+            memcpy(obj + 0x38, &_r, 4); memcpy(obj + 0x3C, &_l, 4); } while (0)
+        #define BUTTONS(b) do { unsigned long long _b = (b); memcpy(obj + 0x20, &_b, 8); } while (0)
+        st.zoom = 0; st.tilt = 0;
+        RSTICK(zero, zero, zero, zero); LSTICK(zero, zero, zero, zero);
+        BUTTONS(BTN_ZL);
+        for (int f = 0; f < 400; f++) { set_camera(0.3, 0.9, 4000, 100000, 100000); worldfar_camera(&st, g2h, callx, got); }
+        s32 z = gi(0xDE6A20 + 0x12 + 8);
+        printf("ZL: camera distance %d\n", z);
+        if (z != 35000) errors++;
+        BUTTONS(BTN_ZR);
+        for (int f = 0; f < 400; f++) { set_camera(0.3, 0.9, 4000, 100000, 100000); worldfar_camera(&st, g2h, callx, got); }
+        z = gi(0xDE6A20 + 0x12 + 8);
+        printf("ZR: camera distance %d\n", z);
+        if (z != 4000) errors++;
+        BUTTONS(0);
+        set_camera(0.3, 1.52, 7000, 100000, 100000);
+        u8 before[18]; memcpy(before, mem + G_CAM_ROT, 18);
+        worldfar_camera(&st, g2h, callx, got);
+        if (memcmp(before, mem + G_CAM_ROT, 18)) { fprintf(stderr, "camera changed with no input\n"); errors++; }
+        set_camera(0.3, 0.9, 7000, 100000, 100000);
+        double el0 = asin(fabs(gs(G_CAM_ROT + 2 * 7) / 4096.0)) * 57.29578;
+        RSTICK(one, zero, zero, zero);
+        for (int f = 0; f < 400; f++) { set_camera(0.3, 0.9, 7000, 100000, 100000); worldfar_camera(&st, g2h, callx, got); }
+        double el1 = asin(fabs(gs(G_CAM_ROT + 2 * 7) / 4096.0)) * 57.29578;
+        RSTICK(zero, one, zero, zero);
+        for (int f = 0; f < 400; f++) { set_camera(0.3, 0.9, 7000, 100000, 100000); worldfar_camera(&st, g2h, callx, got); }
+        double el2 = asin(fabs(gs(G_CAM_ROT + 2 * 7) / 4096.0)) * 57.29578;
+        printf("tilt: game %.1f deg, stick up %.1f, stick down %.1f\n", el0, el1, el2);
+        if (fabs(el1 - 5.0) > 0.3 || fabs(el2 - 85.0) > 0.3) errors++;
+        /* BUILD 591: holding R3 no longer resets anything by itself; a new
+           R3 press (worldfar_input) resets zoom and tilt once */
+        BUTTONS(BTN_R3); RSTICK(zero, zero, zero, zero);
+        set_camera(0.3, 0.9, 7000, 100000, 100000);
+        float t0 = st.tilt;
+        worldfar_camera(&st, g2h, callx, got);
+        if (st.tilt != t0) { fprintf(stderr, "held R3 reset the camera\n"); errors++; }
+        st.r3_click = 1; st.zoom = 5000;
+        worldfar_camera(&st, g2h, callx, got);
+        if (st.tilt != 0 || st.zoom != 0 || st.r3_click) { fprintf(stderr, "R3 click did not reset\n"); errors++; }
+        BUTTONS(0);
+
+        /* 360-degree movement: the stock UP+RIGHT move (45, -45) with the
+           stick up-right becomes 60 along the camera's up-right */
+        si(G_CONTROL, 1); si(G_VIEW_TYPE, 0); si(G_MAP_TYPE, 0);
+        set_camera(0.7, 0.9, 7000, 100000, 100000);
+        u32 ent = 0x00240000; si(G_ENTITY, ent);
+        si(G_CAM_FRONT, 1000); si(G_CAM_ROTY, 1000);
+        float c = 0.70710678f;
+        LSTICK(c, zero, c, zero);
+        worldfar_input(&st, g2h, callx, got, 0);
+        u8 ctx[0x40] = { 0 };
+        u32 esp = 0x00380000;
+        si(esp + 4, 45); si(esp + 8, -45);
+        st32(ctx + 0x10, esp);
+        worldfar_move(&st, g2h, callx, ctx, 0);
+        double wx = (Rf[0][0] + Rf[2][0] / hypot(Rf[2][0], Rf[2][2])), wz = (Rf[0][2] + Rf[2][2] / hypot(Rf[2][0], Rf[2][2]));
+        double wl = hypot(wx, wz);
+        s32 mx_ = gi(esp + 4), mz_ = gi(esp + 8);
+        printf("move: (%d, %d), want (%.0f, %.0f)\n", mx_, mz_, 60 * wx / wl, 60 * wz / wl);
+        if (fabs(mx_ - 60 * wx / wl) > 1.5 || fabs(mz_ - 60 * wz / wl) > 1.5) errors++;
+        si(G_KEYS, 0x1000 | 0x2000);             /* the stick made UP+RIGHT */
+        si(G_CAM_FRONT, 1016);                   /* and the stock turned 16 */
+        worldfar_input(&st, g2h, callx, got, 1);
+        s32 fr = gi(G_CAM_FRONT);
+        s16 face = gs(ent + 0x40);
+        double wantf = atan2(wx, wz) * 2048.0 / M_PI;
+        s32 wantfr = 1016;
+        printf("follow: heading 1000 -> %d (want %d), facing %d (want %.0f)\n", fr, wantfr, face, wantf);
+        if (fr != wantfr || fabs(face - wantf) > 3) errors++;
+        /* (stick, keys, what the stock did, want) */
+        struct { float u, d, r, l; u32 keys; s32 stock, want; int model; const char *what; } T[] = {
+            { 0, 0, 1, 0, 0x2000, 1032, 1032, 0, "stick right = holding right" },
+            { 0, 0, 0, 1, 0x8000,  968,  968, 0, "stick left = holding left" },
+            { 0, 0, 0, .6f, 0x8000, 968, 981, 0, "stick part left turns less" },
+            { 1, 0, 0, 0, 0x1000, 1000, 1000, 0, "stick up: no turn" },
+            { 1, 0, 0, 0, 0x1004,  984,  984, 0, "L1 still turns" },
+            { 1, 0, 0, 0, 0x1008, 1016, 1016, 2, "R1 still turns (Cid)" },
+            { 0, .70710678f, .70710678f, 0, 0x6000, 984, 1005, 0, "down-right eases, no whip" },
+            { 0, 1, 0, 0, 0x4000, 1000, 1000, 0, "stick down: no turn" },
+            { 0, 0, 1, 0, 0x2000, 1005, 1005, 0, "an unexplained change is kept" },
+            { 0, 0, 1, 0, 0x2000, 1032, 1032, 6, "buggy: stock" },
+            { 0, 0, 1, 0, 0x2000, 1032, 1032, 19, "chocobo: follows" },
+        };
+        for (unsigned t = 0; t < sizeof T / sizeof T[0]; t++) {
+            test_model = T[t].model;
+            LSTICK(T[t].u, T[t].d, T[t].r, T[t].l);
+            si(G_CAM_FRONT, 1000); si(G_CAM_ROTY, 1000);
+            worldfar_input(&st, g2h, callx, got, 0);
+            si(G_KEYS, (s32)T[t].keys);
+            si(G_CAM_FRONT, T[t].stock);
+            worldfar_input(&st, g2h, callx, got, 1);
+            if (gi(G_CAM_FRONT) != T[t].want) {
+                fprintf(stderr, "%s: %d, want %d\n", T[t].what, gi(G_CAM_FRONT), T[t].want); errors++;
+            }
+        }
+        test_model = 0;
+        printf("turns: %u stick/key cases checked\n", (unsigned)(sizeof T / sizeof T[0]));
+        /* the buggy moves as stock */
+        test_model = 6; LSTICK(zero, zero, one, zero);
+        si(esp + 4, 0); si(esp + 8, 45);
+        worldfar_move(&st, g2h, callx, ctx, 0);
+        if (gi(esp + 4) != 0 || gi(esp + 8) != 45) { fprintf(stderr, "buggy move changed\n"); errors++; }
+        test_model = 0;
+        si(G_KEYS, 0);
+        LSTICK(one, zero, zero, zero);
+        si(G_CAM_FRONT, 1000);
+        worldfar_input(&st, g2h, callx, got, 0);
+        worldfar_input(&st, g2h, callx, got, 1);
+        if (gi(G_CAM_FRONT) != 1000) { fprintf(stderr, "followed while running straight\n"); errors++; }
+        /* the d-pad alone: the stock turn stands */
+        LSTICK(zero, zero, zero, zero);
+        si(G_CAM_FRONT, 1000);
+        worldfar_input(&st, g2h, callx, got, 0);
+        si(G_KEYS, 0x2000); si(G_CAM_FRONT, 1032);
+        worldfar_input(&st, g2h, callx, got, 1);
+        if (gi(G_CAM_FRONT) != 1032) { fprintf(stderr, "d-pad turn undone\n"); errors++; }
+        si(G_KEYS, 0);
+        LSTICK(zero, zero, zero, zero);
+        si(esp + 4, 60); si(esp + 8, 0);
+        worldfar_move(&st, g2h, callx, ctx, 0);
+        if (gi(esp + 4) != 60 || gi(esp + 8) != 0) { fprintf(stderr, "d-pad move changed\n"); errors++; }
+        si(G_VIEW_TYPE, 3);
+        si(G_CAM_FRONT, 1000);
+        worldfar_input(&st, g2h, callx, got, 0);
+        si(G_CAM_FRONT, 1032);
+        worldfar_input(&st, g2h, callx, got, 1);
+        if (gi(G_CAM_FRONT) != 1032) { fprintf(stderr, "Highwind turn undone\n"); errors++; }
+        si(esp + 4, 60); si(esp + 8, 0); LSTICK(one, zero, zero, zero);
+        worldfar_move(&st, g2h, callx, ctx, 0);
+        if (gi(esp + 4) != 60) { fprintf(stderr, "Highwind move changed\n"); errors++; }
+        si(G_VIEW_TYPE, 0); LSTICK(zero, zero, zero, zero);
+        RSTICK(zero, zero, one, zero);
+        si(G_CAM_FRONT, 1000);
+        worldfar_input(&st, g2h, callx, got, 0);
+        worldfar_input(&st, g2h, callx, got, 1);
+        printf("yaw: right stick turns %d units per step\n", gi(G_CAM_FRONT) - 1000);
+        if (gi(G_CAM_FRONT) - 1000 != 22) errors++;
+        /* R3 (bit 62 with no-cheats, bit 5 without): a new press is the
+           stock L2 (view toggle) for exactly one update, and resets the
+           camera (behind him when the view is the normal one) */
+        RSTICK(zero, zero, zero, zero);
+        for (int b = 0; b < 2; b++) {
+            BUTTONS(0);
+            worldfar_input(&st, g2h, callx, got, 0);
+            worldfar_input(&st, g2h, callx, got, 1);
+            st.r3_click = 0;
+            u16 f968 = 968; memcpy(mem + ent + 0x40, &f968, 2);
+            int ok = 1;
+            for (int f = 0; f < 4; f++) {          /* press, then held 3 updates */
+                BUTTONS(b ? (1ull << 62) : (1ull << 5));
+                si(G_KEYS, 0x0010);
+                si(G_CAM_FRONT, 300);
+                si(G_VIEW_TYPE, 0);
+                worldfar_input(&st, g2h, callx, got, 0);
+                u32 during = (u32)gi(G_KEYS);
+                worldfar_input(&st, g2h, callx, got, 1);
+                u32 after = (u32)gi(G_KEYS);
+                int want_l2 = f == 0;
+                if (((during & 1) != 0) != want_l2 || after != 0x0010) ok = 0;
+                if (f == 0 && (gi(G_CAM_FRONT) != 1080 || !st.r3_click)) ok = 0;
+                if (f > 0 && gi(G_CAM_FRONT) != 300) ok = 0;
+                st.r3_click = 0;
+            }
+            printf("R3 (bit %d): one L2 press per click, heading 1080 on the click: %s\n", b ? 62 : 5, ok ? "yes" : "NO");
+            if (!ok) errors++;
+        }
+        /* a click that enters the fixed view leaves its heading alone */
+        BUTTONS(0);
+        worldfar_input(&st, g2h, callx, got, 0);
+        worldfar_input(&st, g2h, callx, got, 1);
+        BUTTONS(1ull << 5);
+        si(G_CAM_FRONT, 300);
+        worldfar_input(&st, g2h, callx, got, 0);
+        si(G_VIEW_TYPE, 2);                         /* the game toggled */
+        worldfar_input(&st, g2h, callx, got, 1);
+        if (gi(G_CAM_FRONT) != 300) { fprintf(stderr, "R3 turned the fixed view\n"); errors++; }
+        si(G_VIEW_TYPE, 0); st.r3_click = 0;
+        BUTTONS(0); si(G_KEYS, 0);
+        si(G_CONTROL, 0);
+        si(G_CAM_FRONT, 1000);
+        worldfar_input(&st, g2h, callx, got, 0);
+        si(G_CAM_FRONT, 1032);
+        worldfar_input(&st, g2h, callx, got, 1);
+        if (gi(G_CAM_FRONT) != 1032) { fprintf(stderr, "turned without control\n"); errors++; }
+    }
+    printf("height: %d ground queries on bent meshes, worst %.2f from the flat height, %d touched without a hit\n",
+           height_checks, height_worst, height_bad);
+    if (!height_checks || height_worst > 1.01 || height_bad) errors++;
+    printf("horizon: %ld of %ld visible L2 tiles drawn, %d frames short\n", l2_drawn, l2_wanted, l2_short_frames);
+    if (l2_drawn != l2_wanted) errors++;
+    printf("wrap: %d wrapped sector copies drawn, all past the nearest copy\n", wrap_copies);
+    if (!wrap_copies) errors++;
+    printf("state %zu zoom %zu tilt %zu\n", sizeof(State), __builtin_offsetof(State, zoom), __builtin_offsetof(State, tilt));
+    printf("frames %u, total errors %d\n", st.frames, errors);
+    return errors ? 1 : 0;
+}

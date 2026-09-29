@@ -1,0 +1,326 @@
+/*
+ * leakprobe.c -- what grows across fship <-> world-map trips. DIAGNOSTIC.
+ *
+ * The fship speckles appear only after SEVERAL trips in and out (and the
+ * graphics-pool notes of build 191 saw the same: corruption "after enough
+ * churn", sooner with a bigger pool). texprobe proved every texture's data,
+ * id and object correct at load, so this probe measures accumulation instead.
+ *
+ * One hook: native gfx_drv_flip (+0x10DA880), every frame.
+ *   * visits: a run of frames with the same key = (driver mode << 16) |
+ *     field id. For each visit it keeps, over the visit:
+ *       - live texture objects in the texture manager (table of 1024 at
+ *         *(module+0x12CF4F0)): at the start, at the end, and the peak
+ *       - the manager's parked (recycled) objects, +0x2080
+ *       - the guest heap (HeapCreate's pool at guest 0x02000000): free
+ *         bytes (minimum and at the end), the largest free block, and the
+ *         number of free blocks, walked off the free list every 32 frames
+ *   * R3 click outside the world map: the last 16 visits go into the crash
+ *     report (stack dump 0..7, TLS dump 8..15) and svcBreak.
+ *
+ * Built like texprobe.c: position independent, no data/bss sections.
+ */
+#include <stdint.h>
+typedef uint8_t u8; typedef uint16_t u16; typedef uint32_t u32;
+typedef uint64_t u64; typedef int32_t s32; typedef int16_t s16;
+typedef u8 *(*g2h_fn)(u32 guest);
+typedef u32 (*glerr_fn)(void);
+
+#define G_FIELD_ID  0xCFF468u
+#define G_PLAYER_ENT 0xE3A7D0u
+#define G_VIEW_TYPE 0xDFC4B4u
+#define HEAP_DESC   0x02000000u   /* +0 total, +4 remains, +8 free list */
+#define BLK_HDR     0x34u         /* list points at payload; header before */
+#define BLK_SIZE    0x14u
+#define BLK_NEXT    0x1Cu
+#define BLK_USED    0x20u
+#define MGR_NTEX    1024u
+#define MGR_PARKED  0x2080u
+#define DRIVER_WORLD 4u
+#define BTN_R3      ((1ull << 5) | (1ull << 62))
+#define MAGIC       0x324B454Cu   /* 'LEK2' */
+#define GL_OOM      0x0505u
+#define NV          16
+#define SAMPLE      32u
+
+typedef struct {                  /* 32 bytes, also the dump format */
+    u32 key;                      /* mode << 16 | field */
+    u32 frames;
+    u16 tex_start, tex_end, tex_peak, parked;
+    u16 nerr;                     /* GL errors read this visit (v2, saturating) */
+    u16 noom;                     /* ... of them GL_OUT_OF_MEMORY */
+    u16 first, last;              /* the first and last error code */
+    u32 free_end;                 /* guest heap bytes free at the end */
+    u16 seq;                      /* visit number */
+    u16 errframes;                /* frames with any GL error */
+} V;
+_Static_assert(sizeof(V) == 32, "V is the 32-byte dump record");
+
+typedef struct {                  /* v2: the Highwind across world visits */
+    s32 y_first, y_hw, y_last;    /* player entity y: first frame, first Highwind-view frame, last */
+    u32 view_first, view_last;
+    u32 hw_frame;                 /* frame of the first Highwind-view frame, 0 = none */
+    s32 x_first, z_first, x_last, z_last;
+} W;
+
+typedef struct {
+    u32 magic, key, seq, r3_prev;
+    u32 n;                        /* visits kept (ring) */
+    u32 head;                     /* next slot */
+    u32 total_err, total_oom;
+    V cur;
+    V ring[NV];
+    W wcur, hist[2];              /* hist[1] the last finished world visit */
+} State;
+
+static u32 rd32(g2h_fn g2h, u32 g)
+{
+    if (!g) return 0;
+    if ((g & 0xFFFu) <= 0xFFCu) {
+        const u8 *p = g2h(g);
+        if (!p) return 0;
+        return (u32)p[0] | ((u32)p[1] << 8) | ((u32)p[2] << 16) | ((u32)p[3] << 24);
+    }
+    u32 v = 0;
+    for (int i = 0; i < 4; i++) { const u8 *p = g2h(g + i); v |= (u32)(p ? *p : 0) << (8 * i); }
+    return v;
+}
+
+static u32 mode_of(u32 *mode_slot)
+{
+    if (!mode_slot) return 0;
+    u32 *m = *(u32 **)(void *)mode_slot;
+    return m ? *m : 0;
+}
+
+static void textures(u64 **rvar, u32 *live, u32 *parked)
+{
+    *live = 0; *parked = 0;
+    u64 *mgr = rvar ? *rvar : 0;
+    if (!mgr) return;
+    for (u32 i = 0; i < MGR_NTEX; i++) *live += mgr[i] != 0;
+    *parked = (u32)*(u64 *)(void *)((u8 *)mgr + MGR_PARKED);
+}
+
+/* free bytes, largest free block, free blocks: the HeapAlloc free list */
+static void heap(g2h_fn g2h, u32 *freeb, u32 *largest, u32 *nfree)
+{
+    *freeb = 0; *largest = 0; *nfree = 0;
+    u32 p = rd32(g2h, HEAP_DESC + 8);
+    for (u32 guard = 0; p && guard < 200000; guard++) {
+        u32 h = p - BLK_HDR;
+        u32 size = rd32(g2h, h + BLK_SIZE);
+        if (!rd32(g2h, h + BLK_USED)) {
+            *freeb += size;
+            if (size > *largest) *largest = size;
+            (*nfree)++;
+        }
+        u32 nx = rd32(g2h, h + BLK_NEXT);
+        if (nx == p) break;
+        p = nx;
+    }
+}
+
+static void sample(State *st, g2h_fn g2h, u64 **rvar, int end)
+{
+    u32 live, parked;
+    textures(rvar, &live, &parked);
+    if (live > st->cur.tex_peak) st->cur.tex_peak = (u16)live;
+    st->cur.tex_end = (u16)live;
+    st->cur.parked = (u16)parked;
+    u32 fb, lg, nf;
+    heap(g2h, &fb, &lg, &nf);
+    st->cur.free_end = fb;
+    (void)lg; (void)nf; (void)end;
+}
+
+static void begin(State *st, g2h_fn g2h, u64 **rvar, u32 key)
+{
+    u32 *z = (u32 *)(void *)&st->cur;
+    for (u32 i = 0; i < sizeof(V) / 4; i++) z[i] = 0;
+    st->cur.key = key;
+    st->cur.seq = (u16)++st->seq;
+    if ((key >> 16) == 4) {
+        u32 *z2 = (u32 *)(void *)&st->wcur;
+        for (u32 i = 0; i < sizeof(W) / 4; i++) z2[i] = 0;
+    }
+    u32 live, parked;
+    textures(rvar, &live, &parked);
+    st->cur.tex_start = (u16)live;
+    sample(st, g2h, rvar, 0);
+}
+
+static void copyv(V *d, const V *s)
+{
+    u32 *dd = (u32 *)(void *)d;
+    const u32 *ss = (const u32 *)(const void *)s;
+    for (u32 i = 0; i < sizeof(V) / 4; i++) dd[i] = ss[i];
+}
+
+static void world_frame(State *st, g2h_fn g2h)
+{
+    u32 ent = rd32(g2h, G_PLAYER_ENT);
+    if (!ent) return;
+    s32 x = (s32)rd32(g2h, ent + 0xC), y = (s32)rd32(g2h, ent + 0x10);
+    s32 z = (s32)rd32(g2h, ent + 0x14);
+    u32 view = rd32(g2h, G_VIEW_TYPE);
+    W *w = &st->wcur;
+    if (st->cur.frames == 1) { w->y_first = y; w->view_first = view; w->x_first = x; w->z_first = z; }
+    if (view == 3 && !w->hw_frame) { w->hw_frame = st->cur.frames; w->y_hw = y; }
+    w->y_last = y; w->view_last = view; w->x_last = x; w->z_last = z;
+}
+
+static u64 pack_w(const W *w)
+{
+    s32 a = w->y_first, b = w->y_hw, c = w->y_last;
+    #define S16(v) ((u64)(u16)(s16)((v) > 32767 ? 32767 : (v) < -32768 ? -32768 : (v)))
+    return S16(a) | S16(b) << 16 | S16(c) << 32
+         | (u64)(((w->view_first & 0xFF) << 8) | (w->view_last & 0xFF)) << 48;
+    #undef S16
+}
+
+static void finish(State *st)
+{
+    if ((st->cur.key >> 16) == 4) {
+        u32 *d0 = (u32 *)(void *)&st->hist[0], *d1 = (u32 *)(void *)&st->hist[1];
+        const u32 *s = (const u32 *)(const void *)&st->wcur;
+        for (u32 i = 0; i < sizeof(W) / 4; i++) { d0[i] = d1[i]; d1[i] = s[i]; }
+    }
+    copyv(&st->ring[st->head], &st->cur);
+    st->head = (st->head + 1) % NV;
+    if (st->n < NV) st->n++;
+}
+
+static u8 *input_obj(u8 **got)
+{
+    if (!got) return 0;
+    u8 *p = *got;
+    if (!p) return 0;
+    p = *(u8 **)(void *)(p + 0);
+    if (!p) return 0;
+    p = *(u8 **)(void *)(p + 8);
+    if (!p) return 0;
+    p = *(u8 **)(void *)(p + 0);
+    if (!p) return 0;
+    return *(u8 **)(void *)(p + 0x88);
+}
+
+/* the last 16 visits, oldest first, the current (partial) one last */
+static void collect(State *st, g2h_fn g2h, u64 **rvar, V *out, u64 *regs)
+{
+    sample(st, g2h, rvar, 1);
+    u32 k = 0;
+    u32 keep = st->n < NV - 1 ? st->n : NV - 1;
+    for (u32 i = 0; i < keep; i++) {
+        u32 idx = (st->head + NV - keep + i) % NV;
+        copyv(&out[k++], &st->ring[idx]);
+    }
+    copyv(&out[k++], &st->cur);
+    for (; k < NV; k++) { u32 *z = (u32 *)(void *)&out[k]; for (u32 i = 0; i < 8; i++) z[i] = 0; }
+    u32 live, parked;
+    textures(rvar, &live, &parked);
+    regs[0] = ((u64)MAGIC << 32) | st->cur.key;
+    regs[1] = ((u64)st->seq << 32) | st->n;
+    regs[2] = ((u64)live << 32) | parked;
+    regs[3] = ((u64)st->total_err << 32) | st->total_oom;
+    regs[4] = ((u64)rd32(g2h, HEAP_DESC) << 32) | rd32(g2h, HEAP_DESC + 4);
+    /* the Highwind: the world visit before the last one, and the last one
+       (if the current visit is the world map, that one) */
+    int in_world = (st->cur.key >> 16) == 4;
+    const W *wa = in_world ? &st->hist[1] : &st->hist[0];
+    const W *wb = in_world ? &st->wcur : &st->hist[1];
+    regs[5] = pack_w(wa);
+    regs[6] = pack_w(wb);
+    regs[7] = ((u64)wa->hw_frame << 32) | wb->hw_frame;
+    regs[8] = ((u64)(u32)wa->x_last << 32) | (u32)wb->x_first;     /* -> FP */
+    regs[9] = ((u64)(u32)wa->z_last << 32) | (u32)wb->z_first;     /* -> LR */
+}
+
+__attribute__((noreturn)) static void dump(State *st, g2h_fn g2h, u64 **rvar)
+{
+    V out[NV] __attribute__((aligned(16)));
+    u64 regs[10];
+    collect(st, g2h, rvar, out, regs);
+    u8 *tls;
+    __asm__ volatile("mrs %0, tpidrro_el0" : "=r"(tls));
+    {
+        u64 *d = (u64 *)(void *)tls;
+        const u64 *s = (const u64 *)(const void *)&out[8];
+        for (int i = 0; i < 32; i++) d[i] = s[i];
+    }
+    __asm__ volatile(
+        "mov x16, %0\n"
+        "mov x17, %1\n"
+        "ldp x0, x1, [x16, #0]\n"
+        "ldp x2, x3, [x16, #16]\n"
+        "ldp x4, x5, [x16, #32]\n"
+        "ldp x6, x7, [x16, #48]\n"
+        "ldp x29, x30, [x16, #64]\n"
+        "mov sp, x17\n"
+        "svc #0x26\n"
+        "udf #0\n"
+        : : "r"(regs), "r"(out) : "memory");
+    __builtin_unreachable();
+}
+
+__attribute__((section(".text.lp_frame")))
+void lp_frame(State *st, g2h_fn g2h, u8 **got, u32 *mode_slot, u64 **rvar,
+              glerr_fn glerr)
+{
+    u32 mode = mode_of(mode_slot);
+    u32 key = (mode << 16) | (rd32(g2h, G_FIELD_ID) & 0xFFFFu);
+    if (st->magic != MAGIC) {
+        u32 *z = (u32 *)(void *)st;
+        for (u32 i = 0; i < sizeof(State) / 4; i++) z[i] = 0;
+        st->magic = MAGIC;
+        st->key = key;
+        begin(st, g2h, rvar, key);
+    }
+    if (key != st->key) {
+        /* no fresh sample here: the next scene may already be loading, and
+           its textures must not be charged to the visit that just ended */
+        finish(st);
+        st->key = key;
+        begin(st, g2h, rvar, key);
+    }
+    st->cur.frames++;
+    if (mode == 4) world_frame(st, g2h);
+    /* v2: drain GL's error flags once a frame (nothing else reads them after
+       texture or buffer calls). GL_OUT_OF_MEMORY is the graphics pool. */
+    if (glerr) {
+        u32 any = 0;
+        for (int i = 0; i < 8; i++) {
+            u32 e = glerr();
+            if (!e) break;
+            any = 1;
+            if (st->cur.nerr != 0xFFFF) st->cur.nerr++;
+            st->total_err++;
+            if (e == GL_OOM) { if (st->cur.noom != 0xFFFF) st->cur.noom++; st->total_oom++; }
+            if (!st->cur.first) st->cur.first = (u16)e;
+            st->cur.last = (u16)e;
+        }
+        if (any && st->cur.errframes != 0xFFFF) st->cur.errframes++;
+    }
+    if ((st->cur.frames & (SAMPLE - 1)) == 0) sample(st, g2h, rvar, 0);
+    else {
+        u32 live, parked;
+        textures(rvar, &live, &parked);
+        if (live > st->cur.tex_peak) st->cur.tex_peak = (u16)live;
+        st->cur.tex_end = (u16)live;
+        st->cur.parked = (u16)parked;
+    }
+    u8 *p = input_obj(got);
+    u32 r3 = (p && (*(unsigned long long *)(void *)(p + 0x20) & BTN_R3)) ? 1u : 0u;
+    u32 click = r3 && !st->r3_prev;
+    st->r3_prev = r3;
+    if (!click || mode == DRIVER_WORLD) return;
+    dump(st, g2h, rvar);
+}
+
+#ifdef LP_HOST
+/* for the host test: the same collection without the svcBreak */
+void lp_collect(State *st, g2h_fn g2h, u64 **rvar, V *out, u64 *regs)
+{
+    collect(st, g2h, rvar, out, regs);
+}
+#endif

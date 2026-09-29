@@ -1,0 +1,240 @@
+"""BUILD 585: the world map far field -- data, blob, module words, logic."""
+import hashlib
+import os
+import re
+import shutil
+import struct
+import subprocess
+import sys
+import tempfile
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
+sys.path.insert(0, ROOT)
+
+import numpy as np                                             # noqa: E402
+import pytest                                                  # noqa: E402
+
+import a64 as A                                                # noqa: E402
+import ff7nx_audio_cave as AC                                  # noqa: E402
+import ff7nx_worldfar as W                                     # noqa: E402
+import ff7nx_worldfar_data as F                                # noqa: E402
+import ff7nx_worldsphere as WS                                 # noqa: E402
+
+MODULE = os.path.join(ROOT, 'dump', 'exefs', 'main')
+WM0 = os.path.join(ROOT, 'dump', 'romfs', 'ff7', 'workingdir', 'data', 'wm',
+                   'wm0.map')
+NATIVE = os.path.join(ROOT, 'native')
+need_dump = pytest.mark.skipif(not (os.path.exists(MODULE)
+                                    and os.path.exists(WM0)),
+                               reason='needs the dump')
+
+_far = {}
+
+
+def far():
+    if 'b' not in _far:
+        _far['b'], _far['st'] = F.build(WM0)
+    return _far['b']
+
+
+def entries(b):
+    n = struct.unpack_from('<I', b, 8)[0] + struct.unpack_from('<I', b, 12)[0]
+    return [struct.unpack_from(F.ENTRY_FMT, b, 32 + 32 * i) for i in range(n)]
+
+
+def tile_arrays(b, e):
+    at, vat, nat, ntri = e[0], e[1], e[2], e[3]
+    total = ntri + sum(e[8:12])
+    nv = e[12]
+    tris = np.frombuffer(b[at:at + 12 * total], np.uint8).reshape(total, 12)
+    v = np.frombuffer(b[vat:vat + 8 * nv], '<i2').reshape(nv, 4)
+    n = np.frombuffer(b[nat:nat + 8 * nv], '<i2').reshape(nv, 4)
+    return tris, v, n
+
+
+# ------------------------------------------------------------------ source
+def _c_define(name):
+    m = re.search(r'#define\s+%s\s+(0x[0-9A-Fa-f]+|\d+)u?' % name,
+                  open(os.path.join(NATIVE, 'worldfar.c')).read())
+    return int(m.group(1), 0)
+
+
+def test_c_and_python_agree_on_layout():
+    assert _c_define('PRIM_BYTES') == W.PRIM_BYTES
+    assert _c_define('FAR_MAX') == W.FAR_MAX
+    assert _c_define('FAR_DATA') == W.FAR_DATA
+    assert _c_define('FAR_SLACK') == W.FAR_SLACK
+    assert W.FAR_OFF == 0xA6800 + 2 * W.PRIM_BYTES
+    assert W.BSS_BYTES >= W.STATE_BYTES + 16
+
+
+def test_blob_is_built_from_this_source():
+    src = open(os.path.join(NATIVE, 'worldfar.c'), 'rb').read()
+    want = open(os.path.join(NATIVE, 'worldfar.src.sha256')).read().split()[0]
+    assert hashlib.sha256(src).hexdigest() == want, \
+        'native/worldfar.c changed: run native/build_worldfar.sh'
+    code = W.blob()
+    assert len(code) % 4 == 0 and len(code) < 0x3C00
+
+
+def test_blob_has_no_absolute_addresses():
+    """Position independent by construction: no literal pools, no adrp/ldr
+    of a fixed address outside the blob (every call is through a pointer)."""
+    code = W.blob()
+    for i in range(0, len(code), 4):
+        w = struct.unpack_from('<I', code, i)[0]
+        if (w & 0x9F000000) == 0x90000000:      # adrp
+            raise AssertionError('adrp at +%#x' % i)
+        if (w & 0xFC000000) == 0x94000000:      # bl
+            off = w & 0x3FFFFFF
+            if off & 0x2000000:
+                off -= 0x4000000
+            assert 0 <= i + 4 * off < len(code), 'bl out of the blob'
+
+
+# ------------------------------------------------------------------ data
+@need_dump
+def test_tiles_fit_the_native_limits():
+    b = far()
+    assert b[:4] == b'WFAR'
+    es = entries(b)
+    assert len(es) == 36 * 28 + 9 * 7
+    for e in es:
+        tris, v, _n = tile_arrays(b, e)
+        assert len(v) <= 120
+        assert tris[:, :3].max() < len(v)
+        assert v[:, 3].max() == 0
+    assert len(b) <= W.FAR_MAX - W.FAR_DATA - W.FAR_SLACK
+
+
+@need_dump
+def test_l1_neighbours_share_their_edges_and_match_the_native_mesh():
+    b = far()
+    es = entries(b)
+    M = F.read_meshes(WM0)
+
+    def lattice(i):
+        _t, v, _n = tile_arrays(b, es[i])
+        return v[:25, 1].reshape(5, 5)
+    for mz in range(28):
+        for mx in range(36):
+            h = lattice(mz * 36 + mx)
+            if mx < 35:
+                assert (h[:, 4] == lattice(mz * 36 + mx + 1)[:, 0]).all()
+            if mz < 27:
+                assert (h[4, :] == lattice((mz + 1) * 36 + mx)[0, :]).all()
+    # the lattice corners are native vertices: same height
+    bad = 0
+    for mz in range(0, 28, 3):
+        for mx in range(0, 36, 3):
+            tris, verts = F.mesh_at(M, mx, mz)
+            h = lattice(mz * 36 + mx)
+            for (x, z, y) in ((0, 0, h[0, 0]), (8192, 8192, h[4, 4])):
+                sel = (verts[:, 0] == x) & (verts[:, 2] == z)
+                if sel.any():
+                    bad += int(abs(verts[sel][0, 1] - y) > 1)
+    assert bad == 0
+
+
+@need_dump
+def test_winding_and_normals_follow_the_native_convention():
+    """(b-a) x (c-a) and the stored normal both point -y, as in wm0.map."""
+    b = far()
+    for e in entries(b)[::37]:
+        tris, v, n = tile_arrays(b, e)
+        for t in tris[:e[3]]:
+            p = v[t[:3], :3].astype(float)
+            c = np.cross(p[1] - p[0], p[2] - p[0])
+            if np.linalg.norm(c) > 1:
+                assert c[1] < 0
+        assert (n[:, 1] < 0).all()
+
+
+@need_dump
+def test_skirts_hang_below_their_edge():
+    b = far()
+    for e in entries(b)[::11]:
+        tris, v, _n = tile_arrays(b, e)
+        for k in range(4):
+            first, cnt = e[4 + k], e[8 + k]
+            assert cnt % 4 == 0 and cnt > 0
+            sk = tris[first:first + cnt]
+            ys = v[sk[:, :3].ravel(), 1]
+            assert ys.min() < ys.max()
+
+
+# ------------------------------------------------------------------ module
+def _sphere_module(tmp):
+    blob = open(MODULE, 'rb').read()
+    segs, raw = AC.segments(blob)
+    t = bytearray(raw[0])
+    struct.pack_into('<I', t, WS.SINK_SITE, WS.SINK_NEW)
+    raw[0] = bytes(t)
+    p = os.path.join(tmp, 'main_sph')
+    open(p, 'wb').write(AC.pack(blob, raw, 0))
+    return p
+
+
+@need_dump
+def test_module_pass_words():
+    with tempfile.TemporaryDirectory() as tmp:
+        with pytest.raises(ValueError):          # no sphere, no far field
+            W.apply_to_nso(MODULE, os.path.join(tmp, 'x'), stock=MODULE)
+        src = _sphere_module(tmp)
+        out = os.path.join(tmp, 'main_far')
+        r = W.apply_to_nso(src, out, stock=MODULE)
+        nso = open(out, 'rb').read()
+        _s, raw = AC.segments(nso)
+        text = raw[0]
+        word = lambda va: struct.unpack_from('<I', text, va)[0]
+        assert word(W.HOOK_SITE) == A.bl(W.HOOK_SITE, r['stub'])
+        assert word(W.ALLOC_CALL) == A.bl(W.ALLOC_CALL, r['reset'])
+        assert word(W.CAMERA_CALL) == A.bl(W.CAMERA_CALL, r['camera'])
+        assert word(W.TRANSFORM_CALL) == A.bl(W.TRANSFORM_CALL, r['bend'])
+        for i, w in enumerate(W.bend_words(r['bend'],
+                                           r['entry'] + W.entries()['bend'],
+                                           r['state'])):
+            assert word(r['bend'] + 4 * i) == w
+        ent = W.entries()
+        for i, w in enumerate(W.stub_words(r['stub'], r['entry'] + ent['draw'],
+                                           r['state'])):
+            assert word(r['stub'] + 4 * i) == w
+        for i, w in enumerate(W.camera_words(r['camera'],
+                                             r['entry'] + ent['camera'],
+                                             r['state'])):
+            assert word(r['camera'] + 4 * i) == w
+        for i, w in enumerate(W.reset_words(r['reset'], r['state'])):
+            assert word(r['reset'] + 4 * i) == w
+        assert text[r['entry']:r['entry'] + r['code']] == W.blob()
+        assert (word(0xF21CE0), word(0xF21CE4)) == (A.movz(9, 0), A.movk_hi(9, 8))
+        assert (word(0xF2B2A8), word(0xF2B2AC)) == (A.movz(9, 0), A.movk_hi(9, 8))
+        assert (word(0xF799B8), word(0xF799BC)) == (
+            A.movz(8, W.WORLD_ALLOC & 0xFFFF), A.movk_hi(8, W.WORLD_ALLOC >> 16))
+        old_bss = struct.unpack_from('<I', open(src, 'rb').read(), 0x3C)[0]
+        assert struct.unpack_from('<I', nso, 0x3C)[0] == old_bss + r['bss']
+        # a second pass over its own output is refused, never stacked
+        with pytest.raises(ValueError):
+            W.apply_to_nso(out, os.path.join(tmp, 'y'), stock=MODULE)
+
+
+# ------------------------------------------------------------------ logic
+@need_dump
+def test_host_harness_places_tiles_without_holes_or_overlap():
+    cc = shutil.which('cc') or shutil.which('gcc') or shutil.which('clang')
+    if not cc:
+        pytest.skip('no C compiler')
+    with tempfile.TemporaryDirectory() as tmp:
+        fp = os.path.join(tmp, 'wm0.far')
+        open(fp, 'wb').write(far())
+        exe = os.path.join(tmp, 'wfhost')
+        subprocess.check_call([cc, '-O2', '-o', exe,
+                               os.path.join(NATIVE, 'worldfar_host_test.c'),
+                               '-lm'], cwd=NATIVE)
+        r = subprocess.run([exe, fp], capture_output=True, text=True)
+        assert r.returncode == 0, r.stderr[-2000:]
+        assert 'total errors 0' in r.stdout
+        m = re.search(r'state (\d+) zoom (\d+) tilt (\d+)', r.stdout)
+        assert int(m.group(1)) <= W.BSS_BYTES
+        assert int(m.group(2)) == W.STATE_ZOOM
+        assert int(m.group(3)) == W.STATE_TILT

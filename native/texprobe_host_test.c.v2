@@ -1,0 +1,133 @@
+/* Host test for texprobe.c v2: fake guest memory, three visits, the analysis. */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "texprobe.c"
+
+static u8 *mem;
+static u8 *g2h(u32 g) { return mem + g; }
+static void w32(u32 g, u32 v) { memcpy(mem + g, &v, 4); }
+static u32 mode_int_g = 0x100000;              /* host-visible mode word */
+static u32 *mode_slot_host;                    /* what the GOT slot holds */
+static State *st;
+static int errors;
+
+#define TH(k) (0x200000u + 0x100u * (k))
+#define TS(k) (0x500000u + 0x100u * (k))
+#define HA(k) (0x600000u + 0x100u * (k))
+#define TSW(k) (0x800000u + 0x100u * (k))
+#define HAW(k) (0x880000u + 0x100u * (k))
+
+/* a texture: tex_header at th, image at img (w*h bytes), palette at pal */
+static void make_tex(u32 th, u32 img, u32 pal, u32 w, u32 h, u32 seed)
+{
+    memset(mem + th, 0, 0x100);
+    w32(th + TH_FMT + TF_W, w); w32(th + TH_FMT + TF_H, h);
+    w32(th + TH_FMT + TF_BPR, w);
+    w32(th + TH_FMT + TF_PALSIZE, 16); w32(th + TH_FMT + TF_PALDATA, pal);
+    w32(th + TH_IMAGE, img); w32(th + TH_PALIDX, 0);
+    for (u32 i = 0; i < w * h; i++) mem[img + i] = (u8)(i * 7 + seed);
+    for (u32 i = 0; i < 64; i++) mem[pal + i] = (u8)(i * 3 + seed);
+}
+
+/* one loader call: ts_arg 0 makes the set `made`; the upload (if the
+   handle is 0) writes `handle` */
+static void call(u32 ts_arg, u32 th, u32 made, u32 handles, u32 handle)
+{
+    tp_load(st, g2h, ts_arg, th, 0, (u32 *)&mode_slot_host);
+    u32 ts = ts_arg ? ts_arg : made;
+    if (!ts_arg) { w32(ts + TS_HANDLES, handles); w32(handles, 0); }
+    u32 cur; memcpy(&cur, mem + handles, 4);
+    if (!cur) w32(handles, handle);
+    tp_ret(st, g2h, ts);
+}
+
+static void set_visit(u32 mode, u32 field)
+{
+    w32(mode_int_g, mode);
+    mem[G_FIELD_ID] = (u8)field; mem[G_FIELD_ID + 1] = (u8)(field >> 8);
+}
+
+int main(void)
+{
+    mem = calloc(1, 0x1000000);
+    st = calloc(1, sizeof(State));
+    mode_slot_host = (u32 *)(void *)(mem + mode_int_g);
+    for (int k = 0; k < 6; k++) make_tex(TH(k), 0x300000 + 0x10000 * k, 0x400000 + 0x100 * k, 64, 64, k);
+    /* visit 1: fship_2 (mode 1, field 0x1A0) -- clean; new sets, then the
+       game's repeat calls on them */
+    set_visit(1, 0x1A0);
+    for (int k = 0; k < 5; k++) call(0, TH(k), TS(k), HA(k), 0x1000 + k);
+    for (int rep = 0; rep < 300; rep++)
+        for (int k = 0; k < 5; k++) call(TS(k), TH(k), 0, HA(k), 0);
+    /* visit 2: the world map (mode 4); its texture 1 gets handle 0x1003,
+       the handle fship's texture 3 had (freed and reused) */
+    set_visit(4, 0x1A0);
+    for (int k = 0; k < 3; k++) {
+        make_tex(0x700000 + 0x100 * k, 0x780000 + 0x10000 * k, 0x7F0000 + 0x100 * k, 32, 32, 50 + k);
+        call(0, 0x700000 + 0x100 * k, TSW(k), HAW(k), k == 1 ? 0x1003 : 0x2000 + k);
+    }
+    /* visit 3: fship_2 again, with every failure the probe must see */
+    set_visit(1, 0x1A0);
+    make_tex(TH(2), 0x300000 + 0x20000, 0x400000 + 0x200, 64, 64, 99);  /* tex 2: other data */
+    call(0, TH(0), TS(0), HA(0), 0x1100);          /* tex 0: handle 0x1100 */
+    call(0, TH(1), TS(1), HA(1), 0x1101);
+    call(0, TH(2), TS(2), HA(2), 0x1102);
+    w32(HA(3), 0x1003);
+    call(TS(3), TH(3), 0, HA(3), 0);               /* tex 3: the old set, stale handle, skipped */
+    call(0, TH(4), TS(4), HA(4), 0x1100);          /* tex 4: tex 0's handle */
+    call(TSW(2), TH(5), 0, HAW(2), 0);             /* tex 5: a world-map set */
+    for (int rep = 0; rep < 200; rep++) call(TS(2), TH(2), 0, HA(2), 0);
+    call(0, TH(0), TS(0), HA(0), 0x1100);          /* tex 0 made again */
+    w32(HA(1), 0x1201);
+    call(TS(1), TH(1), 0, HA(1), 0);               /* tex 1: handle changed */
+    mem[0x300000 + 0x10000 * 1 + 5] ^= 0xFF;       /* tex 1 overwritten after load */
+    /* R3 not clicked: nothing */
+    tp_frame(st, g2h, 0, (u32 *)&mode_slot_host);
+    Out out[NOUT]; u64 regs[10];
+    analyze(st, g2h, out, regs);
+    u32 fl[6] = {0}, cnt[6] = {0}, tsv[6] = {0}; int seen = 0;
+    for (int i = 0; i < NOUT; i++) {
+        if (!out[i].a) continue;
+        u32 idx = out[i].b & 0x3FF;
+        if (idx >= 6) { errors++; continue; }
+        fl[idx] = out[i].b >> 18; cnt[idx] = out[i].a >> 24; tsv[idx] = out[i].ts; seen++;
+    }
+    printf("regs: magic %s key %08x  cur %u ref %u  unmatched %u skipped %u dup %u reused %u changed %u stale %u\n",
+           (regs[0] >> 32) == MAGIC ? "ok" : "BAD", (u32)regs[0], (u32)(regs[1] >> 48), (u32)((regs[1] >> 32) & 0xFFFF),
+           (u32)(regs[2] >> 48), (u32)((regs[2] >> 32) & 0xFFFF), (u32)((regs[2] >> 16) & 0xFFFF), (u32)(regs[2] & 0xFFFF),
+           (u32)(regs[3] >> 48), (u32)(regs[3] & 0xFFFF));
+    printf("      calls %u uploads %u (ref calls %u uploads %u)\n", (u32)(regs[4] >> 32), (u32)regs[4],
+           (u32)(regs[7] >> 32), (u32)regs[7]);
+    for (int k = 0; k < 6; k++) printf("  tex %d flags %03x count %u ts %08x\n", k, fl[k], cnt[k], tsv[k]);
+    if ((u32)regs[0] != 0x101A0) errors++;
+    if ((regs[1] >> 48) != 6 || ((regs[1] >> 32) & 0xFFFF) != 5 || seen != 6) errors++;
+    if ((regs[7] >> 32) != 5 + 300 * 5 || (u32)regs[7] != 5) errors++;     /* ref visit: all repeats deduped */
+    if ((regs[4] >> 32) != 6 + 200 + 2 || (u32)regs[4] != 5) errors++;
+    if (fl[0] != (F_DUPHANDLE | F_REMADE) || cnt[0] != 2 || tsv[0] != TS(0)) errors++;
+    if (fl[1] != (F_CHANGED | F_HCHANGED)) errors++;
+    if (fl[2] != F_UNMATCHED || cnt[2] != 201) errors++;
+    if (fl[3] != (F_SKIPPED | F_CARRIED | F_STALE)) errors++;
+    if (fl[4] != F_DUPHANDLE) errors++;
+    if (fl[5] != (F_SKIPPED | F_CARRIED | F_TSREUSED | F_STALE | F_UNMATCHED)) errors++;
+    if (!(regs[6] >> 32)) errors++;                /* the unmatched one's twin */
+    /* the same data as Atmosphere prints it, for texprobe_read.py */
+    u8 *bytes = (u8 *)out;
+    FILE *f = fopen("/tmp/texprobe_fake_report.log", "w");
+    fprintf(f, "Crashed Thread Info:\n    Registers:\n");
+    for (int i = 0; i < 8; i++) fprintf(f, "        X[%02d]:           %016llx\n", i, (unsigned long long)regs[i]);
+    fprintf(f, "        FP:              %016llx\n        LR:              %016llx\n", (unsigned long long)regs[8], (unsigned long long)regs[9]);
+    const char *titles[2] = { "    Stack Dump:", "    TLS Dump:" };
+    for (int d = 0; d < 2; d++) {
+        fprintf(f, "%s\n", titles[d]);
+        for (int row = 0; row < 16; row++) {
+            fprintf(f, "        %016llx", 0x1000ull + 16 * row);
+            for (int k = 0; k < 16; k++) fprintf(f, " %02x", bytes[256 * d + 16 * row + k]);
+            fprintf(f, "\n");
+        }
+    }
+    fclose(f);
+    printf("sizeof(State) %zu\n", sizeof(State));
+    printf("texprobe host test: %d error(s)\n", errors);
+    return errors ? 1 : 0;
+}

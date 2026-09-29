@@ -1,0 +1,1387 @@
+/*
+ * worldfar.c -- the world map's spherical terrain and far field.
+ * BUILD 585 (far field), 586 (CPU bend, tilt), 587 (this rewrite).
+ *
+ * Entry points (each reached through a small hook stub in ff7nx_worldfar):
+ *
+ *  worldfar_bend    after EVERY call of the port's terrain transform
+ *                   0x10F28B0 -- the two inlined calls inside world_sub_751EFC
+ *                   (the 5x5 window) and the one in the 0x75F0AD thunk.
+ *                   BUILD 586 hooked only the thunk, which the window never
+ *                   uses: the window stayed flat while models and the far
+ *                   field were bent, which is the "square", the sky-coloured
+ *                   strips at its edges and the characters sinking into the
+ *                   ground when zoomed out. It bends the transformed vertices
+ *                   exactly as FFNx's lmain_vv does, applies the same depth
+ *                   squeeze as the models, and records the translation of
+ *                   every native mesh so the far field knows which cells the
+ *                   game really drew this frame.
+ *  worldfar_draw    after world_sub_751EFC: everything the window does not
+ *                   cover, out to the horizon, in three levels --
+ *                     N  the game's own full-detail mesh, read on demand from
+ *                        wm0.map into a cache, for the ring around the window
+ *                        (and any window cell the game skipped), so the
+ *                        ground at the window's edge is the same ground;
+ *                     S  a 5x5-lattice copy of each mesh (wm0.far);
+ *                     L2 a 9x9 copy of each 4x4-mesh sector (wm0.far).
+ *                   The model->clip matrix of any tile is derived from four
+ *                   calibration transforms per frame (it is affine in the GTE
+ *                   translation), so no per-tile or per-triangle game call is
+ *                   made except the shape allocation, which is batched.
+ *  worldfar_camera  after the camera update 0x74E8CE: ZL/ZR zoom (FFNx up to
+ *                   35000), right stick up/down tilt (FFNx 5..85 degrees).
+ *  worldfar_input   around world_update_player 0x74EA48: right stick
+ *                   left/right turns the camera; on foot the stock camera
+ *                   spin from left/right is taken back out (FFNx analogue
+ *                   behaviour: you walk where you point).
+ *
+ * All the far-field DATA lives in this module's BSS (State), not in the
+ * guest heap: the world allocation only grows by a 32 KB file-read bounce
+ * buffer. Compiled position-independent; HOST_TEST builds it against a fake
+ * guest (native/worldfar_host_test.c).
+ */
+#include <stdint.h>
+#ifdef HOST_TEST
+static void host_tile(int level, int id, int px, int pz);
+#define HOST_TILE(l, i, x, z) host_tile(l, i, x, z)
+#else
+#define HOST_TILE(l, i, x, z) ((void)0)
+#endif
+
+typedef uint8_t u8;
+typedef int8_t s8;
+typedef int16_t s16;
+typedef uint16_t u16;
+typedef int32_t s32;
+typedef uint32_t u32;
+typedef int64_t s64;
+
+typedef u8 *(*g2h_fn)(u32 guest);
+typedef u32 (*callx_fn)(u32 x86, u32 nargs, ...);
+
+/* ---- guest globals (x86 VAs, ff7_en 1.02) ---- */
+#define G_MAP_TYPE      0xE045E8u   /* 0 = overworld */
+#define G_PLAYER_POS    0xE04918u   /* int x, y, z */
+#define G_CAM_ROT       0xDFC448u   /* s16[9] */
+#define G_CAM_DELTA_Y   0xDE6A04u
+#define G_GTE           0x90AAF0u   /* -> state; translation int[3] at +0x22 */
+#define G_WORLD_BASE    0xE2D600u   /* the world map's one allocation */
+#define G_ONSET         0xE045D8u
+#define G_MOVE_MULT     0xDFC480u   /* 1 or 2: logic steps per update */
+#define G_CAM_FRONT     0xDFC484u   /* camera heading target, 0..4095 */
+#define G_VIEW_TYPE     0xDFC4B4u   /* 3 = Highwind */
+#define G_CONTROL       0xDE6B5Cu   /* player control enabled */
+
+#define F_RESET_GTE     0x74D3A7u   /* SetRot(DFC448), SetTrans(DE6A20) */
+#define F_APPLY         0x662ECCu   /* out = R*v + T (s16 v) */
+#define F_NAME          0x74CA00u   /* (kind, idx) -> "...wm/WM<idx><ext>" */
+#define F_READ          0x7593CDu   /* (name, offset, size, dest) -> 0 ok */
+#define F_TRANSFORM     0x75F0ADu
+#define F_ALLOC_SHAPES  0x66E272u   /* (n, graphics object) -> 0 if none */
+#define F_DRAW_ENABLED  0x74C969u   /* the world's own per-triangle gate */
+
+#define G_VERTS_F       0xE38338u   /* float x,y,z per vertex (0xC) */
+#define G_COMBINED      0xE39738u   /* model -> clip, row vectors, 4x4 */
+#define G_TEX_OBJS      0xE2BBD8u   /* graphics object per texture id */
+#define G_TEX_ORIGIN    0xE2D168u   /* -> u16 u, v origin per texture id */
+#define G_LIGHT         0xE360F4u   /* -> +0xF8 the 3x4 light matrix */
+#define G_VIEW_X        0xE2C424u
+#define G_VIEW_Y        0xE2C428u
+#define G_VIEW_W        0xDE68F8u
+#define G_VIEW_H        0xDE67E8u
+#define G_CAM_TRANS_Z   (0xDE6A20u + 0x12u + 8u)
+#define TL_STRIDE       0x20u       /* x,y,z,rhw,colour,specular,u,v */
+
+/* ---- layout shared with ff7nx_worldfar.py (checked there) ---- */
+#ifndef PRIM_BYTES
+#define PRIM_BYTES      0x30000u
+#endif
+#define FAR_OFF         (0xA6800u + 2u * PRIM_BYTES)
+#define FAR_NAME        0x000u      /* "...WM0.FAR" */
+#define FAR_MAPNAME     0x080u      /* "...WM0.MAP" */
+#define FAR_SCRATCH     0x100u      /* 0x40 for 0x662ECC */
+#define FAR_IO          0x200u
+#define FAR_IO_BYTES    0x8000u
+#define FAR_REGION      (FAR_IO + FAR_IO_BYTES)
+#ifndef FAR_MAX
+#define FAR_MAX         0x1E0000u   /* wm0.far, held in BSS */
+#endif
+
+#define MX 36
+#define MZ 28
+#define SX 9
+#define SZ 7
+#define N1 (MX * MZ)
+#define N2 (SX * SZ)
+#define MESH 8192
+#define WRAP_X 0x48000
+#define WRAP_Z 0x38000
+#define SECTOR_BYTES 0xB800
+
+#define NEAR_RING       3           /* sectors holding ring <= 3 use S/N */
+#define FINE_RING       3           /* cells at ring <= 3 use the N mesh */
+#define PREFETCH_RING   4
+#define GRID            8           /* the S rings reach 8 */
+#define GW              (2 * GRID + 1)
+#define NAT_MAX         64
+#define NSLOT           80
+#define SLOT_TRIS       256
+#define SLOT_VERTS      128
+#define LZ_BYTES        8192
+#define LOADS_PER_FRAME 2
+#define MAX_TRIS_FRAME  10000
+#define MAX_TRIS_TILE   512
+
+#define ZOOM_MAX_DIST   35000.0f    /* FFNx getMaxZoomDist */
+#define ZOOM_STEP       125.0f      /* per logic step (x movement mult) */
+#define STICK_DEADZONE  0.2f
+#define TILT_STEP       0.01745f    /* 1 degree per logic step, FFNx */
+#define YAW_STEP        11.4f       /* 1 degree (of 4096) per logic step */
+#define YAW_UNDO        128         /* a stock key turn is at most this */
+#define TILT_MIN        0.0873f     /* 5 degrees below horizontal (FFNx -95) */
+#define TILT_MAX        1.4835f     /* 85 degrees (FFNx -175) */
+#define SPHERE_R        250000.0f
+#define MOUNTAIN        4000.0f
+#define BTN_ZL          (1ull << 8)
+#define BTN_ZR          (1ull << 9)
+#define BTN_R3          (1ull << 5)
+
+typedef struct {
+    u32 tris, verts, norms;         /* offsets into data */
+    u16 ntri;
+    u16 sk_first[4];
+    u8  sk_n[4];
+    u8  nverts, flags;
+    s16 ymin, ymax;
+} Entry;                             /* == ENTRY_FMT, 32 bytes */
+
+typedef struct {
+    s16 cell;                        /* mz * MX + mx, -1 empty */
+    u16 ntri, nv, pad;
+    u32 used;                        /* frame last wanted */
+    u8  tris[SLOT_TRIS * 12];
+    s16 v[SLOT_VERTS * 4];
+    s16 n[SLOT_VERTS * 4];
+} Slot;
+
+typedef struct {
+    u32 magic;                       /* 0x00 'WFAR' once loaded */
+    u32 base;                        /* 0x04 world allocation it was loaded into */
+    u32 failed_base;                 /* 0x08 do not retry a failed load there */
+    u32 refs;                        /* 0x0C offset of the mesh refs in data */
+    u32 frames;                      /* 0x10 */
+    u32 last_tris;                   /* 0x14 diagnostics */
+    u32 last_tiles;                  /* 0x18 */
+    float zoom;                      /* 0x1C extra camera distance */
+    float tilt;                      /* 0x20 camera pitch offset, radians */
+    u32 busy;                        /* 0x24 calibrating: bend stays out */
+    u32 nnat;                        /* 0x28 native meshes this frame */
+    s32 front_saved;                 /* 0x2C camera front before the update */
+    u32 saved_ok;                    /* 0x30 */
+    u32 calib_bad;                   /* 0x34 frames the matrix check failed */
+    u32 loads;                       /* 0x38 meshes read from wm0.map */
+    u32 load_fail;                   /* 0x3C */
+    s32 nat[NAT_MAX][3];
+    Entry e[N1 + N2];
+    u8 cls[N2];
+    u8 pad_[1];
+    u8 bad[N1];                      /* meshes wm0.map could not give */
+    Slot slot[NSLOT];
+    u8 lz[LZ_BYTES];
+    u8 comp[LZ_BYTES];
+    u8 data[FAR_MAX];
+} State;
+
+#define CLS_L2 0
+#define CLS_NEAR 1
+
+typedef struct {
+    g2h_fn g2h;
+    callx_fn call;
+    State *st;
+} Env;
+
+/* ------------------------------------------------------------ memory */
+static u32 ld32(const u8 *p) { return (u32)p[0] | ((u32)p[1] << 8) | ((u32)p[2] << 16) | ((u32)p[3] << 24); }
+static s16 ld16(const u8 *p) { return (s16)((u16)p[0] | ((u16)p[1] << 8)); }
+
+/* The port translates guest addresses page by page (4 KB). */
+static u8 rd8(Env *v, u32 g) { return *v->g2h(g); }
+static u32 rd32(Env *v, u32 g)
+{
+    if ((g & 0xFFFu) <= 0xFFCu)
+        return ld32(v->g2h(g));
+    return (u32)rd8(v, g) | ((u32)rd8(v, g + 1) << 8)
+         | ((u32)rd8(v, g + 2) << 16) | ((u32)rd8(v, g + 3) << 24);
+}
+static s16 rds16(Env *v, u32 g)
+{
+    return (s16)((u16)rd8(v, g) | ((u16)rd8(v, g + 1) << 8));
+}
+static void wr8(Env *v, u32 g, u8 x) { *v->g2h(g) = x; }
+static void st32(u8 *p, u32 x) { p[0] = (u8)x; p[1] = (u8)(x >> 8); p[2] = (u8)(x >> 16); p[3] = (u8)(x >> 24); }
+static void wr32(Env *v, u32 g, u32 x)
+{
+    if ((g & 0xFFFu) <= 0xFFCu) { st32(v->g2h(g), x); return; }
+    wr8(v, g, (u8)x); wr8(v, g + 1, (u8)(x >> 8));
+    wr8(v, g + 2, (u8)(x >> 16)); wr8(v, g + 3, (u8)(x >> 24));
+}
+static void wr16(Env *v, u32 g, u16 x) { wr8(v, g, (u8)x); wr8(v, g + 1, (u8)(x >> 8)); }
+
+static void copy(u8 *d, const u8 *s, u32 n)
+{
+    for (u32 i = 0; i < n; i++) d[i] = s[i];
+}
+/* bulk guest <-> host, one translation per page */
+static void gread(Env *v, u32 g, void *dst, u32 n)
+{
+    u8 *d = (u8 *)dst;
+    while (n) {
+        u32 room = 0x1000u - (g & 0xFFFu);
+        u32 k = n < room ? n : room;
+        copy(d, v->g2h(g), k);
+        d += k; g += k; n -= k;
+    }
+}
+static void gwrite(Env *v, u32 g, const void *src, u32 n)
+{
+    const u8 *s = (const u8 *)src;
+    while (n) {
+        u32 room = 0x1000u - (g & 0xFFFu);
+        u32 k = n < room ? n : room;
+        copy(v->g2h(g), s, k);
+        s += k; g += k; n -= k;
+    }
+}
+
+static float f_of(u32 b) { float f; __builtin_memcpy(&f, &b, 4); return f; }
+static u32 b_of(float f) { u32 b; __builtin_memcpy(&b, &f, 4); return b; }
+static float rdf(Env *v, u32 g) { return f_of(rd32(v, g)); }
+
+static float fsqrt(float x)
+{
+#ifdef HOST_TEST
+    return __builtin_sqrtf(x);
+#else
+    float r;
+    __asm__("fsqrt %s0, %s1" : "=w"(r) : "w"(x));
+    return r;
+#endif
+}
+static double dsqrt(double x)
+{
+#ifdef HOST_TEST
+    return __builtin_sqrt(x);
+#else
+    double r;
+    __asm__("fsqrt %d0, %d1" : "=w"(r) : "w"(x));
+    return r;
+#endif
+}
+static float fabs_(float x) { return x < 0 ? -x : x; }
+static double dabs(double x) { return x < 0 ? -x : x; }
+
+static int wrapi(int d, int period)
+{
+    int h = period / 2;
+    while (d >= h) d -= period;
+    while (d < -h) d += period;
+    return d;
+}
+
+/* ------------------------------------------------------------ series */
+/* sin(x) and cos(x) - 1 for |x| <= ~2 (float, Taylor to x^14) */
+static void fsincm1(float x, float *s, float *cm1)
+{
+    float x2 = x * x;
+    float ss = x * (1.0f - x2 / 6.0f * (1.0f - x2 / 20.0f * (1.0f - x2 / 42.0f
+               * (1.0f - x2 / 72.0f * (1.0f - x2 / 110.0f * (1.0f - x2 / 156.0f))))));
+    float cc = -x2 / 2.0f * (1.0f - x2 / 12.0f * (1.0f - x2 / 30.0f * (1.0f - x2 / 56.0f
+               * (1.0f - x2 / 90.0f * (1.0f - x2 / 132.0f * (1.0f - x2 / 182.0f))))));
+    *s = ss;
+    *cm1 = cc;
+}
+/* exp(x) - 1 without cancellation near 0 */
+static float fexpm1(float x)
+{
+    if (x > 8.0f) x = 8.0f;
+    if (x < -8.0f) x = -8.0f;
+    int h = 0;
+    while ((x > 0.25f || x < -0.25f) && h < 8) { x *= 0.5f; h++; }
+    float r = x * (1.0f + x / 2.0f * (1.0f + x / 3.0f * (1.0f + x / 4.0f
+              * (1.0f + x / 5.0f * (1.0f + x / 6.0f * (1.0f + x / 7.0f))))));
+    while (h--) r = r * (r + 2.0f);          /* e^2x - 1 = (e^x-1)(e^x+1) */
+    return r;
+}
+
+static void dsincos(double x, double *s, double *c)
+{
+    double x2 = x * x, t = x, ss = x, cc = 1.0, u = 1.0;
+    for (int k = 1; k < 9; k++) {
+        t *= -x2 / (double)((2 * k) * (2 * k + 1));
+        ss += t;
+        u *= -x2 / (double)((2 * k - 1) * (2 * k));
+        cc += u;
+    }
+    *s = ss;
+    *c = cc;
+}
+static double dexpm1(double x)
+{
+    if (x > 8.0) x = 8.0;
+    if (x < -8.0) x = -8.0;
+    int h = 0;
+    while ((x > 0.25 || x < -0.25) && h < 8) { x *= 0.5; h++; }
+    double t = x, r = x;
+    for (int k = 2; k < 12; k++) { t *= x / (double)k; r += t; }
+    while (h--) r = r * (r + 2.0);
+    return r;
+}
+
+/* ------------------------------------------------------------ matrices */
+typedef struct { double m[16]; } M4;
+
+static void read_m4(Env *v, u32 g, M4 *o)
+{
+    u8 b[64];
+    gread(v, g, b, 64);
+    for (int i = 0; i < 16; i++) o->m[i] = f_of(ld32(b + 4 * i));
+}
+
+static int invert(const M4 *a, M4 *o)
+{
+    const double *m = a->m;
+    double inv[16];
+    inv[0] = m[5]*m[10]*m[15] - m[5]*m[11]*m[14] - m[9]*m[6]*m[15] + m[9]*m[7]*m[14] + m[13]*m[6]*m[11] - m[13]*m[7]*m[10];
+    inv[4] = -m[4]*m[10]*m[15] + m[4]*m[11]*m[14] + m[8]*m[6]*m[15] - m[8]*m[7]*m[14] - m[12]*m[6]*m[11] + m[12]*m[7]*m[10];
+    inv[8] = m[4]*m[9]*m[15] - m[4]*m[11]*m[13] - m[8]*m[5]*m[15] + m[8]*m[7]*m[13] + m[12]*m[5]*m[11] - m[12]*m[7]*m[9];
+    inv[12] = -m[4]*m[9]*m[14] + m[4]*m[10]*m[13] + m[8]*m[5]*m[14] - m[8]*m[6]*m[13] - m[12]*m[5]*m[10] + m[12]*m[6]*m[9];
+    inv[1] = -m[1]*m[10]*m[15] + m[1]*m[11]*m[14] + m[9]*m[2]*m[15] - m[9]*m[3]*m[14] - m[13]*m[2]*m[11] + m[13]*m[3]*m[10];
+    inv[5] = m[0]*m[10]*m[15] - m[0]*m[11]*m[14] - m[8]*m[2]*m[15] + m[8]*m[3]*m[14] + m[12]*m[2]*m[11] - m[12]*m[3]*m[10];
+    inv[9] = -m[0]*m[9]*m[15] + m[0]*m[11]*m[13] + m[8]*m[1]*m[15] - m[8]*m[3]*m[13] - m[12]*m[1]*m[11] + m[12]*m[3]*m[9];
+    inv[13] = m[0]*m[9]*m[14] - m[0]*m[10]*m[13] - m[8]*m[1]*m[14] + m[8]*m[2]*m[13] + m[12]*m[1]*m[10] - m[12]*m[2]*m[9];
+    inv[2] = m[1]*m[6]*m[15] - m[1]*m[7]*m[14] - m[5]*m[2]*m[15] + m[5]*m[3]*m[14] + m[13]*m[2]*m[7] - m[13]*m[3]*m[6];
+    inv[6] = -m[0]*m[6]*m[15] + m[0]*m[7]*m[14] + m[4]*m[2]*m[15] - m[4]*m[3]*m[14] - m[12]*m[2]*m[7] + m[12]*m[3]*m[6];
+    inv[10] = m[0]*m[5]*m[15] - m[0]*m[7]*m[13] - m[4]*m[1]*m[15] + m[4]*m[3]*m[13] + m[12]*m[1]*m[7] - m[12]*m[3]*m[5];
+    inv[14] = -m[0]*m[5]*m[14] + m[0]*m[6]*m[13] + m[4]*m[1]*m[14] - m[4]*m[2]*m[13] - m[12]*m[1]*m[6] + m[12]*m[2]*m[5];
+    inv[3] = -m[1]*m[6]*m[11] + m[1]*m[7]*m[10] + m[5]*m[2]*m[11] - m[5]*m[3]*m[10] - m[9]*m[2]*m[7] + m[9]*m[3]*m[6];
+    inv[7] = m[0]*m[6]*m[11] - m[0]*m[7]*m[10] - m[4]*m[2]*m[11] + m[4]*m[3]*m[10] + m[8]*m[2]*m[7] - m[8]*m[3]*m[6];
+    inv[11] = -m[0]*m[5]*m[11] + m[0]*m[7]*m[9] + m[4]*m[1]*m[11] - m[4]*m[3]*m[9] - m[8]*m[1]*m[7] + m[8]*m[3]*m[5];
+    inv[15] = m[0]*m[5]*m[10] - m[0]*m[6]*m[9] - m[4]*m[1]*m[10] + m[4]*m[2]*m[9] + m[8]*m[1]*m[6] - m[8]*m[2]*m[5];
+    double det = m[0]*inv[0] + m[1]*inv[4] + m[2]*inv[8] + m[3]*inv[12];
+    if (dabs(det) < 1e-300) return 0;
+    det = 1.0 / det;
+    for (int i = 0; i < 16; i++) o->m[i] = inv[i] * det;
+    return 1;
+}
+
+static void xform(const M4 *a, const double p[4], double o[4])
+{
+    for (int c = 0; c < 4; c++)
+        o[c] = p[0] * a->m[c] + p[1] * a->m[4 + c] + p[2] * a->m[8 + c]
+             + p[3] * a->m[12 + c];
+}
+
+/* What lmain_vv's wsSphere() recovers from the same matrix. */
+typedef struct {
+    double cx, cy, cz, sx, sy, r2w, r3w;
+    double za, zb;                   /* clip.z = za * clip.w + zb */
+    int ok;
+} Frame;
+
+static void frame_of(const M4 *a, Frame *f)
+{
+    const double *m = a->m;
+    double r0[4] = { m[0], m[4], m[8], m[12] };
+    double r1[4] = { m[1], m[5], m[9], m[13] };
+    double r2[4] = { m[2], m[6], m[10], m[14] };
+    double r3[4] = { m[3], m[7], m[11], m[15] };
+    double n3 = r3[0] * r3[0] + r3[1] * r3[1] + r3[2] * r3[2];
+    f->ok = 0;
+    if (n3 < 1e-20) return;
+    double s = dsqrt(n3);
+    f->cx = (r0[0] * r3[0] + r0[1] * r3[1] + r0[2] * r3[2]) / n3;
+    f->cy = (r1[0] * r3[0] + r1[1] * r3[1] + r1[2] * r3[2]) / n3;
+    f->cz = (r2[0] * r3[0] + r2[1] * r3[1] + r2[2] * r3[2]) / n3;
+    double tx[3], ty[3];
+    for (int i = 0; i < 3; i++) {
+        tx[i] = r0[i] - f->cx * r3[i];
+        ty[i] = r1[i] - f->cy * r3[i];
+    }
+    f->sx = dsqrt(tx[0] * tx[0] + tx[1] * tx[1] + tx[2] * tx[2]) / s;
+    f->sy = dsqrt(ty[0] * ty[0] + ty[1] * ty[1] + ty[2] * ty[2]) / s;
+    f->r2w = r2[3];
+    f->r3w = r3[3];
+    f->za = f->cz;
+    f->zb = r2[3] - f->cz * r3[3];
+    if (f->sx < 1e-20 || f->sy < 1e-20) return;
+    f->ok = 1;
+}
+
+/* The depth squeeze lmain_vv applies to models: ndc = a + b / Z; past half
+   the far plane Z is compressed smoothly into the rest of it. */
+static double squeeze(double w, double a, double b)
+{
+    double den = 1.0 - a;
+    if (den > -1e-12 && den < 1e-12) return w;
+    double zf = b / den;
+    if (!(zf > 0.0)) return w;
+    double zc = 0.5 * zf, k = 0.999 * zf - zc;
+    if (w <= zc) return w;
+    return zc - k * dexpm1(-(w - zc) / k);
+}
+
+/* FFNx ApplySphericalWorld on a clip vector, exactly as lmain_vv does it.
+   The terrain matrix ends in TL pixels: screen y grows DOWN, so down is
+   +clip.y here (lmain_vv's NDC y grows up, hence its minus). */
+static void sphere(const Frame *f, const double clip[4], double o[4])
+{
+    double X = (clip[0] - f->cx * clip[3]) / f->sx;
+    double Y = (clip[1] - f->cy * clip[3]) / f->sy;
+    double Z = clip[3];
+    double d = dsqrt(X * X + Z * Z);
+    double R = (double)SPHERE_R;
+    double em1 = dexpm1(-Y / R), e = 1.0 + em1;
+    double sa, ca;
+    dsincos(-d / R, &sa, &ca);
+    double Y2 = -R * (e * ca - 1.0);
+    double d2 = -R * e * sa;
+    double k = (d > 0.001) ? d2 / d : e;
+    double X2 = X * k, Z2 = Z * k;
+    o[0] = f->sx * X2 + f->cx * Z2;
+    o[1] = f->cy * Z2 + f->sy * Y2;
+    o[3] = Z2;
+    o[2] = (f->za + f->zb / squeeze(Z2, f->za, f->zb)) * Z2;
+}
+
+/* The same sphere in float for the far field (its own vertices never go
+   back to model space): clip x, y, w -> screen x, y and the bent w. */
+typedef struct { float cx, cy, sx, sy, isx, isy; } FrameF;
+
+static void frame_f(const Frame *f, FrameF *o)
+{
+    o->cx = (float)f->cx; o->cy = (float)f->cy;
+    o->sx = (float)f->sx; o->sy = (float)f->sy;
+    o->isx = 1.0f / o->sx; o->isy = 1.0f / o->sy;
+}
+
+static int sph_f(const FrameF *f, float c0, float c1, float cw,
+                 float *sx, float *sy, float *w)
+{
+    const float R = SPHERE_R, iR = 1.0f / SPHERE_R;
+    float X = (c0 - f->cx * cw) * f->isx, Y = (c1 - f->cy * cw) * f->isy;
+    float d = fsqrt(X * X + cw * cw);
+    float em1 = fexpm1(-Y * iR), e = 1.0f + em1;
+    float s, cm1;
+    fsincm1(-d * iR, &s, &cm1);
+    float Y2 = -R * (em1 * (1.0f + cm1) + cm1);
+    float d2 = -R * e * s;
+    float k = d > 0.001f ? d2 / d : e;
+    float X2 = X * k, Z2 = cw * k;
+    if (!(Z2 > 1.0f)) return 0;
+    *sx = (f->sx * X2 + f->cx * Z2) / Z2;
+    *sy = (f->cy * Z2 + f->sy * Y2) / Z2;
+    *w = Z2;
+    return 1;
+}
+
+/* ------------------------------------------------------------ bend */
+__attribute__((section(".text.worldfar_bend")))
+void worldfar_bend(State *st, g2h_fn g2h, callx_fn call)
+{
+    Env env = { g2h, call, st };
+    Env *v = &env;
+    if (st->busy)
+        return;                      /* the far field's own calibration */
+    u32 gte = rd32(v, G_GTE);
+    if (gte && st->nnat < NAT_MAX) {
+        s32 *t = st->nat[st->nnat++];
+        t[0] = (s32)rd32(v, gte + 0x22);
+        t[1] = (s32)rd32(v, gte + 0x26);
+        t[2] = (s32)rd32(v, gte + 0x2A);
+    }
+    M4 m, inv;
+    read_m4(v, G_COMBINED, &m);
+    Frame f;
+    frame_of(&m, &f);
+    if (!f.ok || !invert(&m, &inv))
+        return;
+    u8 buf[122 * 12];
+    gread(v, G_VERTS_F, buf, sizeof buf);
+    for (u32 i = 0; i < 122; i++) {
+        u8 *q = buf + 12 * i;
+        double p[4] = { f_of(ld32(q)), f_of(ld32(q + 4)), f_of(ld32(q + 8)), 1.0 };
+        double c[4], o[4], r[4];
+        xform(&m, p, c);
+        if (c[3] <= 1.0)
+            continue;               /* at or behind the eye: leave it */
+        sphere(&f, c, o);
+        xform(&inv, o, r);
+        if (dabs(r[3]) < 1e-12)
+            continue;
+        st32(q, b_of((float)(r[0] / r[3])));
+        st32(q + 4, b_of((float)(r[1] / r[3])));
+        st32(q + 8, b_of((float)(r[2] / r[3])));
+    }
+    gwrite(v, G_VERTS_F, buf, sizeof buf);
+}
+
+/* ------------------------------------------------------------ loading */
+static int name_copy(Env *v, u32 from, u32 to, int far_ext)
+{
+    u32 i = 0, dot = 0;
+    for (; i < 120; i++) {
+        u8 c = rd8(v, from + i);
+        wr8(v, to + i, c);
+        if (c == '.') dot = i;
+        if (!c) break;
+    }
+    if (i >= 120 || !dot)
+        return 0;
+    if (far_ext) {
+        wr8(v, to + dot + 1, 'F'); wr8(v, to + dot + 2, 'A');
+        wr8(v, to + dot + 3, 'R'); wr8(v, to + dot + 4, 0);
+    }
+    return 1;
+}
+
+static int load(Env *v, u32 base)
+{
+    State *st = v->st;
+    u32 far = base + FAR_OFF;
+    u32 io = far + FAR_IO;
+    u32 name = v->call(F_NAME, 2, 0, 0);
+    if (!name)
+        return 0;
+    if (!name_copy(v, name, far + FAR_NAME, 1)
+        || !name_copy(v, name, far + FAR_MAPNAME, 0))
+        return 0;
+    if (v->call(F_READ, 4, far + FAR_NAME, 0, 32, io) != 0)
+        return 0;
+    u8 h[32];
+    gread(v, io, h, 32);
+    if (ld32(h) != 0x52414657u /* 'WFAR' */ || ld32(h + 4) != 2
+        || ld32(h + 8) != N1 || ld32(h + 12) != N2 || ld32(h + 24) != 32)
+        return 0;
+    u32 total = ld32(h + 20), refs = ld32(h + 28);
+    if (total < 32u + 32u * (N1 + N2) || total > FAR_MAX
+        || refs > total || total - refs < 8u * N1)
+        return 0;
+    for (u32 at = 0; at < total; at += FAR_IO_BYTES) {
+        u32 n = total - at < FAR_IO_BYTES ? total - at : FAR_IO_BYTES;
+        if (v->call(F_READ, 4, far + FAR_NAME, at, n, io) != 0)
+            return 0;
+        gread(v, io, st->data + at, n);
+    }
+    if (ld32(st->data) != 0x52414657u)
+        return 0;
+    const u8 *p = st->data + 32;
+    for (u32 k = 0; k < N1 + N2; k++, p += 32) {
+        Entry *e = &st->e[k];
+        e->tris = ld32(p);
+        e->verts = ld32(p + 4);
+        e->norms = ld32(p + 8);
+        e->ntri = (u16)ld16(p + 12);
+        u32 ntot = e->ntri;
+        for (int j = 0; j < 4; j++) e->sk_first[j] = (u16)ld16(p + 14 + 2 * j);
+        for (int j = 0; j < 4; j++) { e->sk_n[j] = p[22 + j]; ntot += e->sk_n[j]; }
+        e->nverts = p[26];
+        e->flags = p[27];
+        e->ymin = ld16(p + 28);
+        e->ymax = ld16(p + 30);
+        if (e->nverts > 120 || ntot > MAX_TRIS_TILE
+            || e->tris > total || (total - e->tris) / 12u < ntot
+            || e->verts > total || (total - e->verts) / 6u < e->nverts
+            || e->norms > total || (total - e->norms) / 3u < e->nverts)
+            return 0;
+        for (int j = 0; j < 4; j++)
+            if ((u32)e->sk_first[j] + e->sk_n[j] > ntot)
+                return 0;
+    }
+    st->refs = refs;
+    for (int s = 0; s < NSLOT; s++) { st->slot[s].cell = -1; st->slot[s].used = 0; }
+    for (int k = 0; k < N1; k++) st->bad[k] = 0;
+    return 1;
+}
+
+/* FF7's LZSS (lgp.lzs_decompress): out is at most `cap` bytes */
+static u32 lzs(const u8 *in, u32 n, u8 *out, u32 cap)
+{
+    u32 i = 0, o = 0;
+    while (i < n) {
+        u8 ctrl = in[i++];
+        for (int bit = 0; bit < 8 && i < n; bit++) {
+            if (ctrl & (1u << bit)) {
+                if (o >= cap) return o;
+                out[o++] = in[i++];
+            } else {
+                if (i + 1 >= n) return o;
+                u32 b1 = in[i], b2 = in[i + 1];
+                i += 2;
+                u32 off = b1 | ((b2 & 0xF0u) << 4);
+                u32 len = (b2 & 0x0Fu) + 3;
+                u32 d = (o - 18 - off) & 0xFFFu;
+                for (u32 k = 0; k < len; k++) {
+                    if (o >= cap) return o;
+                    s32 p = (s32)(o - d);
+                    out[o] = (d == 0 || p < 0) ? 0 : out[p];
+                    o++;
+                }
+            }
+        }
+    }
+    return o;
+}
+
+/* read one full-detail mesh from wm0.map into a cache slot */
+static int load_mesh(Env *v, u32 base, int cell, Slot *sl)
+{
+    State *st = v->st;
+    u32 far = base + FAR_OFF;
+    const u8 *r = st->data + st->refs + 8u * (u32)cell;
+    u32 off = ld32(r), len = ld32(r + 4);
+    sl->cell = -1;
+    if (!len || len > FAR_IO_BYTES || len > LZ_BYTES)
+        return 0;
+    if (v->call(F_READ, 4, far + FAR_MAPNAME, off, len, far + FAR_IO) != 0)
+        return 0;
+    gread(v, far + FAR_IO, st->comp, len);
+    u32 n = lzs(st->comp, len, st->lz, LZ_BYTES);
+    if (n < 4) return 0;
+    u32 nt = (u16)ld16(st->lz), nv = (u16)ld16(st->lz + 2);
+    if (nt > SLOT_TRIS || nv > 120 || 4 + nt * 12 + nv * 16 > n)
+        return 0;
+    const u8 *p = st->lz + 4;
+    copy(sl->tris, p, nt * 12);
+    p += nt * 12;
+    for (u32 i = 0; i < nv * 4; i++) sl->v[i] = ld16(p + 2 * i);
+    p += nv * 8;
+    for (u32 i = 0; i < nv * 4; i++) sl->n[i] = ld16(p + 2 * i);
+    for (u32 i = 0; i < nt; i++)
+        if (sl->tris[12 * i] >= nv || sl->tris[12 * i + 1] >= nv
+            || sl->tris[12 * i + 2] >= nv)
+            return 0;
+    sl->ntri = (u16)nt;
+    sl->nv = (u16)nv;
+    sl->cell = (s16)cell;
+    return 1;
+}
+
+static Slot *find_slot(State *st, int cell)
+{
+    for (int s = 0; s < NSLOT; s++)
+        if (st->slot[s].cell == cell) return &st->slot[s];
+    return 0;
+}
+
+static Slot *victim(State *st)
+{
+    Slot *best = 0;
+    for (int s = 0; s < NSLOT; s++) {
+        Slot *sl = &st->slot[s];
+        if (sl->cell < 0) return sl;
+        if (sl->used == st->frames) continue;
+        if (!best || sl->used < best->used) best = sl;
+    }
+    return best;
+}
+
+/* ------------------------------------------------------------ camera */
+typedef struct {
+    float cx[3], cy[3], cz[3];       /* columns of R, unit scale */
+    s32 t[3];
+    float dy;                        /* -[DE6A04], the y of every tile pos */
+    float horizon;                   /* draw radius about the focus */
+} Cam;
+
+static void apply(Env *v, u32 scratch, s16 x, s16 y, s16 z, s32 out[3])
+{
+    wr16(v, scratch, (u16)x); wr16(v, scratch + 2, (u16)y);
+    wr16(v, scratch + 4, (u16)z); wr16(v, scratch + 6, 0);
+    v->call(F_APPLY, 3, scratch, scratch + 0x10, scratch + 0x20);
+    out[0] = (s32)rd32(v, scratch + 0x10);
+    out[1] = (s32)rd32(v, scratch + 0x14);
+    out[2] = (s32)rd32(v, scratch + 0x18);
+}
+
+static void camera(Env *v, u32 scratch, Cam *c)
+{
+    s32 o[3], a[3];
+    v->call(F_RESET_GTE, 0);
+    apply(v, scratch, 0, 0, 0, o);
+    c->t[0] = o[0]; c->t[1] = o[1]; c->t[2] = o[2];
+    apply(v, scratch, 4096, 0, 0, a);
+    for (int i = 0; i < 3; i++) c->cx[i] = (float)(a[i] - o[i]) / 4096.0f;
+    apply(v, scratch, 0, 4096, 0, a);
+    for (int i = 0; i < 3; i++) c->cy[i] = (float)(a[i] - o[i]) / 4096.0f;
+    apply(v, scratch, 0, 0, 4096, a);
+    for (int i = 0; i < 3; i++) c->cz[i] = (float)(a[i] - o[i]) / 4096.0f;
+    c->dy = -(float)(s32)rd32(v, G_CAM_DELTA_Y);
+    float tx = (float)o[0], ty = (float)o[1], tz = (float)o[2];
+    float camy = -(c->cy[0] * tx + c->cy[1] * ty + c->cy[2] * tz);
+    float h = camy - c->dy;
+    if (h < 0) h = -h;
+    if (h < 500.0f) h = 500.0f;
+    float d = fsqrt(2.0f * SPHERE_R * h) + fsqrt(2.0f * SPHERE_R * MOUNTAIN)
+              + 16384.0f;
+    if (d > 200000.0f) d = 200000.0f;
+    c->horizon = d;
+}
+
+static void view(const Cam *c, float x, float y, float z, float out[3])
+{
+    for (int i = 0; i < 3; i++)
+        out[i] = (float)c->t[i] + c->cx[i] * x + c->cy[i] * y + c->cz[i] * z;
+}
+
+/* ------------------------------------------------------------ drawing */
+typedef struct {
+    Env *v;
+    Cam *c;
+    u32 gte;
+    int budget;
+    int tiles;
+    float light[12];                 /* the world's 3x4 light matrix */
+    float vx0, vy0, vx1, vy1;        /* viewport in TL pixels (with margin) */
+    u32 origin_tab;                  /* guest -> u16 u,v origin per tex */
+    float uvscale;                   /* Cosmos Gaia's terrain UV factor */
+    double m0[16];                   /* combined matrix at translation 0 */
+    double dm[3][4];                 /* d(row 3) / d(translation) */
+} Ctx;
+
+typedef struct {
+    const u8 *tris;                  /* 12 bytes each */
+    int ranges[5][2], nr;
+    const u8 *v; u32 vstride;        /* s16 x,y,z at +0 */
+    const u8 *n; u32 nstride;        /* normal x,y,z: s8 (/127) or s16 (/4096) */
+    int n8;
+    u32 nv;
+} Mesh;
+
+static int visible(Ctx *x, float px, float pz, float half, float ymin, float ymax)
+{
+    float ymid = 0.5f * (ymin + ymax);
+    float r = half * 1.4143f + 0.5f * (ymax - ymin) + 64.0f;
+    float w[3];
+    view(x->c, px, x->c->dy + ymid, pz, w);
+    if (w[2] + r < 0.0f)
+        return 0;
+    if (fabs_(w[0]) - r > 1.9f * (w[2] + r))
+        return 0;
+    return 1;
+}
+
+typedef struct { float x, y, z, rhw; u32 col; int ok; } TV;
+
+/* 0x68DAE1 with the base colour 0x75F68C uses (255,255,255, alpha 0xFF) */
+static u8 chan(float l)
+{
+    if (l < 0.0f) return 0;
+    float s = 255.0f * l;
+    if (s >= 255.0f) return 255;
+    return (u8)__builtin_rintf(s);
+}
+
+static u32 light(const Ctx *x, float nx, float ny, float nz)
+{
+    const float *m = x->light;
+    float lx = m[0] * nx + m[1] * ny + m[2] * nz + m[3];
+    float ly = m[4] * nx + m[5] * ny + m[6] * nz + m[7];
+    float lz = m[8] * nx + m[9] * ny + m[10] * nz + m[11];
+    return (u32)chan(lz) | ((u32)chan(ly) << 8) | ((u32)chan(lx) << 16)
+         | 0xFF000000u;
+}
+
+static void put_tl(Env *v, u32 q, const TV *p, float u, float w)
+{
+    u8 b[0x14];
+    st32(b, b_of(p->x)); st32(b + 4, b_of(p->y)); st32(b + 8, b_of(p->z));
+    st32(b + 12, b_of(p->rhw)); st32(b + 16, p->col);
+    gwrite(v, q, b, 0x14);           /* +0x14 (specular) left as the engine has it */
+    u8 t[8];
+    st32(t, b_of(u)); st32(t + 4, b_of(w));
+    gwrite(v, q + 0x18, t, 8);
+}
+
+static void emit(Ctx *x, const Mesh *me, s32 px, s32 pz)
+{
+    Env *v = x->v;
+    State *st = v->st;
+    if (me->nv == 0 || me->nv > SLOT_VERTS || x->budget <= 0)
+        return;
+    float w[3];
+    view(x->c, (float)px, x->c->dy, (float)pz, w);
+    double t[3] = { (double)(s32)w[0], (double)(s32)w[1], (double)(s32)w[2] };
+    M4 m;
+    for (int i = 0; i < 12; i++) m.m[i] = x->m0[i];
+    for (int c = 0; c < 4; c++)
+        m.m[12 + c] = x->m0[12 + c] + t[0] * x->dm[0][c] + t[1] * x->dm[1][c]
+                    + t[2] * x->dm[2][c];
+    Frame f;
+    frame_of(&m, &f);
+    if (!f.ok) return;
+    float mf[16];
+    for (int i = 0; i < 16; i++) mf[i] = (float)m.m[i];
+    FrameF ff;
+    frame_f(&f, &ff);
+
+    TV tv[SLOT_VERTS];
+    for (u32 i = 0; i < me->nv; i++) {
+        const u8 *pv = me->v + me->vstride * i;
+        float p0 = (float)ld16(pv), p1 = (float)ld16(pv + 2), p2 = (float)ld16(pv + 4);
+        float c0 = p0 * mf[0] + p1 * mf[4] + p2 * mf[8] + mf[12];
+        float c1 = p0 * mf[1] + p1 * mf[5] + p2 * mf[9] + mf[13];
+        float cw = p0 * mf[3] + p1 * mf[7] + p2 * mf[11] + mf[15];
+        TV *o = &tv[i];
+        o->ok = cw > 1.0f;
+        if (!o->ok) continue;
+        float sx_, sy_, Z2;
+        if (!sph_f(&ff, c0, c1, cw, &sx_, &sy_, &Z2)) { o->ok = 0; continue; }
+        float rhw = 1.0f / Z2;
+        o->x = sx_;
+        o->y = sy_;
+        o->rhw = rhw;
+        o->z = (float)(f.za + f.zb / squeeze((double)Z2, f.za, f.zb));
+        const u8 *pn = me->n + me->nstride * i;
+        float nx, ny, nz;
+        if (me->n8) {
+            nx = (float)(s8)pn[0] * (1.0f / 127.0f);
+            ny = (float)(s8)pn[1] * (1.0f / 127.0f);
+            nz = (float)(s8)pn[2] * (1.0f / 127.0f);
+        } else {
+            nx = (float)ld16(pn) * (1.0f / 4096.0f);
+            ny = (float)ld16(pn + 2) * (1.0f / 4096.0f);
+            nz = (float)ld16(pn + 4) * (1.0f / 4096.0f);
+        }
+        o->col = light(x, nx, ny, nz);
+    }
+
+    /* accept, then group by texture so shapes are allocated in batches */
+    u16 acc[MAX_TRIS_TILE], key[MAX_TRIS_TILE];
+    int na = 0;
+    for (int r = 0; r < me->nr; r++)
+        for (int ti = me->ranges[r][0]; ti < me->ranges[r][0] + me->ranges[r][1]; ti++) {
+            const u8 *tb = me->tris + 12 * ti;
+            if (tb[0] >= me->nv || tb[1] >= me->nv || tb[2] >= me->nv) continue;
+            const TV *p0 = &tv[tb[0]], *p1 = &tv[tb[1]], *p2 = &tv[tb[2]];
+            if (!p0->ok || !p1->ok || !p2->ok) continue;
+            /* 0x760CC4, and 0x75F68C keeps area >= 0 after fistp */
+            float area = p0->x * p1->y + p1->x * p2->y + p2->x * p0->y
+                       - p0->x * p2->y - p1->x * p0->y - p2->x * p1->y;
+            if (__builtin_rintf(area) < 0.0f) continue;
+            if ((p0->x < x->vx0 && p1->x < x->vx0 && p2->x < x->vx0)
+                || (p0->x > x->vx1 && p1->x > x->vx1 && p2->x > x->vx1)
+                || (p0->y < x->vy0 && p1->y < x->vy0 && p2->y < x->vy0)
+                || (p0->y > x->vy1 && p1->y > x->vy1 && p2->y > x->vy1))
+                continue;
+            if (na >= MAX_TRIS_TILE || na >= x->budget) break;
+            u16 tex = (u16)(((u32)tb[10] | ((u32)tb[11] << 8)) & 0x1FF);
+            int j = na++;
+            while (j > 0 && key[j - 1] > tex) { key[j] = key[j - 1]; acc[j] = acc[j - 1]; j--; }
+            key[j] = tex;
+            acc[j] = (u16)ti;
+        }
+
+    for (int i = 0; i < na;) {
+        u32 tex = key[i];
+        int end = i;
+        while (end < na && key[end] == tex) end++;
+        u32 obj = rd32(v, G_TEX_OBJS + 4 * tex);
+        if (!obj) { i = end; continue; }
+        float su = rdf(v, obj + 0x24) * x->uvscale, sv = rdf(v, obj + 0x28) * x->uvscale;
+        u32 og = rd32(v, x->origin_tab + 4 * tex);
+        s32 ou = (s32)(og & 0xFFFF), ov = (s32)(og >> 16);
+        while (i < end) {
+            u32 rem = rd32(v, obj + 0x50);
+            u32 want = (u32)(end - i);
+            u32 k = rem > 0 && rem < 0x10000u ? rem : 32u;
+            if (k > want) k = want;
+            if (!v->call(F_ALLOC_SHAPES, 2, k, obj)) { i = end; break; }
+            u32 vp = rd32(v, obj + 0x70);
+            u32 stride = rd32(v, obj + 0x40);
+            if (!vp) { i = end; break; }
+            if (stride < 0x60u) stride = 0x60u;
+            for (u32 s = 0; s < k; s++, i++) {
+                const u8 *tb = me->tris + 12 * acc[i];
+                u32 q = vp + stride * s;
+                for (int c = 0; c < 3; c++)
+                    put_tl(v, q + TL_STRIDE * (u32)c, &tv[tb[c]],
+                           (float)((s32)tb[4 + 2 * c] - ou) * su,
+                           (float)((s32)tb[5 + 2 * c] - ov) * sv);
+                x->budget--;
+                st->last_tris++;
+            }
+        }
+    }
+    x->tiles++;
+}
+
+static void mesh_s(const State *st, const Entry *e, u8 skirts, Mesh *m)
+{
+    m->tris = st->data + e->tris;
+    m->nr = 0;
+    m->ranges[m->nr][0] = 0; m->ranges[m->nr][1] = e->ntri; m->nr++;
+    for (int k = 0; k < 4; k++)
+        if ((skirts & (1 << k)) && e->sk_n[k]) {
+            m->ranges[m->nr][0] = e->sk_first[k];
+            m->ranges[m->nr][1] = e->sk_n[k];
+            m->nr++;
+        }
+    m->v = st->data + e->verts; m->vstride = 6;
+    m->n = st->data + e->norms; m->nstride = 3; m->n8 = 1;
+    m->nv = e->nverts;
+}
+
+static void mesh_n(const Slot *sl, Mesh *m)
+{
+    m->tris = sl->tris;
+    m->nr = 1;
+    m->ranges[0][0] = 0; m->ranges[0][1] = sl->ntri;
+    m->v = (const u8 *)sl->v; m->vstride = 8;
+    m->n = (const u8 *)sl->n; m->nstride = 8; m->n8 = 0;
+    m->nv = sl->nv;
+}
+
+/* The combined matrix is world*view*projection with the GTE translation in
+   the view: row 3 is affine in that translation and rows 0..2 do not depend
+   on it. Four transforms give both; a fifth checks it. */
+static int calibrate(Env *v, Ctx *x, u32 io, u32 onset)
+{
+    State *st = v->st;
+    M4 m[5];
+    s32 T4[3] = { 12345, -6789, 23456 };
+    st->busy = 1;
+    for (int k = 0; k < 5; k++) {
+        for (int i = 0; i < 3; i++) {
+            s32 t = k == 4 ? T4[i] : (k == i + 1 ? 32768 : 0);
+            wr32(v, x->gte + 0x22 + 4 * i, (u32)t);
+        }
+        v->call(F_TRANSFORM, 2, io, onset);
+        read_m4(v, G_COMBINED, &m[k]);
+    }
+    st->busy = 0;
+    for (int i = 0; i < 16; i++) x->m0[i] = m[0].m[i];
+    for (int a = 0; a < 3; a++)
+        for (int c = 0; c < 4; c++)
+            x->dm[a][c] = (m[1 + a].m[12 + c] - m[0].m[12 + c]) / 32768.0;
+    for (int k = 1; k < 5; k++)
+        for (int i = 0; i < 12; i++) {
+            double d = m[k].m[i] - m[0].m[i];
+            if (dabs(d) > 1e-4 * (dabs(m[0].m[i]) + 1.0)) return 0;
+        }
+    for (int c = 0; c < 4; c++) {
+        double want = m[0].m[12 + c] + T4[0] * x->dm[0][c]
+                    + T4[1] * x->dm[1][c] + T4[2] * x->dm[2][c];
+        if (dabs(want - m[4].m[12 + c]) > 1e-3 * (dabs(want) + 100.0)) return 0;
+    }
+    return 1;
+}
+
+static int ringof(int dx, int dz)
+{
+    int a = dx < 0 ? -dx : dx, b = dz < 0 ? -dz : dz;
+    return a > b ? a : b;
+}
+
+static void draw(Env *v, State *st, float uvscale)
+{
+    if (rd32(v, G_MAP_TYPE) != 0)
+        return;
+    u32 base = rd32(v, G_WORLD_BASE);
+    if (!base)
+        return;
+    if (st->magic != 0x52414657u || st->base != base) {
+        if (st->failed_base == base)
+            return;
+        st->magic = 0;
+        if (!load(v, base)) {
+            st->failed_base = base;
+            return;
+        }
+        st->magic = 0x52414657u;
+        st->base = base;
+        st->failed_base = 0;
+    }
+    st->frames++;
+    st->last_tris = 0;
+    st->last_tiles = 0;
+    if (!v->call(F_DRAW_ENABLED, 0))
+        return;
+
+    s32 fx = (s32)rd32(v, G_PLAYER_POS);
+    s32 fz = (s32)rd32(v, G_PLAYER_POS + 8);
+    fx = ((fx % WRAP_X) + WRAP_X) % WRAP_X;
+    fz = ((fz % WRAP_Z) + WRAP_Z) % WRAP_Z;
+    int cx = fx >> 13, cz = fz >> 13;
+    s32 lx = fx & 0x1FFF, lz = fz & 0x1FFF;
+
+    Cam cam;
+    u32 far = base + FAR_OFF;
+    camera(v, far + FAR_SCRATCH, &cam);
+    Ctx x;
+    x.v = v; x.c = &cam; x.tiles = 0;
+    x.gte = rd32(v, G_GTE);
+    x.budget = MAX_TRIS_FRAME;
+    x.uvscale = (uvscale >= 0.125f && uvscale <= 16.0f) ? uvscale : 1.0f;
+    if (!x.gte)
+        return;
+    u32 lg = rd32(v, G_LIGHT);
+    if (!lg)
+        return;
+    for (int i = 0; i < 12; i++) x.light[i] = rdf(v, lg + 0xF8 + 4 * i);
+    x.origin_tab = rd32(v, G_TEX_ORIGIN);
+    if (!x.origin_tab)
+        return;
+    x.vx0 = (float)(s32)rd32(v, G_VIEW_X);
+    x.vy0 = (float)(s32)rd32(v, G_VIEW_Y);
+    x.vx1 = x.vx0 + (float)(s32)rd32(v, G_VIEW_W);
+    x.vy1 = x.vy0 + (float)(s32)rd32(v, G_VIEW_H);
+    if (!(x.vx1 > x.vx0 && x.vy1 > x.vy0)) {
+        x.vx0 = -1e9f; x.vy0 = -1e9f; x.vx1 = 1e9f; x.vy1 = 1e9f;
+    } else {
+        float mw = 0.5f * (x.vx1 - x.vx0), mh = 0.5f * (x.vy1 - x.vy0);
+        x.vx0 -= mw; x.vx1 += mw; x.vy0 -= mh; x.vy1 += mh;
+    }
+    if (!calibrate(v, &x, far + FAR_IO, rd32(v, G_ONSET))) {
+        st->calib_bad++;
+        return;
+    }
+
+    /* which cells the game drew itself this frame */
+    u8 detail[GW][GW];               /* 0 none, 1 S, 2 native / N */
+    u8 nat[GW][GW];
+    for (int j = 0; j < GW; j++) for (int i = 0; i < GW; i++) { detail[j][i] = 0; nat[j][i] = 0; }
+    for (u32 k = 0; k < st->nnat && k < NAT_MAX; k++) {
+        float d[3] = { (float)(st->nat[k][0] - cam.t[0]), (float)(st->nat[k][1] - cam.t[1]),
+                       (float)(st->nat[k][2] - cam.t[2]) };
+        float mxp = cam.cx[0] * d[0] + cam.cx[1] * d[1] + cam.cx[2] * d[2];
+        float mzp = cam.cz[0] * d[0] + cam.cz[1] * d[1] + cam.cz[2] * d[2];
+        float gx = (mxp + (float)lx) / (float)MESH, gz = (mzp + (float)lz) / (float)MESH;
+        int ix = (int)(gx + (gx < 0 ? -0.5f : 0.5f)), iz = (int)(gz + (gz < 0 ? -0.5f : 0.5f));
+        float ex = gx - (float)ix, ez = gz - (float)iz;
+        if (ex > 0.25f || ex < -0.25f || ez > 0.25f || ez < -0.25f) continue;
+        if (ix >= -GRID && ix <= GRID && iz >= -GRID && iz <= GRID)
+            nat[iz + GRID][ix + GRID] = 1;
+    }
+
+    for (int sz = 0; sz < SZ; sz++)
+        for (int sx = 0; sx < SX; sx++) {
+            int near = 0;
+            for (int k = 0; k < 16 && !near; k++) {
+                int dxm = wrapi(sx * 4 + (k & 3) - cx, MX);
+                int dzm = wrapi(sz * 4 + (k >> 2) - cz, MZ);
+                if (ringof(dxm, dzm) <= NEAR_RING) near = 1;
+            }
+            st->cls[sz * SX + sx] = near ? CLS_NEAR : CLS_L2;
+        }
+
+    /* decide every cell's level first (skirts depend on the neighbours) */
+    int want[96], nwant = 0;
+    Slot *nslot[GW][GW];
+    for (int dz = -GRID; dz <= GRID; dz++)
+        for (int dx = -GRID; dx <= GRID; dx++) {
+            int mx = ((cx + dx) % MX + MX) % MX, mz = ((cz + dz) % MZ + MZ) % MZ;
+            int cell = mz * MX + mx;
+            int r = ringof(dx, dz);
+            nslot[dz + GRID][dx + GRID] = 0;
+            if (st->cls[(mz >> 2) * SX + (mx >> 2)] != CLS_NEAR) continue;
+            if (nat[dz + GRID][dx + GRID]) {
+                detail[dz + GRID][dx + GRID] = 2;
+                /* the window's own edge becomes the ring as you move on */
+                if (r >= 2) {
+                    Slot *sl = find_slot(st, cell);
+                    if (sl) sl->used = st->frames;
+                    else if (!st->bad[cell] && nwant < 96) want[nwant++] = (8 << 16) | cell;
+                }
+                continue;
+            }
+            if (r <= PREFETCH_RING) {
+                Slot *sl = find_slot(st, cell);
+                if (sl) sl->used = st->frames;
+                if (r <= FINE_RING && sl) {
+                    nslot[dz + GRID][dx + GRID] = sl;
+                    detail[dz + GRID][dx + GRID] = 2;
+                    continue;
+                }
+                if (!sl && !st->bad[cell] && nwant < 96) want[nwant++] = (r << 16) | cell;
+            }
+            detail[dz + GRID][dx + GRID] = 1;
+        }
+
+    for (int ring = 0; ring <= GRID && x.budget > 0; ring++)
+        for (int dz = -ring; dz <= ring; dz++)
+            for (int dx = -ring; dx <= ring; dx++) {
+                if (ringof(dx, dz) != ring) continue;
+                u8 lvl = detail[dz + GRID][dx + GRID];
+                if (lvl == 0 || nat[dz + GRID][dx + GRID]) continue;
+                int mx = ((cx + dx) % MX + MX) % MX, mz = ((cz + dz) % MZ + MZ) % MZ;
+                const Entry *e = &st->e[mz * MX + mx];
+                s32 px = dx * MESH - lx, pz = dz * MESH - lz;
+                float ax = (float)(px > 0 ? px : (px + MESH < 0 ? -(px + MESH) : 0));
+                float az = (float)(pz > 0 ? pz : (pz + MESH < 0 ? -(pz + MESH) : 0));
+                if (fsqrt(ax * ax + az * az) > cam.horizon)
+                    continue;
+                if (!visible(&x, (float)(px + MESH / 2), (float)(pz + MESH / 2),
+                             MESH / 2, (float)e->ymin, (float)e->ymax))
+                    continue;
+                HOST_TILE(lvl, mz * MX + mx, px, pz);
+                Mesh me;
+                if (lvl == 2) {
+                    mesh_n(nslot[dz + GRID][dx + GRID], &me);
+                } else {
+                    u8 sk = 0;
+                    int nb[4][2] = { { dx, dz - 1 }, { dx + 1, dz }, { dx, dz + 1 }, { dx - 1, dz } };
+                    for (int k = 0; k < 4; k++) {
+                        int ix = nb[k][0], iz = nb[k][1];
+                        if (ix < -GRID || ix > GRID || iz < -GRID || iz > GRID) continue;
+                        if (detail[iz + GRID][ix + GRID] == 2) sk |= (u8)(1 << k);
+                    }
+                    mesh_s(st, e, sk, &me);
+                }
+                emit(&x, &me, px, pz);
+            }
+
+    int order[N2], nord = 0;
+    float dist[N2];
+    s32 posx[N2], posz[N2];
+    for (int s = 0; s < N2; s++) {
+        if (st->cls[s] != CLS_L2) continue;
+        int sx = s % SX, sz = s / SX;
+        s32 rx = wrapi(sx * 4 * MESH + 2 * MESH - fx, WRAP_X);
+        s32 rz = wrapi(sz * 4 * MESH + 2 * MESH - fz, WRAP_Z);
+        float ax = (float)(rx < 0 ? -rx : rx) - 2.0f * MESH;
+        float az = (float)(rz < 0 ? -rz : rz) - 2.0f * MESH;
+        if (ax < 0) ax = 0;
+        if (az < 0) az = 0;
+        float dn = fsqrt(ax * ax + az * az);
+        if (dn > cam.horizon) continue;
+        const Entry *e = &st->e[N1 + s];
+        if (!visible(&x, (float)rx, (float)rz, 2.0f * MESH, (float)e->ymin, (float)e->ymax))
+            continue;
+        int j = nord++;
+        while (j > 0 && dist[order[j - 1]] > dn) {
+            order[j] = order[j - 1];
+            j--;
+        }
+        order[j] = s;
+        dist[s] = dn; posx[s] = rx; posz[s] = rz;
+    }
+    for (int i = 0; i < nord && x.budget > 0; i++) {
+        int s = order[i];
+        int sx = s % SX, sz = s / SX;
+        const Entry *e = &st->e[N1 + s];
+        u8 sk = 0;
+        int nb[4][2] = { { sx, sz - 1 }, { sx + 1, sz }, { sx, sz + 1 }, { sx - 1, sz } };
+        for (int k = 0; k < 4; k++) {
+            int nx = (nb[k][0] + SX) % SX, nz = (nb[k][1] + SZ) % SZ;
+            int ns = nz * SX + nx;
+            if (st->cls[ns] == CLS_NEAR
+                || ((st->e[N1 + ns].flags ^ e->flags) & 1))
+                sk |= (u8)(1 << k);
+        }
+        HOST_TILE(3, s, posx[s], posz[s]);
+        Mesh me;
+        mesh_s(st, e, sk, &me);
+        emit(&x, &me, posx[s], posz[s]);
+    }
+    st->last_tiles = (u32)x.tiles;
+
+    /* read the missing full-detail meshes, nearest first, a few per frame */
+    for (int a = 1; a < nwant; a++) {
+        int w = want[a], j = a;
+        while (j > 0 && want[j - 1] > w) { want[j] = want[j - 1]; j--; }
+        want[j] = w;
+    }
+    for (int a = 0, done = 0; a < nwant && done < LOADS_PER_FRAME; a++) {
+        Slot *sl = victim(st);
+        if (!sl) break;
+        done++;
+        if (load_mesh(v, base, want[a] & 0xFFFF, sl)) {
+            sl->used = st->frames;
+            st->loads++;
+        } else {
+            st->load_fail++;
+            st->bad[want[a] & 0xFFFF] = 1;   /* never again: S stands in */
+        }
+    }
+}
+
+__attribute__((section(".text.worldfar_draw")))
+void worldfar_draw(State *st, g2h_fn g2h, callx_fn call, float uvscale)
+{
+    Env env = { g2h, call, st };
+    draw(&env, st, uvscale);
+    st->nnat = 0;                    /* the next frame's window starts empty */
+    call(F_RESET_GTE, 0);
+}
+
+/* ------------------------------------------------------------ input */
+static u8 *input_obj(u8 **got)
+{
+    if (!got) return 0;
+    u8 *p = *got;
+    if (!p) return 0;
+    p = *(u8 **)(p + 0);
+    if (!p) return 0;
+    p = *(u8 **)(p + 8);
+    if (!p) return 0;
+    p = *(u8 **)(p + 0);
+    if (!p) return 0;
+    return *(u8 **)(p + 0x88);
+}
+
+static float stick(float v)
+{
+    if (v > STICK_DEADZONE) return (v - STICK_DEADZONE) / (1.0f - STICK_DEADZONE);
+    if (v < -STICK_DEADZONE) return (v + STICK_DEADZONE) / (1.0f - STICK_DEADZONE);
+    return 0.0f;
+}
+
+static float mult(Env *v)
+{
+    s32 m = (s32)rd32(v, G_MOVE_MULT);
+    if (m < 1) m = 1;
+    if (m > 4) m = 4;
+    return (float)m;
+}
+
+/* ------------------------------------------------------------ camera
+ * FFNx's world camera (camera.cpp): pitch -95..-175 degrees, zoom up to
+ * 35000 on the triggers, right stick for the view.
+ *   ZL / ZR     zoom out / in (ZR in, as FFNx's right trigger)
+ *   up/down     tilt: up looks toward the horizon, down at the ground
+ *   R3          both back to the game's own camera
+ * Runs right after the game's camera update 0x74E8CE, which rebuilds the
+ * camera rotation (0xDFC448) and position (0xDE6A20, t = (0,0,dist)) every
+ * frame from its own state, so these are pure offsets on top of it. */
+__attribute__((section(".text.worldfar_camera")))
+void worldfar_camera(State *st, g2h_fn g2h, callx_fn call, u8 **got)
+{
+    Env env = { g2h, call, st };
+    Env *v = &env;
+    if (rd32(v, G_MAP_TYPE) != 0)
+        return;
+    u8 *p = input_obj(got);
+    if (!p) return;
+    float ry = stick(*(float *)(p + 0x40) - *(float *)(p + 0x44));
+    unsigned long long buttons = *(unsigned long long *)(p + 0x20);
+    float mm = mult(v);
+    float zoom = st->zoom, tilt = st->tilt;
+    if (!(zoom >= 0.0f && zoom < 100000.0f)) zoom = 0.0f;
+    if (!(tilt > -3.2f && tilt < 3.2f)) tilt = 0.0f;
+    if (buttons & BTN_R3) {
+        zoom = 0.0f;
+        tilt = 0.0f;
+    }
+    if (buttons & BTN_ZL) zoom += ZOOM_STEP * mm;
+    if (buttons & BTN_ZR) zoom -= ZOOM_STEP * mm;
+    tilt -= TILT_STEP * mm * ry;
+    if (tilt == 0.0f) {
+        /* no offset: the game's own camera, whatever its pitch */
+        st->tilt = 0.0f;
+        goto zoom_only;
+    }
+
+zoom_only:;
+    /* zoom: add to the distance the game just wrote */
+    s32 base = (s32)rd32(v, G_CAM_TRANS_Z);
+    float room = ZOOM_MAX_DIST - (float)base;
+    if (room < 0.0f) room = 0.0f;
+    if (zoom > room) zoom = room;
+    if (zoom < 0.0f) zoom = 0.0f;
+    if (zoom > 0.0f)
+        wr32(v, G_CAM_TRANS_Z, (u32)(base + (s32)zoom));
+    st->zoom = zoom;
+    if (tilt == 0.0f)
+        return;
+
+    /* tilt: R' = Rx(delta) * R on the 3x3 the game just wrote. Row 2 is
+       the view axis in world space; asin(|y|) is how far it looks below
+       (or above) the horizontal, and the offset is added to that. */
+    double Rm[3][3];
+    for (int i = 0; i < 3; i++)
+        for (int j = 0; j < 3; j++)
+            Rm[i][j] = (double)rds16(v, G_CAM_ROT + 2 * (3 * i + j)) / 4096.0;
+    double fy = dabs(Rm[2][1]);
+    if (fy > 1.0) fy = 1.0;
+    double mag0 = fy;                          /* asin by Newton */
+    for (int it = 0; it < 30; it++) {
+        double s, c;
+        dsincos(mag0, &s, &c);
+        if (c < 1e-6) break;
+        mag0 -= (s - fy) / c;
+    }
+    double wantd = mag0 + (double)tilt;
+    if (wantd < TILT_MIN) wantd = TILT_MIN;
+    if (wantd > TILT_MAX) wantd = TILT_MAX;
+    tilt = (float)(wantd - mag0);
+    st->zoom = zoom;
+    st->tilt = tilt;
+    if (tilt == 0.0f)
+        return;
+    double sw, cw;
+    dsincos(wantd, &sw, &cw);
+    double best = 1e9, b1[3] = { 0 }, b2[3] = { 0 };
+    for (int attempt = 0; attempt < 2; attempt++) {
+        double d = attempt ? -(wantd - mag0) : (wantd - mag0);
+        double s, c;
+        dsincos(d, &s, &c);
+        double r1[3], r2[3];
+        for (int j = 0; j < 3; j++) {
+            r1[j] = c * Rm[1][j] - s * Rm[2][j];
+            r2[j] = s * Rm[1][j] + c * Rm[2][j];
+        }
+        double err = dabs(dabs(r2[1]) - sw);
+        if (err < best) {
+            best = err;
+            for (int j = 0; j < 3; j++) { b1[j] = r1[j]; b2[j] = r2[j]; }
+        }
+    }
+    for (int j = 0; j < 3; j++) {
+        s32 a1 = (s32)(b1[j] * 4096.0 + (b1[j] >= 0 ? 0.5 : -0.5));
+        s32 a2 = (s32)(b2[j] * 4096.0 + (b2[j] >= 0 ? 0.5 : -0.5));
+        wr16(v, G_CAM_ROT + 2 * (3 + j), (u16)(s16)a1);
+        wr16(v, G_CAM_ROT + 2 * (6 + j), (u16)(s16)a2);
+    }
+}
+
+/* ------------------------------------------------------------ input
+ * Around world_update_player 0x74EA48 (phase 0 before, 1 after).
+ * The stock game turns the camera heading 0xDFC484 whenever left/right (or
+ * L1/R1) is held, so walking left runs Cloud in a circle. FFNx's analogue
+ * world controls keep the camera still and let the right stick turn it.
+ * Here: on the overworld, outside the Highwind view, with the player in
+ * control, a small change of the heading made by the update is taken back
+ * out (scripted camera moves are large jumps, or happen out of control);
+ * then the right stick's left/right turns it, in every view. */
+__attribute__((section(".text.worldfar_input")))
+void worldfar_input(State *st, g2h_fn g2h, callx_fn call, u8 **got, u32 phase)
+{
+    Env env = { g2h, call, st };
+    Env *v = &env;
+    if (rd32(v, G_MAP_TYPE) != 0) {
+        st->saved_ok = 0;
+        return;
+    }
+    if (phase == 0) {
+        st->front_saved = (s32)rd32(v, G_CAM_FRONT);
+        st->saved_ok = 1;
+        return;
+    }
+    if (!st->saved_ok)
+        return;
+    st->saved_ok = 0;
+    s32 front = (s32)rd32(v, G_CAM_FRONT);
+    if (rd32(v, G_VIEW_TYPE) != 3 && rd32(v, G_CONTROL) != 0) {
+        s32 d = wrapi(front - st->front_saved, 4096);
+        if (d != 0 && d <= YAW_UNDO && d >= -YAW_UNDO)
+            front = st->front_saved;
+    }
+    u8 *p = input_obj(got);
+    if (p && rd32(v, G_CONTROL) != 0) {
+        float rx = stick(*(float *)(p + 0x48) - *(float *)(p + 0x4C));
+        front += (s32)(YAW_STEP * mult(v) * rx);
+    }
+    front = ((front % 4096) + 4096) % 4096;
+    wr32(v, G_CAM_FRONT, (u32)front);
+}

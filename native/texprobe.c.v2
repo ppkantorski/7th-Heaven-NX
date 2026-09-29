@@ -1,0 +1,442 @@
+/*
+ * texprobe.c v2 -- a texture-load probe. DIAGNOSTIC ONLY.
+ *
+ * Question: when fship_2's crew and Cloud come back speckled on the second
+ * entry from the world map, is the TEXTURE DATA different (corrupted before
+ * or after the load), or is the data the same and the GPU side wrong (the
+ * upload skipped, a stale handle, a handle shared with another texture)?
+ *
+ * v1 on hardware: the loader runs ~12000 times per fship visit, almost all
+ * of them repeat calls for textures it already has; the 256-entry table
+ * filled with the first background pages and never reached the models, and
+ * ts was the argument (0 for a new set), not the set the loader returned.
+ * v2 keeps ONE record per texture (texture_set, palette index), counts the
+ * repeat calls on it, records the returned set, and has room for 1024.
+ *
+ * Hooks (applied to a BUILT main by texprobe.py, into the dead-space 'probe'
+ * part -- see ff7nx_deadspace):
+ *   tp_load   native gfx_drv_load_texture (+0x10D6BC0) entry:
+ *             (texture_set, tex_header, texture_format), all guest pointers
+ *   tp_ret    its only `ret` (+0x10D7048), with the returned texture_set
+ *   tp_frame  native gfx_drv_flip entry (+0x10DA880): R3 edge outside the
+ *             world map -> dump and svcBreak (a crash report)
+ *
+ * A VISIT is a run of loads with the same key = (driver mode << 16) | field
+ * id; when the key changes the finished visit is kept as the reference for
+ * its key (6 keys, least recent replaced). At the trigger the current visit
+ * is compared with the previous visit of the same key by CONTENT, and its
+ * handles with the handles every other kept visit got.
+ *
+ * Built like worldfar.c: position independent, no data/bss sections, the
+ * state block is passed in x0 by the hook stubs.
+ */
+#include <stdint.h>
+typedef uint8_t u8; typedef uint16_t u16; typedef uint32_t u32;
+typedef uint64_t u64; typedef int32_t s32;
+typedef u8 *(*g2h_fn)(u32 guest);
+
+#define TH_FMT      0x3Cu      /* tex_header: struct texture_format */
+#define TF_W        0x00u
+#define TF_H        0x04u
+#define TF_BPR      0x08u
+#define TF_PALSIZE  0x1Cu
+#define TF_PALDATA  0x24u
+#define TH_PALIDX   0xD0u
+#define TH_IMAGE    0xD4u
+#define TS_HANDLES  0x7Cu      /* texture_set: u32 *texturehandle (guest) */
+#define G_FIELD_ID  0xCFF468u  /* u16 */
+#define DRIVER_WORLD 4u
+#define BTN_R3      ((1ull << 5) | (1ull << 62))
+#define MAGIC       0x32505854u /* 'TXP2' */
+
+#define NREC   1024
+#define NKEY   6
+#define NOUT   16
+#define REPEAT 0x80000000u     /* pend_idx: a repeat call on record idx */
+
+enum {                          /* Rec.flags */
+    F_SKIPPED   = 1u << 0,      /* first call: handle already set, no upload */
+    F_NOIMAGE   = 1u << 1,      /* no image data pointer */
+    F_CHANGED   = 1u << 2,      /* (trigger) image hash differs from load */
+    F_UNMATCHED = 1u << 3,      /* (trigger) no texture of this content in the ref visit */
+    F_DUPHANDLE = 1u << 4,      /* (trigger) handle shared with a different texture, this visit */
+    F_TSREUSED  = 1u << 5,      /* (trigger) texture_set also used in another key's visit */
+    F_BIG       = 1u << 6,      /* image hashed only partly (> 4 MB) */
+    F_STALE     = 1u << 7,      /* (trigger) handle was a DIFFERENT texture's in another key's visit */
+    F_CARRIED   = 1u << 8,      /* first call already had a texture_set: made before this visit */
+    F_REMADE    = 1u << 9,      /* a new set was made again for the same header */
+    F_HCHANGED  = 1u << 10,     /* the handle changed between calls */
+};
+#define F_TRIGGER (F_CHANGED | F_UNMATCHED | F_DUPHANDLE | F_TSREUSED | F_STALE)
+
+typedef struct {                /* 48 bytes */
+    u32 ts_in;                  /* texture_set argument of the first call */
+    u32 ts;                     /* texture_set returned (or ts_in) */
+    u32 th;                     /* tex_header */
+    u32 img;                    /* hash of the image data at the first call */
+    u32 pal;                    /* hash of the palette */
+    u32 hpre;                   /* handle[palidx] at the first call's entry */
+    u32 hpost;                  /* ... at its return */
+    u32 image_ptr;              /* guest image data pointer */
+    u16 w, h;
+    u16 palidx;
+    u16 count;                  /* calls (saturating) */
+    u32 flags;
+    u32 len64;                  /* image bytes hashed / 64 */
+} Rec;
+
+typedef struct {                /* 32 bytes: the dump format */
+    u32 a;                      /* w (12) | h (12) << 12 | min(count,255) << 24 */
+    u32 b;                      /* idx (10) | palidx (8) << 10 | flags (14) << 18 */
+    u32 ts, img, pal, hpre, hpost, image_ptr;
+} Out;
+
+typedef struct {
+    u32 key, n, visit, age;
+    u32 calls, uploads, lost, newsets;
+    Rec r[NREC];
+} Visit;
+
+typedef struct {
+    u32 magic;
+    u32 key;                    /* current visit's key */
+    u32 visit_no;               /* running count of visits */
+    u32 total;                  /* calls since boot */
+    u32 depth;                  /* pending tp_load -> tp_ret */
+    u32 pend_idx[4];
+    u32 pend_ts[4];
+    u32 pend_th[4];
+    u32 r3_prev;
+    u32 clock;
+    u32 pad;
+    Visit cur;
+    Visit old[NKEY];
+} State;
+
+static u32 hash_words(u32 h, u32 w) { return (h ^ w) * 16777619u; }
+
+/* hash n guest bytes, page by page (g2h is per page) */
+static u32 ghash(g2h_fn g2h, u32 g, u32 n)
+{
+    u32 h = 2166136261u;
+    while (n) {
+        u32 room = 0x1000u - (g & 0xFFFu);
+        u32 k = n < room ? n : room;
+        const u8 *p = g2h(g);
+        if (!p) return 0;
+        u32 i = 0;
+        if (((uintptr_t)p & 3) == 0)
+            for (; i + 4 <= k; i += 4) h = hash_words(h, *(const u32 *)(const void *)(p + i));
+        for (; i < k; i++) h = hash_words(h, p[i]);
+        g += k; n -= k;
+    }
+    return h;
+}
+
+static u32 rd32(g2h_fn g2h, u32 g)
+{
+    if (!g) return 0;
+    if ((g & 0xFFFu) <= 0xFFCu) {
+        const u8 *p = g2h(g);
+        if (!p) return 0;
+        return (u32)p[0] | ((u32)p[1] << 8) | ((u32)p[2] << 16) | ((u32)p[3] << 24);
+    }
+    u32 v = 0;
+    for (int i = 0; i < 4; i++) { const u8 *p = g2h(g + i); v |= (u32)(p ? *p : 0) << (8 * i); }
+    return v;
+}
+
+static u32 handle_of(g2h_fn g2h, u32 ts, u32 palidx)
+{
+    u32 handles = ts ? rd32(g2h, ts + TS_HANDLES) : 0;
+    return (handles && palidx < 0x100u) ? rd32(g2h, handles + 4u * palidx) : 0;
+}
+
+static u32 cur_mode(u32 *mode_slot)
+{
+    if (!mode_slot) return 0;
+    u32 *m = *(u32 **)(void *)mode_slot;
+    return m ? *m : 0;
+}
+
+static void copyv(Visit *d, const Visit *s)
+{
+    const u32 *ss = (const u32 *)(const void *)s;
+    u32 *dd = (u32 *)(void *)d;
+    for (u32 i = 0; i < 8; i++) dd[i] = ss[i];
+    u64 *dr = (u64 *)(void *)d->r;
+    const u64 *sr = (const u64 *)(const void *)s->r;
+    for (u32 i = 0; i < s->n * (sizeof(Rec) / 8); i++) dr[i] = sr[i];
+}
+
+/* the finished visit becomes the reference for its key */
+static void end_visit(State *st)
+{
+    if (!st->cur.n) return;
+    Visit *slot = 0;
+    for (int k = 0; k < NKEY; k++)
+        if (st->old[k].n && st->old[k].key == st->cur.key) { slot = &st->old[k]; break; }
+    if (!slot)
+        for (int k = 0; k < NKEY; k++)
+            if (!slot || st->old[k].age < slot->age) slot = &st->old[k];
+    st->cur.age = ++st->clock;
+    copyv(slot, &st->cur);
+}
+
+static void check_key(State *st, g2h_fn g2h, u32 *mode_slot)
+{
+    u32 key = (cur_mode(mode_slot) << 16) | (rd32(g2h, G_FIELD_ID) & 0xFFFFu);
+    if (st->magic != MAGIC) {
+        u64 *z = (u64 *)(void *)st;
+        for (u32 i = 0; i < sizeof(State) / 8; i++) z[i] = 0;
+        st->magic = MAGIC;
+        st->key = key;
+        st->cur.key = key;
+        st->cur.visit = ++st->visit_no;
+    }
+    if (key != st->key) {
+        end_visit(st);
+        u32 *c = (u32 *)(void *)&st->cur;
+        for (u32 i = 0; i < 8; i++) c[i] = 0;
+        st->key = key;
+        st->cur.key = key;
+        st->cur.visit = ++st->visit_no;
+    }
+}
+
+__attribute__((section(".text.tp_load")))
+void tp_load(State *st, g2h_fn g2h, u32 ts, u32 th, u32 tf, u32 *mode_slot)
+{
+    (void)tf;
+    check_key(st, g2h, mode_slot);
+    st->total++;
+    Visit *v = &st->cur;
+    v->calls++;
+    u32 d = st->depth < 4 ? st->depth : 3;
+    st->depth++;
+    st->pend_idx[d] = 0xFFFFFFFFu;
+    st->pend_ts[d] = ts;
+    st->pend_th[d] = th;
+    if (!th) return;
+    u32 palidx = rd32(g2h, th + TH_PALIDX);
+    u32 hpre = handle_of(g2h, ts, palidx);
+    if (!hpre) v->uploads++;
+    if (!ts) v->newsets++;
+    /* a texture this visit already has: the same set (or, for a new set,
+       the same header) and palette */
+    for (u32 i = 0; i < v->n; i++) {
+        Rec *q = &v->r[i];
+        if (q->palidx != (u16)palidx) continue;
+        if (ts ? (q->ts == ts || q->ts_in == ts) : (q->th == th && !q->ts_in)) {
+            if (q->count != 0xFFFFu) q->count++;
+            if (!ts) q->flags |= F_REMADE;
+            st->pend_idx[d] = i | REPEAT;
+            return;
+        }
+    }
+    if (v->n >= NREC) { v->lost++; return; }
+    Rec *r = &v->r[v->n];
+    st->pend_idx[d] = v->n;
+    v->n++;
+    u32 fmt = th + TH_FMT;
+    u32 w = rd32(g2h, fmt + TF_W), h = rd32(g2h, fmt + TF_H);
+    u32 bpr = rd32(g2h, fmt + TF_BPR);
+    u32 img = rd32(g2h, th + TH_IMAGE);
+    u32 palsz = rd32(g2h, fmt + TF_PALSIZE), paldata = rd32(g2h, fmt + TF_PALDATA);
+    u32 flags = 0;
+    r->ts_in = ts; r->ts = ts; r->th = th;
+    r->w = (u16)w; r->h = (u16)h;
+    r->palidx = (u16)palidx;
+    r->count = 1;
+    r->image_ptr = img;
+    u32 n = bpr * h;
+    r->len64 = 0;
+    if (!img || !n || w > 4096 || h > 4096) { flags |= F_NOIMAGE; r->img = 0; }
+    else {
+        if (n > 0x3FFFC0u) { n = 0x3FFFC0u; flags |= F_BIG; }
+        n &= ~63u;
+        r->len64 = n >> 6;
+        r->img = n ? ghash(g2h, img, n) : 0;
+    }
+    r->pal = (paldata && palsz && palsz <= 0x10000u) ? ghash(g2h, paldata, palsz * 4u) : 0;
+    r->hpre = hpre;
+    if (hpre) flags |= F_SKIPPED;
+    if (ts) flags |= F_CARRIED;
+    r->hpost = 0;
+    r->flags = flags;
+}
+
+__attribute__((section(".text.tp_ret")))
+void tp_ret(State *st, g2h_fn g2h, u32 ret_ts)
+{
+    if (st->magic != MAGIC || !st->depth) return;
+    st->depth--;
+    u32 d = st->depth < 4 ? st->depth : 3;
+    u32 i = st->pend_idx[d];
+    u32 rep = i & REPEAT;
+    i &= ~REPEAT;
+    if (i >= st->cur.n) return;
+    Rec *r = &st->cur.r[i];
+    u32 ts = ret_ts ? ret_ts : st->pend_ts[d];
+    u32 hpost = handle_of(g2h, ts, r->palidx);
+    if (rep) {
+        if (r->hpost && hpost != r->hpost) r->flags |= F_HCHANGED;
+        return;
+    }
+    r->ts = ts;
+    r->hpost = hpost;
+}
+
+static u8 *input_obj(u8 **got)
+{
+    if (!got) return 0;
+    u8 *p = *got;
+    if (!p) return 0;
+    p = *(u8 **)(void *)(p + 0);
+    if (!p) return 0;
+    p = *(u8 **)(void *)(p + 8);
+    if (!p) return 0;
+    p = *(u8 **)(void *)(p + 0);
+    if (!p) return 0;
+    return *(u8 **)(void *)(p + 0x88);
+}
+
+static void put(Out *o, const Rec *r, u32 idx)
+{
+    u32 c = r->count > 255 ? 255 : r->count;
+    o->a = (r->w & 0xFFFu) | ((u32)(r->h & 0xFFFu) << 12) | (c << 24);
+    o->b = (idx & 0x3FFu) | ((u32)(r->palidx & 0xFFu) << 10) | ((r->flags & 0x3FFFu) << 18);
+    o->ts = r->ts; o->img = r->img; o->pal = r->pal;
+    o->hpre = r->hpre; o->hpost = r->hpost; o->image_ptr = r->image_ptr;
+}
+
+static u32 handle(const Rec *r) { return r->hpost ? r->hpost : r->hpre; }
+static int same(const Rec *a, const Rec *b)
+{
+    return a->w == b->w && a->h == b->h && a->img == b->img && a->pal == b->pal;
+}
+static u64 key20(u32 key) { return (u64)(((key >> 16) & 0xFu) << 16 | (key & 0xFFFFu)); }
+
+/* the comparison, into out[NOUT] and regs[10]; split from dump() so the
+   host test can run it */
+static void analyze(State *st, g2h_fn g2h, Out *out, u64 *regs)
+{
+    Visit *cur = &st->cur, *ref = 0;
+    for (int k = 0; k < NKEY; k++)
+        if (st->old[k].n && st->old[k].key == cur->key) ref = &st->old[k];
+    u32 unmatched = 0, skipped = 0, changed = 0, dup = 0, reused = 0, noimg = 0;
+    u32 stale = 0, carried = 0, remade = 0, hchanged = 0;
+    for (u32 i = 0; i < cur->n; i++) {
+        Rec *r = &cur->r[i];
+        u32 f = r->flags & ~F_TRIGGER;
+        if (!(f & F_NOIMAGE) && r->image_ptr && r->len64
+            && ghash(g2h, r->image_ptr, r->len64 << 6) != r->img)
+            f |= F_CHANGED;             /* the image data moved on since the load */
+        if (ref && !(f & F_NOIMAGE)) {
+            int hit = 0;
+            for (u32 j = 0; j < ref->n && !hit; j++) hit = same(&ref->r[j], r);
+            if (!hit) f |= F_UNMATCHED;
+        }
+        u32 hr = handle(r);
+        if (hr)
+            for (u32 j = 0; j < cur->n; j++) {
+                const Rec *q = &cur->r[j];
+                if (j != i && handle(q) == hr && !same(q, r)
+                    && (q->ts != r->ts || q->palidx != r->palidx)) { f |= F_DUPHANDLE; break; }
+            }
+        for (int k = 0; k < NKEY; k++) {
+            const Visit *o = &st->old[k];
+            if (!o->n || o->key == cur->key) continue;
+            for (u32 j = 0; j < o->n; j++) {
+                const Rec *q = &o->r[j];
+                if (r->ts && q->ts == r->ts) f |= F_TSREUSED;
+                if (hr && handle(q) == hr && !same(q, r)) f |= F_STALE;
+            }
+        }
+        r->flags = f;
+        unmatched += !!(f & F_UNMATCHED); skipped += !!(f & F_SKIPPED);
+        changed += !!(f & F_CHANGED); dup += !!(f & F_DUPHANDLE);
+        reused += !!(f & F_TSREUSED); noimg += !!(f & F_NOIMAGE);
+        stale += !!(f & F_STALE); carried += !!(f & F_CARRIED);
+        remade += !!(f & F_REMADE); hchanged += !!(f & F_HCHANGED);
+    }
+    /* the 16 most telling records: data/handle trouble first, then sets
+       from other visits, then the skipped, then the LAST loads (the models
+       come after the background pages) */
+    u32 no = 0;
+    u8 taken[NREC];
+    for (u32 i = 0; i < cur->n; i++) taken[i] = 0;
+    const u32 want[3] = { (F_TRIGGER & ~F_TSREUSED) | F_REMADE | F_HCHANGED,
+                          F_TSREUSED | F_CARRIED, F_SKIPPED };
+    for (int pass = 0; pass < 3 && no < NOUT; pass++)
+        for (u32 i = 0; i < cur->n && no < NOUT; i++)
+            if (!taken[i] && (cur->r[i].flags & want[pass])) { taken[i] = 1; put(&out[no++], &cur->r[i], i); }
+    for (u32 i = cur->n; i-- > 0 && no < NOUT; )
+        if (!taken[i]) { taken[i] = 1; put(&out[no++], &cur->r[i], i); }
+    for (u32 i = no; i < NOUT; i++) { u32 *z = (u32 *)(void *)&out[i]; for (int k = 0; k < 8; k++) z[k] = 0; }
+    /* the reference visit's own record of the first unmatched texture's
+       SIZE (same w/h, different content): the other half of the pair */
+    u32 pair_img = 0, pair_pal = 0;
+    if (ref)
+        for (u32 i = 0; i < cur->n && !pair_img; i++) {
+            const Rec *r = &cur->r[i];
+            if (!(r->flags & F_UNMATCHED)) continue;
+            for (u32 j = 0; j < ref->n; j++) {
+                const Rec *q = &ref->r[j];
+                if (q->w == r->w && q->h == r->h && q->img) { pair_img = q->img; pair_pal = q->pal; break; }
+            }
+        }
+    regs[0] = ((u64)MAGIC << 32) | cur->key;
+    regs[1] = ((u64)cur->n << 48) | ((u64)(ref ? ref->n : 0) << 32) | ((u64)(cur->visit & 0xFFFF) << 16) | (ref ? ref->visit & 0xFFFF : 0);
+    regs[2] = ((u64)unmatched << 48) | ((u64)skipped << 32) | ((u64)dup << 16) | reused;
+    regs[3] = ((u64)changed << 48) | ((u64)noimg << 32) | ((u64)(cur->lost & 0xFFFF) << 16) | stale;
+    regs[4] = ((u64)cur->calls << 32) | cur->uploads;
+    regs[5] = ((u64)carried << 48) | ((u64)remade << 32) | ((u64)hchanged << 16) | (cur->newsets & 0xFFFF);
+    regs[6] = ((u64)pair_img << 32) | pair_pal;
+    regs[7] = ref ? ((u64)ref->calls << 32) | ref->uploads : 0;
+    regs[8] = key20(st->old[0].key) | key20(st->old[1].key) << 20 | key20(st->old[2].key) << 40;   /* -> FP */
+    regs[9] = key20(st->old[3].key) | key20(st->old[4].key) << 20 | key20(st->old[5].key) << 40    /* -> LR */
+            | (u64)(st->depth & 0xF) << 60;
+}
+
+__attribute__((noreturn)) static void dump(State *st, g2h_fn g2h)
+{
+    Out out[NOUT] __attribute__((aligned(16)));
+    u64 regs[10];
+    analyze(st, g2h, out, regs);
+    /* records 8..15 -> the TLS dump */
+    u8 *tls;
+    __asm__ volatile("mrs %0, tpidrro_el0" : "=r"(tls));
+    {
+        u64 *d = (u64 *)(void *)tls;
+        const u64 *s = (const u64 *)(const void *)&out[8];
+        for (int i = 0; i < 32; i++) d[i] = s[i];
+    }
+    /* records 0..7 -> the stack dump: SP moves onto them */
+    __asm__ volatile(
+        "mov x16, %0\n"
+        "mov x17, %1\n"
+        "ldp x0, x1, [x16, #0]\n"
+        "ldp x2, x3, [x16, #16]\n"
+        "ldp x4, x5, [x16, #32]\n"
+        "ldp x6, x7, [x16, #48]\n"
+        "ldp x29, x30, [x16, #64]\n"
+        "mov sp, x17\n"
+        "svc #0x26\n"
+        "udf #0\n"
+        : : "r"(regs), "r"(out) : "memory");
+    __builtin_unreachable();
+}
+
+__attribute__((section(".text.tp_frame")))
+void tp_frame(State *st, g2h_fn g2h, u8 **got, u32 *mode_slot)
+{
+    if (st->magic != MAGIC) return;
+    u8 *p = input_obj(got);
+    u32 r3 = (p && (*(unsigned long long *)(void *)(p + 0x20) & BTN_R3)) ? 1u : 0u;
+    u32 click = r3 && !st->r3_prev;
+    st->r3_prev = r3;
+    if (!click) return;
+    if (cur_mode(mode_slot) == DRIVER_WORLD) return;   /* R3 is the view toggle there */
+    dump(st, g2h);
+}

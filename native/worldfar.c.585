@@ -1,0 +1,541 @@
+/*
+ * worldfar.c -- the far-field terrain pass (BUILD 585, ff7nx_worldfar).
+ *
+ * Runs once per frame right after world_sub_751EFC has submitted the native
+ * 5x5 window, and submits the rest of the planet from wm0.far through the
+ * SAME native functions the window uses:
+ *
+ *     GTE translation for the tile   (what 0x74D33A computes, but in int32 --
+ *                                     0x74D33A takes an s16 vector)
+ *     0x75F0AD  transform the tile's vertices
+ *     0x75F263  project + outcode them
+ *     0x74C9AF  take primitive memory (capacity-checked here first)
+ *     0x75F68C  submit the triangles into the per-texture graphics objects
+ *
+ * It is compiled position-independent (every internal reference PC-relative,
+ * every module address arrives as a pointer or a constant guest address) so
+ * the same bytes run wherever the build places them. HOST_TEST builds it
+ * natively against a fake guest for tests/test_worldfar.py.
+ */
+#include <stdint.h>
+
+typedef uint8_t u8;
+typedef int16_t s16;
+typedef uint16_t u16;
+typedef int32_t s32;
+typedef uint32_t u32;
+typedef int64_t s64;
+
+typedef u8 *(*g2h_fn)(u32 guest);
+typedef u32 (*callx_fn)(u32 x86, u32 nargs, ...);
+
+/* ---- guest globals (x86 VAs, ff7_en 1.02) ---- */
+#define G_MAP_TYPE      0xE045E8u   /* 0 = overworld */
+#define G_PLAYER_POS    0xE04918u   /* int x, y, z */
+#define G_CAM_ROT       0xDFC448u   /* s16[9] */
+#define G_CAM_DELTA_Y   0xDE6A04u
+#define G_GTE           0x90AAF0u   /* -> state; translation int[3] at +0x22 */
+#define G_WORLD_BASE    0xE2D600u   /* the world map's one allocation */
+#define G_ONSET         0xE045D8u
+#define G_PRIM_CUR      0xDE6A10u
+#define G_PRIM_BASE     0xDF5444u
+#define G_VFLAGS        0xE397B8u   /* u32 per vertex: inside-x | inside-y<<8 */
+
+#define F_RESET_GTE     0x74D3A7u   /* SetRot(DFC448), SetTrans(DE6A20) */
+#define F_APPLY         0x662ECCu   /* out = R*v + T (s16 v) */
+#define F_NAME          0x74CA00u   /* (kind, idx) -> "...wm/WM<idx><ext>" */
+#define F_READ          0x7593CDu   /* (name, offset, size, dest) -> 0 ok */
+#define F_TRANSFORM     0x75F0ADu
+#define F_CULL          0x75F263u
+#define F_PRIM          0x74C9AFu
+#define F_SUBMIT        0x75F68Cu
+
+/* ---- layout shared with ff7nx_worldfar.py (checked there) ---- */
+#ifndef PRIM_BYTES
+#define PRIM_BYTES      0x80000u
+#endif
+#define FAR_OFF         (0xA6800u + 2u * PRIM_BYTES)
+#define FAR_NAME        0x000u
+#define FAR_SCRATCH     0x080u
+#define FAR_DATA        0x100u
+#ifndef FAR_MAX
+#define FAR_MAX         0x240000u
+#endif
+#define FAR_SLACK       0x1000u     /* the transform always reads 122 verts */
+
+#define MX 36
+#define MZ 28
+#define SX 9
+#define SZ 7
+#define N1 (MX * MZ)
+#define N2 (SX * SZ)
+#define MESH 8192
+#define WRAP_X 0x48000
+#define WRAP_Z 0x38000
+
+#define NEAR_RING       3           /* L1 around the 5x5 window */
+#define MAX_TRIS_FRAME  12000
+#define ZOOM_MAX_DIST   35000.0f    /* FFNx getMaxZoomDist */
+#define ZOOM_STEP       250.0f      /* units per camera update at full tilt */
+#define ZOOM_DEADZONE   0.2f
+#define G_CAM_TRANS_Z   (0xDE6A20u + 0x12u + 8u)       /* LOD triangles per frame, nearest first */
+#define SPHERE_R        250000.0f
+#define MOUNTAIN        4000.0f
+
+typedef struct {
+    u32 tris, verts, norms;         /* file offsets */
+    u16 ntri;
+    u16 sk_first[4];
+    u8  sk_n[4];
+    u8  nverts, flags;
+    s16 ymin, ymax;
+} Entry;                             /* == ENTRY_FMT, 32 bytes */
+
+typedef struct {
+    u32 magic;                       /* 'WFAR' once loaded */
+    u32 base;                        /* world allocation it was loaded into */
+    u32 failed_base;                 /* do not retry a failed load there */
+    u32 data;                        /* guest address of the file */
+    u32 frames;
+    u32 last_tris;                   /* diagnostics */
+    u32 last_tiles;
+    float zoom;                      /* extra camera distance (right stick) */
+    Entry e[N1 + N2];
+    u8 cls[N2];                      /* per-frame sector class */
+} State;
+
+#define CLS_L2 0
+#define CLS_NEAR 1
+
+typedef struct {
+    g2h_fn g2h;
+    callx_fn call;
+    State *st;
+} Env;
+
+/* The port translates guest addresses page by page (4 KB); a value that
+   does not cross a page is one translation. */
+static u8 rd8(Env *v, u32 g) { return *v->g2h(g); }
+static u32 rd32(Env *v, u32 g)
+{
+    if ((g & 0xFFFu) <= 0xFFCu) {
+        const u8 *p = v->g2h(g);
+        return (u32)p[0] | ((u32)p[1] << 8) | ((u32)p[2] << 16)
+             | ((u32)p[3] << 24);
+    }
+    return (u32)rd8(v, g) | ((u32)rd8(v, g + 1) << 8)
+         | ((u32)rd8(v, g + 2) << 16) | ((u32)rd8(v, g + 3) << 24);
+}
+static s16 rds16(Env *v, u32 g)
+{
+    return (s16)((u16)rd8(v, g) | ((u16)rd8(v, g + 1) << 8));
+}
+static void wr8(Env *v, u32 g, u8 x) { *v->g2h(g) = x; }
+static void wr32(Env *v, u32 g, u32 x)
+{
+    if ((g & 0xFFFu) <= 0xFFCu) {
+        u8 *p = v->g2h(g);
+        p[0] = (u8)x; p[1] = (u8)(x >> 8); p[2] = (u8)(x >> 16);
+        p[3] = (u8)(x >> 24);
+        return;
+    }
+    wr8(v, g, (u8)x); wr8(v, g + 1, (u8)(x >> 8));
+    wr8(v, g + 2, (u8)(x >> 16)); wr8(v, g + 3, (u8)(x >> 24));
+}
+static void wr16(Env *v, u32 g, u16 x) { wr8(v, g, (u8)x); wr8(v, g + 1, (u8)(x >> 8)); }
+
+static float fsqrt(float x)
+{
+#ifdef HOST_TEST
+    return __builtin_sqrtf(x);
+#else
+    float r;
+    __asm__("fsqrt %s0, %s1" : "=w"(r) : "w"(x));
+    return r;
+#endif
+}
+static float fabs_(float x) { return x < 0 ? -x : x; }
+
+static int wrapi(int d, int period)
+{
+    int h = period / 2;
+    while (d >= h) d -= period;
+    while (d < -h) d += period;
+    return d;
+}
+
+/* ------------------------------------------------------------ loading */
+static int load(Env *v, u32 base)
+{
+    State *st = v->st;
+    u32 far = base + FAR_OFF;
+    u32 data = far + FAR_DATA;
+    u32 name = v->call(F_NAME, 2, 0, 0);
+    if (!name)
+        return 0;
+    /* copy "...WM0.MAP" and turn the extension into .FAR */
+    u32 i = 0, dot = 0;
+    for (; i < 120; i++) {
+        u8 c = rd8(v, name + i);
+        wr8(v, far + FAR_NAME + i, c);
+        if (c == '.') dot = i;
+        if (!c) break;
+    }
+    if (i >= 120 || !dot)
+        return 0;
+    wr8(v, far + dot + 1, 'F'); wr8(v, far + dot + 2, 'A');
+    wr8(v, far + dot + 3, 'R'); wr8(v, far + dot + 4, 0);
+    if (v->call(F_READ, 4, far + FAR_NAME, 0, 32, data) != 0)
+        return 0;
+    if (rd32(v, data) != 0x52414657u /* 'WFAR' */ || rd32(v, data + 4) != 1
+        || rd32(v, data + 8) != N1 || rd32(v, data + 12) != N2
+        || rd32(v, data + 24) != 32)
+        return 0;
+    u32 total = rd32(v, data + 20);
+    if (total <= 32 || total > FAR_MAX - FAR_DATA - FAR_SLACK)
+        return 0;
+    if (v->call(F_READ, 4, far + FAR_NAME, 32, total - 32, data + 32) != 0)
+        return 0;
+    if (rd32(v, data) != 0x52414657u)
+        return 0;
+    u32 at = data + 32;
+    for (u32 k = 0; k < N1 + N2; k++, at += 32) {
+        Entry *e = &st->e[k];
+        e->tris = rd32(v, at);
+        e->verts = rd32(v, at + 4);
+        e->norms = rd32(v, at + 8);
+        e->ntri = (u16)rds16(v, at + 12);
+        for (int j = 0; j < 4; j++)
+            e->sk_first[j] = (u16)rds16(v, at + 14 + 2 * j);
+        for (int j = 0; j < 4; j++)
+            e->sk_n[j] = rd8(v, at + 22 + j);
+        e->nverts = rd8(v, at + 26);
+        e->flags = rd8(v, at + 27);
+        e->ymin = rds16(v, at + 28);
+        e->ymax = rds16(v, at + 30);
+        if (e->nverts > 120 || e->tris >= total || e->verts >= total
+            || e->norms >= total)
+            return 0;
+    }
+    st->data = data;
+    return 1;
+}
+
+/* ------------------------------------------------------------ camera */
+typedef struct {
+    float cx[3], cy[3], cz[3];       /* columns of R, unit scale */
+    s32 t[3];
+    float dy;                        /* -[DE6A04], the y of every tile pos */
+    float horizon;                   /* draw radius about the focus */
+} Cam;
+
+static void apply(Env *v, u32 scratch, s16 x, s16 y, s16 z, s32 out[3])
+{
+    wr16(v, scratch, (u16)x); wr16(v, scratch + 2, (u16)y);
+    wr16(v, scratch + 4, (u16)z); wr16(v, scratch + 6, 0);
+    v->call(F_APPLY, 3, scratch, scratch + 0x10, scratch + 0x20);
+    out[0] = (s32)rd32(v, scratch + 0x10);
+    out[1] = (s32)rd32(v, scratch + 0x14);
+    out[2] = (s32)rd32(v, scratch + 0x18);
+}
+
+static void camera(Env *v, u32 scratch, Cam *c)
+{
+    s32 o[3], a[3];
+    v->call(F_RESET_GTE, 0);
+    apply(v, scratch, 0, 0, 0, o);
+    c->t[0] = o[0]; c->t[1] = o[1]; c->t[2] = o[2];
+    apply(v, scratch, 4096, 0, 0, a);
+    for (int i = 0; i < 3; i++) c->cx[i] = (float)(a[i] - o[i]) / 4096.0f;
+    apply(v, scratch, 0, 4096, 0, a);
+    for (int i = 0; i < 3; i++) c->cy[i] = (float)(a[i] - o[i]) / 4096.0f;
+    apply(v, scratch, 0, 0, 4096, a);
+    for (int i = 0; i < 3; i++) c->cz[i] = (float)(a[i] - o[i]) / 4096.0f;
+    c->dy = -(float)(s32)rd32(v, G_CAM_DELTA_Y);
+    /* camera in tile space: R^T (-T); its height above sea level is that
+       y minus the tile space's own y offset */
+    float tx = (float)o[0], ty = (float)o[1], tz = (float)o[2];
+    float camy = -(c->cy[0] * tx + c->cy[1] * ty + c->cy[2] * tz);
+    float h = camy - c->dy;
+    if (h < 500.0f) h = 500.0f;
+    float d = fsqrt(2.0f * SPHERE_R * h) + fsqrt(2.0f * SPHERE_R * MOUNTAIN)
+              + 16384.0f;
+    if (d > 200000.0f) d = 200000.0f;
+    c->horizon = d;
+}
+
+static void view(const Cam *c, float x, float y, float z, float out[3])
+{
+    for (int i = 0; i < 3; i++)
+        out[i] = (float)c->t[i] + c->cx[i] * x + c->cy[i] * y + c->cz[i] * z;
+}
+
+/* ------------------------------------------------------------ drawing */
+typedef struct {
+    Env *v;
+    Cam *c;
+    u32 gte;
+    u32 onset;
+    u32 prim_limit;
+    int budget;
+    int tiles;
+    u32 scratch;
+} Ctx;
+
+static int visible(Ctx *x, float px, float pz, float half, const Entry *e)
+{
+    float ymid = 0.5f * ((float)e->ymin + (float)e->ymax);
+    float r = half * 1.4143f + 0.5f * (float)(e->ymax - e->ymin) + 64.0f;
+    float w[3];
+    view(x->c, px, x->c->dy + ymid, pz, w);
+    if (w[2] + r < 0.0f)
+        return 0;
+    if (fabs_(w[0]) - r > 1.9f * (w[2] + r))
+        return 0;
+    return 1;
+}
+
+static void submit(Ctx *x, const Entry *e, s32 px, s32 pz, u8 skirts)
+{
+    Env *v = x->v;
+    State *st = v->st;
+    int want = e->ntri;
+    for (int k = 0; k < 4; k++)
+        if (skirts & (1 << k)) want += e->sk_n[k];
+    if (want > x->budget)
+        return;
+    /* the GTE translation 0x74D33A would set for this position */
+    float w[3];
+    view(x->c, (float)px, x->c->dy, (float)pz, w);
+    s32 t[3] = { (s32)w[0], (s32)w[1], (s32)w[2] };
+    for (int i = 0; i < 3; i++)
+        wr32(v, x->gte + 0x22 + 4 * i, (u32)t[i]);
+    u32 tris = st->data + e->tris;
+    v->call(F_TRANSFORM, 2, st->data + e->verts, x->onset);
+    for (int i = 0; i < 3; i++)
+        wr32(v, x->gte + 0x22 + 4 * i, (u32)t[i]);
+    v->call(F_CULL, 0);
+    /* the native outcode cull runs on the FLAT projection; the sphere bends
+       far terrain back into view below it, and the tile was already culled
+       here, so let every vertex pass it */
+    for (u32 i = 0; i < 123; i++)
+        wr32(v, G_VFLAGS + 4 * i, 0x0101u);
+    int ranges[5][2];
+    int nr = 0;
+    ranges[nr][0] = 0; ranges[nr][1] = e->ntri; nr++;
+    for (int k = 0; k < 4; k++)
+        if ((skirts & (1 << k)) && e->sk_n[k]) {
+            ranges[nr][0] = e->sk_first[k];
+            ranges[nr][1] = e->sk_n[k];
+            nr++;
+        }
+    for (int r = 0; r < nr; r++) {
+        u32 n = (u32)ranges[r][1];
+        if (!n) continue;
+        u32 cur = rd32(v, G_PRIM_CUR);
+        if (cur + n * 0x28u + 0x28u >= x->prim_limit) {
+            x->budget = 0;
+            return;
+        }
+        u32 prim = v->call(F_PRIM, 1, n);
+        u32 a = tris + (u32)ranges[r][0] * 12u;
+        v->call(F_SUBMIT, 4, a, a + n * 12u, st->data + e->norms, prim);
+        x->budget -= (int)n;
+        st->last_tris += n;
+    }
+    x->tiles++;
+}
+
+static int in_window(int dxm, int dzm)
+{
+    return dxm >= -2 && dxm <= 2 && dzm >= -2 && dzm <= 2;
+}
+
+__attribute__((section(".text.worldfar_draw"))) void worldfar_draw(State *st, g2h_fn g2h, callx_fn call)
+{
+    Env env = { g2h, call, st };
+    Env *v = &env;
+    if (rd32(v, G_MAP_TYPE) != 0)
+        return;
+    u32 base = rd32(v, G_WORLD_BASE);
+    if (!base)
+        return;
+    if (st->magic != 0x52414657u || st->base != base) {
+        if (st->failed_base == base)
+            return;
+        st->magic = 0;
+        if (!load(v, base)) {
+            st->failed_base = base;
+            return;
+        }
+        st->magic = 0x52414657u;
+        st->base = base;
+        st->failed_base = 0;
+    }
+    st->frames++;
+    st->last_tris = 0;
+    st->last_tiles = 0;
+
+    s32 fx = (s32)rd32(v, G_PLAYER_POS);
+    s32 fz = (s32)rd32(v, G_PLAYER_POS + 8);
+    fx = ((fx % WRAP_X) + WRAP_X) % WRAP_X;
+    fz = ((fz % WRAP_Z) + WRAP_Z) % WRAP_Z;
+    int cx = fx >> 13, cz = fz >> 13;
+    s32 lx = fx & 0x1FFF, lz = fz & 0x1FFF;
+
+    Cam cam;
+    u32 scratch = base + FAR_OFF + FAR_SCRATCH;
+    camera(v, scratch, &cam);
+    Ctx x;
+    x.v = v; x.c = &cam; x.tiles = 0; x.scratch = scratch;
+    x.gte = rd32(v, G_GTE);
+    x.onset = rd32(v, G_ONSET);
+    x.prim_limit = rd32(v, G_PRIM_BASE) + PRIM_BYTES;
+    x.budget = MAX_TRIS_FRAME;
+    if (!x.gte)
+        return;
+
+    /* sector classes: NEAR if any of its meshes is within NEAR_RING of the
+       focus mesh (so every window mesh sits in a NEAR sector), else L2 */
+    for (int sz = 0; sz < SZ; sz++)
+        for (int sx = 0; sx < SX; sx++) {
+            int near = 0;
+            for (int k = 0; k < 16 && !near; k++) {
+                int dxm = wrapi(sx * 4 + (k & 3) - cx, MX);
+                int dzm = wrapi(sz * 4 + (k >> 2) - cz, MZ);
+                if (dxm >= -NEAR_RING && dxm <= NEAR_RING
+                    && dzm >= -NEAR_RING && dzm <= NEAR_RING)
+                    near = 1;
+            }
+            st->cls[sz * SX + sx] = near ? CLS_NEAR : CLS_L2;
+        }
+
+    /* L1: every mesh of a NEAR sector outside the window, nearest first
+       (rings of Chebyshev distance 3, 4, ...) */
+    for (int ring = 3; ring <= 8 && x.budget > 0; ring++)
+        for (int dzm = -ring; dzm <= ring; dzm++)
+            for (int dxm = -ring; dxm <= ring; dxm++) {
+                if (dxm != -ring && dxm != ring && dzm != -ring && dzm != ring)
+                    continue;
+                int mx = ((cx + dxm) % MX + MX) % MX;
+                int mz = ((cz + dzm) % MZ + MZ) % MZ;
+                if (st->cls[(mz >> 2) * SX + (mx >> 2)] != CLS_NEAR)
+                    continue;
+                /* a mesh can be reached from two rings only when the map
+                   wraps inside 8 rings, which it does not (36 x 28) */
+                const Entry *e = &st->e[mz * MX + mx];
+                s32 px = dxm * MESH - lx, pz = dzm * MESH - lz;
+                float dn = 0.0f;
+                {
+                    float ax = (float)(px > 0 ? px : (px + MESH < 0 ? -(px + MESH) : 0));
+                    float az = (float)(pz > 0 ? pz : (pz + MESH < 0 ? -(pz + MESH) : 0));
+                    dn = fsqrt(ax * ax + az * az);
+                }
+                if (dn > cam.horizon)
+                    continue;
+                if (!visible(&x, (float)(px + MESH / 2), (float)(pz + MESH / 2),
+                             MESH / 2, e))
+                    continue;
+                u8 sk = 0;
+                /* N: z-1, E: x+1, S: z+1, W: x-1 -- skirt against the window */
+                if (in_window(dxm, dzm - 1)) sk |= 1;
+                if (in_window(dxm + 1, dzm)) sk |= 2;
+                if (in_window(dxm, dzm + 1)) sk |= 4;
+                if (in_window(dxm - 1, dzm)) sk |= 8;
+                submit(&x, e, px, pz, sk);
+            }
+    /* ring 3..8 covers every NEAR mesh: a NEAR sector's meshes are within
+       NEAR_RING + 3 = 6 of the focus */
+
+    /* L2 sectors, nearest first */
+    int order[N2], nord = 0;
+    float dist[N2];
+    s32 posx[N2], posz[N2];
+    for (int s = 0; s < N2; s++) {
+        if (st->cls[s] != CLS_L2) continue;
+        int sx = s % SX, sz = s / SX;
+        s32 rx = wrapi(sx * 4 * MESH + 2 * MESH - fx, WRAP_X);
+        s32 rz = wrapi(sz * 4 * MESH + 2 * MESH - fz, WRAP_Z);
+        float ax = (float)(rx < 0 ? -rx : rx) - 2.0f * MESH;
+        float az = (float)(rz < 0 ? -rz : rz) - 2.0f * MESH;
+        if (ax < 0) ax = 0;
+        if (az < 0) az = 0;
+        float dn = fsqrt(ax * ax + az * az);
+        if (dn > cam.horizon) continue;
+        if (!visible(&x, (float)rx, (float)rz, 2.0f * MESH, &st->e[N1 + s]))
+            continue;
+        int j = nord++;
+        while (j > 0 && dist[order[j - 1]] > dn) {
+            order[j] = order[j - 1];
+            j--;
+        }
+        order[j] = s;
+        dist[s] = dn; posx[s] = rx; posz[s] = rz;
+    }
+    for (int i = 0; i < nord && x.budget > 0; i++) {
+        int s = order[i];
+        int sx = s % SX, sz = s / SX;
+        const Entry *e = &st->e[N1 + s];
+        u8 sk = 0;
+        int nb[4][2] = { { sx, sz - 1 }, { sx + 1, sz }, { sx, sz + 1 }, { sx - 1, sz } };
+        for (int k = 0; k < 4; k++) {
+            int nx = (nb[k][0] + SX) % SX, nz = (nb[k][1] + SZ) % SZ;
+            int ns = nz * SX + nx;
+            if (st->cls[ns] == CLS_NEAR
+                || ((st->e[N1 + ns].flags ^ e->flags) & 1))
+                sk |= (u8)(1 << k);
+        }
+        submit(&x, e, posx[s], posz[s], sk);
+    }
+    st->last_tiles = (u32)x.tiles;
+    /* leave the GTE as the native loop would find it */
+    v->call(F_RESET_GTE, 0);
+}
+
+
+/* ------------------------------------------------------------ camera zoom
+ * FFNx's world camera zooms 10000 -> 35000 (camera.cpp getMaxZoomDist) so
+ * you can pull away from the planet. The port has no analogue camera, so
+ * the right stick -- unused on the world map (the DirectInput emulation maps
+ * axis ids 2..0x13 only, 0x10D3968) -- moves the camera out along its own
+ * view direction: down = further, up = back. Runs right after the game's
+ * camera update 0x74E8CE has written the camera distance into the camera
+ * position matrix (0xDE6A20, t.z = [0xDFC478]); it only ever ADDS to that,
+ * so every vanilla view keeps its own distance as the nearest one.
+ */
+__attribute__((section(".text.worldfar_camera")))
+void worldfar_camera(State *st, g2h_fn g2h, callx_fn call, u8 **got)
+{
+    Env env = { g2h, call, st };
+    Env *v = &env;
+    if (rd32(v, G_MAP_TYPE) != 0 || !got)
+        return;
+    /* the port's input object: the chain its own axis getters walk */
+    u8 *p = *got;
+    if (!p) return;
+    p = *(u8 **)(p + 0);
+    if (!p) return;
+    p = *(u8 **)(p + 8);
+    if (!p) return;
+    p = *(u8 **)(p + 0);
+    if (!p) return;
+    p = *(u8 **)(p + 0x88);
+    if (!p) return;
+    float up = *(float *)(p + 0x40), down = *(float *)(p + 0x44);
+    float ry = up - down;
+    float zoom = st->zoom;
+    if (!(zoom >= 0.0f && zoom < 100000.0f))
+        zoom = 0.0f;
+    if (ry > ZOOM_DEADZONE)
+        zoom -= ZOOM_STEP * (ry - ZOOM_DEADZONE) / (1.0f - ZOOM_DEADZONE);
+    else if (ry < -ZOOM_DEADZONE)
+        zoom += ZOOM_STEP * (-ry - ZOOM_DEADZONE) / (1.0f - ZOOM_DEADZONE);
+    s32 base = (s32)rd32(v, G_CAM_TRANS_Z);
+    float room = ZOOM_MAX_DIST - (float)base;
+    if (room < 0.0f) room = 0.0f;
+    if (zoom > room) zoom = room;
+    if (zoom < 0.0f) zoom = 0.0f;
+    st->zoom = zoom;
+    if (zoom > 0.0f)
+        wr32(v, G_CAM_TRANS_Z, (u32)(base + (s32)zoom));
+}

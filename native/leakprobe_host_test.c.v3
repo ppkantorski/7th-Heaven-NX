@@ -1,0 +1,84 @@
+/* Host test for leakprobe.c v3: fake texture manager, heap, GL errors and
+   the Highwind around a trip into fship. */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#define LP_HOST
+#include "leakprobe.c"
+
+static u8 *mem;
+static u8 *g2h(u32 g) { return mem + g; }
+static void w32(u32 g, u32 v) { memcpy(mem + g, &v, 4); }
+static u64 mgr[0x2090 / 8];
+static u64 *rendp = mgr;
+static u32 mode_word;
+static u32 *mode_host = &mode_word;
+static int errors;
+static int gl_queue[64], gl_n;
+static u32 fake_glerr(void) { return gl_n ? (u32)gl_queue[--gl_n] : 0; }
+static u32 hwblk[8] = { 1, 50000, 20000, 70000, 0, 0, 1, 3 };
+#define ENT 0x02F00000u
+#define CHECK(c, w) do { if (!(c)) { printf("  FAIL: %s\n", w); errors++; } } while (0)
+
+static void make_heap(void)
+{
+    w32(HEAP_DESC + 0, 0x04000000); w32(HEAP_DESC + 4, 0x01000000);
+    u32 h = 0x02001000u;
+    w32(h + BLK_SIZE, 0x100000); w32(h + BLK_USED, 0); w32(h + BLK_NEXT, 0);
+    w32(HEAP_DESC + 8, h + BLK_HDR);
+}
+static void frame(State *st, u32 mode, u32 field)
+{
+    mode_word = mode;
+    mem[G_FIELD_ID] = (u8)field; mem[G_FIELD_ID + 1] = (u8)(field >> 8);
+    lp_frame(st, g2h, 0, (u32 *)(void *)&mode_host, (u64 **)(void *)&rendp, fake_glerr, hwblk);
+}
+static void ship(u32 y, u32 ctl, u32 view)
+{
+    w32(G_PLAYER_ENT, ENT);
+    w32(ENT + 0xC, 50000); w32(ENT + 0x10, y); w32(ENT + 0x14, 70000);
+    w32(G_CONTROL, ctl); w32(G_VIEW_TYPE, view); w32(G_HW_TAKEOFF, 4000);
+}
+
+int main(void)
+{
+    mem = calloc(1, 0x3000000);
+    State *st = calloc(1, sizeof(State));
+    make_heap();
+    for (u32 i = 0; i < 100; i++) mgr[i] = 0x1000 + i;
+    /* world A: fly at 20000, then the game takes control and brings it to 10000 */
+    ship(20000, 1, 3);
+    for (int f = 0; f < 300; f++) frame(st, 4, 72);
+    for (int k = 0; k < 10; k++) { ship(20000 - 1000 * (k + 1), 0, 3); frame(st, 4, 72); }
+    /* fship */
+    for (int f = 0; f < 50; f++) frame(st, 2, 72);
+    /* world B: back at 10000, control off for 3 frames, then on */
+    for (int f = 0; f < 3; f++) { ship(10000, 0, 3); frame(st, 4, 72); }
+    for (int f = 0; f < 40; f++) { ship(10000, 1, 3); frame(st, 4, 72); }
+    /* fship again, then the collection (R3 there) */
+    gl_queue[gl_n++] = 0x505;
+    for (int f = 0; f < 20; f++) frame(st, 2, 72);
+    V out[NV]; W w[2]; u64 regs[10];
+    lp_collect(st, g2h, (u64 **)(void *)&rendp, out, w, regs, hwblk);
+    printf("A: frames %u y_last_ctl %d y_max %d last16:", w[0].frames, w[0].y_last_ctl, w[0].y_max);
+    for (int i = 0; i < 16; i++) printf(" %d%s", w[0].y_last[i], (w[0].ctl_last >> i) & 1 ? "" : "*");
+    printf("\nB: frames %u first16:", w[1].frames);
+    for (int i = 0; i < 16; i++) printf(" %d%s", w[1].y_first[i], (w[1].ctl_first >> i) & 1 ? "" : "*");
+    printf("\n");
+    CHECK((regs[0] >> 32) == MAGIC, "magic");
+    CHECK(w[0].frames == 310 && w[0].y_last_ctl == 20000 && w[0].y_max == 20000, "A: the altitude flown");
+    CHECK(w[0].y_last[15] == 10000 && !((w[0].ctl_last >> 15) & 1) && ((w[0].ctl_last >> 5) & 1),
+          "A: the last 16 frames in order, control off for the last 10");
+    CHECK(w[0].y_last[5] == 20000 && w[0].y_last[6] == 19000, "A: the descent starts at the 11th-last frame");
+    CHECK(w[1].y_first[0] == 10000 && !(w[1].ctl_first & 7) && ((w[1].ctl_first >> 3) & 1), "B: the return");
+    CHECK(w[1].hw_first == 0xFFFF && w[1].takeoff == 4000, "B: view and take-off height");
+    CHECK(w[0].y_sparse[0] == 20000, "A: the sparse samples");
+    CHECK((u32)regs[5] == 20000 && (regs[5] >> 56) == 1 && ((regs[5] >> 48) & 0xFF) == 1
+          && (regs[7] >> 32) == 3, "the module's restore state");
+    CHECK(out[0].key != 0, "visits");
+    int nv = 0; while (nv < NV && out[nv].key) nv++;
+    CHECK(nv == 4 && out[nv - 1].noom == 1, "4 visits, the last with an OOM");
+    printf("sizeof(State) %zu\n", sizeof(State));
+    printf("leakprobe host test: %d error(s)\n", errors);
+    return errors ? 1 : 0;
+}
