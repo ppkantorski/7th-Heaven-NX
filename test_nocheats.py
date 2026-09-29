@@ -40,12 +40,15 @@ def main(argv=None):
 
     print('encodings')
     ok(dis(NC.NOP) == 'nop', 'the replacement is a nop')
-    ok(dis(NC.AND_NOT_STICKR) == 'and x13, x13, #0xffffffffffffffdf',
-       'the mask clears exactly bit %d (StickR) of the button word'
-       % NC.STICKR_BIT)
-    ok((~NC.AND_NOT_STICKR or True) and (0xFFFFFFFFFFFFFFDF
-                                         == ~(1 << NC.STICKR_BIT) & (1 << 64) - 1),
-       'and bit %d is the one nn::hid uses for StickR' % NC.STICKR_BIT)
+    body = [dis(w) for w in NC.nocheats_body()]
+    ok(body == ['ror x13, x13, #5', 'bfi x13, x13, #0x39, #1',
+                'and x13, x13, #0xfffffffffffffffe', 'ror x13, x13, #0x3b'],
+       'the cave body is ror/bfi/and/ror on x13 alone: %s' % body)
+    for word in (0x20, 0x21 | (1 << 9), 0, 0xFFFFFFFF, 0xFFFFDFFF):
+        want = (word & ~0x20) | (((word >> 5) & 1) << NC.R3_SHADOW_BIT)
+        ok(NC.apply_body(word) == want,
+           'StickR (bit 5) of %#x moves to bit %d, nothing else changes'
+           % (word, NC.R3_SHADOW_BIT))
 
     try:
         import nxmap

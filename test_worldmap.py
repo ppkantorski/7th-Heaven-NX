@@ -161,7 +161,7 @@ def main(argv=None):
     vals = list(patches.values())
     ok(W.WORLD_SKY_BOTTOM_HOOK in patches,
        'the cave map includes the stock store hook')
-    ok(A.movz(23, 20) in vals, 'the cave materialises 20 in w23')
+    ok(A.movz(23, W.WORLD_SKY_LOWER) in vals, 'the cave materialises the lower guard in w23')
     ok(W.WORLD_SKY_BOTTOM_STORE in vals,
        'the cave stores that 20 through the original address register')
     ok(A.strh(23, 0) == W.WORLD_SKY_BOTTOM_STORE,

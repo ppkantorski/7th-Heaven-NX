@@ -572,3 +572,279 @@ def verify_roundtrip(path):
     finally:
         if os.path.exists(tmp):
             os.remove(tmp)
+
+
+# ----------------------------------------------------------- native LZS
+#
+# BUILD 583. Both LZS routines are pure Python, and the flevel build calls
+# them per field in every section-9 pass: ~0.3 s to decompress an HD field,
+# and ~1.4 MB/s to compress one -- a 5 MB field takes seconds, and every
+# field a pass changes is compressed (and verify-decompressed) again.
+#
+# The C below is a byte-for-byte transcription of `lzs_decompress` and
+# `lzs_compress` above. It is compiled on first use with the system C
+# compiler into cache/lzs_native/, loaded with ctypes, and SELF-TESTED
+# against the Python originals on every run before either is used; any
+# failure (no compiler, load error, one differing byte) falls back to the
+# Python routines silently. Output is therefore identical either way -- the
+# only difference is time. SEVENTH_NX_NO_NATIVE_LZS=1 forces Python.
+
+_NATIVE_SRC = r'''
+/* lzs_native.c -- byte-exact C twins of lgp.lzs_decompress / lgp.lzs_compress.
+ *
+ * Built on demand by lgp.py (cc -O2 -shared) and loaded with ctypes. lgp.py
+ * self-tests both against the pure-Python originals before using them and
+ * falls back to Python if the compiler, the load, or the test fails.
+ */
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+
+/* Returns the number of bytes written, or -1 if `cap` would be exceeded. */
+long lzs_decompress(const uint8_t *in, long n, uint8_t *out, long cap)
+{
+    long i = 0, o = 0;
+    while (i < n) {
+        unsigned ctrl = in[i++];
+        for (int bit = 0; bit < 8; bit++) {
+            if (i >= n)
+                break;
+            if (ctrl & (1u << bit)) {
+                if (o >= cap) return -1;
+                out[o++] = in[i++];
+            } else {
+                if (i + 1 >= n)
+                    break;
+                unsigned b1 = in[i], b2 = in[i + 1];
+                i += 2;
+                long offset = (long)(b1 | ((b2 & 0xF0u) << 4));
+                long length = (long)(b2 & 0x0Fu) + 3;
+                long d = (o - 18 - offset) & 0xFFF;
+                long start = o - d;
+                if (o + length > cap) return -1;
+                if (d == 0) {
+                    memset(out + o, 0, (size_t)length);
+                    o += length;
+                } else {
+                    /* byte by byte: identical to the Python fast paths
+                       (slice copy, periodic repeat) and to its start<0
+                       fallback, where a position before 0 reads 0. */
+                    for (long k = 0; k < length; k++) {
+                        long p = start + k;
+                        out[o] = (p >= 0) ? out[p] : 0;
+                        o++;
+                    }
+                }
+            }
+        }
+    }
+    return o;
+}
+
+#define MIN_MATCH 3
+#define MAX_MATCH 18
+#define WINDOW 4095
+#define NKEYS (1u << 24)
+
+/* Greedy hash-chain matcher, exactly lgp.lzs_compress: every position j
+ * with j+3 <= n is appended to the chain of its 3-byte key after it is
+ * consumed; candidates are tried newest first, stopping at the window floor
+ * or after `max_chain` tries; the first strictly longest match wins.
+ * Returns bytes written or -1 on allocation failure / capacity. */
+long lzs_compress(const uint8_t *data, long n, uint8_t *out, long cap,
+                  int max_chain)
+{
+    int32_t *head = (int32_t *)malloc(sizeof(int32_t) * NKEYS);
+    int32_t *prev = (int32_t *)malloc(sizeof(int32_t) * (n > 0 ? n : 1));
+    if (!head || !prev) { free(head); free(prev); return -1; }
+    memset(head, 0xFF, sizeof(int32_t) * NKEYS);      /* -1 */
+
+    long i = 0, o = 0;
+    int bit = 8;
+    unsigned ctrl = 0;
+    long ctrl_idx = 0;
+    while (i < n) {
+        if (bit == 8) {
+            if (o >= cap) goto fail;
+            ctrl_idx = o;
+            out[o++] = 0;
+            ctrl = 0;
+            bit = 0;
+        }
+        long best_len = 0, best_pos = 0;
+        if (i + MIN_MATCH <= n) {
+            uint32_t key = ((uint32_t)data[i] << 16) |
+                           ((uint32_t)data[i + 1] << 8) | data[i + 2];
+            long floor = i - WINDOW;
+            if (floor < 0) floor = 0;
+            long limit = n - i;
+            if (limit > MAX_MATCH) limit = MAX_MATCH;
+            int tried = 0;
+            for (long p = head[key]; p >= 0; p = prev[p]) {
+                if (p < floor)
+                    break;
+                tried++;
+                if (tried > max_chain)
+                    break;
+                long length = MIN_MATCH;
+                while (length < limit && data[p + length] == data[i + length])
+                    length++;
+                if (length > best_len) {
+                    best_len = length;
+                    best_pos = p;
+                    if (length == limit)
+                        break;
+                }
+            }
+        }
+        long step;
+        if (best_len >= MIN_MATCH) {
+            unsigned enc = (unsigned)((best_pos - 18) & 0xFFF);
+            if (o + 2 > cap) goto fail;
+            out[o++] = (uint8_t)(enc & 0xFF);
+            out[o++] = (uint8_t)(((enc >> 4) & 0xF0) | (best_len - MIN_MATCH));
+            step = best_len;
+        } else {
+            ctrl |= 1u << bit;
+            if (o >= cap) goto fail;
+            out[o++] = data[i];
+            step = 1;
+        }
+        out[ctrl_idx] = (uint8_t)ctrl;
+        long end = i + step;
+        for (long j = i; j < end; j++) {
+            if (j + MIN_MATCH <= n) {
+                uint32_t key = ((uint32_t)data[j] << 16) |
+                               ((uint32_t)data[j + 1] << 8) | data[j + 2];
+                prev[j] = head[key];
+                head[key] = (int32_t)j;
+            }
+        }
+        i = end;
+        bit++;
+    }
+    free(head); free(prev);
+    return o;
+fail:
+    free(head); free(prev);
+    return -1;
+}
+
+'''
+
+_native = None
+_native_tried = False
+_py_lzs_decompress = lzs_decompress
+_py_lzs_compress = lzs_compress
+
+
+def _native_lib():
+    global _native, _native_tried
+    if _native_tried:
+        return _native
+    _native_tried = True
+    if os.environ.get('SEVENTH_NX_NO_NATIVE_LZS', '').strip() == '1':
+        return None
+    try:
+        import ctypes
+        import hashlib
+        import subprocess
+        import sys
+        tag = hashlib.sha1((_NATIVE_SRC + sys.platform).encode()).hexdigest()
+        base = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            'cache', 'lzs_native')
+        os.makedirs(base, exist_ok=True)
+        lib_path = os.path.join(base, 'lzs_%s.so' % tag[:16])
+        if not os.path.exists(lib_path):
+            src = os.path.join(base, 'lzs_%s.c' % tag[:16])
+            with open(src, 'w') as f:
+                f.write(_NATIVE_SRC)
+            tmp = lib_path + '.part'
+            for cc in (os.environ.get('CC') or 'cc', 'clang', 'gcc'):
+                try:
+                    r = subprocess.run([cc, '-O2', '-shared', '-fPIC', '-o',
+                                        tmp, src], capture_output=True,
+                                       timeout=120)
+                except (OSError, subprocess.SubprocessError):
+                    continue
+                if r.returncode == 0 and os.path.exists(tmp):
+                    os.replace(tmp, lib_path)
+                    break
+            if not os.path.exists(lib_path):
+                return None
+        lib = ctypes.CDLL(lib_path)
+        lib.lzs_decompress.restype = ctypes.c_long
+        lib.lzs_decompress.argtypes = [ctypes.c_char_p, ctypes.c_long,
+                                       ctypes.c_void_p, ctypes.c_long]
+        lib.lzs_compress.restype = ctypes.c_long
+        lib.lzs_compress.argtypes = [ctypes.c_char_p, ctypes.c_long,
+                                     ctypes.c_void_p, ctypes.c_long,
+                                     ctypes.c_int]
+        _native = lib
+        if not _native_selftest():
+            _native = None
+    except Exception:                                          # noqa: BLE001
+        _native = None
+    return _native
+
+
+def _native_selftest():
+    import random
+    rnd = random.Random(583)
+    samples = [b'', b'a', b'\0' * 5000, bytes(range(256)) * 40,
+               bytes(rnd.randrange(4) for _ in range(20000)),
+               bytes(rnd.randrange(256) for _ in range(9000)),
+               (b'FF7 field ' * 700) + bytes(rnd.randrange(256)
+                                             for _ in range(3000))]
+    for s in samples:
+        c = _native_compress(s, 24)
+        if c is None or c != _py_lzs_compress(s):
+            return False
+        if _native_decompress(c) != _py_lzs_decompress(c):
+            return False
+        if _py_lzs_decompress(c) != s:
+            return False
+    # decoder corner cases: truncated streams, zero-distance refs
+    for s in (b'\x00\x00', b'\x00\x12\x0f\xff', b'\xfe\x41\x00\x00\x00',
+              bytes(rnd.randrange(256) for _ in range(5000))):
+        if _native_decompress(s) != _py_lzs_decompress(s):
+            return False
+    return True
+
+
+def _native_decompress(data):
+    import ctypes
+    data = bytes(data)
+    cap = 9 * len(data) + 64
+    buf = ctypes.create_string_buffer(cap)
+    k = _native.lzs_decompress(data, len(data), buf, cap)
+    if k < 0:
+        return None
+    return ctypes.string_at(buf, k)
+
+
+def _native_compress(data, max_chain):
+    import ctypes
+    data = bytes(data)
+    cap = len(data) + len(data) // 8 + 64
+    buf = ctypes.create_string_buffer(cap)
+    k = _native.lzs_compress(data, len(data), buf, cap, int(max_chain))
+    if k < 0:
+        return None
+    return ctypes.string_at(buf, k)
+
+
+def lzs_decompress(data):                                      # noqa: F811
+    if _native_lib() is not None:
+        out = _native_decompress(data)
+        if out is not None:
+            return out
+    return _py_lzs_decompress(data)
+
+
+def lzs_compress(data, max_chain=24):                          # noqa: F811
+    if _native_lib() is not None:
+        out = _native_compress(data, max_chain)
+        if out is not None:
+            return out
+    return _py_lzs_compress(data, max_chain)

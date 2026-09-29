@@ -191,7 +191,9 @@ def _quantise(samples, n_colours):
     w = counts.astype(np.float64)
     pts = uniq.astype(np.float64)
     # deterministic init: sort by luminance, split by cumulative weight
-    lum = pts @ np.array([0.299, 0.587, 0.114])
+    # elementwise, not `@`: macOS's Accelerate matmul raises spurious
+    # divide/overflow RuntimeWarnings on finite input (numpy 2 + BLAS).
+    lum = pts[:, 0] * 0.299 + pts[:, 1] * 0.587 + pts[:, 2] * 0.114
     order = np.argsort(lum, kind='stable')
     cw = np.cumsum(w[order])
     bins = np.minimum((cw / cw[-1] * n_colours).astype(int), n_colours - 1)

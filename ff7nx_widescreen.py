@@ -328,6 +328,21 @@ WORLD_PATCHES = [
      'va': 0x00F3C190, 'expect': '13 00 40 B9', 'set': 'D3 6A 80 52'},
 ]
 
+# BUILD 586: the sky dome's lower edge sits this many pixels below the FLAT
+# horizon line. Stock 0, FFNx-widescreen 20. With the spherical world the
+# real horizon is lower than the flat one (by the dip angle, more the higher
+# the camera), and whatever lies between the dome's edge and the curved
+# terrain was the framebuffer's black. The terrain always draws over the
+# dome, so taking its edge to the bottom of the screen only ever fills that
+# gap with the dome's horizon colour.
+WORLD_SKY_LOWER = 480
+WORLD_SKY_LOWER_STOCK = 20               # FFNx widescreen, SEVENTH_NX_WORLD_GAIA=0
+
+
+def world_sky_lower(env=None):
+    import ff7nx_worldsphere
+    return (WORLD_SKY_LOWER if ff7nx_worldsphere.gaia_enabled(env)
+            else WORLD_SKY_LOWER_STOCK)
 WORLD_SKY_BOTTOM_HOOK = 0x00F38AFC
 WORLD_SKY_BOTTOM_ORIG = 0x7900001F       # strh wzr, [x0]
 WORLD_SKY_BOTTOM_STORE = 0x79000017      # strh w23, [x0]
@@ -495,9 +510,9 @@ def world_cave_patches(img, starts, log=lambda *_: None, pool=None):
         pool = ff7nx_cave.HolePool(img, starts=starts)
     out, entry = ff7nx_cave.emit_hooked(
         pool, WORLD_SKY_BOTTOM_HOOK, WORLD_SKY_BOTTOM_STORE,
-        [A.movz(23, 20)])
-    log('  world sky lower guard: 0 -> 20 via %d-word padding cave, '
-        'entry +%#x' % (3, entry))
+        [A.movz(23, world_sky_lower())])
+    log('  world sky lower guard: 0 -> %d via %d-word padding cave, '
+        'entry +%#x' % (world_sky_lower(), 3, entry))
     return out
 
 

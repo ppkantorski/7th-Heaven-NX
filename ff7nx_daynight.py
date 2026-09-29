@@ -213,6 +213,7 @@ import ff7nx_audio_cave as AC
 import ff7nx_cave
 import ff7nx_tables
 import nxmap
+import ff7nx_worldsphere as WS
 
 Asm = AC.Asm
 GUEST_TRANSLATE = AC.GUEST_TRANSLATE
@@ -1039,7 +1040,7 @@ def _white(a, bss_reg):
     a.emit(A.str_(31, bss_reg, BSS_TINT_INV))
 
 
-def build_block_cave(cave, addr, bss):
+def build_block_cave(cave, addr, bss, world=False):
     """
     Park the tint in the two ivec4 lanes the shaders never read.
 
@@ -1074,6 +1075,11 @@ def build_block_cave(cave, addr, bss):
     a.emit(A.str_(2, 31, BLOCK_BASE + TINT_LANE))      # blendMode.y
     AC.mov32(a, 2, TINT_MAGIC)
     a.emit(A.str_(2, 31, BLOCK_BASE + MAGIC_LANE))     # blendMode.z
+    if world:
+        # BUILD 584: blendMode.w carries ff7nx_worldsphere's magic while the
+        # driver is in world-map mode -- the shader's spherical-world switch.
+        WS.emit_block_flag(a, AC.bss_ptr, 3, bss, BSS_MODE, DRIVER_WORLD,
+                           BLOCK_BASE)
     a.emit(BLOCK_ORIG)                         # add x1, sp, #0x18
     a.emit(A.b(a.pc(), BLOCK_RESUME))
     return a.resolve()
@@ -1931,7 +1937,7 @@ def check_sky_page_site(text):
 
 def build_all(pool, space, bss, bitmap, frames_per_minute, force_on=True,
               freeze_hour=None, strength=DEFAULT_STRENGTH, sky_rows=(),
-              condor=True):
+              condor=True, world_sphere=False):
     """Place the three tables and runtime caves. Returns entries and patches."""
     outdoor_at = space.place('daynight-outdoor', bitmap, align=4)
     phase_at = space.place('daynight-phase', phase_table(), align=4)
@@ -1954,9 +1960,24 @@ def build_all(pool, space, bss, bitmap, frames_per_minute, force_on=True,
         pool, lambda cave, addr: build_sky_page_cave(cave, addr, bss))
     placed.update(words)
     for name, builder in STATE_ONLY_CAVES:
-        entries[name], words = ff7nx_cave.emit_laid_out(
-            pool, lambda cave, addr, _b=builder: _b(cave, addr, bss))
+        if name == 'block':
+            entries[name], words = ff7nx_cave.emit_laid_out(
+                pool, lambda cave, addr: build_block_cave(
+                    cave, addr, bss, world=world_sphere))
+        else:
+            entries[name], words = ff7nx_cave.emit_laid_out(
+                pool, lambda cave, addr, _b=builder: _b(cave, addr, bss))
         placed.update(words)
+    if world_sphere:
+        def _stub(cave, addr):
+            a = Asm(cave, addr)
+            for w in WS.model_stub_words():
+                a.emit(w)
+            return a.resolve()
+        entries['ws_model'], words = ff7nx_cave.emit_laid_out(pool, _stub)
+        placed.update(words)
+        placed[WS.SINK_SITE] = WS.SINK_NEW
+        placed[WS.MODEL_CALL] = A.bl(WS.MODEL_CALL, entries['ws_model'])
     for name, hook, orig, before, after in all_ui_sites(condor):
         entries[name], words = ff7nx_cave.emit_laid_out(
             pool, lambda cave, addr, _h=hook, _o=orig, _b=before, _a=after:
@@ -1993,7 +2014,7 @@ def freeze_hour_from_env():
 
 def apply_to_nso(src, dest, bitmap, space=None, fps=60,
                  force_on=True, freeze_hour=None, strength=DEFAULT_STRENGTH,
-                 sky_rows=(), condor=None):
+                 sky_rows=(), condor=None, world_sphere=False):
     """
     Install the day/night runtime, patching `src` into `dest`.
 
@@ -2022,6 +2043,8 @@ def apply_to_nso(src, dest, bitmap, space=None, fps=60,
     check_sky_page_site(text)
     check_driver_modes(text, space.rodata, segs[1][1])
     check_scene_sites(text)
+    if world_sphere:
+        WS.check_sites(text)
     bss = AC.scratch_base(blob, segs)
     # FFNx: `modeFramesPerMinute = framesPerMinute * 2 * common_frame_multiplier`
     # for field and world, where the multiplier is 1 at 30 FPS. The factor of
@@ -2042,7 +2065,7 @@ def apply_to_nso(src, dest, bitmap, space=None, fps=60,
     entries, placed, outdoor_at, phase_at, gamma_at, sky_at = build_all(
         pool, space, bss, bitmap, frames, force_on=force_on,
         freeze_hour=freeze_hour, strength=strength, sky_rows=sky_rows,
-        condor=condor)
+        condor=condor, world_sphere=world_sphere)
     for where, word in placed.items():
         struct.pack_into('<I', text, where, word)
 
@@ -2053,6 +2076,13 @@ def apply_to_nso(src, dest, bitmap, space=None, fps=60,
         if got != A.b(site, entries[name]):
             raise ValueError('daynight: the %s hook did not survive the '
                              'repack' % name)
+    if world_sphere:
+        if struct.unpack_from('<I', check_raw[0], WS.SINK_SITE)[0] \
+                != WS.SINK_NEW or struct.unpack_from(
+                    '<I', check_raw[0], WS.MODEL_CALL)[0] != A.bl(
+                    WS.MODEL_CALL, entries['ws_model']):
+            raise ValueError('daynight: the world-sphere words did not '
+                             'survive the repack')
     old_bss, = struct.unpack_from('<I', blob, 0x3C)
     if struct.unpack_from('<I', out, 0x3C)[0] != old_bss + BSS_BYTES:
         raise ValueError('daynight: BSS did not grow by the state block')
@@ -2073,4 +2103,5 @@ def apply_to_nso(src, dest, bitmap, space=None, fps=60,
             'frames_per_minute': frames, 'fps': fps,
             'day_minutes': minutes_per_day, 'force_on': force_on,
             'freeze_hour': freeze_hour,
-            'outdoor_fields': sum(bin(b).count('1') for b in bitmap)}
+            'outdoor_fields': sum(bin(b).count('1') for b in bitmap),
+            'world_sphere': bool(world_sphere)}

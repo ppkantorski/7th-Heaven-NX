@@ -79,12 +79,37 @@ def autorun_patch():
              '(KEYBUF[0x52])', AUTORUN_SITE, AUTORUN_ORIG, NOP)]
 
 
+# BUILD 590: the world map's camera reset (R3, FFNx's) still needs to see
+# the click. The cave MOVES StickR to bit 62 instead of dropping it: no
+# reader of the booster/cheat bit (5) sees it any more, the DirectInput key
+# loop only maps ids through the table at 0x11DDAE4 (bits 0..15), and bit 62
+# is no nn::hid button, so nothing but ff7nx_worldfar's native code, which
+# asks for it by name, reads it.
+R3_SHADOW_BIT = 62
+ROR_X13_5 = 0x93CD15AD               # ror x13, x13, #5    (StickR -> bit 0)
+BFI_X13_57 = 0xB34701AD              # bfi x13, x13, #57, #1 (-> bit 62 after)
+AND_NOT_BIT0 = 0x927FF9AD            # and x13, x13, #~1   (drop StickR)
+ROR_X13_59 = 0x93CDEDAD              # ror x13, x13, #59   (back in place)
+
+
 def nocheats_body():
     """
-    The cave body: clear StickR before the poll stores the button mask.
+    The cave body: move StickR out of the booster's reach before the poll
+    stores the button mask -- cleared at bit 5, kept at bit 62.
 
-    One instruction. `x13` holds the freshly read buttons and is dead after
-    the store this cave displaces, so nothing else sees the change and no
-    register has to be saved.
+    Four instructions on `x13` alone. `x13` holds the freshly read buttons and
+    is dead after the store this cave displaces, so no register has to be
+    saved.
     """
-    return [AND_NOT_STICKR]
+    return [ROR_X13_5, BFI_X13_57, AND_NOT_BIT0, ROR_X13_59]
+
+
+def apply_body(buttons):
+    """What the body does to a 64-bit button word (for the tests)."""
+    m = (1 << 64) - 1
+    x = buttons & m
+    x = ((x >> 5) | (x << 59)) & m
+    x = (x & ~(1 << 57)) | ((x & 1) << 57)
+    x &= ~1
+    x = ((x >> 59) | (x << 5)) & m
+    return x
