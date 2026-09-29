@@ -276,6 +276,67 @@ def static_animated():
         '1', 'true', 'yes', 'on')
 
 
+# BUILD 608: A SCRIPT-ANIMATED PALETTE STAYS PALETTED ONLY WHERE THE MOD
+# ANIMATES IT TOO.
+#
+# FFNx replaces a paletted page with the DDS for (page, palette) -- exact
+# palette first, then palette 0 (`_selected_palette`). When the field script
+# rewrites that palette at runtime (LDPAL/LDPLS, see ff7nx_palanim), FFNx
+# swaps to a `_<hash>` DDS for the new state IF Cosmos ships one; ghotel's fog
+# (palettes 8/11: 20 and 18 frames) and sinbil_1's glow (6/8: 19 and 50) do,
+# in the AA REMOVED folder. Those keep their BUILD 581 veto whether or not
+# that folder is enabled: the author animated them. When the mod has no state
+# frame for the palette in ANY folder, it ships one static picture for it.
+#
+# BUILD 581 vetoed conversion for ANY script-animated palette, so a page like
+# bugin1a's 15/16 (Bugenhagen's planetarium: palettes 1/2 are dimmed by
+# MPPAL, and Cosmos resolves both to the single `_15_00`/`_16_00`) kept its
+# 1997 256px art and the room dropped to low resolution the moment the show
+# started. The veto now applies only where Cosmos itself animates the palette
+# (state frames anywhere in the .iro). The cost, stated: where the script
+# animates such a palette -- bugin1a's show dims palettes 1/2 with MPPAL --
+# that colour change no longer runs; the tiles show Cosmos's one picture.
+# SEVENTH_NX_FX_ANIM_ALWAYS=1 restores the BUILD 581 rule.
+ANIM_ALWAYS_ENV = 'SEVENTH_NX_FX_ANIM_ALWAYS'
+
+
+def anim_always():
+    return os.environ.get(ANIM_ALWAYS_ENV, '').strip().lower() in (
+        '1', 'true', 'yes', 'on')
+
+
+def cosmos_animates(provider, field, page, palette):
+    """True when the mod ships runtime-state frames for this palette on this
+    page -- in ANY of its folders, enabled or not -- or more than one state
+    for the slot FFNx would load. False means the mod has one static picture
+    for it: the script's palette animation has no HD counterpart anywhere."""
+    field = field.lower()
+    anyst = getattr(provider, 'any_state_slots', None)
+    if anyst is None:
+        return True                       # unknown provider: keep BUILD 581
+    q = _selected_palette(provider, field, page, palette)
+    for key in {(field, page, palette), (field, page, q)}:
+        if key in anyst:
+            return True
+    if q is not None and len(getattr(provider, 'state_slots', {}).get(
+            (field, page, q), ())) > 1:
+        return True
+    return False
+
+
+def live_animated(provider, field, page, palettes, animated):
+    """The subset of `animated` (script-written palettes) that must stay
+    paletted on `page`: all of them under SEVENTH_NX_FX_ANIM_ALWAYS=1, else
+    only those Cosmos animates too."""
+    if static_animated():
+        return frozenset()
+    pals = set(palettes) & set(animated)
+    if anim_always():
+        return frozenset(pals)
+    return frozenset(q for q in pals
+                     if cosmos_animates(provider, field, page, q))
+
+
 def upgrade_section9(name, sec9, art, px, max_raw_delta=None,
                      max_runtime_delta=None, animated=frozenset()):
     """Return ``(section9, stats)`` after page-neutral additive conversion.
@@ -366,8 +427,9 @@ def upgrade_section9(name, sec9, art, px, max_raw_delta=None,
         # BUILD 581. A palette the field script loads at runtime (LDPAL /
         # LDPLS -- see ff7nx_palanim) is a colour ANIMATION: ghotel's fog
         # pulse, sinbil_1's green glow. One truecolor page would freeze it.
-        if (not static_animated()
-                and any(t.pal in animated for t in refs)):
+        _live = live_animated(provider, name, slot,
+                              {t.pal for t in refs}, animated)
+        if any(t.pal in _live for t in refs):
             st['anim_veto'] += 1
             if name not in st['anim_names']:
                 st['anim_names'].append(name)

@@ -1074,13 +1074,14 @@ def resolve(exe, nso, specs, mults, md_x86):
 # Opcode numbers are from FFNx's FieldOpcode enum, cross-checked against the
 # four table indices FFNx hardcodes ([0x21]=TUTOR, [0x39]=GOLDu, [0x59]=DLITM,
 # [0x5B]=SMTRA).
-OPCODE_NUM = {'NFADE': 0x25, 'SCRLA': 0x63, 'SCR2DC': 0x66, 'SCR2DL': 0x68,
+OPCODE_NUM = {'NFADE': 0x25, 'SCRLC': 0x62, 'SCRLA': 0x63, 'SCR2DC': 0x66, 'SCR2DL': 0x68,
               'VWOFT': 0x6A, 'SCRLP': 0x6F, 'JUMP': 0xC0, 'OFST': 0xC3}
 
 # (opcode, offset of the call inside the handler, operation, what it governs)
 OPCODE_SCALERS = [
     ('JUMP',   0x1F1, 'mul', 'field jump arc: lands before the animation ends'),
     ('SCRLA',  0x072, 'mul', 'scripted scroll / elevator speed'),
+    ('SCRLC',  0x03B, 'mul', 'scripted scroll to the current character'),
     ('SCR2DC', 0x03C, 'mul', 'scripted 2D scroll with constant speed'),
     ('SCR2DL', 0x03C, 'mul', 'scripted 2D scroll, linear'),
     ('SCRLP',  0x0A7, 'mul', 'scripted scroll to party'),

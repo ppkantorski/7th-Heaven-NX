@@ -549,7 +549,8 @@ def enabled():
     return (os.environ.get(ENV, '') or '1').strip() not in ('0', 'off', 'no')
 
 
-def apply_to_nso(src, dest, space=None, log=lambda *_: None, guest=None):
+def apply_to_nso(src, dest, space=None, log=lambda *_: None, guest=None,
+                 stock=None):
     """Install the menu calendar, patching `src` into `dest`."""
     if guest:
         check_guest(guest)
@@ -565,40 +566,64 @@ def apply_to_nso(src, dest, space=None, log=lambda *_: None, guest=None):
     table_at = space.place('calendar-months', table, align=4)
 
     import nxmap
+    import ff7nx_deadspace as DS
     pool = ff7nx_cave.HolePool(text, starts=set(nxmap.Main(src).arm_starts))
 
-    placed = {}
-    # ANY_SPAN: none of this module's caves contains a short-range branch --
-    # `build_date_cave` emits only bl/b/ret, and the clock and separator
-    # caves only ret -- so none of them needs the 960 KB window that exists
-    # for b.cond/cbz/adr. Requiring one is what made this pass fail with
-    # `NoRoom: no 983040-byte window holds 105 usable word(s)` once the
-    # day/night cycle started installing and took the dense low runs.
-    # a64 range-checks every resolved label, so if a short branch is ever
-    # added here the build fails rather than encoding into another function.
-    entry, words = ff7nx_cave.emit_laid_out(
-        pool, lambda cave, at: build_date_cave(cave, at, table_at, layout),
-        span=ff7nx_cave.ANY_SPAN)
-    placed.update(words)
-    # what the window had to hold, which is the number that matters -- the
-    # map also carries the `b` at the end of each run it was chained through
-    date_words = len(build_date_cave([], lambda i: 4 * i, table_at, layout))
-    chained = len(words)
+    def emit(pool, build):
+        """(entry, {address: word}) from the padding pool, or from the dead-
+        space part when `pool` is a ff7nx_deadspace.Bump."""
+        if isinstance(pool, DS.Bump):
+            before = dict(pool.placed)
+            e = pool.put(build)
+            return e, {k: v for k, v in pool.placed.items() if k not in before}
+        return ff7nx_cave.emit_laid_out(pool, build, span=ff7nx_cave.ANY_SPAN)
 
-    clock_entries = {}
-    for site, _want, reg, guest, what in CLOCK_SITES:
-        where, words = ff7nx_cave.emit_laid_out(
-            pool, lambda cave, at, _g=guest, _r=reg:
-            build_clock_cave(cave, at, _g, _r), span=ff7nx_cave.ANY_SPAN)
+    def place_all(pool):
+        placed = {}
+        # ANY_SPAN: none of this module's caves contains a short-range branch --
+        # `build_date_cave` emits only bl/b/ret, and the clock and separator
+        # caves only ret -- so none of them needs the 960 KB window that exists
+        # for b.cond/cbz/adr. Requiring one is what made this pass fail with
+        # `NoRoom: no 983040-byte window holds 105 usable word(s)` once the
+        # day/night cycle started installing and took the dense low runs.
+        # a64 range-checks every resolved label, so if a short branch is ever
+        # added here the build fails rather than encoding into another function.
+        entry, words = emit(
+            pool, lambda cave, at: build_date_cave(cave, at, table_at, layout))
         placed.update(words)
-        clock_entries[what] = where
-        placed[site] = A.bl(site, where)
+        # what the window had to hold, which is the number that matters -- the
+        # map also carries the `b` at the end of each run it was chained through
+        chained = len(words)
 
-    where, words = ff7nx_cave.emit_laid_out(pool, build_separator_cave,
-                                            span=ff7nx_cave.ANY_SPAN)
-    placed.update(words)
-    clock_entries['separator'] = where
-    placed[SEPARATOR_SITE] = A.bl(SEPARATOR_SITE, where)
+        clock_entries = {}
+        for site, _want, reg, guest, what in CLOCK_SITES:
+            where, words = emit(
+                pool, lambda cave, at, _g=guest, _r=reg:
+                build_clock_cave(cave, at, _g, _r))
+            placed.update(words)
+            clock_entries[what] = where
+            placed[site] = A.bl(site, where)
+
+        where, words = emit(pool, build_separator_cave)
+        placed.update(words)
+        clock_entries['separator'] = where
+        placed[SEPARATOR_SITE] = A.bl(SEPARATOR_SITE, where)
+        return entry, chained, placed, clock_entries
+
+    # BUILD 596: the padding pool ran dry for the calendar once the day/night
+    # pass grew (log 372 onward: "need 7 more word(s)"), and it was silently
+    # left out of the build. It has its own dead-space part now; the pool is
+    # still tried first, so a module with room lays out as before.
+    where_from = 'the padding pool'
+    try:
+        entry, chained, placed, clock_entries = place_all(pool)
+    except ff7nx_cave.NoRoom as exc:
+        lo, hi = DS.part(src, 'calendar', stock)
+        entry, chained, placed, clock_entries = place_all(DS.Bump(lo, hi))
+        where_from = ('the dead-space part +0x%X..+0x%X (the padding pool '
+                      'had no room: %s)' % (lo, hi, exc))
+    date_words = len(build_date_cave([], lambda i: 4 * i, table_at, layout))
+    log('  caves: %s' % where_from)
 
     placed[DATE_HOOK] = A.bl(DATE_HOOK, entry)
     placed[TIME_LABEL_X_SITE] = A.nop()

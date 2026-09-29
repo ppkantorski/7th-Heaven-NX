@@ -2105,6 +2105,12 @@ class ArtProvider:
         self.ambiguous_slots = set()
         self.ambiguous_base = 0        # settled on the page's base dump
         self.ambiguous_arbitrary = 0   # no base dump; first by sorted name
+        # BUILD 608: (field, page, palette) keys for which the mod ships
+        # runtime-state (`_<hash>`) dumps in ANY folder, enabled or not. The
+        # mod author animated that palette (ghotel's fog, sinbil_1's glow
+        # live in AA REMOVED); a palette with no state dumps anywhere is one
+        # static picture in the mod. ff7nx_fxpages.cosmos_animates reads it.
+        self.any_state_slots = set()
         import iro
         for path, allowed in sources:
             try:
@@ -2113,6 +2119,9 @@ class ArtProvider:
                 log('! field art: cannot read %s (%s)' % (path, exc))
                 continue
             idx = index_field_dds(entries, allowed)
+            for key, cands in index_field_dds(entries, None).items():
+                if any(not _is_base_dump(c, key[0]) for c in cands):
+                    self.any_state_slots.add(key)
             for key, candidates in idx.items():
                 self.state_slots[key] = tuple((path, entry)
                                               for entry in candidates)

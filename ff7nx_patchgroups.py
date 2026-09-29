@@ -323,6 +323,8 @@ OPCODE_SITES = [
          ctx=21, handler=0x615CA3, x86_call=0x615E94, what='field jump arc: lands before the animation ends'),
     dict(name='SCRLA', op='mul', hook=0x0097A190, displaced=0xB94012C8,
          ctx=22, handler=0x61A607, x86_call=0x61A679, what='scripted scroll / elevator speed'),
+    dict(name='SCRLC', op='mul', hook=0x00979EAC, displaced=0xB94012A8,
+         ctx=21, handler=0x61A58A, x86_call=0x61A5C5, what='scripted scroll to the current character'),
     dict(name='SCR2DC', op='mul', hook=0x0097A8C4, displaced=0xB9401288,
          ctx=20, handler=0x61A7F9, x86_call=0x61A835, what='scripted 2D scroll with constant speed'),
     dict(name='SCR2DL', op='mul', hook=0x0097AB20, displaced=0xB9401288,

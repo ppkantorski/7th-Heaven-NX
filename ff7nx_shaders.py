@@ -25,7 +25,13 @@ Scaler -- three files each, all replacing the same kernel:
               reconstructing downsampled flevel crops, so it is the one
               aimed at THIS game's art rather than at pixel art generally.
     xbr       level-1 edge-directed: crisp flats, smooth 45-degree edges.
-    crisp     nearest neighbour. Raw pixels, no reconstruction at all.
+    crisp     nearest neighbour. Raw pixels, no reconstruction at all, and
+              NO GRADING -- blacks keep the 8/255 lift a truecolor page has
+              to store them with. Sharp, but a known-incomplete control.
+    sharp     `crisp`'s point sample, CLAMPED so it cannot read outside the
+              rect, plus `hd`'s black point and saturation. This is the one
+              to use at scale 3: the reconstruction has already happened, so
+              the only thing worth keeping from `hd` is the grading.
     soft      plain bilinear. The mildest change, and the closest thing to
               an identity pass -- useful as a control.
 
@@ -77,6 +83,15 @@ SCALER_SETS = {
     'hd': ('hd', SCALER_FILES, 'HD — Catmull-Rom + sharpen'),
     'xbr': ('xbr', SCALER_FILES, 'xBR — edge-directed'),
     'crisp': ('crisp', SCALER_FILES, 'Crisp — nearest neighbour'),
+    # FINDINGS-251. `crisp` proved the direction right -- the sky/girder edge
+    # ramp went 1.39 px -> 0.91 px against FFNx's 0.97 -- but it ships two
+    # defects: it samples with an UNCLAMPED floor (at 1:1 the texel and pixel
+    # grids align, so fp noise picks texel N or N-1 and at a rect boundary
+    # that reads outside it) and it drops `hd_grade_rgb` entirely, so
+    # HD_BLACK_POINT never cancels NEAR_BLACK's 8/255 lift. `sharp` is the
+    # same single tap, clamped to the stock kernel's own tap span, with the
+    # grading kept verbatim.
+    'sharp': ('sharp', SCALER_FILES, 'Sharp — point sample + HD grading'),
     'soft': ('soft', SCALER_FILES, 'Soft — plain bilinear'),
 }
 
@@ -155,6 +170,10 @@ def _install(kind, value, sets, dest_dir, log):
     for f in files:
         dest = os.path.join(dest_dir, f)
         shutil.copy2(os.path.join(src_dir, f), dest)
+        # BUILD 591: dated by the build, not the source (copy2 kept the
+        # source's date, so a rebuilt set looked untouched in sdout and a
+        # copy-by-date to the card skipped it)
+        os.utime(dest, None)
         out.append(dest)
     log('  %-22s %s   (%s)' % (kind + ':', label, ', '.join(files)))
     return out

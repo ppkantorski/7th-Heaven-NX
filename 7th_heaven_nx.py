@@ -1445,6 +1445,16 @@ def run_build(mods, enabled, settings_by_mod, log, progress,
     # word, and DEFAULT OFF: the mechanism is measured but the graphics pool
     # was believed on good grounds too. FINDINGS-306.
     produced += build.apply_texcache(SDOUT_DIR, DUMP, log, produced)
+    # BUILD 603. The background scaler's filtered copy of every texture is
+    # 4x width AND height -- 17x its memory. fship's 512x512 textures ran the
+    # graphics pool out (GL_OUT_OF_MEMORY, the crew's speckles). Capped at
+    # 1024 px a side; stock-size art unchanged. Two words, two padding caves.
+    produced += build.apply_texscale(SDOUT_DIR, DUMP, log, produced)
+    # BUILD 604. World-map shadows wrote rhw = 1.0 (2D to the shader), so
+    # they kept the game's old depth and showed through the crater lip. They
+    # now carry the nearest corner's 1/w: the terrain's depth formula.
+    # 604b: and a shadow's size stops at 0 high up instead of inverting.
+    produced += build.apply_shadowdepth(SDOUT_DIR, DUMP, log, produced)
     # Resized SYW TEX payloads carry a per-file integer scale in two inert
     # header words. All three u/v reciprocal pairs in _load_texture apply that
     # scale when each graphics object is constructed, so every consumer keeps
@@ -1557,6 +1567,8 @@ def run_build(mods, enabled, settings_by_mod, log, progress,
     produced += build.apply_field_pacing(SDOUT_DIR, DUMP, plan, log, produced)
     # BUILD 533. The zero-travel SCR2D rule; see ff7nx_campreserve.
     produced += build.apply_cam_preserve(SDOUT_DIR, DUMP, plan, log, produced)
+    # BUILD 610. The camera follows the unfloored position; see ff7nx_campos.
+    produced += build.apply_campos(SDOUT_DIR, DUMP, plan, log, produced)
     # BUILD 537. The sound-buffer pool: 32 MB static -> heap, so Cosmo
     # Memory's long SFX loops cannot close the game (Chocobo Race). Last of
     # the cave passes so no shipping cave moves. See ff7nx_audiopool.
@@ -1573,6 +1585,10 @@ def run_build(mods, enabled, settings_by_mod, log, progress,
     produced += build.apply_condorpad(SDOUT_DIR, DUMP, log, produced)
     # BUILD 580. 60 FPS partial field animations. See ff7nx_canim60.
     produced += build.apply_canim60(SDOUT_DIR, DUMP, log, produced)
+    # BUILD 585. The world map's far field (the rest of the planet, through
+    # the native terrain pipeline). After day/night, whose pass installs the
+    # spherical world it needs. See ff7nx_worldfar.
+    produced += build.apply_worldfar(SDOUT_DIR, DUMP, log, produced)
     # BUILD 528. Diagnostic frame probe, off unless SEVENTH_NX_FRAME_PROBE=1.
     # Must be the last module pass. See ff7nx_frameprobe.
     produced += build.apply_frame_probe(SDOUT_DIR, DUMP, plan, log, produced)

@@ -385,6 +385,26 @@ def scratch_base(blob, segs):
     return data_end + old_bss
 
 
+def bss_tail_slack(segs):
+    """
+    Bytes a pass must ADD to its BSS growth so its scratch really ends where
+    it thinks. BUILD 605b.
+
+    Scratch is laid out from `scratch_base` (the page-aligned end of .data
+    plus bssSize), but the loader maps BSS from the RAW end of .data:
+    the module's last mapped byte is page_align(data_end_raw + bssSize).
+    So a pass whose scratch runs to the very end of its growth loses
+    (page_align(data_end) - data_end) bytes -- 0x328 in this module -- past
+    the mapping unless page rounding happens to cover them. Measured: 605's
+    worldfar State ended 0x130 bytes past the last page, and the first write
+    to its tail (worldfar_alloc, the world map's load) was a data abort.
+    Passes that come later cover an earlier pass's tail; the LAST one needs
+    this.
+    """
+    data_end = segs[2][1] + segs[2][2]
+    return ((data_end + 0xFFF) & ~0xFFF) - data_end
+
+
 def read_word(segs, raw, va):
     """
     The u32 at module offset `va`, from whichever segment actually holds it.

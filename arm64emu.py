@@ -334,6 +334,18 @@ class Cpu:
                            | ((0x1F if b else 0) << 25)
                            | ((imm8 & 0x3F) << 19))
             return None
+        if (w & 0xFFFFFC00) == 0x1E220000:                    # scvtf Sd,Wn
+            # BUILD 610 (ff7nx_campos). Signed; exact in a double, then one
+            # rounding to single, as the hardware does.
+            x = float(s32(g(rn, True)))
+            self.fp[rd] = struct.unpack('<I', struct.pack('<f', x))[0]
+            return None
+        if (w & 0xFFFF0000) == 0x1E020000 and (w >> 10) & 0x3F >= 32:
+            # scvtf Sd, Wn, #fbits  (fixed point; scale = 64 - fbits)
+            fbits = 64 - ((w >> 10) & 0x3F)
+            x = float(s32(g(rn, True))) / (1 << fbits)
+            self.fp[rd] = struct.unpack('<I', struct.pack('<f', x))[0]
+            return None
         if (w & 0xFFFFFC00) == 0x1E230000:                    # ucvtf Sd,Wn
             x = float(g(rn, True))
             self.fp[rd] = struct.unpack('<I', struct.pack('<f', x))[0]
@@ -745,6 +757,15 @@ class Cpu:
             ra = (w >> 10) & 31
             return s(rd, (s32(g(rn, True)) * s32(g(rm, True))
                           + s64(gz(ra, False))) & M64, False)
+        if (w & 0xFFE08000) == 0x9B208000:                    # smsubl Xd,Wn,Wm,Xa
+            # BUILD 610b (ff7nx_campos walk height): Xa - Wn*Wm, signed.
+            ra = (w >> 10) & 31
+            return s(rd, (s64(gz(ra, False)) - s32(g(rn, True))
+                          * s32(g(rm, True))) & M64, False)
+        if (w & 0xFFE08000) == 0x9B008000:                    # msub Xd,Xn,Xm,Xa
+            ra = (w >> 10) & 31
+            return s(rd, (gz(ra, False) - gz(rn, False) * gz(rm, False))
+                     & M64, False)
         if (w & 0xFFE08000) == 0x9B000000:                    # madd Xd,Xn,Xm,Xa
             ra = (w >> 10) & 31
             # NOTE gz(r, wide=True) forwards to get(r, w=True), and that `w`

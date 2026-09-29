@@ -1847,10 +1847,14 @@ def opcode_scaler_cave(cave, site, mult, shift):
     return w
 
 
-# The seven multiply sites. NFADE is separate: it is a divide, and it belongs
+# The eight multiply sites. NFADE is separate: it is a divide, and it belongs
 # with the field-fade constants it was always meant to accompany.
-OPCODE_MUL_NAMES = ('JUMP', 'SCRLA', 'SCR2DC', 'SCR2DL', 'SCRLP', 'OFST',
-                    'VWOFT')
+# SCRLC (BUILD 610) was missing: FFNx scales it with the other scrolls
+# (field.cpp, execute_opcode_table[SCRLC] + 0x3B). Unscaled, a SCRLC that
+# follows a scaled JUMP ended in half the time and left the camera mid-air
+# (mds6_2: Cloud jumps off the slide, the camera stops, then snaps at SCRCC).
+OPCODE_MUL_NAMES = ('JUMP', 'SCRLC', 'SCRLA', 'SCR2DC', 'SCR2DL', 'SCRLP',
+                    'OFST', 'VWOFT')
 OPCODE_DIV_NAMES = ('NFADE',)
 
 # --------------------------------------------------------------------------

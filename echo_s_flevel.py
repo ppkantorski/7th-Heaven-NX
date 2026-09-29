@@ -148,6 +148,207 @@ PC_BUTTON_GLYPHS = {
 BUTTON_GLYPHS_RETARGETED = 0
 
 
+# BUILD 609. THE GLYPH BYTE IS THE BUTTON; THE NAME IS ONLY ITS CAPTION.
+#
+# Measured over every `<glyph> ( NAME )` in Echo-S's own field set, each
+# glyph byte carries exactly one name -- with one exception, and it is a typo
+# in the NAME: games_2's snowboard list writes glyph 94 (RIGHT) captioned
+# "(LEFT)", so the port showed "LEFT Move left / LEFT Move right". Keying on
+# the byte fixes that and covers every name spelling Echo-S uses ("PAGEDN",
+# "PGDN", "PAGEDOWN", "Page Down").
+#
+# The Switch code for each button is read from the port's OWN strings for
+# the same action, not inferred:
+#   F6 11  L    fship_4 "{L} arc Left", mds7_w2 "{L}/{R}: turn",
+#               junpb_2 "Magic-All and Magic with {L}/{R}", elm "{L} or {R}"
+#   F6 13  R    the same strings; subin_1b "{R}: Sight"
+#   F6 14  ZR   subin_1b "{ZR}: View"                (Echo-S TARGET)
+#   F6 15  +    elm "{+} once to view the World Map", mogu_1 "PRESS {+}",
+#               niv_ti2 "Use {+} to end"              (Echo-S START)
+#   F6 16  -    mds7_w2 "press {-} ... [Help]", crcin_1 "{-} AUTO or MANUAL",
+#               mtnvl2 "End with {-}"                 (Echo-S ASSIST)
+#   F6 17..1A  d-pad up / down / left / right: snow "{up} Move forward,
+#               {left} Move left, {right} Move right", zcoal_3 levers
+# L = previous page and R = next page is also the port's own key
+# assignment (howtoplay_keyassign), i.e. PAGEUP and PAGEDOWN.
+PC_BUTTON_GLYPH_BY_BYTE = {
+    0x81: b'\xf6\x16',      # ASSIST  -> -
+    0x82: b'\xf6\x15',      # START   -> +
+    0x93: b'\xf6\x19',      # LEFT    -> d-pad left
+    0x94: b'\xf6\x1a',      # RIGHT   -> d-pad right
+    0x95: b'\xf9',          # CANCEL  -> B
+    0x96: b'\xf8',          # SWITCH  -> Y
+    0x97: b'\xf7',          # MENU    -> X
+    0x98: b'\xf6\x10',      # CONFIRM -> A
+    0x99: b'\xf6\x11',      # PAGEUP  -> L
+    0x9A: b'\xf6\x13',      # PAGEDN  -> R
+    0x9B: b'\xf6\x12',      # CAMERA  -> ZL
+    0x9C: b'\xf6\x14',      # TARGET  -> ZR
+    0xBE: b'\xf6\x17',      # UP      -> d-pad up
+    0xBF: b'\xf6\x18',      # DOWN    -> d-pad down
+}
+
+
+def _enc(text: str) -> bytes:
+    return bytes(ord(c) - 0x20 for c in text)
+
+
+# BUILD 609. The same buttons written as BRACKETED WORDS with no glyph byte
+# ("{FE D5}[MENU]{FE D9}", "by using [PAGEUP] and [PAGEDOWN]") -- 21 in
+# blackbg2, junmin1, mds7_w2, ujunon1 and whitebg3. Only these exact names,
+# only inside brackets, so a menu label such as [Magic] or [Check] is never
+# touched.
+PC_BRACKET_BUTTONS = {
+    _enc('MENU'): b'\xf7',
+    _enc('CANCEL'): b'\xf9',
+    _enc('SWITCH'): b'\xf8',
+    _enc('OK'): b'\xf6\x10',
+    _enc('CONFIRM'): b'\xf6\x10',
+    _enc('START'): b'\xf6\x15',
+    _enc('ASSIST'): b'\xf6\x16',
+    _enc('TARGET'): b'\xf6\x14',
+    _enc('CAMERA'): b'\xf6\x12',
+    _enc('PAGEUP'): b'\xf6\x11',
+    _enc('PAGEDOWN'): b'\xf6\x13',
+    _enc('PAGEUP/PAGEDOWN'): b'\xf6\x11' + _enc('/') + b'\xf6\x13',
+}
+
+
+def _retarget_bracketed_buttons(part: bytes):
+    """[NAME] -> glyph for the names above, before the terminator only."""
+    end = part.find(b'\xff')
+    if end < 0:
+        end = len(part)
+    head = bytes(part[:end])
+    changed = 0
+    for name, glyph in PC_BRACKET_BUTTONS.items():
+        token = b'\x3b' + name + b'\x3d'
+        n = head.count(token)
+        if n:
+            head = head.replace(token, glyph)
+            changed += n
+    if changed:
+        global BUTTON_GLYPHS_RETARGETED
+        BUTTON_GLYPHS_RETARGETED += changed
+    return head + bytes(part[end:]), changed
+
+
+# BUILD 609. WHERE ECHO-S NAMES A DIFFERENT BUTTON THAN THE SWITCH DOES FOR
+# THE SAME ACTION. Echo-S follows the PC bindings; these strings are
+# corrected to what the port's own text says for the same action, after the
+# glyphs above are in place (so they match on Switch codes). Each rule must
+# match exactly `count` times in the named field, or the build fails loudly
+# rather than shipping a half-applied table.
+#
+#   elm     "if you press ZL ... change the camera's point-of-view": with the
+#           Gaia world map that is the right stick (R3 toggles the view), and
+#           the font has no stick glyph, so it says RS. "rotate the camera
+#           by pressing A or R": the port says "{L} or {R}".
+#   junpb_2 escape "Hold A and R" -> "{L} and {R}" (mds7_w2/port: "{L} and
+#           {R} together"); single/multiple targets "A/R" -> "{L}/{R}"
+#           (port: "Magic-All and Magic with {L}/{R}"); battle help "press
+#           ZL" -> "{-}" (port: "Press {-} during battle ... Help").
+#   subin_1b, games_2 (the same submarine): "A Rapid ascent" -> "{L}"
+#           (port: "{L}: Climb").
+#   games_2, snow: snowboard "R + left/right Sharp" -> "{L}" (port: "{left}
+#           + {L} Edge Left").
+#   blackbg2 (debug room): Reset Flag is {L} and Battle On/Off is {R} in the
+#           port; Echo-S has them the other way round.
+def _c(text):
+    return _enc(text)
+
+
+_D5, _D9 = b'\xfe\xd5', b'\xfe\xd9'
+_A, _L, _R, _ZL, _MINUS = (b'\xf6\x10', b'\xf6\x11', b'\xf6\x13',
+                           b'\xf6\x12', b'\xf6\x16')
+FIELD_BUTTON_FIXES = {
+    'elm': (
+        (_c('if you press ') + _D5 + _ZL + _D9,
+         _c('if you press ') + _D5 + _c('RS') + _D9, 1),
+        (_c('by pressing ') + _D5 + _A + _D9 + b'\xe7' + _c('  or ') + _D5 + _R,
+         _c('by pressing ') + _D5 + _L + _D9 + b'\xe7' + _c('  or ') + _D5 + _R,
+         1),
+    ),
+    'junpb_2': (
+        (_c('Hold ') + _D5 + _A + _D9 + _c(' and ') + _D5 + _R,
+         _c('Hold ') + _D5 + _L + _D9 + _c(' and ') + _D5 + _R, 1),
+        (_c('with ') + _D5 + _A + _D9 + _c('/') + _D5 + _R,
+         _c('with ') + _D5 + _L + _D9 + _c('/') + _D5 + _R, 1),
+        (_c('press ') + _D5 + _ZL + _D9 + _c(' during battle'),
+         _c('press ') + _D5 + _MINUS + _D9 + _c(' during battle'), 1),
+    ),
+    'subin_1b': (
+        (_D5 + _A + _D9 + _c(' Rapid ascent'),
+         _D5 + _L + _D9 + _c(' Rapid ascent'), 1),
+    ),
+    'games_2': (
+        (b'\xfe\xd4' + _A + _D9 + _c(' Rapid ascent'),
+         b'\xfe\xd4' + _L + _D9 + _c(' Rapid ascent'), 1),
+        (_D5 + _R + _D9 + _c('+ ') + _D5, _D5 + _L + _D9 + _c('+ ') + _D5, 2),
+    ),
+    'snow': (
+        (_D5 + _R + _D9 + _c(' + ') + _D5, _D5 + _L + _D9 + _c(' + ') + _D5, 2),
+    ),
+    'blackbg2': (
+        (_D5 + _R + _D9 + _c(': Reset Flag'),
+         _D5 + _L + _D9 + _c(': Reset Flag'), 1),
+        (_D5 + _L + _D9 + _c(':   Battle On/Off'),
+         _D5 + _R + _D9 + _c(':   Battle On/Off'), 1),
+    ),
+}
+FIELD_BUTTON_FIXES_APPLIED = 0
+
+
+def apply_field_button_fixes(script_section: bytes, field_name):
+    """Apply FIELD_BUTTON_FIXES to one field's section 1, relocating string
+    and AKAO offsets exactly as the markup cleanup does."""
+    rules = FIELD_BUTTON_FIXES.get((field_name or '').lower())
+    if not rules:
+        return script_section, 0
+    string_offset = struct.unpack_from('<H', script_section, 4)[0]
+    count = struct.unpack_from('<H', script_section, string_offset)[0]
+    table = string_offset + 2
+    offsets = list(struct.unpack_from('<%dH' % count, script_section, table))
+    unique_offsets = sorted(set(offsets))
+    starts = [string_offset + value for value in unique_offsets]
+    rebuilt = bytearray(script_section[:starts[0]])
+    rewritten = {}
+    hits = [0] * len(rules)
+    for index, (old_offset, start) in enumerate(zip(unique_offsets, starts)):
+        end = starts[index + 1] if index + 1 < len(starts) else len(script_section)
+        part = script_section[start:end]
+        term = part.index(b'\xff')
+        head, tail = bytes(part[:term]), bytes(part[term:])
+        for r, (old, new, _n) in enumerate(rules):
+            k = head.count(old)
+            if k:
+                head = head.replace(old, new)
+                hits[r] += k
+        rewritten[old_offset] = len(rebuilt) - string_offset
+        rebuilt.extend(head + tail)
+    for r, (old, _new, want) in enumerate(rules):
+        if hits[r] != want:
+            raise EchoFlevelError(
+                '%s button fix %d matched %d time(s), expected %d -- the '
+                'Echo-S text changed; re-derive FIELD_BUTTON_FIXES'
+                % (field_name, r, hits[r], want))
+    for index, old_offset in enumerate(offsets):
+        struct.pack_into('<H', rebuilt, table + index * 2,
+                         rewritten[old_offset])
+    delta = len(rebuilt) - len(script_section)
+    actor_count = script_section[2]
+    akao_count = struct.unpack_from('<H', script_section, 6)[0]
+    akao_table = _SECTION1_FIXED_HEADER + actor_count * 8
+    for index in range(akao_count):
+        offset = akao_table + index * 4
+        akao = struct.unpack_from('<I', rebuilt, offset)[0]
+        if akao >= starts[0]:
+            struct.pack_into('<I', rebuilt, offset, akao + delta)
+    global FIELD_BUTTON_FIXES_APPLIED
+    FIELD_BUTTON_FIXES_APPLIED += sum(hits)
+    return bytes(rebuilt), sum(hits)
+
+
 def _upper_name(name: bytes) -> bytes:
     return bytes(b - 0x20 if 0x41 <= b <= 0x5a else b for b in name)
 
@@ -280,6 +481,8 @@ def _strip_pc_field_markup(part: bytes):
     changed = 0
     part, retargeted = _retarget_pc_button_glyphs(part)
     changed += retargeted
+    part, bracketed = _retarget_bracketed_buttons(part)
+    changed += bracketed
     # BUILD 558: item icons wherever they stand (lists, prose, "Obtained
     # prize: {icon}...", "Obtained 3 {icon}..."). An icon right after
     # "Obtained " goes here too; the older rule below then finds a letter
@@ -403,7 +606,12 @@ def _retarget_pc_button_glyphs(part: bytes):
                 continue
             name = bytes(part[cursor + 1:close])
             out.extend(colour)
-            out.extend(PC_BUTTON_GLYPHS.get(_upper_name(name), name))
+            run = bytes(part[index:cursor - len(colour)])
+            if len(run) == 1 and run[0] in PC_BUTTON_GLYPH_BY_BYTE:
+                # BUILD 609: the byte decides (see PC_BUTTON_GLYPH_BY_BYTE).
+                out.extend(PC_BUTTON_GLYPH_BY_BYTE[run[0]])
+            else:
+                out.extend(PC_BUTTON_GLYPHS.get(_upper_name(name), name))
             index = close + 1
             changed += 1
             continue
@@ -1444,6 +1652,10 @@ def merge_field_payload(stock_payload: bytes, echo_payload: bytes,
         echo_sections[0])
     echo_sections[0], _restored_tutorials = restore_switch_tutorial_dialogues(
         echo_sections[0], stock_sections[0], field_name)
+    # BUILD 609: strings where Echo-S's PC binding names another button than
+    # the Switch uses for the same action. See FIELD_BUTTON_FIXES.
+    echo_sections[0], _button_fixes = apply_field_button_fixes(
+        echo_sections[0], field_name)
     # Echo-S's optional PC Day/Night system is enabled by default upstream.
     # When Time is append-only, remove its metadata completely: the Switch's
     # actor-array layout must remain the stock layout.  A small minority of

@@ -251,8 +251,36 @@ def _install_shaders(sdout, log=lambda *_: None):
                 'rather than shipping the wrong scale' % name)
             os.remove(dest)
             return out
+        # BUILD 590: stamp it with the build time. copy2 carries the source's
+        # date, so a rebuilt shader looked untouched in sdout and a copy by
+        # date to the card skipped it.
+        os.utime(dest, None)
         out.append(dest)
         log('  shader      %s  (WS_SCALE %.8f)' % (name, want))
+        # BUILD 584: the world-map sphere radius, same rewrite discipline.
+        try:
+            import ff7nx_worldsphere
+            radius = ff7nx_worldsphere.radius()
+            # BUILD 591: the shader no longer carries a radius (the planet
+            # is on the CPU); only a shader that HAS the define must take it.
+            # 591's first cut deleted lmain_vv here, which took the world
+            # sphere and far field out of the whole build with it.
+            _text = open(dest).read()
+            if (name == 'lmain_vv.glsl'
+                    and ff7nx_worldsphere.SHADER_MARK in _text
+                    and 'WS_SPHERE_RADIUS' in _text
+                    and not ff7nx_worldsphere.write_radius(dest, radius)):
+                log('! %s: could not set WS_SPHERE_RADIUS; removing it '
+                    'rather than shipping an unknown radius' % name)
+                os.remove(dest)
+                out.remove(dest)
+                return out
+            if name == 'lmain_vv.glsl' and radius != \
+                    ff7nx_worldsphere.FFNX_RADIUS:
+                log('  shader      lmain_vv.glsl world sphere radius %.0f '
+                    '(FFNx: %.0f)' % (radius, ff7nx_worldsphere.FFNX_RADIUS))
+        except ImportError:
+            pass
     return out
 
 

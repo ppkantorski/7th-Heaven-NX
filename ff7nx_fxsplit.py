@@ -184,40 +184,75 @@ def split_section9(name, sec9, art, px, max_raw_delta=None,
             by_q[q].append(t)
         if missing:
             continue
-        live = set() if XP.static_animated() else set(animated)
-        animated_q = {q for q in by_q
-                      if ((field, slot, q) in provider.ambiguous_slots
-                          or any(t.pal in live for t in by_q[q]))
-                      and not (q in frozen and all(
-                          t.pal in frozen for t in by_q[q]))}
-        static = [q for q in sorted(by_q) if q not in animated_q]
-        if not animated_q or not static:
-            continue
-        groups = []
-        seen = {}
-        bad = False
-        for q in static:
-            if (field, slot, q) in provider.ambiguous_slots:
-                img = _brightest_state(provider, field, slot, q, px)
-                st['frozen'] += len(by_q[q])
-            else:
-                img = FXM._provider_rgba(art, field, slot, q, px)
-            if (img is None or img.shape != (px, px, 4)
-                    or not np.any(img[..., 3] >= 8)):
-                bad = True
-                break
-            # Two palettes that resolve to byte-identical art share a clone.
-            key = img.tobytes()
-            if key in seen:
-                groups[seen[key]][2].extend(by_q[q])
+        # BUILD 608: only palettes Cosmos animates too (see
+        # ff7nx_fxpages.live_animated); a script-animated palette that
+        # resolves to one static DDS is static on PC and is static here.
+        def _plan(live):
+            """(groups, kept, frozen_tiles) splitting off every palette not
+            animated under `live`; None when there is nothing to split;
+            'bad' when a static palette has no usable art."""
+            animated_q = {q for q in by_q
+                          if ((field, slot, q) in provider.ambiguous_slots
+                              or any(t.pal in live for t in by_q[q]))
+                          and not (q in frozen and all(
+                              t.pal in frozen for t in by_q[q]))}
+            static = [q for q in sorted(by_q) if q not in animated_q]
+            if not static:
+                return None
+            if not animated_q:
+                # BUILD 608. Every palette here is static on PC, but the page
+                # still resolves to more than one Cosmos DDS, so fxpages
+                # cannot convert it in place. When that is only because the
+                # field script animates a palette Cosmos ships one image for
+                # (the BUILD 581 rule kept that palette paletted and split the
+                # rest), every palette gets its own clone and the old page is
+                # left with no reference. Pages with no script animation at
+                # all are still fxpages's, exactly as before.
+                if len(static) < 2 or not any(
+                        t.pal in old_live for q in static for t in by_q[q]):
+                    return None
+            groups = []
+            seen = {}
+            nfrozen = 0
+            for q in static:
+                if (field, slot, q) in provider.ambiguous_slots:
+                    img = _brightest_state(provider, field, slot, q, px)
+                    nfrozen += len(by_q[q])
+                else:
+                    img = FXM._provider_rgba(art, field, slot, q, px)
+                if (img is None or img.shape != (px, px, 4)
+                        or not np.any(img[..., 3] >= 8)):
+                    return 'bad'
+                # Two palettes that resolve to byte-identical art share a
+                # clone.
+                key = img.tobytes()
+                if key in seen:
+                    groups[seen[key]][2].extend(by_q[q])
+                    continue
+                seen[key] = len(groups)
+                groups.append((q, img, list(by_q[q])))
+            kept = sum(len(by_q[q]) for q in animated_q)
+            return groups, kept, nfrozen
+
+        old_live = set() if XP.static_animated() else set(animated)
+        live = set(XP.live_animated(provider, field, slot,
+                                    {t.pal for t in refs}, animated))
+        primary = _plan(live)
+        # BUILD 608: the BUILD 581 plan, tried when the fuller split does not
+        # fit, so no page ends with fewer HD tiles than that rule gave it.
+        _pals = {t.pal for t in refs}
+        fallback = (_plan(old_live) if live != (old_live & _pals)
+                    else None)
+        if primary == 'bad':
+            primary = None
+            if fallback in (None, 'bad'):
+                st['veto_art'] += 1
                 continue
-            seen[key] = len(groups)
-            groups.append((q, img, list(by_q[q])))
-        if bad:
-            st['veto_art'] += 1
+        if fallback == 'bad':
+            fallback = None
+        if primary is None and fallback is None:
             continue
-        kept = sum(len(by_q[q]) for q in animated_q)
-        plans.append((slot, groups, kept))
+        plans.append((slot, primary, fallback))
 
     if not plans:
         return sec9, st
@@ -232,16 +267,69 @@ def split_section9(name, sec9, art, px, max_raw_delta=None,
     buf = bytearray(sec9)
     new_pages = {}
     # Most-referenced page first: if only one fits, it is the one seen most.
-    plans.sort(key=lambda p: -sum(len(g[2]) for g in p[1]))
-    for slot, groups, kept in plans:
+    def _tiles(plan):
+        return sum(len(g[2]) for g in plan[0]) if plan else 0
+
+    plans.sort(key=lambda p: -max(_tiles(p[1]), _tiles(p[2])))
+    # BUILD 608: choose primary / fallback / nothing per page to convert the
+    # most tile references within the free band slots and byte budgets. The
+    # all-fallback assignment is the BUILD 581 result, so the best one is
+    # never worse than it. Exhaustive for up to 10 pages (3^10), else greedy.
+    if len(plans) <= 10 and any(p[2] for p in plans):
+        _cap_room = (cap - present - reserve_pages) if cap else 1 << 30
+        _slots = min(len(free), max(0, _cap_room))
+        _best = [(-1, 0), None]
+
+        def _search(i, used_slots, used_raw, used_run, tiles, pick):
+            if i == len(plans):
+                score = (tiles, -used_slots)
+                if score > _best[0]:
+                    _best[0], _best[1] = score, list(pick)
+                return
+            for opt in (1, 2, 0):
+                plan = plans[i][opt] if opt else None
+                if opt and not plan:
+                    continue
+                n = len(plan[0]) if plan else 0
+                if (used_slots + n > _slots
+                        or used_raw + n * d2_raw > raw_left
+                        or used_run + n * d2_run > run_left):
+                    continue
+                pick.append(opt)
+                _search(i + 1, used_slots + n, used_raw + n * d2_raw,
+                        used_run + n * d2_run, tiles + _tiles(plan), pick)
+                pick.pop()
+
+        _search(0, 0, 0, 0, 0, [])
+        if _best[1] is not None:
+            plans = [(sl, (pr if o == 1 else fb if o == 2 else None), None)
+                     for (sl, pr, fb), o in zip(plans, _best[1])]
+            for sl, pr, _fb in plans:
+                if pr is None:
+                    st['veto_fit'] += 1
+            plans = [p for p in plans if p[1] is not None]
+    for slot, primary, fallback in plans:
+        chosen = None
+        why = None
+        for plan in (primary, fallback):
+            if not plan:
+                continue
+            n = len(plan[0])
+            if len(free) < n or (cap and present + len(new_pages) + n
+                                 + reserve_pages > cap):
+                why = why or 'veto_fit'
+                continue
+            if n * d2_raw > raw_left or n * d2_run > run_left:
+                why = why or 'veto_budget'
+                continue
+            chosen = plan
+            break
+        if chosen is None:
+            st[why or 'veto_fit'] += 1
+            continue
+        groups, kept, nfrozen = chosen
         n = len(groups)
-        if len(free) < n or (cap and present + len(new_pages) + n
-                             + reserve_pages > cap):
-            st['veto_fit'] += 1
-            continue
-        if n * d2_raw > raw_left or n * d2_run > run_left:
-            st['veto_budget'] += 1
-            continue
+        st['frozen'] += nfrozen
         for _q, img, gtiles in groups:
             ns = free.pop(0)
             new_pages[ns] = FN.Page(ns, 0, 2, _encode(img, px), px)

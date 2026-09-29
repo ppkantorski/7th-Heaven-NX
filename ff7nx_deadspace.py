@@ -27,7 +27,15 @@ It is split so a shipping pass and the diagnostic probe can never collide:
                                 Fort Condor's 360-degree, slower cursor
     [lo + 0x2A00,  lo + 0x2E00) 'canim': ff7nx_canim60 (BUILD 580) -- the
                                 60 FPS partial-animation frame mapping
-    [lo + 0x2E00,  hi)          ff7nx_frameprobe, diagnostic builds only
+    [lo + 0x2E00,  lo + 0x3600) 'calendar': ff7nx_calendar (BUILD 596) --
+                                the menu date row and clock caves, when the
+                                padding pool has no room left for them
+    [lo + 0x3600,  lo + 0x3C00) 'campos': ff7nx_campos (BUILD 610) -- the
+                                field camera's unfloored follow position
+    [lo + 0x3C00,  hi - FAR)    ff7nx_frameprobe, diagnostic builds only
+    [hi - FAR,     hi)          'far': ff7nx_worldfar (BUILD 585) -- the
+                                world map's far-field terrain pass, a
+                                compiled C blob plus its hook stub
 
 Each owner checks that ITS part is still the stock bytes before writing, so
 a second writer to the same part is refused rather than silently merged.
@@ -47,7 +55,10 @@ CONDOR_AT = 0x2000
 ZOOM_AT = 0x2400
 PAD_AT = 0x2600
 CANIM_AT = 0x2A00
-PROBE_AT = 0x2E00
+CALENDAR_AT = 0x2E00
+CAMPOS_AT = 0x3600
+PROBE_AT = 0x3C00
+FAR_BYTES = 0x8000
 
 
 def region(src, stock=None):
@@ -84,9 +95,15 @@ def part(src, which, stock=None):
     elif which == 'condorpad':
         p = (lo + PAD_AT, lo + CANIM_AT)
     elif which == 'canim':
-        p = (lo + CANIM_AT, lo + PROBE_AT)
+        p = (lo + CANIM_AT, lo + CALENDAR_AT)
+    elif which == 'calendar':
+        p = (lo + CALENDAR_AT, lo + CAMPOS_AT)
+    elif which == 'campos':
+        p = (lo + CAMPOS_AT, lo + PROBE_AT)
     elif which == 'probe':
-        p = (lo + PROBE_AT, hi)
+        p = (lo + PROBE_AT, (hi - FAR_BYTES) & ~15)
+    elif which == 'far':
+        p = ((hi - FAR_BYTES) & ~15, hi)
     else:
         raise ValueError(which)
     if stock is not None:

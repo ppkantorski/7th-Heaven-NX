@@ -67,6 +67,7 @@ import ff7nx_moviecam
 import ff7nx_fieldpace
 import ff7nx_frameprobe
 import ff7nx_campreserve
+import ff7nx_campos
 import ff7nx_moviecull
 import ff7nx_moviebars
 import ff7nx_camclamp
@@ -95,6 +96,7 @@ import ff7nx_fxsplit
 import ff7nx_palanim
 import ff7nx_fxrequant
 import ff7nx_lostdetail
+import ff7nx_worldsphere
 import ff7nx_chardds
 import ff7nx_vanillatc
 import ff7nx_parallaxfill
@@ -105,6 +107,7 @@ import ff7nx_fxpalette
 import ff7nx_fxcoverage
 import ff7nx_fxart
 import ff7nx_fxbake
+import ff7nx_stackorder
 import ff7nx_spelltex
 import ff7nx_ddstex
 import ff7nx_minigametex
@@ -8737,6 +8740,19 @@ def _build_flevel(archive_path, chunks, field_files, romfs, log,
     # promotes to truecolor takes the DDS at full depth anyway.
     _PAGES_BEFORE_MARGIN.clear()
     _PAGES_BEFORE_MARGIN.update(_snapshot_page_counts(archive, payloads))
+    # BUILD 608. The same moment, for the same reason: this is the field as
+    # the mod ships it, before any background pass has moved a cell. Which
+    # tile wins where two share a spot and a depth is recorded here and
+    # restored at the end of the background passes (ff7nx_stackorder).
+    def _raw_now(name, entry):
+        blob = payloads.get(name)
+        if blob is not None:
+            if not _is_lzs_wrapped(blob):
+                return None
+            return lgp.lzs_decompress(blob[4:])
+        return archive.decompressed(entry)
+    _stack_ref = ({} if ff7nx_stackorder.disabled()
+                  else ff7nx_stackorder.snapshot(archive, payloads, _raw_now))
     # SAY IT OUT LOUD. The first version of the no-growth loop used `parts[8]`
     # as its baseline and was a silent no-op in the fields being tested -- the
     # log said `266 field(s) RE-RUN` and `0 GREW` while mds5_1 stayed one page
@@ -9208,6 +9224,16 @@ def _build_flevel(archive_path, chunks, field_files, romfs, log,
     fb_line = ff7nx_fxbake.summarise(fb_stats)
     if fb_line:
         log(fb_line)
+
+    # BUILD 608. LAST of the background passes, so no later pass can move a
+    # cell after it: tiles stacked on one spot at one depth get the winner
+    # the mod draws back (zz2's chest). See ff7nx_stackorder.
+    so_total, so_names = ff7nx_stackorder.apply_to_flevel(
+        archive, payloads, _stack_ref,
+        encode=lambda raw: _encode_field_cached(archive, raw), log=log)
+    so_line = ff7nx_stackorder.summarise(so_total, so_names)
+    if so_line:
+        log(so_line)
 
     # AFTER that, so the camera range is the last thing written into section
     # 8 and cannot be reverted by a field the background pass rebuilt. The
@@ -11357,6 +11383,9 @@ MAIN_ONLY_ENV = frozenset((
                                  # exefs/main, so toggling it must not cost a
                                  # 40-minute archive rebuild
     ff7nx_calendar.ENV,          # ff7nx_calendar  the menu date row
+    'SEVENTH_NX_TEXSCALE',       # ff7nx_texscale  exefs/main only
+    'SEVENTH_NX_WORLD_OWNWINDOW', # ff7nx_worldfar 606: the far field draws the 5x5 window
+    'SEVENTH_NX_SHADOWDEPTH',    # ff7nx_shadowdepth  exefs/main only
     ff7nx_calendar.LAYOUT_ENV,   # ff7nx_calendar  ... and its columns
     'SEVENTH_NX_VOICE_WORKERS',  # voice_ogg  encoder parallelism
     'SEVENTH_NX_NO_VOICE',       # ff7nx_voice   the whole half, off
@@ -11379,6 +11408,9 @@ MAIN_ONLY_ENV = frozenset((
     ff7nx_daynight.STRENGTH_ENV,   # how hard the tint lands; module-only too
     ff7nx_daynight.CONDOR_ENV,     # BUILD 572: Fort Condor minigame tint
     ff7nx_daynight.FORCE_OUTDOOR_ENV,  # BUILD 572: convil_2 treated outdoor
+    ff7nx_worldsphere.ENV,         # BUILD 584: world sphere on/off (main)
+    'SEVENTH_NX_WORLD_FAR',        # BUILD 585: world far field on/off
+    'SEVENTH_NX_WORLD_GAIA',       # BUILD 587: ALL world-map work on/off
     'SEVENTH_NX_AUDIO_POOL_MB',    # BUILD 537, ff7nx_audiopool.MB_ENV
     'SEVENTH_NX_MINIGAME_FADE', 'SEVENTH_NX_MINIGAME_60', 'SEVENTH_NX_SNOW_DRAW',    # BUILD 538/539, ff7nx_minifade.MINIFADE_ENV
     'SEVENTH_NX_DEFERRED_VT',    # BUILD 550, ff7nx_deferredvt.ENV
@@ -11439,8 +11471,16 @@ MAIN_ONLY_MODULES = frozenset((
     # change an archive's bytes -- and this feature has taken enough builds
     # without each one also costing a 1.4 GB flevel rebuild.
     'ff7nx_calendar.py',
+    # BUILD 603. Two words + two caves in exefs/main only.
+    'ff7nx_texscale.py',
+    # BUILD 604. One word + a padding cave in exefs/main only.
+    'ff7nx_shadowdepth.py',
     'ff7nx_camclamp.py',
     'ff7nx_daynight.py',
+    # BUILD 584. World-map sphere: two words + a stub in exefs/main.
+    'ff7nx_worldsphere.py',
+    'ff7nx_worldfar.py',
+    'ff7nx_worldfar_data.py',
     # BUILD 537. The sound-buffer pool cave: exefs/main only.
     'ff7nx_audiopool.py',
     # BUILD 538/539. In-place words in the two minigame fade submitters.
@@ -11508,10 +11548,14 @@ MOVIECAM_ONLY_ENV = frozenset((MOVIECAM_INTERP_ENV,
                                ff7nx_fieldpace.LATE_ENV,
                                ff7nx_fieldpace.BATTLE_LATE_ENV,
                                # BUILD 533: exefs/main only.
-                               ff7nx_campreserve.ENV))
+                               ff7nx_campreserve.ENV,
+                               # BUILD 610: exefs/main only.
+                               ff7nx_campos.ENV,
+                               ff7nx_campos.WALK_ENV))
 MOVIECAM_ONLY_MODULES = frozenset(('ff7nx_moviecam.py',
                                    'ff7nx_frameprobe.py',
                                    'ff7nx_campreserve.py',
+                                   'ff7nx_campos.py',
                                    'ff7nx_deadspace.py'))
 
 # This setting changes only SYW minigame TEX. Its value is included in the
@@ -13324,6 +13368,117 @@ def apply_texcache(sdout, dump, log=lambda *_: None, produced=()):
     return [dest] if not built else []
 
 
+def apply_texscale(sdout, dump, log=lambda *_: None, produced=()):
+    """
+    Cap the background scaler's filtered texture copy at 1024 px. BUILD 603.
+
+    The fship speckles: leakprobe v2 measured GL_OUT_OF_MEMORY in fship and
+    nowhere else, more on every trip. Every loader texture carries a filtered
+    copy at 4x width and height (the literal `mov w5, #4` at +0x10DCB34 and,
+    for framebuffer-copy textures, +0x10D7270) -- 17x its memory; fship's
+    512x512 textures cost 16 MB each and the fragmented pool could not place
+    them. Both sites now call a 10-word cave in verified padding: 4x up to
+    256 px, 2x up to 512, 1x above. Stock-size art is unchanged. Confirmed on
+    hardware. See ff7nx_texscale.py. SEVENTH_NX_TEXSCALE=0 leaves it stock.
+
+    Runs right after `apply_texcache`, on its output: same subsystem, and
+    whoever edits exefs/main later must see its caves.
+    """
+    import ff7nx_texscale
+    if not ff7nx_texscale.enabled():
+        log('')
+        log('  texture scaler copy: LEFT STOCK (%s=0) -- 4x copies for every '
+            'texture; fship runs the graphics pool out after a few trips'
+            % ff7nx_texscale.ENV)
+        return []
+    if dump is None or not dump.nso:
+        log('! texscale: needs exefs/main from a full game dump; skipped')
+        return []
+    dest = os.path.join(sdout, 'atmosphere', 'contents', TITLE_ID, 'exefs',
+                        'main')
+    fresh = {os.path.normpath(os.path.abspath(p)) for p in produced}
+    built = os.path.normpath(os.path.abspath(dest)) in fresh
+    src = dest if built else dump.nso
+    log('')
+    log('texture scaler copy -> at most %d px a side ...' % ff7nx_texscale.CAP)
+    if not built and os.path.exists(dest):
+        try:
+            same = (os.path.getsize(dest) == os.path.getsize(dump.nso)
+                    and open(dest, 'rb').read() == open(dump.nso, 'rb').read())
+        except OSError:
+            same = False
+        if not same:
+            log(f'! texscale: {dest}')
+            log('  already holds a module this build did not produce. Basing '
+                "on the dump's stock copy would throw those patches away, so "
+                'nothing was written. Delete sdout/ and rebuild.')
+            return []
+    log(f'  base main   {src}'
+        + ('   (previous patch output)' if built else '   (from dump)'))
+    tmp = dest + '.texscale-tmp'
+    if not ff7nx_texscale.apply_to_nso(src, tmp, log):
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        return []
+    os.replace(tmp, dest)
+    return [dest] if not built else []
+
+
+def apply_shadowdepth(sdout, dump, log=lambda *_: None, produced=()):
+    """
+    World-map shadows take the world's depth. BUILD 604.
+
+    The shadow routine (x86 0x75D544) wrote rhw = 1.0 on its four vertices,
+    which tlmain_vv reads as 2D -- so shadows kept the game's old z while the
+    terrain around them uses 591's 0.99 (1 - 32/Z). Terrain in front (the
+    crater lip) did not hide them. Its one `mov w19, #1.0` (+0xF68E90) becomes
+    a call to a 9-word cave that loads the nearest corner's 1/w (vanilla's own
+    [ebp-0x160]). See ff7nx_shadowdepth.py. SEVENTH_NX_SHADOWDEPTH=0: stock.
+
+    604b: the per-entity shadow size (x86 0x75DEAA) is 0x64 - (height >> 6)
+    with no floor; above 6400 over the ground (only reachable with the 587
+    ceiling) the Highwind's shadow went negative -- mirrored and growing.
+    Its `sub` (+0xF858B0) calls a 4-word cave that floors it at 0.
+    """
+    import ff7nx_shadowdepth
+    if not ff7nx_shadowdepth.enabled():
+        log('')
+        log('  world shadows: LEFT STOCK (%s=0) -- they keep the old depth and '
+            'show through terrain in front of them' % ff7nx_shadowdepth.ENV)
+        return []
+    if dump is None or not dump.nso:
+        log('! shadowdepth: needs exefs/main from a full game dump; skipped')
+        return []
+    dest = os.path.join(sdout, 'atmosphere', 'contents', TITLE_ID, 'exefs',
+                        'main')
+    fresh = {os.path.normpath(os.path.abspath(p)) for p in produced}
+    built = os.path.normpath(os.path.abspath(dest)) in fresh
+    src = dest if built else dump.nso
+    log('')
+    log('world-map shadows -> the world depth ...')
+    if not built and os.path.exists(dest):
+        try:
+            same = (os.path.getsize(dest) == os.path.getsize(dump.nso)
+                    and open(dest, 'rb').read() == open(dump.nso, 'rb').read())
+        except OSError:
+            same = False
+        if not same:
+            log(f'! shadowdepth: {dest}')
+            log('  already holds a module this build did not produce. Basing '
+                "on the dump's stock copy would throw those patches away, so "
+                'nothing was written. Delete sdout/ and rebuild.')
+            return []
+    log(f'  base main   {src}'
+        + ('   (previous patch output)' if built else '   (from dump)'))
+    tmp = dest + '.shadowdepth-tmp'
+    if not ff7nx_shadowdepth.apply_to_nso(src, tmp, log):
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        return []
+    os.replace(tmp, dest)
+    return [dest] if not built else []
+
+
 def apply_spelluv(sdout, dump, log=lambda *_: None, produced=(), needed=False):
     """Install the per-TEX logical-texel bridge used by resized SYW art."""
     if not needed:
@@ -13526,6 +13681,63 @@ def apply_cam_preserve(sdout, dump, plan, log=lambda *_: None, produced=()):
         'train bar). %s=off restores the BUILD 513 rule'
         % (rep['entry'], rep['words'], 'x and y' if rep['vertical'] else 'x',
            ', '.join(rep['preserved']), ff7nx_campreserve.ENV))
+    return [dest] if not built else []
+
+
+def apply_campos(sdout, dump, plan, log=lambda *_: None, produced=()):
+    """BUILD 610/610b: smooth field camera and walk height. See ff7nx_campos.
+
+    * camera (SEVENTH_NX_CAMPOS=0 off): the follow code projected three
+      separately floored coordinates; it now projects the model's real
+      position (610 tagged the wrong call sites -- the recompiler reorders
+      0x644075's calls -- so it never ran; 610b proves each site from code).
+    * walk height (SEVENTH_NX_WALKZ=0 off): the walk step stored the height
+      as a whole unit of the plane at the truncated x, y, so on a steep
+      triangle (wcrimb_2's cable, slope 10) the model hopped 10 units at a
+      time. It now stores the same plane at the real x, y.
+    """
+    cam, walk = ff7nx_campos.enabled(), ff7nx_campos.walk_enabled()
+    if not (cam or walk):
+        log('')
+        log('camera follow / walk height: stock (%s=0, %s=0)'
+            % (ff7nx_campos.ENV, ff7nx_campos.WALK_ENV))
+        return []
+    src, built = _audio_bridge_base(sdout, dump, log, produced,
+                                    'camera follow / walk height')
+    if src is None:
+        return []
+    dest = os.path.join(sdout, 'atmosphere', 'contents', TITLE_ID, 'exefs',
+                        'main')
+    log('')
+    log('camera follow position / walk height (unfloored) ...')
+    tmp = dest + '.campos-tmp'
+    try:
+        rep = ff7nx_campos.apply_to_nso(src, tmp, dump.nso, cam, walk)
+    except Exception as exc:                                   # noqa: BLE001
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        log('! camera follow / walk height: %s: %s -- NOT INSTALLED (stock '
+            'kept)' % (type(exc).__name__, exc))
+        return []
+    os.replace(tmp, dest)
+    if cam:
+        log('  camera: follow +0x%X, SCRLC/SCRLA +0x%X, hand +0x%X/+0x%X '
+            'tagged (sites proven from code), conversion +0x%X projects the '
+            'real position. %s=0 removes it'
+            % (ff7nx_campos.FOLLOW_SITES[0][0],
+               ff7nx_campos.FOLLOW_SITES[1][0],
+               ff7nx_campos.FOLLOW_SITES[2][0],
+               ff7nx_campos.FOLLOW_SITES[3][0], ff7nx_campos.CONV_SITE,
+               ff7nx_campos.ENV))
+    else:
+        log('  camera: stock (%s=0)' % ff7nx_campos.ENV)
+    if walk:
+        log('  walk height: +0x%X stores the triangle plane at the real x, y '
+            '(no more whole-unit hops on steep walkmeshes). %s=0 removes it'
+            % (ff7nx_campos.WALK_SITE, ff7nx_campos.WALK_ENV))
+    else:
+        log('  walk height: stock (%s=0)' % ff7nx_campos.WALK_ENV)
+    log('  %d words in dead space' % rep['words'])
     return [dest] if not built else []
 
 
@@ -13920,6 +14132,142 @@ def apply_canim60(sdout, dump, log=lambda *_: None, produced=()):
         "animation's frames (BUILD 580; wcrimb_1's swinging bar) "
         '(%d words written)' % report['words'])
     return [dest] if not built else []
+
+
+def apply_worldfar(sdout, dump, log=lambda *_: None, produced=()):
+    """
+    BUILD 585/588. The world map's far field: the rest of the planet drawn through
+    the native terrain pipeline, so the spherical world has a horizon to show
+    (Cosmos Gaia's whole-planet view). Needs the spherical world in the module
+    (ff7nx_worldsphere via the day/night pass) -- without it the CPU sink would
+    bury far terrain. Writes data/wm/wm0.far and one dead-space cave. See
+    ff7nx_worldfar.
+    """
+    import ff7nx_worldfar
+    if not ff7nx_worldfar.enabled():
+        log('')
+        log('world far field: off (%s=0 or %s=0)'
+            % (ff7nx_worldfar.ENV, ff7nx_worldsphere.GAIA_ENV))
+        return []
+    src, built = _audio_bridge_base(sdout, dump, log, produced,
+                                    'world far field')
+    if src is None:
+        return []
+    log('')
+    log('world map far field ...')
+    try:
+        import ff7nx_audio_cave as _AC
+        _segs, _raw = _AC.segments(open(src, 'rb').read())
+        if not ff7nx_worldfar.sphere_installed(_raw[0]):
+            src_has = ff7nx_worldsphere.source_shader_has_sphere()
+            card_has = ff7nx_worldsphere.shader_has_sphere(sdout, TITLE_ID)
+            log('! world far field: NOT installed -- this module has no '
+                'spherical world. It rides the day/night pass (Echo-S "Day '
+                'Night" on) and needs custom_shaders/wide_screen/lmain_vv.glsl '
+                'carrying it: source %s, card %s'
+                % ('yes' if src_has else 'NO (copy the BUILD 585 file)',
+                   'yes' if card_has else 'NO'))
+            return []
+    except Exception as exc:                                   # noqa: BLE001
+        log('! world far field: NOT installed (%s)' % exc)
+        return []
+    romfs = os.path.join(sdout, 'atmosphere', 'contents', TITLE_ID, ROMFS)
+    map_src = os.path.join(romfs, 'data', 'wm', 'wm0.map')
+    if not os.path.exists(map_src):
+        map_src = os.path.join(dump.workingdir, 'data', 'wm', 'wm0.map')
+    far_dest = os.path.join(romfs, 'data', 'wm', 'wm0.far')
+    dest = os.path.join(sdout, 'atmosphere', 'contents', TITLE_ID, 'exefs',
+                        'main')
+    tmp = dest + '.worldfar-tmp'
+    try:
+        stats = ff7nx_worldfar.write_data(map_src, far_dest)
+        report = ff7nx_worldfar.apply_to_nso(src, tmp, stock=dump.nso)
+    except Exception as exc:                                   # noqa: BLE001
+        for p in (tmp, far_dest):
+            if os.path.exists(p):
+                os.remove(p)
+        log('! world far field: NOT installed (%s: %s) -- the world map is '
+            'exactly as before' % (type(exc).__name__, exc))
+        return []
+    os.replace(tmp, dest)
+    log('  world 5x5 window: %s' % (
+        'drawn by the far field (606; the game skips its per-triangle submit '
+        'while every nearby cell is cached)' if report.get('own') else
+        'the game\'s own per-triangle path (%s=0)' % ff7nx_worldfar.OWN_ENV))
+    # BUILD 590: the module half above is only right with the shader half
+    # (lmain_vv: depth squeeze only since 588; the 587 one bends models about
+    # the camera). Install both 16:9 vertex shaders again here, every build,
+    # and stamp them, so the card can never keep an older lmain_vv.
+    shaders = []
+    try:
+        import re
+        import ff7nx_ws
+
+        def _body(path):
+            try:
+                return re.sub(r'(?m)^\s*#define\s+WS_SCALE\s+\S+', '',
+                              open(path).read())
+            except OSError:
+                return None
+        here = os.path.dirname(os.path.abspath(__file__))
+        card = os.path.join(sdout, 'atmosphere', 'contents', TITLE_ID,
+                            'romfs', 'ff7', 'shaders')
+        stale = [n for n in ff7nx_ws.WS_SHADERS
+                 if _body(os.path.join(card, n)) != _body(os.path.join(
+                     here, ff7nx_ws.WS_SHADER_SET, n))]
+        # BUILD 591: installed EVERY build the far field is, not only when
+        # they differ. Only written paths go into `produced`, and prune_stale
+        # deletes anything a previous build produced that this one did not:
+        # "install when stale" made the two shaders appear and vanish on
+        # alternate builds whenever the 16:9 framing pass was not also
+        # writing them.
+        if stale:
+            log('  shaders: %s on the card differ from %s -- installing'
+                % (', '.join(stale), ff7nx_ws.WS_SHADER_SET))
+        shaders = ff7nx_ws._install_shaders(sdout, log)
+        missing = [n for n in ff7nx_ws.WS_SHADERS
+                   if not os.path.exists(os.path.join(card, n))]
+        if missing:
+            log('! world map: %s NOT on the card after installing -- the '
+                'world map will be wrong; see the lines above'
+                % ', '.join(missing))
+    except Exception as exc:                                   # noqa: BLE001
+        log('! world far field: could not install the 16:9 vertex shaders '
+            '(%s) -- copy custom_shaders/wide_screen/*.glsl to '
+            'romfs/ff7/shaders by hand' % exc)
+    if shaders:
+        log('  shaders: %s written this build (the world map needs this '
+            'lmain_vv)' % ', '.join(os.path.basename(p) for p in shaders))
+    log('  wm0.far from %s: %d L1 mesh tiles (%d tris), %d L2 sector tiles '
+        '(%d tris, %d open sea), %d story variants, %d KB'
+        % (os.path.relpath(map_src, sdout) if map_src.startswith(sdout)
+           else 'the dump\'s wm0.map', stats['l1'], stats['l1_tris'],
+           stats['l2'], stats['l2_tris'], int(stats['l2_flat']),
+           int(stats.get('variants', 0)), stats['bytes'] // 1024))
+    log('  planet: world-fixed curve around the player (radius 250000) '
+        'applied to all %d terrain transform calls (%s), the far field, '
+        'the models (sink at +0x%X, %d calls); clouds and meteor drawn on '
+        'the curved horizon by the module (stock quad routine +0x%X '
+        'replaced); one depth for every world draw (lmain/tlmain_vv)'
+        % (len(ff7nx_worldfar.TRANSFORM_CALLS),
+           ', '.join('+0x%X' % a for a in ff7nx_worldfar.TRANSFORM_CALLS),
+           ff7nx_worldfar.SINK_TARGET, len(ff7nx_worldfar.SINK_CALLS),
+           ff7nx_worldfar.SKY_TARGET))
+    log('  far field (+0x%X): every mesh preloaded from wm0.far into BSS at '
+        'the first world frame (no file reads while flying); state +0x%X, '
+        '%d KB, world allocation 0x%X (was 0x3E6801); code +0x%X, %d bytes'
+        % (ff7nx_worldfar.HOOK_SITE, report['state'], report['bss'] // 1024,
+           ff7nx_worldfar.WORLD_ALLOC, report['entry'], report['code']))
+    log('  controls: on foot and on chocobos the left stick moves 360 '
+        'degrees and turns the camera with you at the stock rate (L1/R1, '
+        'd-pad, Highwind, buggy, Tiny Bronco, submarine stock); ZL/ZR zoom '
+        '(to 35000), right stick '
+        'turns/tilts, R3 = the stock ZL/ZR view toggle + camera reset (once '
+        'per click); Highwind ceiling %d, camera pitch clamped '
+        'at %d (the overflow that jammed the ship in the sky)'
+        % (ff7nx_worldfar.HIGHWIND_CEILING, ff7nx_worldfar.PITCH_CLAMP))
+    log('  SEVENTH_NX_WORLD_GAIA=0 builds the stock world map (baseline)')
+    return ([dest] if not built else []) + [far_dest] + list(shaders)
 
 
 def apply_condorpad(sdout, dump, log=lambda *_: None, produced=()):
@@ -14512,11 +14860,21 @@ def apply_daynight(sdout, dump, plan, log=lambda *_: None, produced=()):
             log('! day/night sky: %s: %s -- the window sky is off, the rest '
                 'of the cycle is unaffected' % (type(exc).__name__, exc))
             sky_rows = []
+        # BUILD 584: FFNx's spherical world rides the same BlockVertex hook.
+        # Only with the shader half on the card -- the CPU sink it removes
+        # must never go without the bend that replaces it.
+        # BUILD 591: or in the SOURCE set -- apply_worldfar installs it from
+        # there later in this same build. Checking only the card meant one
+        # build without lmain_vv on the card (deleted sdout, pruned, or a
+        # failed install) switched the world sphere and far field off.
+        _ws_sphere = (ff7nx_worldsphere.enabled()
+                      and (ff7nx_worldsphere.shader_has_sphere(sdout, TITLE_ID)
+                           or ff7nx_worldsphere.source_shader_has_sphere()))
         report = ff7nx_daynight.apply_to_nso(
             src, tmp, bitmap, fps=_field_tick_hz(),
             freeze_hour=ff7nx_daynight.freeze_hour_from_env(),
             strength=ff7nx_daynight.strength_from_env(),
-            sky_rows=sky_rows)
+            sky_rows=sky_rows, world_sphere=_ws_sphere)
     except Exception as exc:                                   # noqa: BLE001
         report = None
         log('! day/night: %s: %s' % (type(exc).__name__, exc))
@@ -14592,6 +14950,15 @@ def apply_daynight(sdout, dump, plan, log=lambda *_: None, produced=()):
             'variable and rebuild for a real cycle'
             % (ff7nx_daynight.FREEZE_ENV, report['freeze_hour'],
                report['freeze_hour']))
+    if report.get('world_sphere'):
+        log('  world map: FFNx\'s spherical world -- the CPU terrain sink '
+            '(+0x10F2AAC) and the models\' sink call (+0xF93C88) are off and '
+            'lmain_vv bends every world-map 3D vertex in view space '
+            '(ApplySphericalWorld, radius 250000), flagged by blendMode.w. '
+            '%s=0 restores the stock sink' % ff7nx_worldsphere.ENV)
+    elif ff7nx_worldsphere.enabled():
+        log('  world map: spherical world NOT installed -- lmain_vv on the '
+            'card does not carry it (16:9 shaders off?); stock curvature kept')
     if ff7nx_daynight.shaders_carry_the_tint(sdout, TITLE_ID):
         log('  tint: written into the BlockVertex block where the port\'s one '
             'draw helper assembles it on its own stack (+0x10DA260), in '
@@ -14652,7 +15019,8 @@ def apply_calendar(sdout, dump, plan, log=lambda *_: None, produced=()):
     if not os.path.isfile(guest):
         guest = None
     try:
-        report = ff7nx_calendar.apply_to_nso(src, tmp, log=log, guest=guest)
+        report = ff7nx_calendar.apply_to_nso(src, tmp, log=log, guest=guest,
+                                             stock=dump.nso)
     except Exception as exc:                                   # noqa: BLE001
         report = None
         log('! menu calendar: %s: %s' % (type(exc).__name__, exc))
