@@ -505,6 +505,96 @@ def _msub64(xd, xn, xm, xa):
     return 0x9B008000 | (xm << 16) | (xa << 10) | (xn << 5) | xd
 
 
+# ------------------------------------------------------------ wall facing
+# BUILD 610c. Rubbing a wall with the stick at a slight angle made Cloud
+# vibrate (md0, hardware video). The player branch of
+# field_update_models_positions (x86 0x634B3E..0x634BBD):
+#
+#     dir = keys -> 8-way + control direction (the 360 cave's nudge) + [a5]
+#     [model+0x36] = dir                        0x634B77
+#     call 0x636C41                             the walk step
+#     if (![model+0x37]) [model+0x38] = [model+0x36]   0x634BB7  <- FACING
+#
+# and the walk step, when a side probe (+/-45 deg at the collision radius)
+# touches the walkmesh edge, ROTATES [model+0x36] by 8 (11 deg) and retries.
+# Along a wall at a slight angle it alternates: blocked -> rotate away ->
+# next tick clear -> straight at the wall -> blocked ... so the facing copied
+# from the rotated value flips 11-22 deg every tick (30 Hz at 60 fps). With
+# the d-pad the eight directions line up with the walls and it never starts.
+#
+# Fix: the facing is the direction the player is pushing. 0x634B77's store
+# also parks dir in the function's own unused frame slot [ebp-0x30] (the x86
+# body never touches -0x30, -0x2C, -0x28, -0x18, -0xC or -8, and takes no
+# frame address), and 0x634BB7 reads it back instead of the rotated byte --
+# and writes it back to [model+0x36], so direction and facing agree. The walk
+# step, its probes, its rotation and therefore the path are untouched.
+FACE_STORE = 0x9D81AC           # strb w28, [x0]   (x86 0x634B77)
+FACE_STORE_STOCK = 0x3900001C
+FACE_LOAD = 0x9D829C            # ldrb w27, [x0]   (x86 0x634BB7)
+FACE_LOAD_STOCK = 0x3940001B
+FACE_CONTEXT = {0x9D81A8: None,              # bl g2h (checked by target)
+                0x9D81B0: 0xB9401728,        # ldr w8, [x25, #0x14]
+                0x9D8298: 0xB9400B28,        # ldr w8, [x25, #8]
+                0x9D82A0: 0x0B1A0108}        # add w8, w8, w26
+FACE_CTX = 25
+FACE_SLOT = 0x30                # [ebp-0x30]
+FACE_ENV = 'SEVENTH_NX_WALLFACE'
+
+
+def face_enabled(env=None):
+    env = os.environ if env is None else env
+    return env.get(FACE_ENV, '1').strip().lower() not in ('0', 'off', 'no',
+                                                         'false')
+
+
+def face_store_body(addr):
+    """Replaces `strb w28, [x0]`: the stock store, then [ebp-0x30] = w28.
+    After the site only x0 and x8 are written before use; x28 is kept."""
+    b = _B(addr)
+    b.emit(FACE_STORE_STOCK,
+           A.stp64_pre(29, 30, 31, -16),
+           A.ldr(0, FACE_CTX, 0x14), A.sub_imm(0, 0, FACE_SLOT))
+    b.bl(G2H)
+    b.emit(A.strb(28, 0, 0),
+           A.ldp64_post(29, 30, 31, 16), A.ret())
+    return b.resolve({})
+
+
+def face_load_body(addr):
+    """Replaces `ldrb w27, [x0]` (x0 -> [model+0x36]): w27 = [ebp-0x30], and
+    [model+0x36] = w27. w8 is live after the site and is preserved."""
+    b = _B(addr)
+    b.emit(A.stp64_pre(29, 30, 31, -32),
+           0xA90103E8)                         # stp x8, x0, [sp, #16]
+    b.emit(A.ldr(0, FACE_CTX, 0x14), A.sub_imm(0, 0, FACE_SLOT))
+    b.bl(G2H)
+    b.emit(A.ldrb(27, 0, 0),
+           0xA94103E8,                         # ldp x8, x0, [sp, #16]
+           A.strb(27, 0, 0),                   # direction = facing
+           A.ldp64_post(29, 30, 31, 32), A.ret())
+    return b.resolve({})
+
+
+def face_state(text):
+    a, b2 = _word(text, FACE_STORE), _word(text, FACE_LOAD)
+    if a == FACE_STORE_STOCK and b2 == FACE_LOAD_STOCK:
+        return 'stock'
+    if _bl_target(FACE_STORE, a) and _bl_target(FACE_LOAD, b2):
+        return 'on'
+    return 'unknown'
+
+
+def _face_context_ok(text):
+    for va, want in FACE_CONTEXT.items():
+        w = _word(text, va)
+        if want is None:
+            if _bl_target(va, w) != G2H:
+                return False
+        elif w != want:
+            return False
+    return True
+
+
 # ------------------------------------------------------------------ state
 def _word(text, va):
     return struct.unpack_from('<I', text, va)[0]
@@ -562,7 +652,7 @@ def _walk_context_ok(text):
     return all(_word(text, va) == want for va, want in WALK_CONTEXT.items())
 
 
-def build_patches(text, lo, hi, camera=True, walk=True):
+def build_patches(text, lo, hi, camera=True, walk=True, face=False):
     """{va: word} for the caves and their hook words."""
     pool = DS.Bump(lo, hi)
     words, entries = {}, {}
@@ -577,15 +667,21 @@ def build_patches(text, lo, hi, camera=True, walk=True):
     if walk:
         entries['walk'] = pool.put(lambda _e, addr: walk_body(addr))
         words[WALK_SITE] = A.bl(WALK_SITE, entries['walk'])
+    if face:
+        entries['face_store'] = pool.put(lambda _e, addr: face_store_body(addr))
+        words[FACE_STORE] = A.bl(FACE_STORE, entries['face_store'])
+        entries['face_load'] = pool.put(lambda _e, addr: face_load_body(addr))
+        words[FACE_LOAD] = A.bl(FACE_LOAD, entries['face_load'])
     words.update(pool.placed)
     n = len(pool.placed)
     return words, entries, n
 
 
-def apply_to_nso(src, dest, stock, camera=None, walk=None):
+def apply_to_nso(src, dest, stock, camera=None, walk=None, face=None):
     camera = enabled() if camera is None else camera
     walk = walk_enabled() if walk is None else walk
-    if not (camera or walk):
+    face = face_enabled() if face is None else face
+    if not (camera or walk or face):
         raise ValueError('nothing to install')
     with open(src, 'rb') as handle:
         blob = handle.read()
@@ -606,11 +702,19 @@ def apply_to_nso(src, dest, stock, camera=None, walk=None):
                              'lsl w8, w8, #12 between ldr w8, [x0] and '
                              'str w8, [x22, #4]'
                              % (WALK_SITE, _word(text, WALK_SITE)))
+    if face:
+        if face_state(text) != 'stock' or not _face_context_ok(text):
+            raise ValueError('wall-facing sites +0x%X / +0x%X are %08X / %08X,'
+                             ' not the stock player-branch store and load'
+                             % (FACE_STORE, FACE_LOAD,
+                                _word(text, FACE_STORE),
+                                _word(text, FACE_LOAD)))
     lo, hi = DS.part(src, 'campos', stock)
-    words, entries, n = build_patches(text, lo, hi, camera, walk)
+    words, entries, n = build_patches(text, lo, hi, camera, walk, face)
     for va, w in words.items():
         struct.pack_into('<I', text, va, w)
     out = AC.pack(blob, [bytes(text), raw[1], raw[2]], 0)
     with open(dest, 'wb') as handle:
         handle.write(out)
-    return {'entries': entries, 'words': n, 'camera': camera, 'walk': walk}
+    return {'entries': entries, 'words': n, 'camera': camera, 'walk': walk,
+            'face': face}

@@ -11551,7 +11551,8 @@ MOVIECAM_ONLY_ENV = frozenset((MOVIECAM_INTERP_ENV,
                                ff7nx_campreserve.ENV,
                                # BUILD 610: exefs/main only.
                                ff7nx_campos.ENV,
-                               ff7nx_campos.WALK_ENV))
+                               ff7nx_campos.WALK_ENV,
+                               ff7nx_campos.FACE_ENV))
 MOVIECAM_ONLY_MODULES = frozenset(('ff7nx_moviecam.py',
                                    'ff7nx_frameprobe.py',
                                    'ff7nx_campreserve.py',
@@ -13697,7 +13698,8 @@ def apply_campos(sdout, dump, plan, log=lambda *_: None, produced=()):
       time. It now stores the same plane at the real x, y.
     """
     cam, walk = ff7nx_campos.enabled(), ff7nx_campos.walk_enabled()
-    if not (cam or walk):
+    face = ff7nx_campos.face_enabled()
+    if not (cam or walk or face):
         log('')
         log('camera follow / walk height: stock (%s=0, %s=0)'
             % (ff7nx_campos.ENV, ff7nx_campos.WALK_ENV))
@@ -13712,7 +13714,7 @@ def apply_campos(sdout, dump, plan, log=lambda *_: None, produced=()):
     log('camera follow position / walk height (unfloored) ...')
     tmp = dest + '.campos-tmp'
     try:
-        rep = ff7nx_campos.apply_to_nso(src, tmp, dump.nso, cam, walk)
+        rep = ff7nx_campos.apply_to_nso(src, tmp, dump.nso, cam, walk, face)
     except Exception as exc:                                   # noqa: BLE001
         if os.path.exists(tmp):
             os.remove(tmp)
@@ -13737,6 +13739,14 @@ def apply_campos(sdout, dump, plan, log=lambda *_: None, produced=()):
             % (ff7nx_campos.WALK_SITE, ff7nx_campos.WALK_ENV))
     else:
         log('  walk height: stock (%s=0)' % ff7nx_campos.WALK_ENV)
+    if face:
+        log('  wall facing: the player faces the direction pushed (+0x%X / '
+            '+0x%X), not the walk step\'s collision rotation -- no more '
+            'vibrating along walls with the stick. %s=0 removes it'
+            % (ff7nx_campos.FACE_STORE, ff7nx_campos.FACE_LOAD,
+               ff7nx_campos.FACE_ENV))
+    else:
+        log('  wall facing: stock (%s=0)' % ff7nx_campos.FACE_ENV)
     log('  %d words in dead space' % rep['words'])
     return [dest] if not built else []
 
