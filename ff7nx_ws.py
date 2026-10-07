@@ -438,6 +438,8 @@ def load(config_path, movie_path=None):
 # --------------------------------------------------------------------------
 HALF_WIDTH_43 = 160                 # the stock `#0xa0` immediates
 HALF_WIDTH_CAP = 53                 # FFNx's std::min cap; 160 + 53 = 213
+# BUILD 618e: fields whose camera never moves horizontally on PC.
+HPIN_FIELDS = ('fship_2', 'fship_22', 'fship_23', 'fship_24', 'fship_25')
 
 
 def half_width(range_size):
@@ -659,6 +661,25 @@ def preserve_diagonal_rail(before, plan, resolved, field_modes):
 # --------------------------------------------------------------------------
 # the plan
 # --------------------------------------------------------------------------
+def hpin_overrides(current, env=None):
+    """{field: ((old_left, old_right), new_range)} for HPIN_FIELDS whose
+    written horizontal range is not already exactly 320 units (BUILD 618e)."""
+    raw = (os.environ if env is None else env).get('SEVENTH_NX_NO_HPIN', '')
+    if raw.strip() == '1':
+        return {}
+    out = {}
+    for name in HPIN_FIELDS:
+        r = current.get(name)
+        if r is None:
+            continue
+        c = (int(r['left']) + int(r['right'])) // 2
+        new = {k: int(r[k]) for k in W.RANGE_ORDER}
+        new['left'], new['right'] = c - HALF_WIDTH_43, c + HALF_WIDTH_43
+        if (new['left'], new['right']) != (int(r['left']), int(r['right'])):
+            out[name] = ((int(r['left']), int(r['right'])), new)
+    return out
+
+
 def plan_ranges(before, config, movie_config=None, clamp=False):
     """
     ({field: new_range}, resolved, stats) for a {field: range} mapping.
@@ -783,6 +804,23 @@ def apply_to_flevel(archive, payloads, config, movie_config=None,
     # right". ff7nx_camfit measures the art in section 9 and tightens the
     # clamp until the window cannot leave it. It only ever tightens, so a
     # field that renders correctly today comes out a no-op.
+    # BUILD 617. A field whose missing 16:9 strip was completed from a
+    # sibling room takes that sibling's horizontal range (fship_22 <-
+    # fship_24). camfit below still measures the art and tightens it, so
+    # the camera can never travel past what was actually completed.
+    try:
+        import ff7nx_siblingmargin as SM
+        _cur = dict(before)
+        _cur.update(plan)
+        for _n, _r in SM.range_overrides(_cur).items():
+            log('  widescreen: %s camera range %d..%d -> %d..%d (sibling '
+                'margin completed)' % (_n, _cur[_n]['left'],
+                                       _cur[_n]['right'], _r['left'],
+                                       _r['right']))
+            plan[_n] = _r
+    except Exception as exc:                                   # noqa: BLE001
+        log('  ! widescreen: sibling range skipped (%s)' % exc)
+
     if clamp and not CF.disabled():
         final = dict(before)
         final.update(plan)
@@ -836,6 +874,23 @@ def apply_to_flevel(archive, payloads, config, movie_config=None,
                 log('    %s: range is far wider than its art (%d units bare) '
                     '-- left alone, that range is not describing this '
                     'background' % (nm, band))
+
+    # BUILD 618e. The Highwind bridge (fship_2 and its four story variants)
+    # holds the camera still horizontally on PC with Cosmos (hardware
+    # comparison, 10-01); here the written -170..170 range left +/-10 units
+    # of horizontal travel and the camera followed Cloud left and right. The
+    # horizontal range is pinned to exactly 320 written units (the stock
+    # `#0xa0` clip then gives left+160 == right-160) around the range's own
+    # centre, so the 16:9 window sits still over the middle of the 448-unit
+    # art. Vertical travel is untouched. SEVENTH_NX_NO_HPIN=1 disables.
+    _cur = dict(before)
+    _cur.update(plan)
+    for _n, (_old, _new) in hpin_overrides(_cur).items():
+        log('  widescreen: %s camera range %d..%d -> %d..%d (horizontal '
+            'camera held still, as on PC)' % (_n, _old[0], _old[1],
+                                              _new['left'], _new['right']))
+        plan[_n] = _new
+        stats['hpin'] = stats.get('hpin', 0) + 1
 
     # A rectangular art fit cannot describe the one diagonal camera rail.
     # Restore that rail from the field's own trigger envelope after every

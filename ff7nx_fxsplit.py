@@ -166,6 +166,7 @@ def split_section9(name, sec9, art, px, max_raw_delta=None,
             fx_refs[fx].append(t)
 
     plans = []          # (slot, [(q, image, [tiles])], kept_tiles)
+    _field_live = None  # BUILD 617, see ff7nx_fxpages.field_live_palettes
     for slot in range(FX_LO, FX_HI):
         page = pages.get(slot)
         refs = fx_refs.get(slot, ())
@@ -235,8 +236,12 @@ def split_section9(name, sec9, art, px, max_raw_delta=None,
             return groups, kept, nfrozen
 
         old_live = set() if XP.static_animated() else set(animated)
+        if _field_live is None:
+            _field_live = XP.field_live_palettes(provider, field, sec9,
+                                                 animated)
         live = set(XP.live_animated(provider, field, slot,
-                                    {t.pal for t in refs}, animated))
+                                    {t.pal for t in refs}, animated,
+                                    field_live=_field_live))
         primary = _plan(live)
         # BUILD 608: the BUILD 581 plan, tried when the fuller split does not
         # fit, so no page ends with fewer HD tiles than that rule gave it.

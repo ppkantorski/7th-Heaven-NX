@@ -211,6 +211,7 @@ except ImportError:                                          # pragma: no cover
 import a64 as A
 import ff7nx_audio_cave as AC
 import ff7nx_cave
+import ff7nx_deadspace as DS
 import ff7nx_tables
 import nxmap
 import ff7nx_worldsphere as WS
@@ -434,6 +435,95 @@ CONDOR_OFF_CALLEE = 0x8FB5D0          # x86 0x60218E
 CONDOR_ENV = 'SEVENTH_NX_DAYNIGHT_CONDOR'
 
 
+# BUILD 617. THE SNOWBOARD MINIGAME -- the story run down the Great Glacier
+# follows the clock like Fort Condor; the Gold Saucer arcade version does
+# not, and neither interface does.
+#
+# One loop serves both games. x86 0x72381C (ARM +0xE4C9A0) draws a frame in
+# this order:
+#
+#     0x72DAF0          sky and mountains            (+0xE4CA74)
+#     [0xDD7CEC] ...    the state function(s): the course blocks and
+#                       placed objects are queued
+#     0x735220          the queued models: board, Cloud, trees, balloons
+#     0x72D0C0          the course lists and in-world sprites, flushed
+#                       through 0x66E641 (engine_draw_graphics_object)
+#                                                     (+0xE4CE24)
+#       ... its LAST call, 0x72D661 (+0xE568C4 -> +0xE929F0): the fade quad
+#                       (0x72DD94) and the 2D lists (0x72E7FE) -- the
+#                       TIME / SPEED text is drawn and cleared HERE
+#     0x724DBF          timer / score / points HUD (gameplay state only)
+#     0x72D64E          the 2D lists again -- the HUD, result screens
+#
+# So the tint goes ON immediately before the sky call and OFF immediately
+# before 0x72D0C0's own call to 0x72D661: the 2D lists, the HUD and the
+# result screens draw white. (617a put OFF after 0x72D0C0 returned, which
+# left the TIME / SPEED text tinted -- hardware report.) Both are ordinary
+# `build_ui_cave` sites.
+#
+# WHICH GAME. snowboard_enter (x86 0x722C10, ARM +0xE4A110) stores
+# `[0xDD865C] = (engine mode == 8)`: 1 for FF7_MODE_SNOWBOARD, the story
+# run from the Icicle Inn side, 0 for FF7_MODE_SNOWBOARD2, the Wonder Square
+# arcade (0x722F82 picks the story course table 0x939CE0 on 1 and the Gold
+# Saucer's 0x949F00 on 0). The flip cave decides the colour into
+# BSS_ARMED_INV only when that word is non-zero; the arcade frame arms WHITE,
+# so its bracket copies white and nothing changes. Driver mode 10 is the
+# port's own `set_driver_mode(10)` at the top of snowboard_enter (+0xE4A120
+# `mov w0, #10`, +0xE4A124 `bl set_driver_mode`), checked at install.
+DRIVER_SNOW = 10
+G_SNOW_STORY = 0xDD865C               # u32: 1 = story run, 0 = arcade
+SNOW_LOOP = 0xE4C9A0                  # x86 0x72381C
+SNOW_LOOP_END = 0xE4CF90              # the next function start
+SNOW_ON_HOOK = 0xE4CA74               # bl x86 0x72DAF0 (sky, mountains)
+SNOW_SCENE_HOOK = 0xE4CE24            # bl x86 0x72D0C0 (course, sprites)
+SNOW_SCENE = 0xE563A0                 # x86 0x72D0C0
+SNOW_SCENE_END = 0xE56910             # the next function start
+SNOW_OFF_HOOK = 0xE568C4              # in 0x72D0C0: bl x86 0x72D661 (2D)
+SNOW_BL_ORIG = {SNOW_ON_HOOK: 0x9400225F,
+                SNOW_SCENE_HOOK: 0x9400255F,
+                SNOW_OFF_HOOK: 0x9400F04B}
+SNOW_ON_CALLEE = 0xE553F0
+SNOW_OFF_CALLEE = 0xE929F0            # x86 0x72D661
+# THE CLEAR COLOUR. The per-frame driver (x86 0x722CCF, ARM +0xE4BFE0)
+# starts each frame with `0x722E0F(1.0, 1.0, 1.0, 0)` -- r, g, b, a floats
+# that it packs as the bgra clear colour (0x66075C) -- and the screen is
+# cleared WHITE. Wherever the course leaves a gap under the mountain band,
+# that white shows, and at night it is the only untinted thing on screen
+# (hardware report after 617a). The `snow_clear` cave sits on that call
+# (+0xE4C098): if this frame is armed with a colour it scales the three
+# pushed floats by it, in the guest stack slots the callee reads (guest esp
+# +4/+8/+12 -- the return slot is already pushed), then makes the call.
+# Armed white (day, the arcade, any other mode) leaves them untouched.
+SNOW_CLEAR_HOOK = 0xE4C098            # bl x86 0x722E0F (clear colour)
+SNOW_CLEAR_CALLEE = 0xE4C3C0
+SNOW_CLEAR_ORIG = 0x940000CA
+SNOW_FRAME = 0xE4BFE0                 # x86 0x722CCF
+SNOW_FRAME_END = 0xE4C3C0
+SNOW_BL_ORIG[SNOW_CLEAR_HOOK] = SNOW_CLEAR_ORIG
+GUEST_CTX_PAGE = 0x12CE000            # adrp; the ctx pointer is at +0x2B0
+GUEST_CTX_OFF = 0x2B0
+GUEST_ESP = 0x10                      # ctx+0x10: guest esp
+SNOW_MODE_SET = 0xE4A120              # mov w0, #10 ; bl set_driver_mode
+SNOW_MODE_WORDS = (0x52800140, 0x940AA6F7)
+SNOW_ENV = 'SEVENTH_NX_DAYNIGHT_SNOW'
+
+
+SNOW_HUD_ENV = 'SEVENTH_NX_DAYNIGHT_SNOW_HUD'
+
+
+def snow_hud_enabled(env=None):
+    """BUILD 617b: the snowboard 2D gate in the block cave (HUD white)."""
+    e = os.environ if env is None else env
+    return e.get(SNOW_HUD_ENV, '').strip().lower() not in ('0', 'off', 'no',
+                                                          'false')
+
+
+def snow_enabled(env=None):
+    e = os.environ if env is None else env
+    return e.get(SNOW_ENV, '').strip().lower() not in ('0', 'off', 'no',
+                                                      'false')
+
+
 def condor_enabled(env=None):
     e = os.environ if env is None else env
     return e.get(CONDOR_ENV, '').strip().lower() not in ('0', 'off', 'no',
@@ -463,6 +553,9 @@ TINT_LANE = 4                         # blendMode.y
 MAGIC_LANE = 8                        # blendMode.z
 TINT_MAGIC = 0x44594E                 # 'DYN'
 TINT_WHITE = 0xFFFFFF
+MAT_34 = 0x10 + 11 * 4                # block offsets of the matrix's _34
+MAT_44 = 0x10 + 15 * 4                # and _44 (row-major, after blendMode)
+VERTS_REG = 22                        # the draw helper's vertex array
 
 # ----------------------------------------------------------------- our state
 BSS_TINT_INV = 0x00                   # u32, packed 0xRRGGBB, COMPLEMENTED
@@ -484,7 +577,9 @@ BSS_SCENE_MODE = 0x24                 # u32, the last mode that was a SCENE --
                                       #      FIELD or WORLDMAP, never a menu.
                                       #      A battle asks this where it came
                                       #      from; see build_flip_cave.
-BSS_BYTES = 0x28
+BSS_SNOW_SKY = 0x28                   # u32, 1 while the snowboard's sky call
+                                      #      runs -- see build_snow_on_cave
+BSS_BYTES = 0x2C
 
 # --------------------------------------------------------- the mod's config
 # Read out of Echo-S's own `DayNight/Time/config.toml`, kept here as the
@@ -793,7 +888,33 @@ def read_maplist(flevel_path):
 # midnight. Listed here it gets the outdoor bit, which is all the tick reads.
 # `SEVENTH_NX_DAYNIGHT_OUTDOOR=convil_2,...` replaces the list; `=none`
 # empties it.
-FORCE_OUTDOOR = ('convil_2',)
+#
+# BUILD 614. Indoor rooms whose backgrounds are painted in daylight -- sun
+# through the windows -- and so read as noon at any hour. Checked against
+# Echo-S: every name below is marked INDOOR by its Time actor. (jailin1,
+# loslake1, blue_2, las0_1, hill and hill2 were asked for too; Echo-S already
+# marks them outdoor, so they need no entry.)
+FORCE_OUTDOOR = (
+    'convil_2',
+    # BUILD 614
+    'frmin', 'frcyo',
+    'chrin_1a', 'chrin_1b', 'chrin_2', 'chrin_3a', 'chrin_3b',
+    'ealin_1', 'ealin_12', 'ealin_2',
+    'delmin1', 'delmin2',
+    'jailin4', 'jailpb',
+    'niv_ti3', 'niv_ti4', 'nivinn_3',
+    'losin3',
+    'ancnt1', 'ancnt2', 'ancnt3', 'ancnt4',
+    # Snow Village: `snw_w` is the maplist name for the requested `Saww`.
+    'snw_w', 'sninn_1', 'sninn_2', 'sninn_b1',
+    'snmin1', 'snmin2', 'snmayor',
+    # Great Glacier caves; icedun_2 is already outdoor in Echo-S.
+    'icedun_1', 'hyou5_3', 'hyou8_2', 'hyou12', 'hyou13_2',
+    'holu_2',
+    'junbin21', 'junbin22', 'junbin3', 'junsbd1',
+    'itmin1', 'itmin2', 'ithos',
+    'fship_5',
+)
 FORCE_OUTDOOR_ENV = 'SEVENTH_NX_DAYNIGHT_OUTDOOR'
 
 
@@ -862,11 +983,11 @@ def outdoor_bitmap(maplist, field_paths, log=lambda *_: None,
                 bits[field_id >> 3] |= 1 << (field_id & 7)
                 forced.append('%s #%d' % (name, field_id))
                 outdoor += 1
-        log('  outdoor bitmap: %d outdoor, %d indoor, %d with no Time actor, '
+    log('  outdoor bitmap: %d outdoor, %d indoor, %d with no Time actor, '
         '%d maplist name(s) not in the mod (%d bytes)'
         % (outdoor, indoor, silent, missing, len(bits)))
     if forced:
-        log('  outdoor bitmap: forced outdoor (BUILD 572): %s'
+        log('  outdoor bitmap: forced outdoor (BUILD 572/614): %s'
             % ', '.join(forced))
     if not outdoor:
         raise ValueError('not one field is marked outdoor -- either the Time '
@@ -1040,7 +1161,7 @@ def _white(a, bss_reg):
     a.emit(A.str_(31, bss_reg, BSS_TINT_INV))
 
 
-def build_block_cave(cave, addr, bss, world=False):
+def build_block_cave(cave, addr, bss, world=False, snow=False):
     """
     Park the tint in the two ivec4 lanes the shaders never read.
 
@@ -1071,6 +1192,46 @@ def build_block_cave(cave, addr, bss, world=False):
     AC.bss_ptr(a, 3, bss)
     a.emit(A.ldr(2, 3, BSS_SKY_INV))
     a.label('normal_tint')
+    if snow:
+        # BUILD 617c. The snowboard's HUD (TIME / SPEED and its gauges) is
+        # built by the gameplay state function (x86 0x723F60 -> 0x72D864 /
+        # 0x72F26C / 0x72F680) as screen quads through ONE helper, 0x72D880,
+        # which writes every vertex with z = 0.0, rhw = 1.0. They are drawn
+        # by the sprite flush inside 0x72D0C0 together with the in-world
+        # sprites, which is why no call-site bracket could untint them
+        # (617a after 0x72D0C0, 617b before 0x72D661). So this decides per
+        # DRAW: in driver mode 10, outside the sky call, a TLVERTEX draw
+        # (the block's matrix is the 2D ortho: _34 == 0, _44 == 1.0) whose
+        # first vertex has z == 0.0 and rhw == 1.0 exactly is white.
+        # Projected sprites, the course and the models carry a real depth
+        # and keep the tint. x22 is the draw helper's vertex array (32-byte
+        # TLVERTEX: x y z rhw colour specular u v), live from its entry to
+        # the upload below this hook.
+        AC.bss_ptr(a, 3, bss)
+        a.emit(A.ldr(3, 3, BSS_MODE))
+        a.emit(A.cmp_imm(3, DRIVER_SNOW))
+        a.bcond('keep_tint', NE)
+        AC.bss_ptr(a, 3, bss)
+        a.emit(A.ldr(3, 3, BSS_SNOW_SKY))
+        a.cbnz(3, 'keep_tint')
+        a.emit(A.ldr(3, 31, BLOCK_BASE + MAT_34))
+        a.cbnz(3, 'keep_tint')
+        a.emit(A.ldr(3, 31, BLOCK_BASE + MAT_44))
+        a.emit(A.lsr(3, 3, 20))
+        a.emit(A.cmp_imm(3, 0x3F8))            # 1.0f's top twelve bits
+        a.bcond('keep_tint', NE)
+        a.cbz64(VERTS_REG, 'keep_tint')
+        a.emit(A.ldr(3, VERTS_REG, 8))         # z
+        a.cbnz(3, 'keep_tint')
+        a.emit(A.ldr(3, VERTS_REG, 12))        # rhw == 1.0f exactly
+        a.emit(A.lsr(3, 3, 20))
+        a.emit(A.cmp_imm(3, 0x3F8))
+        a.bcond('keep_tint', NE)
+        a.emit(A.ldr(3, VERTS_REG, 12))
+        a.emit(A.and_mask(3, 3, 20))
+        a.cbnz(3, 'keep_tint')
+        a.emit(A.movz(2, 0))                   # complement of white
+        a.label('keep_tint')
     a.emit(A.mvn_reg(2, 2))                    # the slot holds the complement
     a.emit(A.str_(2, 31, BLOCK_BASE + TINT_LANE))      # blendMode.y
     AC.mov32(a, 2, TINT_MAGIC)
@@ -1322,7 +1483,7 @@ def _emit_clock(a, frames_per_minute, seed_hour, force_on, bss_reg=20):
 
 def build_flip_cave(cave, addr, bss, frames_per_minute, phase_table_addr,
                     gamma_table_addr, force_on=True, seed_hour=8,
-                    condor=True):
+                    condor=True, snow=False):
     """
     The once-a-frame half: tick the clock outside the field, and arm the tint
     for the two modes that have no draw entry of their own.
@@ -1362,6 +1523,10 @@ def build_flip_cave(cave, addr, bss, frames_per_minute, phase_table_addr,
     if condor:
         a.emit(A.cmp_imm(9, DRIVER_CONDOR))    # BUILD 572: Fort Condor ticks
         a.bcond('clock', EQ)
+    if snow:
+        # BUILD 617: the snowboard ticks too -- but only the story run.
+        a.emit(A.cmp_imm(9, DRIVER_SNOW))
+        a.bcond('snow_mode', EQ)
     a.emit(A.sub_imm(9, 9, DRIVER_FIELD))
     a.emit(A.cmp_imm(9, DRIVER_TICKING))
     a.bcond('white', HS)
@@ -1370,12 +1535,25 @@ def build_flip_cave(cave, addr, bss, frames_per_minute, phase_table_addr,
     a.emit(A.ldr(9, 20, BSS_TICKED))
     a.cbnz(9, 'white')
 
+    if snow:
+        a.b('clock')
+        a.label('snow_mode')
+        # the Wonder Square arcade arms white: no clock, no tint
+        _translate_imm(a, G_SNOW_STORY)
+        a.emit(A.ldr(9, 0, 0))
+        a.cbz(9, 'white')
+
     a.label('clock')
     _emit_clock(a, frames_per_minute, seed_hour, force_on)
     if condor:
         # Fort Condor takes the world map's rule: no outdoor bit.
         a.emit(A.ldr(9, 20, BSS_MODE))
         a.emit(A.cmp_imm(9, DRIVER_CONDOR))
+        a.bcond('colour', EQ)
+    if snow:
+        # ... and so does the glacier: it is outdoors by definition.
+        a.emit(A.ldr(9, 20, BSS_MODE))
+        a.emit(A.cmp_imm(9, DRIVER_SNOW))
         a.bcond('colour', EQ)
 
     # WHICH SCENE'S RULE APPLIES -- and BUILD 481 is why this is not just
@@ -1407,6 +1585,12 @@ def build_flip_cave(cave, addr, bss, frames_per_minute, phase_table_addr,
     a.cbz(9, 'white')
     a.label('colour')
     _emit_colour(a, phase_table_addr, gamma_table_addr)
+    if snow:
+        # decided, not applied -- only the scene bracket inside the loop
+        # copies it into the slot the draws read.
+        a.emit(A.ldr(9, 20, BSS_MODE))
+        a.emit(A.cmp_imm(9, DRIVER_SNOW))
+        a.bcond('armed_only', EQ)
     if condor:
         # BUILD 572: decided, not applied. Only the scene bracket inside
         # 0x5F5828 (CONDOR_ON_HOOK .. CONDOR_OFF_HOOK) copies it into the
@@ -1417,6 +1601,12 @@ def build_flip_cave(cave, addr, bss, frames_per_minute, phase_table_addr,
         a.emit(A.ldr(9, 20, BSS_MODE))
         a.emit(A.cmp_imm(9, DRIVER_CONDOR))
         a.bcond('done', NE)
+        if snow:
+            a.label('armed_only')
+        a.emit(A.str_(31, 20, BSS_TINT_INV))
+    elif snow:
+        a.b('done')
+        a.label('armed_only')
         a.emit(A.str_(31, 20, BSS_TINT_INV))
     a.b('done')
 
@@ -1478,6 +1668,70 @@ def build_ui_cave(cave, addr, bss, hook, orig, before, after=None):
     if after is not None:
         put(a, after)
     a.emit(A.b(a.pc(), hook + 4))
+    return a.resolve()
+
+
+def build_snow_on_cave(cave, addr, bss):
+    """
+    BUILD 617b. The snowboard's ON point, as a wrapper round the sky call:
+    tint ON (TINT = ARMED, as build_ui_cave's `True`), BSS_SNOW_SKY = 1 for
+    the length of the call -- the block cave tints 2D draws only then --
+    and BSS_SNOW_SKY = 0 once it returns. Only str/ldr: no flags touched.
+    """
+    lo, hi = UI_SCRATCH
+    a = Asm(cave, addr)
+    a.emit(A.stp64_pre(lo, hi, 31, -16))
+    AC.bss_ptr(a, lo, bss)
+    a.emit(A.ldr(hi, lo, BSS_ARMED_INV))
+    a.emit(A.str_(hi, lo, BSS_TINT_INV))
+    a.emit(A.movz(hi, 1))
+    a.emit(A.str_(hi, lo, BSS_SNOW_SKY))
+    a.emit(A.ldp64_post(lo, hi, 31, 16))
+    a.emit(A.bl(a.pc(), SNOW_ON_CALLEE))
+    a.emit(A.stp64_pre(lo, hi, 31, -16))
+    AC.bss_ptr(a, lo, bss)
+    a.emit(A.str_(31, lo, BSS_SNOW_SKY))
+    a.emit(A.ldp64_post(lo, hi, 31, 16))
+    a.emit(A.b(a.pc(), SNOW_ON_HOOK + 4))
+    return a.resolve()
+
+
+def build_snow_clear_cave(cave, addr, bss):
+    """
+    BUILD 617. Tint the snowboard's clear colour by this frame's armed tint.
+
+    Spliced in front of a `bl` in recompiled code, so everything the callee
+    may clobber (x0..x18, x30, v0..v7, flags) is dead here already; x19..x30
+    are saved anyway. The guest stack is read the way the recompiler reads
+    it: ctx from [adrp 0x12CE000 + 0x2B0], guest esp from ctx+0x10, and every
+    slot translated on its own rather than indexed off one translation.
+    """
+    a = Asm(cave, addr)
+    AC.save_host(a, 0x80)
+    AC.bss_ptr(a, 20, bss)
+    a.emit(A.ldr(21, 20, BSS_ARMED_INV))
+    a.cbz(21, 'done')                          # armed white: stock colour
+    a.emit(A.mvn_reg(21, 21))                  # 0x??RRGGBB
+    a.emit(A.adrp(22, a.pc(), GUEST_CTX_PAGE))
+    a.emit(A.ldr64(22, 22, GUEST_CTX_OFF))
+    for off, shift in ((4, 16), (8, 8), (12, 0)):      # r, g, b
+        a.emit(A.ldr(8, 22, GUEST_ESP))
+        a.emit(A.add_imm(0, 8, off))
+        a.emit(A.bl(a.pc(), GUEST_TRANSLATE))
+        # ubfx w9, w21, #shift, #8
+        a.emit(0x53000000 | (shift << 16) | ((shift + 7) << 10)
+               | (21 << 5) | 9)
+        a.emit(A.ucvtf_s(1, 9))
+        AC.mov32(a, 10, 0x3B808081)            # 1/255
+        a.emit(A.fmov_s_from_w(2, 10))
+        a.emit(A.fmul_s(1, 1, 2))
+        a.emit(A.ldr_s(0, 0, 0))
+        a.emit(A.fmul_s(0, 0, 1))
+        a.emit(A.str_s(0, 0, 0))
+    a.label('done')
+    AC.restore_host(a, 0x80)
+    a.emit(A.bl(a.pc(), SNOW_CLEAR_CALLEE))
+    a.emit(A.b(a.pc(), SNOW_CLEAR_HOOK + 4))
     return a.resolve()
 
 
@@ -1772,12 +2026,54 @@ CONDOR_UI_SITES = (
 )
 
 
-def all_sites(condor=True):
-    return SITES + (CONDOR_SITES if condor else ())
+SNOW_SITES = (
+    ('snow_on', SNOW_ON_HOOK, SNOW_BL_ORIG[SNOW_ON_HOOK],
+     'snowboard: before the sky and mountains'),
+    ('snow_off', SNOW_OFF_HOOK, SNOW_BL_ORIG[SNOW_OFF_HOOK],
+     'snowboard: before the 2D lists (TIME / SPEED), the HUD'),
+    ('snow_clear', SNOW_CLEAR_HOOK, SNOW_CLEAR_ORIG,
+     'snowboard: the frame\'s clear colour, scaled by the armed tint'),
+)
+SNOW_UI_SITES = (
+    ('snow_off', SNOW_OFF_HOOK, SNOW_BL_ORIG[SNOW_OFF_HOOK], None, False),
+)
 
 
-def all_ui_sites(condor=True):
-    return UI_SITES + (CONDOR_UI_SITES if condor else ())
+def all_sites(condor=True, snow=False):
+    return (SITES + (CONDOR_SITES if condor else ())
+            + (SNOW_SITES if snow else ()))
+
+
+def all_ui_sites(condor=True, snow=False):
+    return (UI_SITES + (CONDOR_UI_SITES if condor else ())
+            + (SNOW_UI_SITES if snow else ()))
+
+
+def check_snow_sites(text):
+    """The snowboard bracket, re-derived from the binary at install."""
+    for va, word in zip((SNOW_MODE_SET, SNOW_MODE_SET + 4), SNOW_MODE_WORDS):
+        got, = struct.unpack_from('<I', text, va)
+        if got != word:
+            raise ValueError('daynight: snowboard_enter no longer sets driver '
+                             'mode %d at +0x%X' % (DRIVER_SNOW, va))
+    _count_calls(text, SNOW_LOOP, SNOW_LOOP_END, SNOW_ON_CALLEE, 1, (1,),
+                 [SNOW_ON_HOOK], 'snowboard sky draw')
+    _count_calls(text, SNOW_LOOP, SNOW_LOOP_END, SNOW_SCENE, 1, (1,),
+                 [SNOW_SCENE_HOOK], 'snowboard course/sprite draw')
+    _count_calls(text, SNOW_SCENE, SNOW_SCENE_END, SNOW_OFF_CALLEE, 1, (1,),
+                 [SNOW_OFF_HOOK], 'snowboard 2D-list draw')
+    _count_calls(text, SNOW_FRAME, SNOW_FRAME_END, SNOW_CLEAR_CALLEE, 1, (1,),
+                 [SNOW_CLEAR_HOOK], 'snowboard clear-colour call')
+    # the three pushed 1.0f and the pushed 0 in front of it, as the cave
+    # assumes them (ctx in x19, `mov w20, #1.0`)
+    for va, word in ((0xE4C048, 0xB900001F), (0xE4C05C, 0x32091BF4),
+                     (0xE4C060, 0xB9000014), (0xE4C074, 0xB9000014),
+                     (0xE4C088, 0xB9000014), (0xE4C094, 0xB9001268)):
+        got, = struct.unpack_from('<I', text, va)
+        if got != word:
+            raise ValueError('daynight: the snowboard clear-colour arguments '
+                             'moved (+0x%X is %08X, expected %08X)'
+                             % (va, got, word))
 
 # `tick` is not here: it is the only cave that needs the two tables, so
 # `build_all` places it by hand. These three take nothing but the BSS base.
@@ -1937,35 +2233,66 @@ def check_sky_page_site(text):
 
 def build_all(pool, space, bss, bitmap, frames_per_minute, force_on=True,
               freeze_hour=None, strength=DEFAULT_STRENGTH, sky_rows=(),
-              condor=True, world_sphere=False):
-    """Place the three tables and runtime caves. Returns entries and patches."""
-    outdoor_at = space.place('daynight-outdoor', bitmap, align=4)
-    phase_at = space.place('daynight-phase', phase_table(), align=4)
-    gamma_at = space.place('daynight-gamma', gamma_lut(strength), align=4)
-    sky_at = space.place('daynight-sky', sky_table(sky_rows), align=4)
+              condor=True, world_sphere=False, snow=False):
+    """Place the tables and runtime caves. Returns entries and patches."""
+    outdoor_at, phase_at, gamma_at, sky_at = place_tables(
+        space, bitmap, strength, sky_rows)
+    entries, placed = build_caves(
+        pool, bss, outdoor_at, phase_at, gamma_at, sky_at, frames_per_minute,
+        force_on=force_on, freeze_hour=freeze_hour, condor=condor,
+        world_sphere=world_sphere, snow=snow)
+    return entries, placed, outdoor_at, phase_at, gamma_at, sky_at
+
+
+def place_tables(space, bitmap, strength=DEFAULT_STRENGTH, sky_rows=()):
+    return (space.place('daynight-outdoor', bitmap, align=4),
+            space.place('daynight-phase', phase_table(), align=4),
+            space.place('daynight-gamma', gamma_lut(strength), align=4),
+            space.place('daynight-sky', sky_table(sky_rows), align=4))
+
+
+def _emit(pool, build):
+    """
+    BUILD 614b. One cave, from the padding pool or from the 'daynight'
+    dead-space part. A Bump part is contiguous, so a cave's own b.cond/cbz
+    resolve exactly as they do in a windowed pool run; a64 range-checks them
+    either way.
+    """
+    if isinstance(pool, DS.Bump):
+        before = set(pool.placed)
+        entry = pool.put(build)
+        return entry, {k: v for k, v in pool.placed.items()
+                       if k not in before}
+    return ff7nx_cave.emit_laid_out(pool, build)
+
+
+def build_caves(pool, bss, outdoor_at, phase_at, gamma_at, sky_at,
+                frames_per_minute, force_on=True, freeze_hour=None,
+                condor=True, world_sphere=False, snow=False):
     entries, placed = {}, {}
-    entries['tick'], words = ff7nx_cave.emit_laid_out(
+    entries['tick'], words = _emit(
         pool, lambda cave, addr: build_tick_cave(
             cave, addr, bss, outdoor_at, phase_at, gamma_at, sky_at,
             frames_per_minute, force_on=force_on, freeze_hour=freeze_hour))
     placed.update(words)
-    entries['flip'], words = ff7nx_cave.emit_laid_out(
+    entries['flip'], words = _emit(
         pool, lambda cave, addr: build_flip_cave(
             cave, addr, bss, frames_per_minute, phase_at, gamma_at,
             force_on=force_on,
             seed_hour=None if freeze_hour is not None else 8,
-            condor=condor))
+            condor=condor, snow=snow))
     placed.update(words)
-    entries['sky_page'], words = ff7nx_cave.emit_laid_out(
+    entries['sky_page'], words = _emit(
         pool, lambda cave, addr: build_sky_page_cave(cave, addr, bss))
     placed.update(words)
     for name, builder in STATE_ONLY_CAVES:
         if name == 'block':
-            entries[name], words = ff7nx_cave.emit_laid_out(
+            entries[name], words = _emit(
                 pool, lambda cave, addr: build_block_cave(
-                    cave, addr, bss, world=world_sphere))
+                    cave, addr, bss, world=world_sphere,
+                    snow=snow and snow_hud_enabled()))
         else:
-            entries[name], words = ff7nx_cave.emit_laid_out(
+            entries[name], words = _emit(
                 pool, lambda cave, addr, _b=builder: _b(cave, addr, bss))
         placed.update(words)
     if world_sphere:
@@ -1974,18 +2301,25 @@ def build_all(pool, space, bss, bitmap, frames_per_minute, force_on=True,
             for w in WS.model_stub_words():
                 a.emit(w)
             return a.resolve()
-        entries['ws_model'], words = ff7nx_cave.emit_laid_out(pool, _stub)
+        entries['ws_model'], words = _emit(pool, _stub)
         placed.update(words)
         placed[WS.SINK_SITE] = WS.SINK_NEW
         placed[WS.MODEL_CALL] = A.bl(WS.MODEL_CALL, entries['ws_model'])
-    for name, hook, orig, before, after in all_ui_sites(condor):
-        entries[name], words = ff7nx_cave.emit_laid_out(
+    if snow:
+        entries['snow_on'], words = _emit(
+            pool, lambda cave, addr: build_snow_on_cave(cave, addr, bss))
+        placed.update(words)
+        entries['snow_clear'], words = _emit(
+            pool, lambda cave, addr: build_snow_clear_cave(cave, addr, bss))
+        placed.update(words)
+    for name, hook, orig, before, after in all_ui_sites(condor, snow):
+        entries[name], words = _emit(
             pool, lambda cave, addr, _h=hook, _o=orig, _b=before, _a=after:
             build_ui_cave(cave, addr, bss, _h, _o, _b, _a))
         placed.update(words)
-    for name, site, _orig, _what in all_sites(condor):
+    for name, site, _orig, _what in all_sites(condor, snow):
         placed[site] = A.b(site, entries[name])
-    return entries, placed, outdoor_at, phase_at, gamma_at, sky_at
+    return entries, placed
 
 
 FREEZE_ENV = 'SEVENTH_NX_DAYNIGHT_HOUR'
@@ -2014,9 +2348,15 @@ def freeze_hour_from_env():
 
 def apply_to_nso(src, dest, bitmap, space=None, fps=60,
                  force_on=True, freeze_hour=None, strength=DEFAULT_STRENGTH,
-                 sky_rows=(), condor=None, world_sphere=False):
+                 sky_rows=(), condor=None, world_sphere=False, stock=None,
+                 snow=None):
     """
     Install the day/night runtime, patching `src` into `dest`.
+
+    BUILD 614b: the caves live in the 'daynight' dead-space part (`stock`
+    is the dump's module, used to prove that part is still unwritten). Log
+    381: from the padding pool, the 172-word flip cave found no window and
+    the whole cycle was left out.
 
     `bitmap` is what `outdoor_bitmap` produced; it is a required argument
     rather than something this function goes and derives, because deriving it
@@ -2037,8 +2377,11 @@ def apply_to_nso(src, dest, bitmap, space=None, fps=60,
     space = own if space is None else space
     text = space.text
     condor = condor_enabled() if condor is None else condor
-    for _name, site, orig, what in all_sites(condor):
+    snow = snow_enabled() if snow is None else snow
+    for _name, site, orig, what in all_sites(condor, snow):
         AC.expect_word(text, site, orig, 'daynight: %s' % what)
+    if snow:
+        check_snow_sites(text)
     check_block_shape(text)
     check_sky_page_site(text)
     check_driver_modes(text, space.rodata, segs[1][1])
@@ -2062,16 +2405,33 @@ def apply_to_nso(src, dest, bitmap, space=None, fps=60,
     # the correct construction. Changing it here moves every day/night cave,
     # and this build is carrying one variable, not two.
     pool = ff7nx_cave.HolePool(text, starts=set(nxmap.Main(src).arm_starts))
-    entries, placed, outdoor_at, phase_at, gamma_at, sky_at = build_all(
-        pool, space, bss, bitmap, frames, force_on=force_on,
-        freeze_hour=freeze_hour, strength=strength, sky_rows=sky_rows,
-        condor=condor, world_sphere=world_sphere)
+    outdoor_at, phase_at, gamma_at, sky_at = place_tables(
+        space, bitmap, strength, sky_rows)
+    cave_args = (bss, outdoor_at, phase_at, gamma_at, sky_at, frames)
+    cave_kw = dict(force_on=force_on, freeze_hour=freeze_hour, condor=condor,
+                   world_sphere=world_sphere, snow=snow)
+    # BUILD 614b: the day/night runtime LIVES in its own dead-space part.
+    # It is ~600 words, the largest single user of the padding pool, and
+    # log 381 showed the pool cannot be relied on for it: whatever the
+    # passes before it take decides whether it fits, and when it did not
+    # the whole cycle (and the world far field riding on it) was dropped.
+    # The part is 768 words, proven dead on every build, and no other pass
+    # writes it. The pool is only a fallback if the part is unavailable.
+    try:
+        lo, hi = DS.part(src, 'daynight', stock)
+        entries, placed = build_caves(DS.Bump(lo, hi), *cave_args, **cave_kw)
+        caves_from = ('its own dead-space part +0x%X..+0x%X (%d of %d words)'
+                      % (lo, hi, len(placed) - len(all_sites(condor, snow)),
+                         (hi - lo) // 4))
+    except ValueError as exc:
+        entries, placed = build_caves(pool, *cave_args, **cave_kw)
+        caves_from = 'the padding pool (dead-space part unavailable: %s)' % exc
     for where, word in placed.items():
         struct.pack_into('<I', text, where, word)
 
     out = AC.pack(blob, space.commit(), BSS_BYTES)
     _segs, check_raw = AC.segments(out)
-    for name, site, _orig, _what in all_sites(condor):
+    for name, site, _orig, _what in all_sites(condor, snow):
         got = struct.unpack_from('<I', check_raw[0], site)[0]
         if got != A.b(site, entries[name]):
             raise ValueError('daynight: the %s hook did not survive the '
@@ -2092,8 +2452,9 @@ def apply_to_nso(src, dest, bitmap, space=None, fps=60,
         handle.write(out)
     minutes_per_day = DAY_MINUTES * frames / float(fps) / 60.0
     return {'bss_bytes': BSS_BYTES, 'bss_base': bss, 'entries': entries,
-            'cave_words': len(placed) - len(all_sites(condor)),
-            'condor': condor,
+            'caves_from': caves_from,
+            'cave_words': len(placed) - len(all_sites(condor, snow)),
+            'condor': condor, 'snow': snow,
             'table_bytes': (len(bitmap) + len(phase_table()) + len(GAMMA_LUT)
                             + len(sky_table(sky_rows))),
             'strength': strength,

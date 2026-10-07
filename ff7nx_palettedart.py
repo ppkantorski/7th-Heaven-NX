@@ -146,9 +146,55 @@ def _target_codes(page_art):
     return codes, rgb
 
 
-def _requantise(page_art):
+ATLAS_CELLS = 8                # 8x8 cells of 32 px on a 256px size-1 page
+MAX_LAYOUT_ERROR = 8.0         # old page vs Cosmos, mean 4x4-block RGB error
+LAYOUT_MARGIN = 0.5            # the chosen layout must beat the other by 2x
+
+
+def _cell_transpose(arr):
+    """Swap atlas cell (u, v) with (v, u); pixels inside a cell stay put."""
+    shape = arr.shape
+    c = PAGE_PX // ATLAS_CELLS
+    return np.ascontiguousarray(
+        arr.reshape(ATLAS_CELLS, c, ATLAS_CELLS, c, *shape[2:])
+        .swapaxes(0, 2).reshape(shape))
+
+
+def _blocks(rgb):
+    return rgb.astype(np.float32).reshape(
+        PAGE_PX // 4, 4, PAGE_PX // 4, 4, 3).mean((1, 3))
+
+
+def _atlas_layout(old_rgb, target_rgb):
+    """BUILD 617. Which cell layout the page ALREADY uses.
+
+    The dense repack may lay a sky atlas out with its cells transposed and
+    the records' UVs swapped to match -- fship_22's five pages are exactly
+    that (280 of 320 records sample cell (v, u) of the 1997 atlas; the 40 on
+    the diagonal are unaffected). The page drew correctly because page and
+    UVs agree. Writing Cosmos's row-major raster into it broke that
+    agreement: every off-diagonal cell showed another cell's clouds, which
+    is the checkerboard in the fship_22 sky on hardware. The page's own
+    pixels say which layout it is in; take the one that matches, and refuse
+    when neither clearly does.
+    """
+    old_b = _blocks(old_rgb)
+    ident = float(np.abs(old_b - _blocks(target_rgb)).mean())
+    trans = float(np.abs(old_b - _blocks(_cell_transpose(target_rgb))).mean())
+    best, other, transposed = ((ident, trans, False) if ident <= trans
+                               else (trans, ident, True))
+    if best > MAX_LAYOUT_ERROR or best > LAYOUT_MARGIN * other:
+        raise PalettedArtError('atlas layout is unclear (identity %.1f, '
+                               'transposed %.1f)' % (ident, trans))
+    return transposed, ident, trans
+
+
+def _requantise(page_art, transposed=False):
     """(new indices, palette entries, target RGB, represented RGB)."""
     codes, target_rgb = _target_codes(page_art)
+    if transposed:
+        codes = _cell_transpose(codes)
+        target_rgb = _cell_transpose(target_rgb)
     unique = np.unique(codes)
     if len(unique) > 255:
         raise PalettedArtError('%d A1B5G5R5 colours need more than the 255 '
@@ -208,6 +254,7 @@ def improve_field(name, parts, art):
     rows = _records(parts[SECTION9], surv)
 
     plans = []
+    layouts = []
     for i, slot in enumerate(range(6, 11)):
         pal = slot + 4
         page = pages[slot]
@@ -252,7 +299,13 @@ def improve_field(name, parts, art):
         old_indices = np.frombuffer(page.data, np.uint8)
         used = np.unique(old_indices)
         page_art = _page_art(art, name, slot)
-        new_indices, new_colours, target_rgb, represented = _requantise(page_art)
+        old_rgb0 = _rgb555(cols[pal][old_indices]).reshape(PAGE_PX, PAGE_PX, 3)
+        transposed, _e_id, _e_tr = _atlas_layout(
+            old_rgb0, _target_codes(page_art)[1])
+        new_indices, new_colours, target_rgb, represented = _requantise(
+            page_art, transposed)
+        if transposed:
+            layouts.append(slot)
         new_data = new_indices.tobytes()
         digest = hashlib.sha256(page.data).hexdigest()
         if digest == hashes[i]:
@@ -301,7 +354,8 @@ def improve_field(name, parts, art):
 
     stats = {'pages': 5, 'pixels': 5 * PAGE_PX ** 2,
              'old_colours': old_colours, 'new_colours': new_colours_count,
-             'old_error': old_error / 5, 'new_error': new_error / 5}
+             'old_error': old_error / 5, 'new_error': new_error / 5,
+             'transposed': len(layouts)}
     if not changed:
         stats['already'] = 1
         return None, stats
@@ -344,6 +398,8 @@ def apply_to_flevel(archive, payloads, art, encode=None, log=lambda *_: None):
                 stats['new_colours'] += st['new_colours']
                 stats['old_error'] += st['old_error']
                 stats['new_error'] += st['new_error']
+                if st.get('transposed'):
+                    stats.setdefault('transposed', []).append(name)
             else:
                 stats['already'] += st.get('already', 0)
         except Exception as exc:                               # noqa: BLE001
@@ -361,4 +417,7 @@ def summarise(stats):
             'live colours; mean RGB error %.2f -> %.2f/255). No page, record, '
             'animation state, UV, byte count, or memory allocation changed.'
             % (stats['pages'], n, stats['old_colours'], stats['new_colours'],
-               stats['old_error'] / n, stats['new_error'] / n))
+               stats['old_error'] / n, stats['new_error'] / n)
+            + (' Cell-transposed atlas layout kept (BUILD 617): %s.'
+               % ', '.join(stats['transposed']) if stats.get('transposed')
+               else ''))

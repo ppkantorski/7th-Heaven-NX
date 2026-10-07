@@ -34,7 +34,10 @@ It is split so a shipping pass and the diagnostic probe can never collide:
                                 field camera's unfloored follow position
     [lo + 0x3C00,  lo + 0x4C00) 'pointers': ff7nx_pointers (BUILD 611) --
                                 the pointer hand and the exit-arrow table
-    [lo + 0x4C00,  hi - FAR)    ff7nx_frameprobe, diagnostic builds only
+    [lo + 0x4C00,  lo + 0x5800) 'daynight': ff7nx_daynight (BUILD 614b) --
+                                the whole day/night runtime, when the
+                                padding pool has no window left for it
+    [lo + 0x5800,  hi - FAR)    ff7nx_frameprobe, diagnostic builds only
     [hi - FAR,     hi)          'far': ff7nx_worldfar (BUILD 585) -- the
                                 world map's far-field terrain pass, a
                                 compiled C blob plus its hook stub
@@ -60,7 +63,8 @@ CANIM_AT = 0x2A00
 CALENDAR_AT = 0x2E00
 CAMPOS_AT = 0x3600
 POINTERS_AT = 0x3C00
-PROBE_AT = 0x4C00
+DAYNIGHT_AT = 0x4C00
+PROBE_AT = 0x5800
 FAR_BYTES = 0x8000
 
 
@@ -104,7 +108,9 @@ def part(src, which, stock=None):
     elif which == 'campos':
         p = (lo + CAMPOS_AT, lo + POINTERS_AT)
     elif which == 'pointers':
-        p = (lo + POINTERS_AT, lo + PROBE_AT)
+        p = (lo + POINTERS_AT, lo + DAYNIGHT_AT)
+    elif which == 'daynight':
+        p = (lo + DAYNIGHT_AT, lo + PROBE_AT)
     elif which == 'probe':
         p = (lo + PROBE_AT, (hi - FAR_BYTES) & ~15)
     elif which == 'far':

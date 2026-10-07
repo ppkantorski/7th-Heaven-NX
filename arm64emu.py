@@ -343,6 +343,16 @@ class Cpu:
             x = struct.unpack('<d', struct.pack('<Q', self.fp[rn] & M64))[0]
             self.fp[rd] = struct.unpack('<I', struct.pack('<f', x))[0]
             return None
+        if (w & 0xFFFFFC00) == 0x1E240000:                    # fcvtas Wd,Sn
+            # BUILD 613: round to nearest, ties AWAY from zero (C round()).
+            import math
+            x = struct.unpack('<f', struct.pack('<I', self.fp[rn] & M32))[0]
+            if math.isnan(x):
+                v = 0
+            else:
+                v = int(math.floor(abs(x) + 0.5)) * (1 if x >= 0 else -1)
+                v = max(-(1 << 31), min((1 << 31) - 1, v))
+            return s(rd, v & M32, True)
         if (w & 0xFFFFFC00) == 0x1E380000:                    # fcvtzs Wd,Sn
             import math
             x = struct.unpack('<f', struct.pack('<I', self.fp[rn] & M32))[0]
@@ -1097,6 +1107,14 @@ class Cpu:
             else:
                 self.x[rn] = addr + imm * 8
             return None
+        if (w & 0xFFFFFC1F) == 0xD63F0000:                    # blr (native)
+            tgt = self.x[(w >> 5) & 0x1F]
+            if tgt in self.native:
+                self.x[30] = pc + 4
+                self.native[tgt](self)
+                return None
+            raise Unsupported('blr to 0x%X: only modelled native calls'
+                              % tgt)
         if (w & 0xFFFFFC1F) == 0xD65F0000:                    # ret
             return self.x[(w >> 5) & 0x1F]
         if (w & 0xFC000000) == 0x94000000:                    # bl

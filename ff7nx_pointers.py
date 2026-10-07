@@ -77,7 +77,7 @@ SUBMIT_TGT = 0x928CE0
 SUBMIT_STOCK = 0x9400003F
 HAND_CTX = 23
 VIEW_MULT = 0xCFF1F0
-BSS_BYTES = 8
+BSS_BYTES = 16                  # hand x, y ; camera x, y (BUILD 613)
 
 # 2. hand clamp
 CLAMP_SITE = 0x928164           # add w22, w19, #4
@@ -101,8 +101,8 @@ DUP_DIST = 80.0
 ENV_SMOOTH = 'SEVENTH_NX_HANDSMOOTH'
 ENV_WIDE = 'SEVENTH_NX_HANDWIDE'
 ENV_ARROW = 'SEVENTH_NX_ARROWDEDUPE'
-ENVS = (ENV_SMOOTH, ENV_WIDE, ENV_ARROW)
-NE, HS, GE, LE, EQ = 1, 2, 10, 13, 0
+ENVS = (ENV_SMOOTH, ENV_WIDE, ENV_ARROW, 'SEVENTH_NX_CAMRAIL')
+NE, HS, GE, LE, EQ, HI, GT, LT = 1, 2, 10, 13, 0, 8, 12, 11
 
 
 def _on(name, env=None):
@@ -224,13 +224,15 @@ def ftol_body(addr, bss, slot):
     _mov32(b.w, 10, MAGIC)
     b.emit(A.cmp_reg(9, 10))
     b.to('call', NE)
+    # kind 1 (the hand) -> slot, kind 0 (the camera, BUILD 613) -> slot + 8
     b.emit(_ubfx(9, 24, 16, 8), _cmp_imm(9, KIND_CURSOR))
-    b.to('call', NE)
+    b.to('call', HI)
+    b.emit(A.movz(10, 8), A.movz(11, 0), _csel(11, 11, 10, EQ))   # EQ: hand
     b.emit(A.ldr(9, FP_REG, FP_TOP),
            _add_lsl64(9, FP_REG, 9, 3),
            _ldr_d(0, 9, 0), _fcvt_sd(0, 0))
-    _bss_ptr(b, 10, bss)
-    b.emit(_str_s(0, 10, slot))
+    _bss_ptr(b, 10, bss + slot)
+    b.emit(A.add_reg64(10, 10, 11), _str_s(0, 10, 0))
     call = len(b.w)
     b.bl(FTOL)
     b.emit(A.ldp64_post(29, 30, 31, 16), A.ret())
@@ -332,6 +334,128 @@ def flag_body(addr, table, n_ids):
     return b.resolve(labels)
 
 
+# ------------------------------------------------------------ the rail
+# BUILD 613. mds5_3 (and every field whose trigger header +0x14 is 1 or 2)
+# puts the camera on a DIAGONAL RAIL: 0x643628 projects the clamped camera
+# point onto the line between two corners of the camera range, in integers,
+# from an integer point. Walking at an angle to the rail, the point moves in
+# a staircase (x ticks, then y ticks), and each tick moves the projection
+# FORWARD along the rail for one axis and BACK for the other -- the camera
+# steps a unit forward and back from frame to frame (measured: (+3,+3),
+# (-3,-3), (+3,+3) px on consecutive frames). FFNx's float_sub_643628 does the
+# same projection in float from the float camera point. Same here: the call
+# at +0x9FA5B4 runs the stock function, then, for a rail field, recomputes
+# the projection from the REAL point -- the integer point plus the remainder
+# the camera's own projection rounded away (captured by the ftol cave as
+# kind 0), taken per axis only when the range clip left that axis alone --
+# and rounds it to the nearest unit.
+RAIL_SITE = 0x9FA5B4            # bl 0x643628's body, in 0x644075
+RAIL_TGT = 0xA108A0
+RAIL_CTX = 21
+RAIL_POINT = 0x38               # the camera point, [ebp-0x38] (x, y shorts)
+TRIGGERS_HDR = 0xCFF454
+VIEW_Y = 0xCFF208
+ENV_RAIL = 'SEVENTH_NX_CAMRAIL'
+
+
+def _fcvtas(wd, sn):
+    return 0x1E240000 | (sn << 5) | wd
+
+
+def rail_body(addr, bss):
+    """Replaces `bl 0x643628` at +0x9FA5B4 (0x644075's normal camera path).
+
+    Integers are gathered first (every translator call clobbers x0-x18);
+    the float work is done after the last load and survives the two
+    translator calls that store the result (they do not touch v-regs).
+    Frame: x19-x28 saved; vy parked at sp+0x60."""
+    b = _B(addr)
+    b.emit(A.stp64_pre(19, 20, 31, -0x70),
+           _stp_off(21, 22, 0x10), _stp_off(23, 24, 0x20),
+           _stp_off(25, 26, 0x30), _stp_off(27, 28, 0x40),
+           _stp_off(29, 30, 0x50))
+    b.emit(A.ldr(19, RAIL_CTX, 0x14), A.sub_imm(19, 19, RAIL_POINT))
+    b.emit(A.mov_reg(0, 19))
+    b.bl(G2H)
+    b.emit(A.ldrsh(20, 0, 0))                  # x before the rail
+    b.emit(A.add_imm(0, 19, 2))
+    b.bl(G2H)
+    b.emit(A.ldrsh(22, 0, 0))                  # y before the rail
+    b.bl(RAIL_TGT)                             # the stock projection
+    _mov32(b.w, 0, TRIGGERS_HDR)
+    b.bl(G2H)
+    b.emit(A.ldr(23, 0, 0))                    # header (guest)
+    b.emit(A.add_imm(0, 23, 0x14))
+    b.bl(G2H)
+    b.emit(A.ldrb(9, 0, 0), A.sub_imm(9, 9, 1), _cmp_imm(9, 1))
+    b.to('done', HI)                           # not 1 or 2
+    b.emit(A.add_imm(24, 9, 0))                # w24 = mode - 1 (0 or 1)
+    regs = (25, 26, 27, 28)                    # L, T, R, B
+    for k, r in enumerate(regs):
+        b.emit(A.add_imm(0, 23, 0xC + 2 * k))
+        b.bl(G2H)
+        b.emit(A.ldrsh(r, 0, 0))
+    _mov32(b.w, 0, VIEW_X)
+    b.bl(G2H)
+    b.emit(A.ldr(23, 0, 0))                    # vx (header no longer needed)
+    _mov32(b.w, 0, VIEW_Y)
+    b.bl(G2H)
+    b.emit(A.ldr(9, 0, 0), A.str_(9, 31, 0x60))   # vy
+    # ---- floats: s0,s1 the real point; s2..s5 A and B' ------------------
+    _bss_ptr(b, 10, bss + 8)
+    b.emit(_ldr_s(6, 10, 0), _ldr_s(7, 10, 4))     # captured cx, cy
+    # x: frac only if trunc(cx) - vx == x_pre (the clip left x alone)
+    b.emit(_fcvtzs(9, 6), A.sub_reg(10, 9, 23), A.cmp_reg(10, 20),
+           _scvtf(16, 9), A.fsub_s(6, 6, 16),      # s6 = cx - trunc(cx)
+           _scvtf(0, 20))
+    b.to('nofx', NE)
+    b.emit(A.fadd_s(0, 0, 6))
+    nofx = len(b.w)
+    b.emit(A.ldr(11, 31, 0x60),
+           _fcvtzs(9, 7), A.sub_reg(10, 9, 11), A.cmp_reg(10, 22),
+           _scvtf(16, 9), A.fsub_s(7, 7, 16),
+           _scvtf(1, 22))
+    b.to('nofy', NE)
+    b.emit(A.fadd_s(1, 1, 7))
+    nofy = len(b.w)
+    # A = (L+160, T+120) B' = (R-160, B-120) for mode 1; mode 2 swaps the y's
+    b.emit(A.add_imm(9, 25, 160), _scvtf(2, 9),        # Ax = L + 160
+           A.add_imm(9, 26, 120), A.sub_imm(10, 28, 120),
+           _cmp_imm(24, 0),
+           _csel(11, 9, 10, EQ),                       # Ay
+           _csel(12, 10, 9, EQ),                       # B'y
+           _scvtf(3, 11),
+           A.sub_imm(9, 27, 160), _scvtf(4, 9),        # B'x = R - 160
+           _scvtf(5, 12))
+    # d = B' - A ; dd = d.d ; t = ((p - A).d) / dd ; r = A + t d
+    b.emit(A.fsub_s(4, 4, 2), A.fsub_s(5, 5, 3),       # s4,s5 = d
+           A.fmul_s(16, 4, 4), A.fmul_s(17, 5, 5), A.fadd_s(16, 16, 17))
+    b.emit(_fcmp_zero(16))
+    b.to('done', EQ)
+    b.emit(A.fsub_s(0, 0, 2), A.fsub_s(1, 1, 3),
+           A.fmul_s(0, 0, 4), A.fmul_s(1, 1, 5), A.fadd_s(0, 0, 1),
+           A.fdiv_s(0, 0, 16),                         # t
+           A.fmul_s(1, 0, 5), A.fadd_s(1, 1, 3),       # ry
+           A.fmul_s(0, 0, 4), A.fadd_s(0, 0, 2),       # rx
+           _fcvtas(20, 0), _fcvtas(22, 1))
+    b.emit(A.mov_reg(0, 19))
+    b.bl(G2H)
+    b.emit(A.strh(20, 0, 0))
+    b.emit(A.add_imm(0, 19, 2))
+    b.bl(G2H)
+    b.emit(A.strh(22, 0, 0))
+    done = len(b.w)
+    b.emit(_ldp_off(29, 30, 0x50), _ldp_off(27, 28, 0x40),
+           _ldp_off(25, 26, 0x30), _ldp_off(23, 24, 0x20),
+           _ldp_off(21, 22, 0x10), A.ldp64_post(19, 20, 31, 0x70),
+           A.ret())
+    return b.resolve({'done': done, 'nofx': nofx, 'nofy': nofy})
+
+
+def _fcmp_zero(sn):
+    return 0x1E202008 | (sn << 5)              # fcmp Sn, #0.0
+
+
 # ------------------------------------------------------------ arrow table
 def _s16(v):
     v &= 0xFFFF
@@ -384,6 +508,31 @@ def hidden_gateways(sec2, sec8, dist=DUP_DIST):
                    for g in gws)
         if g[2] == 1 and d <= dist:
             hide.add(g[0])
+    # BUILD 618z (woa_3, user 10-05): one exit line can be split into
+    # several gateways with the same destination, end to end. Hiding the
+    # one nearest the explicit arrow left its neighbour's arrow at the
+    # corner of the 16:9 picture (gateways 1/2 -> map 705). Every gateway
+    # chained to a hidden one (shared endpoint, same destination) goes too.
+    segs = {}
+    for i in range(12):
+        v = struct.unpack_from('<9hH', sec8, 0x38 + 24 * i)
+        if v[9] == 0x7FFF or not any(v[:6]):
+            continue
+        segs[i] = (v[0:3], v[3:6], v[6:10])
+    grew = True
+    while grew:
+        grew = False
+        for i, (a0, a1, dest) in segs.items():
+            if i in hide or sec8[0x218 + i] != 1:
+                continue
+            for j in list(hide):
+                if j not in segs or segs[j][2] != dest:
+                    continue
+                b0, b1 = segs[j][0], segs[j][1]
+                if a0 in (b0, b1) or a1 in (b0, b1):
+                    hide.add(i)
+                    grew = True
+                    break
     return hide
 
 
@@ -427,8 +576,10 @@ def _word(text, va):
     return struct.unpack_from('<I', text, va)[0]
 
 
-def check_sites(text, smooth, wide, arrow):
+def check_sites(text, smooth, wide, arrow, rail=False):
     bad = []
+    if rail and _word(text, RAIL_SITE) != A.bl(RAIL_SITE, RAIL_TGT):
+        bad.append('+0x%X' % RAIL_SITE)
     if smooth:
         for va, want in FTOL_STOCK.items():
             if _word(text, va) != want:
@@ -447,32 +598,39 @@ def check_sites(text, smooth, wide, arrow):
 
 
 def apply_to_nso(src, dest, stock, flevel=None, smooth=None, wide=None,
-                 arrow=None):
+                 arrow=None, rail=None):
     smooth = _on(ENV_SMOOTH) if smooth is None else smooth
+    rail = _on(ENV_RAIL) if rail is None else rail
     wide = _on(ENV_WIDE) if wide is None else wide
     arrow = (_on(ENV_ARROW) if arrow is None else arrow) and bool(flevel)
-    if not (smooth or wide or arrow):
+    if not (smooth or wide or arrow or rail):
         raise ValueError('nothing to install')
     with open(src, 'rb') as handle:
         blob = handle.read()
     segs, raw = AC.segments(blob)
     text = bytearray(raw[0])
-    bad = check_sites(text, smooth, wide, arrow)
+    bad = check_sites(text, smooth or rail, wide, arrow, rail)
     if bad:
         raise ValueError('sites not stock: ' + ', '.join(bad))
     lo, hi = DS.part(src, 'pointers', stock)
     pool = DS.Bump(lo, hi)
-    words, rep = {}, {'smooth': smooth, 'wide': wide, 'arrow': arrow}
+    words, rep = {}, {'smooth': smooth, 'wide': wide, 'arrow': arrow,
+                      'rail': rail}
     growth = 0
-    if smooth:
+    if smooth or rail:
+        # the ftol capture serves both: hand (kind 1) and camera (kind 0)
         bss = AC.scratch_base(blob, segs)
         growth = BSS_BYTES + AC.bss_tail_slack(segs)
         for va, slot in ((FTOL_X, 0), (FTOL_Y, 4)):
             e = pool.put(lambda _e, ad, s=slot: ftol_body(ad, bss, s))
             words[va] = A.bl(va, e)
+        rep['bss'] = bss
+    if smooth:
         e = pool.put(lambda _e, ad: submit_body(ad, bss))
         words[SUBMIT] = A.bl(SUBMIT, e)
-        rep['bss'] = bss
+    if rail:
+        e = pool.put(lambda _e, ad: rail_body(ad, bss))
+        words[RAIL_SITE] = A.bl(RAIL_SITE, e)
     if wide:
         e = pool.put(lambda _e, ad: clamp_body(ad))
         words[CLAMP_SITE] = A.b(CLAMP_SITE, e)

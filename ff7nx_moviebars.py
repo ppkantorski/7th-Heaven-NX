@@ -237,6 +237,32 @@ empty and the bars change nothing except hiding a model that had wandered
 into black.
 
 =============================================================================
+5b. BUILD 612 -- THE CREDITS
+=============================================================================
+The intro (and ending) credits are FF7's CREDITS mode: a 4:3 still, text
+staged OFF the 4:3 picture and slid in. At 16:9 the staging area is on
+screen, so the text is seen before it should be ("Producer" sitting in the
+right margin). ff7nx_credits already widened the fade quad and forces the
+colour clear, which stopped the SMEAR; nothing covered live text.
+
+The same painter now paints the LEFT and RIGHT bars (full height) when no
+movie plays and FF7's `_mode` word (guest 0xCBF9DC -- FFNx's
+common_externals._mode, main_loop + 0x8C) is 27, FF7_MODE_CREDITS: the
+main loop's jump table sends 27 to the case at x86 0x4094C8 that installs the
+credits loop 0x7A7A33. That is a MODE, set on every mode change, so it cannot
+be sticky the way HANDOFF-104 s5.1's [0xF4F454] was.
+
+Layout: the gate's three cbz now go to L_CRED instead of L_OUT; a movie sets
+w22 = 0 and paints all four bars as before. L_CRED translates 0xCBF9DC (the
+only new mechanism: one translator call, x0-x18/x30 clobbered, x30 dead, w22
+kept), compares with 27, and on a match sets w22 = 1 and `cbnz`s to the left
+bar; after the right bar `cbnz w22` leaves. No new `b`, so walk()'s rule --
+the one `b` is the return -- still holds. 86 words.
+
+SEVENTH_NX_CREDITS_BARS=0 compares with 0xFFF instead (never matches), so the
+layout and revert never depend on the switch.
+
+=============================================================================
 6. WHAT TO LOOK FOR ON HARDWARE
 =============================================================================
 Reactor 1 explosion, Cloud at the left edge of the picture:
@@ -305,8 +331,25 @@ LINK = 28                       # x28
 ONE_F = 23                      # x23 already holds 0x3F800000
 
 # word indices of the cave's labels; asserted in cave_words()
-L_GATE, L_LEFT, L_RIGHT, L_TOP, L_BOTTOM, L_OUT, L_ISSUE = 0, 7, 18, 25, 36, 43, 45
-N_WORDS = 76
+# BUILD 612: the credits arm (L_CRED) and the flag word before L_LEFT / the
+# stop word before L_TOP. See section 7 of the docstring.
+# BUILD 618y: five words after the movie gate skip every bar while the
+# field's BACKGROUND is a movie (BGMOVIE_flag), as FFNx does.
+(L_GATE, L_FLAG, L_LEFT, L_RIGHT, L_STOP, L_TOP, L_BOTTOM, L_OUT, L_CRED,
+ L_ISSUE) = 0, 12, 13, 24, 31, 32, 43, 50, 52, 60
+N_WORDS = 91
+BGMOVIE_FLAG = 0xCC0DC2            # modules_global_object + 0x3A
+NOP = 0xD503201F
+
+# BUILD 612 -- the intro / ending credits get the side bars too.
+CREDITS_ENV = 'SEVENTH_NX_CREDITS_BARS'
+GAME_MODE = 0xCBF9DC            # FF7's _mode word (FFNx: main_loop + 0x8C)
+MODE_CREDITS = 27               # FF7_MODE_CREDITS; main_loop's jump table
+                                # sends 27 to the case that installs the
+                                # credits loop 0x7A7A33 (x86 0x4094C8)
+MODE_NEVER = 0xFFF              # the compare when the arm is switched off
+CREDIT_FLAG = 22                # w22: 1 = side bars only (free, see s4)
+TRANSLATE = 0x10FC3A0
 
 # Anchors. Each says something different, and each is read out of the module
 # rather than typed from a listing.
@@ -420,7 +463,7 @@ def issue_block(t):
     return out
 
 
-def cave_words(addr, displaced, ext, block):
+def cave_words(addr, displaced, ext, block, credits=True):
     """
     The 76 words, laid out at addr(i).
 
@@ -438,16 +481,31 @@ def cave_words(addr, displaced, ext, block):
         return w
 
     # ---- gate --------------------------------------------------------- 7
-    lout = addr(L_OUT)
+    lcred = addr(L_CRED)
     words += [
         A.adrp(g, addr(0), PAGE),
         A.ldr64(g, g, MOVIE_PTR_OFF),
-        A.cbz64(g, addr(2), lout),
+        A.cbz64(g, addr(2), lcred),
         A.ldr64(g, g, 0),
-        A.cbz64(g, addr(4), lout),
+        A.cbz64(g, addr(4), lcred),
         A.ldr(g, g, IS_PLAYING_OFF),
-        A.cbz(g, addr(6), lout),
+        A.cbz(g, addr(6), lcred),
     ]
+    # a field whose background is a movie: no bars (ff7nx_moviealign fills)
+    try:
+        import ff7nx_moviealign as _MA
+        fill = _MA.fill_enabled()
+    except Exception:                                          # noqa: BLE001
+        fill = False
+    if fill:
+        words += A.movz_movk(0, BGMOVIE_FLAG)
+        words.append(A.bl(addr(len(words)), TRANSLATE))
+        words.append(A.ldrb(c, 0, 0))
+        words.append(A.cbnz(c, addr(len(words)), addr(L_OUT)))
+    else:
+        words += [NOP] * 5
+    assert len(words) == L_FLAG
+    words.append(A.movz(CREDIT_FLAG, 0))            # a movie: all four bars
     assert len(words) == L_LEFT
 
     # ---- left bar: x 0..m, y 0..1 ------------------------------------ 11
@@ -464,6 +522,8 @@ def cave_words(addr, displaced, ext, block):
         A.str_(c, SP, VX[0]), A.str_(one, SP, VX[1]),
         A.str_(c, SP, VX[2]), A.str_(one, SP, VX[3]),
     ])
+    assert len(words) == L_STOP
+    words.append(A.cbnz(CREDIT_FLAG, addr(L_STOP), addr(L_OUT)))  # credits
     assert len(words) == L_TOP
 
     # ---- top bar: x 0..1, y 0..ytop ---------------------------------- 11
@@ -485,7 +545,24 @@ def cave_words(addr, displaced, ext, block):
     # ---- tail: fallen into from the bottom bar, jumped to by the gate - 2
     words.append(displaced)
     words.append(A.b(addr(L_OUT + 1), RETURN_VA))
-    assert len(words) == L_ISSUE
+    assert len(words) == L_CRED
+
+    # ---- credits: no movie, but FF7's _mode is CREDITS -> side bars -- 8
+    # The translator clobbers x0-x18 and x30 only; x30 is dead here (the
+    # epilogue reloads it) and w22 survives. No `b` is added: the jump back
+    # to the left bar is a cbnz on the flag just set, so the cave's only `b`
+    # is still the return (walk() depends on that).
+    mode = MODE_CREDITS if credits else MODE_NEVER
+    words += A.movz_movk(0, GAME_MODE)
+    words.append(A.bl(addr(len(words)), TRANSLATE))
+    words += [
+        A.ldrh(c, 0, 0),
+        A.cmp_imm(c, mode),
+        A.bcond(addr(len(words) + 2), addr(L_OUT), A.NE),
+        A.movz(CREDIT_FLAG, 1),
+        A.cbnz(CREDIT_FLAG, addr(len(words) + 4), addr(L_LEFT)),
+    ]
+    assert len(words) == L_ISSUE, len(words)
 
     # ---- the issue block, copied out of the module ------------------- 31
     words.append(A.add_imm64(LINK, 30, 0))          # mov x28, x30
@@ -604,7 +681,7 @@ def build_patches(img, starts, ws_scale, log=print):
     entry, words = ff7nx_cave.emit_laid_out(
         pool,
         lambda entry_va, addr, _d=displaced, _e=ext, _b=block:
-            cave_words(addr, _d, _e, _b),
+            cave_words(addr, _d, _e, _b, credits_enabled()),
         span=0x80000)
     words[HOOK] = A.b(HOOK, entry)
     log('  movie margin bars: %d words in padding, entry +%#x' % (N_WORDS, entry))
@@ -614,6 +691,9 @@ def build_patches(img, starts, ws_scale, log=print):
     log('    right  x %.6f .. 1.000000' % ext['rm'])
     log('    top    y 0.000000 .. %.6f' % ext['ytop'])
     log('    bottom y %.6f .. 1.000000' % ext['ybot'])
+    log('    credits (FF7 _mode %d at 0x%X): left + right bars only -- %s'
+        % (MODE_CREDITS, GAME_MODE,
+           'ON' if credits_enabled() else 'OFF (%s=0)' % CREDITS_ENV))
     return words
 
 
@@ -701,7 +781,7 @@ def _cpu_class():
     return Cpu
 
 
-def _emu_run(words_map, entry, playing, copy_tgt):
+def _emu_run(words_map, entry, playing, copy_tgt, game_mode=1):
     """
     Execute the cave and read back every rect it submits.
 
@@ -720,6 +800,8 @@ def _emu_run(words_map, entry, playing, copy_tgt):
         mem.setu(MOVIE_OBJ + IS_PLAYING_OFF, 1 if playing else 0, 4)
 
     cpu = _cpu_class()(mem)
+    # FF7's _mode word, where the interpreter's flat translator will look
+    mem.setu(cpu.guest_to_host(GAME_MODE), game_mode, 2)
     cpu.sp = SP
     cpu.set(19, 0x81000000)                    # the vertex-buffer object
     cpu.set(20, 0x82000000)                    # the renderer
@@ -739,7 +821,7 @@ def _emu_run(words_map, entry, playing, copy_tgt):
                     for k in range(4)])
 
     cpu.native = {tgt: (capture if tgt == copy_tgt else (lambda _c: None))
-                  for tgt in _external_calls(words_map)}
+                  for tgt in _external_calls(words_map) if tgt != TRANSLATE}
     exit_pc = cpu.run(entry, None, code=words_map, start_pc=entry,
                       max_steps=20000)
     return got, exit_pc
@@ -902,6 +984,28 @@ def verify(main=None, log=print):
         ck(not nullo and pc_null == RETURN_VA,
            'a null movie object is guarded, not dereferenced')
 
+        # ---- 5b. BUILD 612: the credits get the side bars only --------
+        cr, pc_cr = _emu_run(words_map, entry, False, copy_tgt,
+                             game_mode=MODE_CREDITS)
+        r = _rects(cr)
+        ck(len(r) == 2 and pc_cr == RETURN_VA,
+           'credits, no movie: exactly two quads, then return (%d)' % len(r))
+        if len(r) == 2:
+            ck(abs(r[0][0]) < 1e-6 and abs(r[0][1] - ext['m']) < 1e-6
+               and r[0][2] == 0.0 and r[0][3] == 1.0,
+               'credits left bar  x 0 .. %.6f, full height' % ext['m'])
+            ck(abs(r[1][0] - ext['rm']) < 1e-6 and r[1][1] == 1.0
+               and r[1][2] == 0.0 and r[1][3] == 1.0,
+               'credits right bar x %.6f .. 1, full height' % ext['rm'])
+        crn, _ = _emu_run(words_map, entry, None, copy_tgt,
+                          game_mode=MODE_CREDITS)
+        ck(len(crn) == 2, 'credits with no movie object at all: still 2 bars')
+        fld, pc_f = _emu_run(words_map, entry, False, copy_tgt, game_mode=1)
+        ck(not fld and pc_f == RETURN_VA, 'field mode, no movie: nothing')
+        both, _ = _emu_run(words_map, entry, True, copy_tgt,
+                           game_mode=MODE_CREDITS)
+        ck(len(both) == 4, 'a movie during credits: the full four bars')
+
         # ---- 6. the cave disassembles -------------------------------
         ck(_disasm_ok(words_map, entry, log),
            'every word of the cave disassembles to a real instruction')
@@ -967,6 +1071,16 @@ def enabled(env=None):
         return ff7nx_moviealign.enabled()
     except Exception:                                          # noqa: BLE001
         return False
+
+
+def credits_enabled(env=None):
+    """BUILD 612: side bars during FF7_MODE_CREDITS too. On by default;
+    SEVENTH_NX_CREDITS_BARS=0 keeps the arm but makes its compare impossible,
+    so the cave's layout (and revert) never depends on the switch."""
+    raw = env if env is not None else os.environ.get(CREDITS_ENV)
+    if raw is None:
+        return True
+    return str(raw).strip().lower() not in ('', '0', 'off', 'no', 'false')
 
 
 def resolve_main(path):

@@ -24,6 +24,38 @@
    "Spells": 1
   }
  },
+ "Nitpick.iro": {
+  "enabled": false,
+  "options": {
+   "UI": 0,
+   "NITPICK-CR": 1,
+   "NITPICK-TITLE": 2,
+   "NITPICK-RED": 0,
+   "NITPICK-BMARKER": 1,
+   "NITPICK-WMALT": 0,
+   "Battle": 0,
+   "NITPICK-DIAMONDFMV": 0,
+   "NITPICK-WEAPONSHD": 1,
+   "FieldModel": 0,
+   "NITPICK-BLACK": 2,
+   "Background": 0,
+   "NITPICK-BGMD8_2": 1,
+   "NITPICK-BGMD8_3": 1,
+   "NITPICK-BGMDS7": 1,
+   "NITPICK-BGMDS7PB_1": 1,
+   "NITPICK-BGMRKT4": 1,
+   "NITPICK-BGMDS5_5": 1,
+   "NITPICK-BGJAIL2": 1,
+   "Title Screen Music": 0,
+   "NITPICK-TITLEMUSIC": 1,
+   "PS1Style": 0,
+   "OPTIC-BLAST": 0,
+   "LIGHT-WORLD": 0,
+   "PIXELBACK": 0,
+   "UWBACK": 0,
+   "PBS": 0
+  }
+ },
  "Enhanced Stock UI-rel2.iro": {
   "enabled": false,
   "options": {
@@ -83,6 +115,28 @@
    "CHARACTER_TYPE": 1,
    "NON_CHIBI_CHARACTER_TYPE": 1,
    "Common": 1
+  }
+ },
+ "Double-input-fix": {
+  "enabled": true,
+  "options": {
+   "difix": 1,
+   "rate": 50,
+   "delay": 200
+  }
+ },
+ "Tsunamods__Idle_Animations_2.2_60fps": {
+  "enabled": true,
+  "options": {
+   "CloudAnim": 1,
+   "BarretAnim": 1,
+   "TifaAnim": 1,
+   "AerithAnim": 1,
+   "RedAnim": 1,
+   "CaitAnim": 1,
+   "CidAnim": 1,
+   "YuffieAnim": 1,
+   "VincentAnim": 1
   }
  },
  "ff7-60fps-mod.iro": {
@@ -233,9 +287,12 @@
   "mod_load_order": [
    "[Tsunamods]_Cosmo_Memory.iro",
    "[Tsunamods]_Modern_Spell_Names.iro",
+   "Nitpick.iro",
    "Enhanced Stock UI-rel2.iro",
    "Echo-s.iro",
    "CosmosFMV30.iro",
+   "Double-input-fix",
+   "Tsunamods__Idle_Animations_2.2_60fps",
    "ff7-60fps-mod.iro",
    "Ninostyle Chibi Fixes and Additions v2.5.iro",
    "Ninostyle Battle.iro",

@@ -175,6 +175,85 @@ def cave_body() -> list[int]:
     return w
 
 
+# ---------------------------------------------------------------------------
+# BUILD 618y -- WM_FILL for a field whose BACKGROUND is a movie
+# ---------------------------------------------------------------------------
+# las4_2 (hardware 10-04): the waterfall is the movie last4_2 playing under
+# the field, and it showed 4:3 with bars. FFNx draws it with Cosmos's
+# movie_config `mode = 4` (WM_FILL, gl.cpp gl_draw_movie_quad_common): the
+# quad spans the whole wide viewport. Cosmos lists exactly the background
+# movies (last4_2, last4_3, lastmap, mtcrl). The port's equivalent is the
+# guest's own flag: modules_global_object (0xCC0D88) + 0x3A, BGMOVIE_flag,
+# which ff7nx_camclamp already reads on hardware. When it is set, the quad's
+# x runs -M .. 640+M (M = 640 * (1/WS_SCALE - 1) / 2), the 16:9 width; y is
+# left as moviealign sets it. ff7nx_moviebars skips its bars on the same flag.
+FILL_ENV = 'SEVENTH_NX_MOVIE_FILL'
+BGMOVIE_FLAG = 0xCC0DC2
+TRANSLATE = 0x10FC3A0              # guest -> host; clobbers x0-x18, x30
+X_SLOTS = ((0x28, 1), (0x48, 1), (0x68, 0), (0x88, 0))   # (slot, at 640?)
+FRAME = 0xA0                       # x0..x18 + x30
+
+
+def fill_enabled():
+    v = os.environ.get(FILL_ENV, '').strip().lower()
+    return v not in ('0', 'off', 'false', 'no')
+
+
+def fill_margin(ws_scale):
+    return 640.0 * (1.0 / ws_scale - 1.0) / 2.0
+
+
+def fill_cave(ws_scale):
+    """build(entry, addr) for ff7nx_cave.emit_laid_out: the ten y words,
+    then the BGMOVIE test and the x stores, the displaced word, the return."""
+    import a64 as A
+    m = fill_margin(ws_scale)
+    lo = struct.unpack('<I', struct.pack('<f', -m))[0]
+    hi = struct.unpack('<I', struct.pack('<f', 640.0 + m))[0]
+    zoom = (640.0 + 2.0 * m) / 640.0
+
+    def build(entry, addr):
+        w = list(cave_body())
+        w.append(A.sub_imm64(SP, SP, FRAME))
+        regs = list(range(0, 19)) + [30]
+        for i in range(0, 20, 2):
+            w.append(A.stp64_off(regs[i], regs[i + 1], SP, 8 * i))
+        w += A.movz_movk(0, BGMOVIE_FLAG)
+        w.append(A.bl(addr(len(w)), TRANSLATE))
+        w.append(A.ldrb(9, 0, 0))
+        skip_at = len(w)
+        w.append(None)                                  # cbz w9, skip
+        w += A.movz_movk(10, hi)
+        w += [A.str_(10, SP, FRAME + off) for off, at in X_SLOTS if at]
+        w += A.movz_movk(10, lo)
+        w += [A.str_(10, SP, FRAME + off) for off, at in X_SLOTS if not at]
+        # BUILD 618y (hardware): stretching left bands above and below --
+        # zoom instead. y is scaled about the picture's centre by the same
+        # factor as x, so the movie keeps its shape and covers the screen
+        # (a little is cropped top and bottom, as FFNx's WM_ZOOM does).
+        ytop, ybot = FRAME + Y_ZERO[0], FRAME + Y_H[0]
+        w += [A.ldr_s(0, SP, ytop), A.ldr_s(1, SP, ybot),
+              A.fadd_s(2, 0, 1)]
+        w += A.movz_movk(10, struct.unpack('<I', struct.pack('<f', 0.5))[0])
+        w += [A.fmov_s_from_w(3, 10), A.fmul_s(2, 2, 3),       # centre
+              A.fsub_s(4, 1, 0), A.fmul_s(4, 4, 3)]            # half height
+        w += A.movz_movk(10, struct.unpack('<I', struct.pack(
+            '<f', zoom))[0])
+        w += [A.fmov_s_from_w(3, 10), A.fmul_s(4, 4, 3),
+              A.fsub_s(5, 2, 4), A.fadd_s(6, 2, 4)]
+        w += [A.str_s(5, SP, FRAME + off) for off in Y_ZERO]
+        w += [A.str_s(6, SP, FRAME + off) for off in Y_H]
+        skip = len(w)
+        w[skip_at] = A.cbz(9, addr(skip_at), addr(skip))
+        for i in range(0, 20, 2):
+            w.append(A.ldp64_off(regs[i], regs[i + 1], SP, 8 * i))
+        w.append(A.add_imm64(SP, SP, FRAME))
+        w.append(DISPLACED)
+        w.append(A.b(addr(len(w)), DRAW_CALL))
+        return w
+    return build
+
+
 DISASM = [
     'mov w9, #0x41800000',
     'str w9, [sp, #0x2c]',
@@ -262,9 +341,24 @@ def plan(main, revert: bool, log=print):
     if st['applied']:
         return [], ['  movie align: already applied']
 
-    out, entry = ff7nx_cave.emit_hooked(
-        ff7nx_cave.HolePool(img, starts=set(m.arm_starts)),
-        HOOK_VA, DISPLACED, cave_body())
+    if fill_enabled():
+        import a64 as A
+        import ff7nx_movieclip
+        ws = ff7nx_movieclip.shipped_ws_scale(str(main),
+                                              log=lambda *_: None)
+        entry, out = ff7nx_cave.emit_laid_out(
+            ff7nx_cave.HolePool(img, starts=set(m.arm_starts)),
+            fill_cave(ws))
+        out[HOOK_VA] = A.b(HOOK_VA, entry)
+        notes.append('  movie fill (BUILD 618y): a background movie '
+                     '(BGMOVIE_flag) is zoomed to fill 16:9, x %.2f..%.2f, '
+                     'height x%.4f about its centre'
+                     % (-fill_margin(ws), 640 + fill_margin(ws),
+                        (640 + 2 * fill_margin(ws)) / 640))
+    else:
+        out, entry = ff7nx_cave.emit_hooked(
+            ff7nx_cave.HolePool(img, starts=set(m.arm_starts)),
+            HOOK_VA, DISPLACED, cave_body())
     patches = []
     for va in sorted(out):
         cur = w32(img, va)

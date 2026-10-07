@@ -260,7 +260,36 @@ EDGE_X = os.environ.get('SEVENTH_NX_NO_PARALLAX_EDGE_X') != '1'
 # 256 and is still an overlay, not a backdrop.  Keep the exclusion at the
 # field/layer boundary, rather than changing the shared wrap/fill arithmetic;
 # every other layer continues to use the existing, hardware-tested behavior.
-NON_TILEABLE_OVERLAYS = frozenset({('junonl2', 4), ('junonr2', 4)})
+#
+# BUILD 618k. `crater_1` layers 3 and 4 (the sky and the crater wall) are the
+# same mistake: the wall's header speed is 32 (1/8 of the camera), so this
+# pass copied its ten rows every 320 units and the copied ragged top edge
+# hung at the top of the screen (hardware, 10-02). Cosmos's chunk.9 already
+# lays both layers out for 16:9 (x -224..224), the wall's exact reach is rows
+# -139..160, which the chunk covers, and FFNx fills neither. Both layers are
+# redrawn from the chunk by ff7nx_chunkparallax.
+NON_TILEABLE_OVERLAYS = frozenset({('junonl2', 4), ('junonr2', 4),
+                                   ('crater_1', 3), ('crater_1', 4)})
+
+# BUILD 618p. `las0_3` layer 4 (the animated fog, hardware 10-03): flat-edged
+# fog bands at the top of the screen. The layer is CAMERA-LOCKED (header speed
+# 256/256) with a 1024x1024 period, so it moves exactly like layers 1/2 and
+# can never wrap inside a 240x427 view: there is nothing for this pass to
+# repeat. The planner still copied its rows upward (y -88 -> -280), stacking
+# fog above fog. The whole archive has six such layers that this pass grew,
+# and every one of them is a one-off overlay copied onto itself:
+#   las0_3 L4 (fog), del3 L4 (beach props/water), junair L3/L4 (the plane and
+#   its searchlights, stacked 2-3 times), junonl2 L3 and junonr2 L3 (the
+#   Rufus parade float, the L3 half of the 618 junonl2/junonr2 banner bug).
+# FFNx does not fill any layer, so skipping these draws exactly what FFNx
+# draws. Proved per field in _scratch/c6/grown.py: no layer-1/2 hole is
+# exposed by the removal.
+def camera_locked_overlay(hdr, layer):
+    """True for a layer that scrolls 1:1 with the camera and never wraps."""
+    return (hdr.get('bg%d_speed_x' % layer) == 256
+            and hdr.get('bg%d_speed_y' % layer) == 256
+            and hdr.get('bg%d_w' % layer, 0) >= 1024
+            and hdr.get('bg%d_h' % layer, 0) >= 1024)
 
 
 class FillError(Exception):
@@ -969,6 +998,8 @@ def _apply_plan(sec9, hdr, field_name, planner, budgeted, cap_sec9=None):
         if layer not in (3, 4) or n == 0:
             continue
         if (field_name, layer) in NON_TILEABLE_OVERLAYS:
+            continue
+        if camera_locked_overlay(hdr, layer):
             continue
         p = planner(sec9, first, n, hdr, layer)
         if p:

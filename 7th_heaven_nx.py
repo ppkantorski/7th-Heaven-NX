@@ -963,6 +963,36 @@ def _manifest_id(mod):
             .strip().lower())
 
 
+def _name_key(name):
+    """7th Heaven's name order (BUILD 619).
+
+    7H sorts names with .NET's default, culture-aware comparer, not by code
+    point: whitespace, then punctuation, then symbols, then digits, then
+    letters, case-insensitively. `casefold()` order agreed with that for
+    every mod we had, and disagrees the first time a name starting with "["
+    meets one starting with a digit -- "[Tsunamods] Idle Animations - 60fps"
+    against "60/30 FPS Gameplay", both category Animations. 7H puts the idle
+    mod ABOVE 60 FPS (its 60 fps idle clips win the shared names, as its
+    author intends); code-point order put it below.
+    """
+    import unicodedata
+    out = []
+    for ch in name:
+        if ch.isspace():
+            out.append((0, 0, ''))
+            continue
+        cat = unicodedata.category(ch)
+        if cat[0] == 'P':
+            out.append((1, ord(ch), ''))
+        elif cat[0] == 'S':
+            out.append((2, ord(ch), ''))
+        elif cat == 'Nd':
+            out.append((3, int(unicodedata.digit(ch, 0)), ''))
+        else:
+            out.append((4, 0, ch.casefold()))
+    return tuple(out)
+
+
 def _autosort_7h(mods):
     """Exactly mirror 7th Heaven's AutoSortBasedOnCategory().
 
@@ -975,7 +1005,7 @@ def _autosort_7h(mods):
     behavior for imperfect third-party constraints.
     """
     ordered = sorted(mods, key=lambda m: (mod_load_rank(m),
-                                           m.display_name.casefold()))
+                                           _name_key(m.display_name)))
     by_id = {_manifest_id(mod): mod for mod in ordered if _manifest_id(mod)}
     # Snapshot iteration is intentional: it is the `sortedList.ToList()` in
     # 7H's MyModsViewModel.AutoSortBasedOnCategory().
@@ -1026,8 +1056,13 @@ def discover_mods(order=None):
         return []
     found = []
     for fn in sorted(os.listdir(MODS_DIR)):
-        if fn.lower().endswith('.iro'):
-            mod = build.Mod(os.path.join(MODS_DIR, fn), CACHE_DIR)
+        full = os.path.join(MODS_DIR, fn)
+        # BUILD 619: an unpacked mod folder (mod.xml at its root) is a mod
+        # too, exactly as in 7th Heaven PC -- same options, same priority.
+        is_folder = (os.path.isdir(full) and not fn.startswith('.')
+                     and iro.folder_path(full, 'mod.xml') is not None)
+        if fn.lower().endswith('.iro') or is_folder:
+            mod = build.Mod(full, CACHE_DIR)
             # Cheap: reads mod.xml only, no extraction. Needed up front so
             # the category is known before we sort.
             mod._load_manifest()
@@ -1455,6 +1490,9 @@ def run_build(mods, enabled, settings_by_mod, log, progress,
     # now carry the nearest corner's 1/w: the terrain's depth formula.
     # 604b: and a shadow's size stops at 0 high up instead of inverting.
     produced += build.apply_shadowdepth(SDOUT_DIR, DUMP, log, produced)
+    # BUILD 620. Double Input Bugfix: the mod's x86 code patches as ARM64
+    # words (four at most, in place). Nothing unless the mod is enabled.
+    produced += build.apply_difix(SDOUT_DIR, DUMP, log, produced)
     # Resized SYW TEX payloads carry a per-file integer scale in two inert
     # header words. All three u/v reciprocal pairs in _load_texture apply that
     # scale when each graphics object is constructed, so every consumer keeps
@@ -1571,6 +1609,16 @@ def run_build(mods, enabled, settings_by_mod, log, progress,
     produced += build.apply_campos(SDOUT_DIR, DUMP, plan, log, produced)
     # BUILD 611. Pointer hand and exit arrows; see ff7nx_pointers.
     produced += build.apply_pointers(SDOUT_DIR, DUMP, plan, log, produced)
+    # BUILD 618z. Background-movie fields at 60, the movie at its own rate.
+    # It grows BSS, so it must come AFTER the Echo-S voice runtime (whose
+    # block has to end in the page the old BSS ended in) -- in build 387 it
+    # ran inside apply_field_frame and the voice runtime refused to install.
+    # See ff7nx_moviepace.
+    produced += build.apply_moviepace(SDOUT_DIR, DUMP, log, produced)
+    # BUILD 620j. Layers 3/4 in sub-unit steps (anfrst_4's beams). Grows BSS
+    # by 4 bytes, so it sits beside moviepace, after the voice runtime. See
+    # ff7nx_subparallax.
+    produced += build.apply_subparallax(SDOUT_DIR, DUMP, log, produced)
     # BUILD 537. The sound-buffer pool: 32 MB static -> heap, so Cosmo
     # Memory's long SFX loops cannot close the game (Chocobo Race). Last of
     # the cave passes so no shipping cave moves. See ff7nx_audiopool.

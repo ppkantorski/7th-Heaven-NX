@@ -46,11 +46,37 @@ already on screen can drop out and pop back. Routes 0 and 2 (8 and 9 block
 connectors) stay stock. The story (Icicle Inn) course, table 0x939CE0, is
 untouched in this build.
 
+THE STORY COURSE (BUILD 617c)
+=============================
+The Icicle Inn run uses a second set of the same tables, picked by
+0x722F82 on [0xDD865C] (1 = story): routes 0x939CE0 (7 routes: a 301-block
+trunk forking twice into four 50-block legs, 601 blocks), first-block
+indices 0x926298, spawn functions 0x9661B0 (run once per block via the
+flag at 0xDDC1A8, objects from the same 32-entry pool shape at 0xDDC478).
+Its per-block object counts are not hand-derived like the Gold Saucer's:
+`_scratch`'s static counter -- calls to the story allocator (0x73BF70 /
+0x73CE98) through every helper, a loop or a helper with runtime behaviour
+counted as UNKNOWN -- reproduces the Gold Saucer's hand table exactly on
+635 of 636 blocks (the 636th is one under), and on the story course every
+UNKNOWN is taken as 6. Same rule, same three budgets, all seven routes.
+
 FAR PLANE
 =========
 16384 units (x86 0x722F40 `push 0x46800000`, ARM +0xE4D528
 `mov w8, #0x46800000`, the only site) -> 32768, so the longer window is
 never clipped at the back.
+
+BUILD 617c turns it back ON by default. Build 544 turned it off because
+build 542 was the first build in which Cloud's eyes flickered. The real
+cause turned out to be the eye decal sitting exactly on his skin, which
+BUILD 547 fixed by lifting it 2 units (ff7nx_snowface). Depth precision
+near the camera is set by the near plane (64); doubling the far plane
+barely moves it. With the plane at 32768, a newly listed block may be up to
+FAR_DIST (30000) away, and the lookahead may grow by up to K_FAR (8) blocks.
+The block-list cap (12 ahead) then decides, rather than the distance limit:
+the Gold Saucer's median lookahead goes from 9 to 12 blocks (a median of
+12.3k to 14.6k units). SEVENTH_NX_SNOW_FAR=0 restores the stock plane, along
+with BUILD 544's 14500 / +4 limits.
 """
 from __future__ import annotations
 
@@ -78,7 +104,20 @@ MAX_BLOCKS, MAX_QUEUE, MAX_POOL = 14, 96, 20
 QUEUE_RESERVE = 12
 # block positions: route +0x1C, 3 x int32 per block (x, y, z)
 MAX_DIST = 14500.0
-FAR_ENV = 'SEVENTH_NX_SNOW_FAR'          # 1 = also raise the far plane
+FAR_ENV = 'SEVENTH_NX_SNOW_FAR'          # 0 = keep the stock far plane
+FAR_DIST = 30000.0                     # 617c: inside the 32768 plane
+K_FAR = 8
+
+# BUILD 617c: the Icicle Inn (story) course
+STORY_ROUTE_TABLE = 0x939CE0
+STORY_ROUTES = 7
+STORY_ROUTE_BASES = 0x926298
+STORY_SPAWN_TABLE = 0x9661B0
+STORY_BLOCKS = 601
+STORY_SPAWN_SHA1 = '7f911228cc96fc6b488af430881e2dac897155bc'
+STORY_SPAWNS = bytes(int(c, 16) for c in (
+    '0000000010000001100010000010000210000000300000003010000010100101001000000111100100000100000000000000000000000000000100000000000000002100001000000010100000001000020600000000011201120112011201120112011201120112011201120112000000000000066666666666666666666666666600000300013000000100000000000000000000000100000000000000212222221122021321222120203020200000000000111112000000010111110121022101010102200000010000000000000666000000666666666000000666600000000000000000000002022220022201122002131112266666666001000000000000000063200003224322222420000000000000000000032322000000000000000000000000000000000000000'))
+STORY_GROW_ROUTES = tuple(range(STORY_ROUTES))
 
 FAR_SITE = 0xE4D528
 FAR_STOCK = 0x52A8D008                 # mov w8, #0x46800000   16384.0
@@ -110,13 +149,16 @@ class _Pe:
         raise ValueError('VA %#x not in file' % va)
 
 
-def _routes(data):
+def _routes(data, story=False):
     pe = _Pe(data)
     rd = lambda va, n: data[pe.off(va):pe.off(va) + n]
-    bases = struct.unpack('<5h', rd(ROUTE_BASES, 10))
+    nr = STORY_ROUTES if story else ROUTES
+    bases = struct.unpack('<%dh' % nr, rd(STORY_ROUTE_BASES if story
+                                           else ROUTE_BASES, 2 * nr))
+    table = STORY_ROUTE_TABLE if story else ROUTE_TABLE
     out = []
-    for k in range(ROUTES):
-        e = rd(ROUTE_TABLE + 32 * k, 32)
+    for k in range(nr):
+        e = rd(table + 32 * k, 32)
         n = struct.unpack_from('<h', e, 0)[0]
         ptrs = struct.unpack_from('<5I', e, 12)
         words = struct.unpack('<%dI' % n, rd(ptrs[2], 4 * n))
@@ -140,6 +182,23 @@ def check(data):
     return []
 
 
+def check_story(data):
+    _r, _pe, rd = _routes(data, story=True)
+    if hashlib.sha1(rd(STORY_SPAWN_TABLE, 4 * STORY_BLOCKS)
+                    ).hexdigest() != STORY_SPAWN_SHA1:
+        return ['story spawn table 0x%X is not the measured one'
+                % STORY_SPAWN_TABLE]
+    if sum(r['n'] for r in _r) != STORY_BLOCKS:
+        return ['story route table does not describe %d blocks'
+                % STORY_BLOCKS]
+    return []
+
+
+def _limits():
+    """(K, distance limit) -- 617c: the longer reach rides on the far plane."""
+    return (K_FAR, FAR_DIST) if far_enabled() else (K, MAX_DIST)
+
+
 def _window(i, look, r, sp):
     n = r['n']
     j0, j1 = max(0, i - 1), min(n - 1, i + look)
@@ -152,19 +211,20 @@ def _dist(a, b):
     return sum((x - y) ** 2 for x, y in zip(a, b)) ** 0.5
 
 
-def plan(stock_look, r):
+def plan(stock_look, r, spawns=None):
     """New lookahead list for one route (from its STOCK values)."""
     n = r['n']
-    sp = list(SPAWNS[r['base']:r['base'] + n])
+    sp = list((SPAWNS if spawns is None else spawns)[r['base']:r['base'] + n])
     pos = r['pos']
+    grow, limit = _limits()
     new = []
     for i in range(n):
         best = stock_look[i]
-        # BUILD 544: stay inside the STOCK far plane (16384). The newest
-        # block may be no further than MAX_DIST, or than stock already put
-        # it at this position if that is further.
-        dmax = max(MAX_DIST, _dist(pos[i], pos[min(n - 1, i + best)]))
-        for L in range(stock_look[i] + 1, min(stock_look[i] + K, L_MAX) + 1):
+        # BUILD 544: stay inside the far plane. The newest block may be no
+        # further than the distance limit, or than stock already put it at
+        # this position if that is further.
+        dmax = max(limit, _dist(pos[i], pos[min(n - 1, i + best)]))
+        for L in range(stock_look[i] + 1, min(stock_look[i] + grow, L_MAX) + 1):
             if i + L > n - 1:
                 break
             if _dist(pos[i], pos[i + L]) > dmax:
@@ -187,26 +247,40 @@ def build(data, revert=False):
     bad = check(data)
     if bad:
         raise ValueError('; '.join(bad))
-    routes, pe, _rd = _routes(data)
     out = bytearray(data)
     stats = []
-    for k in GROW_ROUTES:
-        r = routes[k]
-        stock = _STOCK[k]
+    courses = [(False, GROW_ROUTES, _STOCK, SPAWNS)]
+    if story_enabled():
+        bad = check_story(data)
+        if bad:
+            raise ValueError('; '.join(bad))
+        courses.append((True, STORY_GROW_ROUTES, _STORY_STOCK, STORY_SPAWNS))
+    for story, grow_routes, stocks, spawns in courses:
+        routes, pe, _rd = _routes(data, story=story)
+        for k in grow_routes:
+            stats.append(_grow_route(out, pe, routes[k], k, stocks[k], spawns,
+                                     revert, story))
+    return bytes(out), stats
+
+
+def _grow_route(out, pe, r, k, stock, spawns, revert, story):
+    if True:
         cur = r['look']
-        target = stock if revert else plan(stock, r)
-        if cur not in (stock, plan(stock, r)):
-            raise ValueError('route %d lookahead is neither stock nor ours'
-                             % k)
+        mine = plan(stock, r, spawns)
+        target = stock if revert else mine
+        if cur != stock and cur != mine and not all(
+                c >= s for c, s in zip(cur, stock)):
+            raise ValueError('%s route %d lookahead is neither stock nor ours'
+                             % ('story' if story else 'Gold Saucer', k))
         o = pe.off(r['look_va'])
         out[o:o + r['n']] = bytes(target)
-        sp = list(SPAWNS[r['base']:r['base'] + r['n']])
+        sp = list(spawns[r['base']:r['base'] + r['n']])
         grown = [i for i in range(r['n']) if target[i] > stock[i]] or [0]
         worst = [max(_window(i, target[i], r, sp)[j] for i in grown)
                  for j in range(3)]
-        stats.append((k, sorted(stock)[len(stock) // 2],
-                      sorted(target)[len(target) // 2], max(target), worst))
-    return bytes(out), stats
+        return (('story ' if story else '') + str(k),
+                sorted(stock)[len(stock) // 2],
+                sorted(target)[len(target) // 2], max(target), worst)
 
 
 def _stock_tables():
@@ -218,6 +292,22 @@ _S1 = ('050403040a0908070807060606060606080808080706060606060605040306060b0a0a09
 _S3 = ('05030202080808090a090908070605050505050707070707070707060505040505050606060606060606070706050504050505070707070908070706060505090807060505040807060505050a09080708080808080706050504040504030304050807070707070808080808080707070605060606060606060606060606060807080808070607060504050404030405040307060504030708070605040304060706050403040605040305070a0a0909080807060807070606060605060504030808080809080706050403020101')
 _S4 = ('0503020207070605050604030202060606060606060a09080707060504040606050404060504040505040405050406050506050407080708090807070605040505040606050404040706050404040407060504040404040507060505040505060505070605070605050504040506060504060606060606060606060606060606060606050403060606050403070707060504030306050807070707070908070605040605050706050407060506080808080706060505050706050407060505060605050407060505040404070605080706050403020101')
 _STOCK = _stock_tables()
+# BUILD 617c: the story course's stock lookaheads, routes 0..6
+_STORY_STOCK = {k: list(bytes.fromhex(h)) for k, h in {
+    0: '03040506060606060808090909090908070707070707070707070708080807060607060606060606060606060606060606060706060606050508070605050508070606050508070605050508070605050508070605050505060707060605050505050505060605050505050505050506060505050505050505050507060606060606070808080808080808080808080808080808080808080808080807070706060606060707070606060606060606060606060606060606060606060606060606060606060606060606060606060606060606060606060707070708090908080807070707060504040404040404040404040404040404040404040404040404040506060606060606060606060707060609090908080706060606060606060606060606060606060707060605',
+    1: '0708090909080707070707070606060505050505050505050505050505050505050505050505050605040303030707070707',
+    2: '0506060606060606060606060505050505050505050505050505050505050505050505050505050606060606060707070606',
+    3: '0707070606060606060707070707070707070706060606060606060606060606060606060606060606060606060606060606',
+    4: '0606060909090807070605050706060505050505060606060606070707060505050505060707060504040606060606060606',
+    5: '0608080605050507060505050404050706050505040508070605050504040404050505050605060505050506050505050505',
+    6: '0605040303020204050504030305050605050505060606060706060505070707070708080706060505060606060606060606',
+}.items()}
+STORY_ENV = 'SEVENTH_NX_SNOW_DRAW_STORY'
+
+
+def story_enabled(env=None):
+    v = (os.environ if env is None else env).get(STORY_ENV, '').strip().lower()
+    return v not in ('0', 'off', 'false', 'no', 'stock')
 
 
 def _exe_path(target):
@@ -247,15 +337,16 @@ def apply_exe(target, revert=False, log=print):
             fh.write(new)
         os.replace(path + '.snowdraw-tmp', path)
     for k, med0, med1, mx, (b, q, pl) in stats:
-        log('  snowboard route %d lookahead median %d -> %d blocks (max %d); '
+        log('  snowboard route %s lookahead median %d -> %d blocks (max %d); '
             'worst lengthened window %d blocks / %d queue / %d pool (budget %d / %d / %d)'
             % (k, med0, med1, mx, b, q, pl, MAX_BLOCKS, MAX_QUEUE, MAX_POOL))
     return 0
 
 
 def far_enabled(env=None):
+    """617c: ON unless SEVENTH_NX_SNOW_FAR=0 (see FAR PLANE above)."""
     v = (os.environ if env is None else env).get(FAR_ENV, '').strip().lower()
-    return v in ('1', 'on', 'true', 'yes')
+    return v not in ('0', 'off', 'false', 'no', 'stock')
 
 
 def apply_nso(target, revert=False, log=print):

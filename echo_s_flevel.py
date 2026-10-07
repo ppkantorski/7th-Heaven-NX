@@ -1379,6 +1379,102 @@ def pace_unpaced_hour_pickers(script_section: bytes, field_name=None):
     return bytes(out), changed
 
 
+# ------------------------------------------ time changes behind the black
+# BUILD 615. ealin_2: Cloud wakes in Aerith's house at night. Echo-S's
+# director sets the clock (hours = 2, days += 1) only AFTER the scene has
+# faded in and Cloud has said "I must've fallen asleep", so on a day/night
+# build the room is revealed in daylight and snaps to night in front of the
+# player. The two instructions move to the top of the scene's own gated
+# block -- after `if story == 0xAA`, before the scroll and the fade-in -- so
+# the room is already night when it appears.
+#
+#   before: scr2d scrlw fade(in) fadew reqew | if(bit) wait skip wsize mes |
+#           set h=2  plus d+1
+#   after:  set h=2  plus d+1 | scr2d scrlw fade(in) fadew reqew |
+#           if(bit) wait skip wsize mes
+#
+# Same bytes, same length. Every jump in the moved span keeps its target:
+# the `if` lands inside the span (moves with it), and the `skip` pointed at
+# the end of the span, so its offset drops by the 8 bytes now in front of it.
+# Echo-S only advanced the clock on one of the two dialogue branches (the
+# `if` above skips the line AND the clock); with the clock ahead of the
+# branch, both branches wake at night, which is the scene either way.
+# Anything that is not these exact bytes, exactly once, is left alone.
+TIME_HOIST_SCENE = bytes.fromhex(
+    '64 00 28 00 c2 ff'                     # scr2d
+    '67'                                    # scrlw
+    '6b 00 00 00 00 00 02 01 ff'            # fade in
+    '6c'                                    # fadew
+    '03 01 4d'                              # reqew
+    '14 30 41 02 06 06'                     # if bank3[0x41] & 2
+    '24 20 00'                              # wait 32
+    '10 16'                                 # skip -> end of span
+    '50 01 18 00 10 00 b0 00 29 00'         # wsize
+    '40 01 04')                             # mes "I must've fallen asleep."
+TIME_HOIST_CLOCK = bytes.fromhex('80 10 0f 02' '85 10 0e 01')
+TIME_HOIST_SKIP_AT = TIME_HOIST_SCENE.index(bytes.fromhex('10 16'))
+TIME_HOIST_FIELDS = ('ealin_2',)
+HOISTED_TIME_CHANGES = []
+
+
+def hoist_time_change_behind_fade(script_section: bytes, field_name=None):
+    """``(section, n)`` -- see the block above."""
+    if field_name not in TIME_HOIST_FIELDS:
+        return bytes(script_section), 0
+    old = TIME_HOIST_SCENE + TIME_HOIST_CLOCK
+    at = script_section.find(old)
+    if at < 0 or script_section.find(old, at + 1) >= 0:
+        return bytes(script_section), 0
+    scene = bytearray(TIME_HOIST_SCENE)
+    scene[TIME_HOIST_SKIP_AT + 1] -= len(TIME_HOIST_CLOCK)
+    new = TIME_HOIST_CLOCK + bytes(scene)
+    assert len(new) == len(old)
+    out = bytearray(script_section)
+    out[at:at + len(old)] = new
+    if field_name not in HOISTED_TIME_CHANGES:
+        HOISTED_TIME_CHANGES.append(field_name)
+    return bytes(out), 1
+
+
+# Snow Village's two window-light scripts alternate palette levels 57 and 66
+# on consecutive field ticks. On the 60 Hz port that is a full-screen 30 Hz
+# luminance flicker (visible in the user's recording). Keep the palette
+# mapping, banks, animation state and timing intact, but give both branches
+# the midpoint 61. The complete loop signatures are Echo-S-specific so an
+# upstream script change cannot silently patch an unrelated SETBYTE.
+SNOW_LIGHT_LOOPS = (
+    bytes.fromhex(
+        'e5 00 0b 00 0f 14 50 02 00 00 0b '
+        '80 50 00 39 80 50 02 01 10 09 '
+        '80 50 00 42 80 50 02 00 '
+        'ea 00 55 50 00 01 00 00 00 0f '
+        'e6 00 01 0b 0f 12 27 00'),
+    bytes.fromhex(
+        'e5 00 0e 02 0f 14 50 03 00 00 0b '
+        '80 50 01 39 80 50 03 01 10 09 '
+        '80 50 01 42 80 50 03 00 '
+        'ea 00 55 50 02 03 01 01 01 0f '
+        'e6 00 03 0e 0f 12 27 00'),
+)
+
+
+def steady_snow_window_lights(script_section: bytes, field_name=None):
+    """Make `snow`'s two window lights steady without changing script flow."""
+    if field_name != 'snow':
+        return bytes(script_section), 0
+    out = bytes(script_section)
+    changed = 0
+    for old in SNOW_LIGHT_LOOPS:
+        new = old.replace(b'\x39', b'\x3d').replace(b'\x42', b'\x3d')
+        if out.count(old) == 1:
+            out = out.replace(old, new, 1)
+            changed += 1
+        elif out.count(new) != 1:
+            raise EchoFlevelError('snow window-light loop changed; refusing '
+                                  'an unverified palette edit')
+    return out, changed
+
+
 # --------------------------------------------------- 12-hour pickers
 # BUILD 576. Every `Sleep` picker wraps its hour count the same way, right
 # after the step:
@@ -1678,6 +1774,12 @@ def merge_field_payload(stock_payload: bytes, echo_payload: bytes,
     # BUILD 576: every Sleep picker offers 1..12 hours; see the block above
     # `extend_hour_pickers`.
     echo_sections[0], _extended = extend_hour_pickers(
+        echo_sections[0], field_name)
+    # BUILD 615: a scene's clock change happens while the screen is black;
+    # see `hoist_time_change_behind_fade`.
+    echo_sections[0], _hoisted = hoist_time_change_behind_fade(
+        echo_sections[0], field_name)
+    echo_sections[0], _steady_snow_lights = steady_snow_window_lights(
         echo_sections[0], field_name)
     validate_akao_offsets(echo_sections[0])
     # Section 3 travels with section 1 when it can: they are one unit, because

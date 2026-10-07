@@ -422,24 +422,9 @@ def summarise(stats):
         return ''
     worst = ', '.join('%s L%d +%d' % (n, l, c)
                       for c, n, l in stats['worst'][:4])
-    return (
-        '  parallax widescreen fill: %s tile(s) on %d new page(s) across %d '
-        'layer(s) in %d field(s). A 1:1 parallax layer narrower than the '
-        '427-unit 16:9 picture cannot cover it -- the engine\'s wrap slides '
-        'its window around instead of tiling, so a band sits at one edge and '
-        'moves with the camera. MEASURED by EXECUTING the port\'s own shift '
-        'block over a whole period: trnad_4\'s 11 columns leave 157.5 units '
-        'uncovered at worst; copies at k = (-2, +1, +2) periods bring it to '
-        'ZERO. Scope is FFNx\'s own do_increase_width test '
-        '(bg?_width < ceil(854/2)) and the same 24 layers: the hyou* Great '
-        'Glacier, the move_* set, kuro_1, trnad_2, trnad_3 L4, trnad_4. FFNx '
-        'doubles the wrap period and redraws once; we cannot, because this '
-        'port reads one header word for both the wrap and the scroll, and '
-        'FFNx\'s shape still leaves 53.5 units here for want of right_offset '
-        '(0 here, 107 there) -- extra copies close that with no code patch '
-        'and no cave space. THE COPIES GET THEIR OWN PAGE: the frame cap is '
-        'max(256, vanilla\'s worst page) and trnad_4\'s slot 0 is already at '
-        '344 of 344, so the new slot is a BYTE COPY of the source and the '
-        'original page is untouched. Biggest: %s. Set %s=1 to disable.'
-        % (f"{stats['tiles']:,}", stats['pages'], stats['layers'],
-           stats['fields'], worst, OFF_ENV))
+    message = ('  parallax widescreen fill: %s tile(s) on %d new page(s) '
+               'across %d layer(s) in %d field(s); biggest: %s. '
+               'Set %s=1 to disable.'
+               % (f"{stats['tiles']:,}", stats['pages'], stats['layers'],
+                  stats['fields'], worst, OFF_ENV))
+    return message

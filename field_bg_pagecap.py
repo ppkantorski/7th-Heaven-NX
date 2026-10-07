@@ -221,6 +221,13 @@ SINGLE_SCREEN_SLACK = 32
 # regressions in HANDOFF-121 3.6 were built on. It gets its own build.
 FX_SPLIT = False
 
+# BUILD 617. Tiles that draw through an fx page are left out of the raw
+# texture-id split (see `cap_section9`). SEVENTH_NX_PAGECAP_SPLIT_FX_TEXID=1
+# restores the old behaviour.
+FX_TEXID_EXEMPT = os.environ.get('SEVENTH_NX_PAGECAP_SPLIT_FX_TEXID', '') \
+    .strip().lower() not in ('1', 'true', 'yes', 'on')
+T_USE_FX = 28                     # byte flag; byte 29 is separate
+
 # ---------------------------------------------------------------- FINDINGS-126
 # WHEN THERE IS NO FREE SLOT, LOOK AT THE PAGES THAT ARE ALREADY THERE.
 #
@@ -781,7 +788,20 @@ def cap_section9(sec9, src_px=None, max_tiles=MAX_TILES_PER_PAGE,
     st.pages_before = sum(1 for p in pages if p is not None)
 
     by_page = defaultdict(list)
+    _present = {s for s, p in enumerate(pages) if p is not None}
     for off in spans:
+        # BUILD 617: a tile that draws through its fx page does not bind its
+        # texture id (see `effective_counts`), so moving that id relieves no
+        # page -- and on the console it is harmful: the copy is named only by
+        # 16:9 margin tiles, none of its palettes are live (FINDINGS-74), and
+        # every additive tile repointed at it draws nothing. las4_0's steam
+        # was missing from the right edge for exactly the 224 tiles moved to
+        # page 1; ancnt2, las0_2, nivl_b2, nivl_b22, sininb34, ujunon4,
+        # ujunon5, md_e1 and sky were split the same way. Cosmos keeps every
+        # one of them on page 0.
+        if (FX_TEXID_EXEMPT and sec9[off + T_USE_FX]
+                and sec9[off + T_FX_PAGE] in _present):
+            continue
         by_page[sec9[off + T_TEXID]].append(off)
     fx_split_slots = set()      # slots whose split must write offset 34
     _main, fxc = counts(sec9, d2px)

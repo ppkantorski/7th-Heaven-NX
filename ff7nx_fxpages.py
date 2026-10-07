@@ -324,21 +324,70 @@ def cosmos_animates(provider, field, page, palette):
     return False
 
 
-def live_animated(provider, field, page, palettes, animated):
+# BUILD 617: A PALETTE'S ANIMATION IS A PROPERTY OF THE FIELD, NOT OF A PAGE.
+#
+# BUILD 608 asked "does Cosmos animate THIS palette on THIS page?". ghotel's
+# fog is palette 8 on two pages: the 4:3 fog on page 15 (Cosmos ships 20
+# state frames for 15/08) and the widescreen strips on page 16, which Cosmos
+# authored at palette 16 and ff7nx_palrange re-seated onto 8 -- so no state
+# key (16, 8) exists. 608 therefore converted page 16 to a static 768px page
+# while page 15 kept pulsing, and ff7nx_fxrequant -- the hardware-proven
+# BUILD 582 fix that rebuilds palette 8 across BOTH paletted pages into one
+# continuous, still-pulsing Cosmos fog -- had nothing left to rebuild. That is
+# the returned seams/boxes (hardware, build-617 test; test_build582 expects
+# ghotel's 348 cells and was failing on the shipped archive for this reason).
+#
+# The script pulses the WHOLE palette wherever it is drawn, so if Cosmos
+# animates palette P on any FX page of the field, P stays paletted on every
+# FX page that draws it. MEASURED, the pages this keeps paletted that 608
+# converted: ghotel 16, mtnvl3 16, las2_1 19, ancnt2 20/21, anfrst_1 18,
+# bugin3 21, las4_4 16, las4_42 16, md_e1 17-19, whitein 18 -- the BUILD 582
+# family (its note names mtnvl3 and las2_1). Nothing else changes.
+def field_live_palettes(provider, field, sec9, animated):
+    """Script-animated palettes Cosmos animates on ANY FX page of the field."""
+    animated = set(animated)
+    if not animated or static_animated():
+        return frozenset()
+    import diag_common as _DC
+    try:
+        surv = _DC.survey(sec9)
+        walk = list(_DC.walk_layers(sec9, surv['back_start'],
+                                    surv['tex_start']))
+    except Exception:                                          # noqa: BLE001
+        return frozenset()
+    by_slot = {}
+    for _layer, offs in walk:
+        for o in offs:
+            fx = sec9[o + 34]
+            if sec9[o + 28] and 0x0F <= fx < 0x18:
+                by_slot.setdefault(fx, set()).add(sec9[o + 22])
+    live = set()
+    for slot, pals in by_slot.items():
+        for q in pals & animated:
+            if q not in live and cosmos_animates(provider, field, slot, q):
+                live.add(q)
+    return frozenset(live)
+
+
+def live_animated(provider, field, page, palettes, animated,
+                  field_live=frozenset()):
     """The subset of `animated` (script-written palettes) that must stay
     paletted on `page`: all of them under SEVENTH_NX_FX_ANIM_ALWAYS=1, else
-    only those Cosmos animates too."""
+    those Cosmos animates on this page or -- BUILD 617 -- on any FX page of
+    the field (`field_live`, from field_live_palettes)."""
     if static_animated():
         return frozenset()
     pals = set(palettes) & set(animated)
     if anim_always():
         return frozenset(pals)
     return frozenset(q for q in pals
-                     if cosmos_animates(provider, field, page, q))
+                     if q in field_live
+                     or cosmos_animates(provider, field, page, q))
 
 
 def upgrade_section9(name, sec9, art, px, max_raw_delta=None,
-                     max_runtime_delta=None, animated=frozenset()):
+                     max_runtime_delta=None, animated=frozenset(),
+                     only_slots=None):
     """Return ``(section9, stats)`` after page-neutral additive conversion.
 
     The optional deltas are hard remaining byte budgets. A page either fits
@@ -357,6 +406,7 @@ def upgrade_section9(name, sec9, art, px, max_raw_delta=None,
         st['deferred'] = int(name.lower() in DEFER_FIELDS)
         return sec9, st
     provider = getattr(art, 'provider', None)
+    _field_live = None     # BUILD 617, computed on first use
     if provider is None:
         return sec9, st
 
@@ -384,6 +434,8 @@ def upgrade_section9(name, sec9, art, px, max_raw_delta=None,
     candidates = []
     mask_repairs = []
     for slot in range(FX_LO, FX_HI):
+        if only_slots is not None and slot not in only_slots:
+            continue
         page = pages.get(slot)
         refs = fx_refs.get(slot, ())
         # ---- 32-UNIT FX PAGES QUALIFY TOO. FINDINGS-297.
@@ -427,8 +479,11 @@ def upgrade_section9(name, sec9, art, px, max_raw_delta=None,
         # BUILD 581. A palette the field script loads at runtime (LDPAL /
         # LDPLS -- see ff7nx_palanim) is a colour ANIMATION: ghotel's fog
         # pulse, sinbil_1's green glow. One truecolor page would freeze it.
+        if _field_live is None:
+            _field_live = field_live_palettes(provider, name, sec9, animated)
         _live = live_animated(provider, name, slot,
-                              {t.pal for t in refs}, animated)
+                              {t.pal for t in refs}, animated,
+                              field_live=_field_live)
         if any(t.pal in _live for t in refs):
             st['anim_veto'] += 1
             if name not in st['anim_names']:
@@ -561,3 +616,52 @@ def summarise(st):
                     MAX_MASK_FILL_FRACTION * 100, st['mask_veto'],
                     NO_MASK_ENV))
     return line
+
+
+# BUILD 617 (post-384): LATE COMPLETION OF A HALF-CONVERTED EFFECT.
+#
+# upgrade_section9 runs BEFORE the dense repack and budgets against a
+# projection that reserves MAX_TRUECOLOR_PAGES + DOWNSTREAM_D2_RESERVE
+# truecolor pages for scenery -- eight pages, ~27 MiB, in a field that has
+# no scenery pages yet. Most fields end far below that reserve (las4_0:
+# 21.8 MiB of a 35 MiB cap), but nothing came back for the FX pages the
+# projection vetoed. So one effect ended up split: las4_0's rising steam is
+# pages 15-18 at 768 truecolor and pages 19-21 (its bottom rows and the
+# whole 16:9 margin, all four animation states) at 256 paletted -- the
+# dirty squares at the bottom, and a margin that on hardware drew only in
+# some states. complete_mixed_effects runs after the final page decision
+# and converts exactly those leftover pages -- d1 FX pages whose records
+# share an animation group with a page already converted -- against the
+# REAL remaining budget, through the same upgrade_section9 and every one of
+# its vetoes (animated palette, base use, blend mode, art).
+
+
+def mixed_effect_slots(sec9):
+    """d1 FX slots whose records share a param group with d2 FX slots."""
+    pages, ts, _te, _px = DC.parse_pages(sec9)
+    pm = {p.slot: p for p in pages if p is not None}
+    params = collections.defaultdict(set)
+    for _layer, offs in DC.walk_layers(sec9, sec9.find(b'BACK'), ts):
+        for off in offs:
+            fx = sec9[off + T_FX]
+            if fx:
+                params[fx].add(sec9[off + 26])
+    done = set()
+    for slot, ps in params.items():
+        p = pm.get(slot)
+        if p is not None and p.depth == 2 and FX_LO <= slot < FX_HI:
+            done |= ps
+    return {slot for slot, ps in params.items()
+            if slot in pm and pm[slot].depth == 1
+            and FX_LO <= slot < FX_HI and ps & done}
+
+
+def complete_mixed_effects(name, sec9, art, px, max_raw_delta,
+                           max_runtime_delta, animated=frozenset()):
+    only = mixed_effect_slots(sec9)
+    if not only:
+        return sec9, {'fields': 0, 'pages': 0}
+    return upgrade_section9(name, sec9, art, px,
+                            max_raw_delta=max_raw_delta,
+                            max_runtime_delta=max_runtime_delta,
+                            animated=animated, only_slots=only)

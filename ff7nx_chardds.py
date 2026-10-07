@@ -33,11 +33,44 @@ import tex
 ENV = 'SEVENTH_NX_CHAR_DDS'
 CAP_ENV = 'SEVENTH_NX_CHAR_DDS_CAP'
 DEFAULT_CAP = 768
-VERSION = b'char-dds-1'
+VERSION = b'char-dds-2'   # 618y: per-texture clean-ups (grcf)
 ARCHIVE = 'char.lgp'
 CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                          'cache', '_char_dds')
 _DDS = re.compile(r'([a-z0-9_]+)_(\d{2})\.dds')
+
+
+# BUILD 618y. Per-texture clean-ups of Cosmos's upscale, applied to the
+# decoded RGBA before conversion. gldelev's elevator (model GRCC, texture
+# grcf), hardware 10-04: "the elevator model looks a bit rough ... rough
+# edges". The light strip just under the box's top rim (rows 22..40 of the
+# 1024px sheet) carries black squiggles -- upscaler garbage from tiny marks in
+# the 1997 art -- and the rim samples exactly that strip. Texels there much
+# darker than their row are replaced by the strip's own colour (a column-
+# smoothed row median), so the rim reads as a clean light edge.
+def _strip_clean(lo, hi, ratio=0.55, win=41):
+    def run(img):
+        import numpy as np
+        from scipy import ndimage as ND
+        a = np.array(img, dtype=np.float32, copy=True)
+        h = a.shape[0]
+        y0, y1 = int(round(lo * h)), int(round(hi * h))
+        band = a[y0:y1, :, :3]
+        lum = band.mean(-1)
+        # local background: a wide horizontal median, so the darker panel
+        # edges of the sheet are not mistaken for garbage
+        bg = np.stack([ND.median_filter(band[..., c], size=(3, win))
+                       for c in range(3)], -1)
+        bad = lum < ratio * bg.mean(-1)
+        if bad.any():
+            bad = ND.binary_dilation(bad, np.ones((3, 3), bool))
+            band[bad] = bg[bad]
+            a[y0:y1, :, :3] = band
+        return np.clip(np.rint(a), 0, 255).astype(np.uint8)
+    return run
+
+
+PREPROCESS = {'grcf.tex': _strip_clean(22 / 1024.0, 41 / 1024.0)}
 
 
 def enabled(env=None):
@@ -140,7 +173,8 @@ def convert(mod_files, vanilla, dds, mod, log=lambda *_: None):
                     raise ValueError('DDS entry missing')
                 scale = ff7nx_ddstex.max_scale(source, limit)
                 data, _note = ff7nx_ddstex.convert_group(
-                    source, blobs, scale=scale, texture_name=name)
+                    source, blobs, scale=scale, texture_name=name,
+                    preprocess=PREPROCESS.get(name.lower()))
                 made = tex.parse(data)
                 if (made is None or made['width'] % shape['width']
                         or made['height'] % shape['height']

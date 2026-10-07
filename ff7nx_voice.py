@@ -557,6 +557,38 @@ BATTLE_TEXT_LAST_OFF = 0x430            # u32 buffer/character signature
 VOICE_ACTIVE_KEY_HASH_OFF = VOICE_PAGE_OFF + 64    # u32, last key constructed
 VOICE_REPLAY_GUARD_OFF = VOICE_PAGE_OFF + 68       # u32, frames still guarded
 VOICE_MAPJUMP_OFF = VOICE_PAGE_OFF + 72             # u32, worker stop latch
+# BUILD 620g. u64 CNTPCT of the last voice-service tick (field, world or
+# battle). Same dead tail of VOICE_PAGE, 8-aligned (0x290), no new BSS.
+VOICE_HEARTBEAT_OFF = VOICE_PAGE_OFF + 80
+# THE SERVICE THAT STOPS A LINE CAN BE FROZEN WHILE THE LINE PLAYS.
+# ===============================================================
+# Hardware 10-07: a controller disconnect during a voiced Echo-S line puts
+# up Horizon's controller-support applet; the game's frame loop is parked
+# inside it, and the line repeats until the controller is back. Every clip
+# is staged with LOOPSTART (the only shape this decoder streams) and is
+# ended by the field service at a real-time deadline -- a service that does
+# not run while the applet is up, while the native worker thread keeps
+# refilling the ring and rewinding. So the worker now ends OUR player
+# itself -- 620g ended a wrapped line; that was the wrong behaviour (it
+# played on, then stopped). 620i PAUSES it instead, see below.
+CNTPCT_HZ = 19200000                   # Horizon's fixed system counter
+VOICE_STALL_TICKS = CNTPCT_HZ // 10     # 100 ms without a service tick
+# BUILD 620i: the line PAUSES behind the applet and RESUMES with the game
+# (user: "the voice should pause playing, then when controllers are
+# reconnected the voice should resume"). The worker pauses the renderer
+# (vtbl +0x50: state 3, SetVoicePlayState Paused), noting HOST_TICK_NOW;
+# the first service tick back extends the stop deadline by the paused time
+# and resumes it (vtbl +0x48: state 2, SetVoicePlayState Started). Both
+# in the VOICE_PAGE dead tail, no new BSS.
+VOICE_PAUSE_T0_OFF = VOICE_PAGE_OFF + 88      # u64 HOST_TICK_NOW at pause
+VOICE_PAUSED_OFF = VOICE_PAGE_OFF + 96        # u32 1 = our renderer paused
+RENDERER_RESUME_VTBL_OFF = 0x48
+RENDERER_PAUSE_VTBL_OFF = 0x50
+WORKER_HEAD_HOOK = 0x3474               # loop head, player mutex held
+WORKER_HEAD_ORIG = 0xB9409A68           # ldr w8, [x19, #0x98]
+WORKER_HEAD_RESUME = WORKER_HEAD_HOOK + 4
+MRS_CNTPCT = 0xD53BE020                 # mrs xN, cntpct_el0 (| N)
+COND_LO = 0x3
 # Frames after a retirement during which that same line will not be rebuilt.
 # The measured gap is 5-6 frames; a map transition is about 60. Half a second
 # is comfortably outside the time it takes to close a box and talk to an NPC
@@ -942,6 +974,79 @@ def _build_mapjump_worker_stop(cave, addr, scratch):
     a.emit(A.b(a.pc(), WORKER_ENDCHECK))
     a.label('loop_continue')
     a.emit(A.b(a.pc(), WORKER_LOOP_CONTINUE))
+    return a.resolve()
+
+
+def _build_worker_pause(cave, addr, scratch):
+    """BUILD 620i. At the worker loop head (player mutex held): if this is
+    OUR player, playing, not yet paused, and no voice service has ticked for
+    VOICE_STALL_TICKS, note HOST_TICK_NOW and pause its renderer. Then the
+    displaced load and back to the loop. The renderer's play cursor stops,
+    so the worker submits nothing until the service resumes it."""
+    a = Asm(cave, addr)
+    _bss_ptr(a, 11, scratch)
+    a.emit(A.ldr64(12, 11, VOICE_PLAYER_OFF))
+    a.emit(A.cmp_reg64(19, 12))
+    a.bcond('stock', A.NE)
+    a.emit(A.ldr(12, 11, VOICE_PAUSED_OFF))
+    a.cbnz(12, 'stock')
+    a.emit(A.ldr64(12, 19, 0x80))           # renderer
+    a.cbz64(12, 'stock')
+    a.emit(A.ldr(13, 19, 0x98))
+    a.emit(A.cmp_imm(13, 2))                # playing
+    a.bcond('stock', A.NE)
+    a.emit(A.ldr64(13, 11, VOICE_HEARTBEAT_OFF))
+    a.cbz64(13, 'stock')                    # no service has ever ticked
+    a.emit(MRS_CNTPCT | 12)
+    a.emit(A.sub_reg64(12, 12, 13))
+    a.emit(A.movz(13, VOICE_STALL_TICKS & 0xFFFF))
+    a.emit(A.movk_hi(13, VOICE_STALL_TICKS >> 16))
+    a.emit(A.cmp_reg64(12, 13))
+    a.bcond('stock', COND_LO)
+    # frozen: pause first, then publish, so a resume can never precede it
+    a.emit(A.bl(a.pc(), HOST_TICK_NOW))
+    _bss_ptr(a, 11, scratch)
+    a.emit(A.str64(0, 11, VOICE_PAUSE_T0_OFF))
+    a.emit(A.ldr64(0, 19, 0x80))
+    a.emit(A.ldr64(8, 0, 0x00))
+    a.emit(A.ldr64(8, 8, RENDERER_PAUSE_VTBL_OFF))
+    a.emit(0xD63F0100)                      # blr x8
+    _bss_ptr(a, 11, scratch)
+    a.emit(A.movz(12, 1))
+    a.emit(A.str_(12, 11, VOICE_PAUSED_OFF))
+    a.label('stock')
+    a.emit(WORKER_HEAD_ORIG)
+    a.emit(A.b(a.pc(), WORKER_HEAD_RESUME))
+    return a.resolve()
+
+
+def _build_service_resume(cave, addr, scratch):
+    """BUILD 620i. ONE subroutine every voice service `bl`s once per tick:
+    after a pause, push the stop deadline back by the paused time, clear the
+    flag, resume the renderer. Uses only x0..x11 (caller-saved)."""
+    a = Asm(cave, addr)
+    a.emit(A.stp64_pre(29, 30, 31, -0x10))
+    _bss_ptr(a, 9, scratch)
+    a.emit(A.ldr(8, 9, VOICE_PAUSED_OFF))
+    a.cbz(8, 'done')
+    a.emit(A.bl(a.pc(), HOST_TICK_NOW))
+    _bss_ptr(a, 9, scratch)
+    a.emit(A.ldr64(10, 9, VOICE_PAUSE_T0_OFF))
+    a.emit(A.sub_reg64(10, 0, 10))
+    a.emit(A.ldr64(11, 9, VOICE_DEADLINE_OFF))
+    a.emit(A.add_reg64(11, 11, 10))
+    a.emit(A.str64(11, 9, VOICE_DEADLINE_OFF))
+    a.emit(A.str_(A.WZR, 9, VOICE_PAUSED_OFF))
+    a.emit(A.ldr64(0, 9, VOICE_PLAYER_OFF))
+    a.cbz64(0, 'done')
+    a.emit(A.ldr64(0, 0, 0x80))
+    a.cbz64(0, 'done')
+    a.emit(A.ldr64(8, 0, 0x00))
+    a.emit(A.ldr64(8, 8, RENDERER_RESUME_VTBL_OFF))
+    a.emit(0xD63F0100)                      # blr x8
+    a.label('done')
+    a.emit(A.ldp64_post(29, 30, 31, 0x10) if hasattr(A, 'ldp64_post') else 0xA8C17BFD)
+    a.emit(0xD65F03C0)                      # ret
     return a.resolve()
 
 
@@ -2455,7 +2560,8 @@ def _build_field_clocked_voice_service(cave, addr, scratch,
                                        allow_foreign_replace=False,
                                        defer_foreign_play=True,
                                        replay_guard=False,
-                                       stream_once=True):
+                                       stream_once=True,
+                                       resume_entry=None):
     """Consume MESSAGE commands through the v49-proven voice lifecycle.
 
     The MESSAGE cave only writes a compact filename and command.  This native
@@ -2482,6 +2588,12 @@ def _build_field_clocked_voice_service(cave, addr, scratch,
     # field callback is a native AAPCS64 boundary, so SP remains aligned.
     a.emit(A.sub_imm64(A.SP, A.SP, OGG_PATH_STACK_BYTES))
     _bss_ptr(a, 19, scratch)
+    # BUILD 620g heartbeat: the worker ends a wrapped line only when this
+    # has not been written for VOICE_STALL_TICKS (see VOICE_HEARTBEAT_OFF).
+    a.emit(MRS_CNTPCT | 8)
+    a.emit(A.str64(8, 19, VOICE_HEARTBEAT_OFF))
+    if resume_entry is not None:
+        a.emit(A.bl(a.pc(), resume_entry))
     # 100 means the entire duck subsystem is absent, not merely that new
     # players never start an attack. Keep ramp/release code out as well so
     # a disabled mix cannot dereference MusicManager on any service path.
@@ -3120,6 +3232,11 @@ def patch_main_clocked_dialogue(src, dest, forced_name=None,
         raise ValueError('voice worker loop site +0x%X is %08X, expected '
                          '%08X' % (WORKER_LOOP_HOOK, worker_loop_word,
                                    WORKER_LOOP_ORIG))
+    worker_head_word, = struct.unpack_from('<I', text, WORKER_HEAD_HOOK)
+    if worker_head_word != WORKER_HEAD_ORIG:
+        raise ValueError('voice worker loop head +0x%X is %08X, expected '
+                         '%08X' % (WORKER_HEAD_HOOK, worker_head_word,
+                                   WORKER_HEAD_ORIG))
     mapjump_word, = struct.unpack_from('<I', text, MAPJUMP_HOOK)
     if hook_field and mapjump_word != MAPJUMP_ORIG:
         raise ValueError('field MAPJUMP hook +0x%X is %08X, expected %08X'
@@ -3238,6 +3355,8 @@ def patch_main_clocked_dialogue(src, dest, forced_name=None,
     pool = _verified_hole_pool(src, text)
     mapjump_entry, mapjump_placed = (None, {})
     transition_worker_entry, transition_worker_placed = (None, {})
+    pause_entry, pause_placed = (None, {})
+    resume_entry, resume_placed = (None, {})
     if hook_field:
         mapjump_entry, mapjump_placed = ff7nx_cave.emit_laid_out(
             pool, lambda cave, address: _build_mapjump_voice_latch(
@@ -3246,6 +3365,12 @@ def patch_main_clocked_dialogue(src, dest, forced_name=None,
             ff7nx_cave.emit_laid_out(
                 pool, lambda cave, address: _build_mapjump_worker_stop(
                     cave, address, scratch))
+        pause_entry, pause_placed = ff7nx_cave.emit_laid_out(
+            pool, lambda cave, address: _build_worker_pause(
+                cave, address, scratch))
+        resume_entry, resume_placed = ff7nx_cave.emit_laid_out(
+            pool, lambda cave, address: _build_service_resume(
+                cave, address, scratch))
     message_entry, message_placed = (None, {})
     def build_message(cave, address):
         return _build_message_command_cave(
@@ -3347,7 +3472,7 @@ def patch_main_clocked_dialogue(src, dest, forced_name=None,
     if hook_field:
         field_entry, field_placed = ff7nx_cave.emit_laid_out(
             pool, lambda cave, address: _build_field_clocked_voice_service(
-                cave, address, scratch, retain_completed=retain_completed,
+                cave, address, scratch, resume_entry=resume_entry, retain_completed=retain_completed,
                 voice_gain=voice_gain,
                 duck_percent=duck_percent,
                 duck_attack_frames=duck_attack_frames,
@@ -3379,7 +3504,7 @@ def patch_main_clocked_dialogue(src, dest, forced_name=None,
     if battle_probability or battle_text:
         battle_service_entry, battle_service_placed = ff7nx_cave.emit_laid_out(
             pool, lambda cave, address: _build_field_clocked_voice_service(
-                cave, address, scratch, retain_completed=retain_completed,
+                cave, address, scratch, resume_entry=resume_entry, retain_completed=retain_completed,
                 voice_gain=voice_gain,
                 duck_percent=duck_percent,
                 duck_attack_frames=duck_attack_frames,
@@ -3405,7 +3530,7 @@ def patch_main_clocked_dialogue(src, dest, forced_name=None,
         world_service_entry, world_service_placed = \
             ff7nx_cave.emit_laid_out(
                 pool, lambda cave, address: _build_field_clocked_voice_service(
-                    cave, address, scratch, retain_completed=retain_completed,
+                    cave, address, scratch, resume_entry=resume_entry, retain_completed=retain_completed,
                     voice_gain=voice_gain,
                     duck_percent=duck_percent,
                     duck_attack_frames=duck_attack_frames,
@@ -3424,6 +3549,8 @@ def patch_main_clocked_dialogue(src, dest, forced_name=None,
     placed = {}
     placed.update(mapjump_placed)
     placed.update(transition_worker_placed)
+    placed.update(pause_placed)
+    placed.update(resume_placed)
     placed.update(message_placed)
     placed.update(ask_placed)
     placed.update(name_placed)
@@ -3441,6 +3568,7 @@ def patch_main_clocked_dialogue(src, dest, forced_name=None,
         placed[MAPJUMP_HOOK] = A.b(MAPJUMP_HOOK, mapjump_entry)
         placed[WORKER_LOOP_HOOK] = A.b(
             WORKER_LOOP_HOOK, transition_worker_entry)
+        placed[WORKER_HEAD_HOOK] = A.b(WORKER_HEAD_HOOK, pause_entry)
     if hook_ask:
         placed[ASK_PRE_HOOK] = A.b(ASK_PRE_HOOK, ask_entry)
     if disable_name_change:
@@ -3481,6 +3609,9 @@ def patch_main_clocked_dialogue(src, dest, forced_name=None,
         assert struct.unpack_from('<I', check_raw[0],
                                   WORKER_LOOP_HOOK)[0] == \
             A.b(WORKER_LOOP_HOOK, transition_worker_entry)
+        assert struct.unpack_from('<I', check_raw[0],
+                                  WORKER_HEAD_HOOK)[0] == \
+            A.b(WORKER_HEAD_HOOK, pause_entry)
     # Native MESSAGE/ASK updates are PC-relative BLs.  Their original words
     # cannot be copied into caves; prove every emitted replacement reaches
     # the same native routine from its new PC.
@@ -3553,6 +3684,8 @@ def patch_main_clocked_dialogue(src, dest, forced_name=None,
             'transition_worker_entry': transition_worker_entry,
             'mapjump_words': len(mapjump_placed),
             'transition_worker_words': len(transition_worker_placed),
+            'worker_pause_words': len(pause_placed),
+            'service_resume_words': len(resume_placed),
             'message_words': len(message_placed), 'ask_words': len(ask_placed),
             'name_change_words': len(name_placed), 'field_words': len(field_placed),
             'battle_action_words': len(battle_action_placed),

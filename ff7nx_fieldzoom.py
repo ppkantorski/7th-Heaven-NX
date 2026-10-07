@@ -4,7 +4,8 @@ ff7nx_fieldzoom.py -- FFNx's WM_ZOOM for fields with no widescreen art
 (BUILD 567). exefs/main only.
 
     SEVENTH_NX_FIELD_ZOOM=0              off
-    SEVENTH_NX_FIELD_ZOOM=convil_2,...   the fields to zoom (default convil_2)
+    SEVENTH_NX_FIELD_ZOOM=convil_2,...   the fields to zoom (default convil_2
+                                         and ztruck; `name:1.25` sets a factor)
 
 WHY
 ===
@@ -84,8 +85,17 @@ import a64 as A
 from ff7nx_analog_cave import Asm
 
 ENV = 'SEVENTH_NX_FIELD_ZOOM'
-DEFAULT = ('convil_2',)
-VERSION = 'fieldzoom-569'
+DEFAULT = ('convil_2', 'ztruck')
+VERSION = 'fieldzoom-618z11'
+# BUILD 618z11. Per-field factor. FFNx's WM_ZOOM shows 2 x (right - left)
+# game px of the field's config range across the 16:9 width; the port's
+# unzoomed 16:9 view is 320 / 0.75 = 426.67 units, so the factor is
+# 426.67 / (right - left). convil_2 has no config range and keeps 4/3 (the
+# 4:3 picture across the width). ztruck (Cosmos's config: mode = 2, left
+# -175, right 175): 350 units across, as FFNx shows it -- the art is 352
+# wide, so the unzoomed 427-unit view runs off it (hardware 10-06).
+VIEW_W = 320.0 / 0.75
+FACTORS = {'ztruck': VIEW_W / 350.0}
 
 TRANSLATE = 0x10FC3A0
 FIELD_ID = 0xCFF468                 # u16, the field the models belong to
@@ -94,7 +104,7 @@ FIELD_VP = 0xCFF1E0                 # x, y, w, h: the field viewport globals
 DRV_SETVIEWPORT = 0x10D6760
 MTX_GOT = 0x12CE668                 # -> driver viewport matrix block
 MTX_WORDS = (0xA8, 0xBC, 0xD8, 0xDC)
-ZOOM = 4.0 / 3.0
+ZOOM = 4.0 / 3.0                    # the default factor
 
 ON_SITE = 0x9E6E84
 ON_STOCK = 0xA9015FF8               # stp x24, x23, [sp, #0x10]
@@ -145,7 +155,34 @@ def fields(env=None):
         return ()
     if not raw or raw.lower() in ('1', 'on', 'yes', 'true'):
         return DEFAULT
-    return tuple(f.strip().lower() for f in raw.split(',') if f.strip())
+    return tuple(f.split(':')[0].strip().lower() for f in raw.split(',')
+                 if f.split(':')[0].strip())
+
+
+def factor(name, env=None):
+    """The zoom for one field: `name:1.25` in the variable, else FACTORS,
+    else 4/3."""
+    raw = (os.environ if env is None else env).get(ENV, '')
+    for f in raw.split(','):
+        if ':' in f and f.split(':')[0].strip().lower() == name:
+            v = float(f.split(':', 1)[1])
+            if not 1.0 <= v <= 2.0:
+                raise ValueError('zoom %r for %s is outside 1..2' % (v, name))
+            return v
+    return FACTORS.get(name, ZOOM)
+
+
+def _bits(v):
+    return struct.unpack('<I', struct.pack('<f', v))[0]
+
+
+def _pairs(ids):
+    """[(field id, factor)] from ids or (id, factor) pairs."""
+    out = []
+    for i in ids:
+        fid, z = (i if isinstance(i, (tuple, list)) else (i, ZOOM))
+        out.append((int(fid), float(z)))
+    return out
 
 
 def maplist_index(flevel_path, names):
@@ -182,6 +219,22 @@ def _field_test(a, ids, miss):
     a.label('hit')
 
 
+def _field_zoom(a, pairs, store):
+    """w10 = the listed field's factor (float bits), or 0."""
+    _movw(a, 0, FIELD_ID)
+    a.emit(A.bl(a.pc(), TRANSLATE))
+    a.emit(A.ldrh(8, 0))
+    for k, (fid, _z) in enumerate(pairs):
+        a.emit(A.cmp_imm(8, fid))
+        a.bcond('hit%d' % k, 0)                    # b.eq
+    a.emit(A.movz(10, 0))
+    a.b(store)
+    for k, (_fid, z) in enumerate(pairs):
+        a.label('hit%d' % k)
+        _movw(a, 10, _bits(z))
+        a.b(store)
+
+
 def _set_field_viewport(a):
     """gfx_drv_setviewport(field x, y, w, h) -- the four guest globals are
     read one translated address at a time and parked on the stack."""
@@ -196,16 +249,15 @@ def _set_field_viewport(a):
 
 
 def build_on(ids, bss):
-    """flag = (this field is listed). Recompiled code: x0, x8-x10 only,
-    which the translator this word's neighbours call clobbers anyway."""
+    """flag = this field's zoom factor as float bits (0 = not listed).
+    Recompiled code: x0, x8-x10 only, which the translator this word's
+    neighbours call clobbers anyway."""
+    pairs = _pairs(ids)
+
     def b(at, addr):
         a = Asm(at, addr)
         a.emit(A.stp64_pre(29, 30, 31, -0x20))
-        _field_test(a, ids, 'miss')             # the translator eats x8-x10
-        a.emit(A.movz(10, 1))
-        a.b('store')
-        a.label('miss')
-        a.emit(A.movz(10, 0))
+        _field_zoom(a, pairs, 'store')          # the translator eats x8-x10
         a.label('store')
         a.emit(A.adrp(9, a.pc(), bss & ~0xFFF))
         a.emit(A.add_imm64(9, 9, bss & 0xFFF))
@@ -239,8 +291,6 @@ def build_draw(bss):
     and the `bl` five words later clobbers every FP register anyway. No
     instruction here other than `cmp` touches NZCV, and nothing downstream
     of the join reads the flags before setting them."""
-    zbits = struct.unpack('<I', struct.pack('<f', ZOOM))[0]
-
     def b(at, addr):
         a = Asm(at, addr)
         a.emit(A.adrp(24, a.pc(), bss & ~0xFFF))
@@ -252,8 +302,7 @@ def build_draw(bss):
         a.emit(A.ldr(24, 24, 0))
         a.emit(A.cmp_imm(24, MODE_FIELD))
         a.bcond('out', COND_NE)
-        _movw(a, 26, zbits)
-        a.emit(A.fmov_s_from_w(16, 26))
+        a.emit(A.fmov_s_from_w(16, 26))         # the flag IS the factor
         for i in XY_ROWS:
             a.emit(A.ldr_s(17, 31, MATRIX_SP + 4 * i))
             a.emit(A.fmul_s(17, 17, 16))
@@ -294,7 +343,8 @@ def patch_text(text, place, ids, bss):
             bad.append('zoom: +%#x no longer joins +%#x' % (j, DRAW_SITE))
     if bad:
         raise ValueError('; '.join(bad))
-    if not ids or any(not 0 <= i < 4096 for i in ids):
+    if not ids or any(not 0 <= i < 4096 or not 1.0 <= z <= 2.0
+                      for i, z in _pairs(ids)):
         raise ValueError('bad field ids %r' % (ids,))
     written = _hook(text, place, ON_SITE, ON_STOCK, build_on(ids, bss))
     written.update(_hook(text, place, OFF_SITE, OFF_STOCK, build_off(bss)))

@@ -1104,3 +1104,122 @@ def describe_source(info):
     return '%s/%s %dx%d @%.6g fps, %s' % (
         re.sub(r',.*', '', info['container'] or '?'), info['vcodec'],
         info['width'] or 0, info['height'] or 0, info['fps'], a)
+
+
+# ---------------------------------------------------------------------------
+# BUILD 618z6/7. THE LOOP POINT OF last4_2 / last4_3.
+#
+# These two are the background-movie loops of las4_2 / las4_3 (BGMOVIE 1).
+# The port's own files are 20 frames (every other movie on the cartridge is
+# 15 fps). Cosmos FMV (30 fps) interpolated them to 2N-1 = 39 frames: every
+# vanilla frame k is its frame 2k, with a new frame between each pair --
+# EXCEPT between the last frame and the first, because the source is not a
+# loop to the interpolator. Played as a loop, that wrap is one step twice as
+# large as every other step (4.9 against ~2.7 per frame in last4_2's file).
+#
+# 618z6 appended the missing in-between as a 40th frame. Hardware 10-05
+# (build 390), every captured frame identified against the movie's frames:
+# each picture is held exactly two 60 Hz frames, frames 0..38 play in order,
+# and frame 39 is NEVER shown -- the engine restarts the loop after decoded
+# frame 38 whatever the file's length (the 39-frame file also showed 39
+# pictures a loop). The loop is 39 frames long, so the fix has to be INSIDE
+# 39 frames.
+#
+# 618z7: the 39 frames are re-timed so they cover one whole cycle evenly:
+# frame j is the picture at t = j * 40/39 along the closed 40-step cycle
+# (C0..C38, the wrap in-between, back to C0). Wrap step 4.9 -> 2.7
+# (last4_2), 10.6 -> 6.3 (last4_3).
+#
+# 618z8 (no redistributed video): the re-timed loop is MADE AT BUILD TIME
+# from the user's own Cosmos file, with ffmpeg alone (no shipped asset, no
+# OpenCV). The source's first two frames are appended after it, the
+# timestamps put the appended C0 two steps after C38 (pts = N, +1 from frame
+# 39 on: the wrap is the one double step), and ffmpeg's motion-compensated
+# interpolation (minterpolate, mci / aobmc / bidir) samples the cycle at
+# 39 fps on a 40-per-second clock, i.e. t = j * 40/39; the first 39 frames
+# are kept and re-stamped at 30 fps. Measured against 618z7's optical-flow
+# frames: PSNR 49-56 dB (last4_2), 36-56 dB (last4_3); wrap step 10.9 /
+# 23.8 against 10.6 / 25.3 (10-bit luma), the loop's median step ~9.7 /
+# 22.7. The result is cached next to the movie cache, keyed by the
+# source's SHA-1; it is only made when the source is the Cosmos FMV30 file
+# measured on hardware (SHA-1 below, 39 frames). SEVENTH_NX_NO_LOOP_CLOSE=1
+# disables.
+# ---------------------------------------------------------------------------
+LOOP_CLOSE_STEMS = ('last4_2', 'last4_3')
+LOOP_CLOSE_ENV = 'SEVENTH_NX_NO_LOOP_CLOSE'
+LOOP_CLOSE_TAG = 'loopclose3'
+LOOP_CLOSE_SOURCES = {
+    'last4_2': '9b8ff5d4c3dd34e78b6656b8de0a7f18849f7350',
+    'last4_3': 'b2e299d6220f933551f1ced6759730e5e00e206e',
+}
+LOOP_CLOSE_FILTER = (
+    "[0:v]split[a][b];[b]trim=end_frame=2,setpts=PTS-STARTPTS[c];"
+    "[a][c]concat=n=2:v=1,settb=1/40,setpts='N+gte(N\\,39)',"
+    "minterpolate=fps=39:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1,"
+    "trim=end_frame=39,settb=1/30,setpts=N")
+
+
+def loop_close_wanted(stem):
+    off = os.environ.get(LOOP_CLOSE_ENV, '').strip().lower() in (
+        '1', 'true', 'yes', 'on')
+    return (not off) and stem.lower() in LOOP_CLOSE_STEMS
+
+
+def _sha1(path):
+    h = hashlib.sha1()
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(1 << 20), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def loop_close(src, dest_dir=None, log=lambda *_: None, stem=None):
+    """Path of the re-timed 39-frame loop for `src` (made with ffmpeg into
+    `dest_dir`, once per source), or None when `src` is not the Cosmos file
+    the fix is measured for or anything fails (the movie is then converted
+    as it is)."""
+    stem = (stem or os.path.splitext(os.path.basename(src))[0]).lower()
+    want = LOOP_CLOSE_SOURCES.get(stem)
+    ffmpeg = _tool('ffmpeg')
+    if not want or not ffmpeg:
+        return None
+    if _sha1(src) != want:
+        log('  %s: source is not the Cosmos FMV30 file the loop fix is made '
+            'for -- left as it is' % stem)
+        return None
+    dest_dir = dest_dir or os.path.dirname(os.path.abspath(src))
+    out = os.path.join(dest_dir, '%s.%s.%s.mkv' % (stem, LOOP_CLOSE_TAG,
+                                                   want[:12]))
+    if not os.path.exists(out):
+        tmp = out + '.part.mkv'
+        r = _run([ffmpeg, '-y', '-nostdin', '-loglevel', 'error', '-i', src,
+                  '-filter_complex', LOOP_CLOSE_FILTER, '-an', '-r', '30',
+                  '-c:v', 'ffv1',
+                  '-pix_fmt', 'yuv420p10le', tmp])
+        info = probe(tmp) if r.returncode == 0 else None
+        n = _count_frames(tmp) if info else 0
+        if not info or n != 39 or abs(info['fps'] - 30.0) > 0.01:
+            log('  ! %s: loop re-time failed (%s) -- left as it is'
+                % (stem, (r.stderr or 'frames %d' % n).strip()[:100]))
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            return None
+        os.replace(tmp, out)
+    log('  %s: loop re-timed at build time (39 frames over one whole cycle, '
+        'even step at the wrap)' % stem)
+    return out
+
+
+def _count_frames(path):
+    ffprobe = _tool('ffprobe')
+    if not ffprobe:
+        return 0
+    r = _run([ffprobe, '-v', 'error', '-count_frames', '-select_streams',
+              'v:0', '-show_entries', 'stream=nb_read_frames', '-of',
+              'default=nw=1:nk=1', path])
+    try:
+        return int((r.stdout or '').strip().splitlines()[0])
+    except (ValueError, IndexError):
+        return 0

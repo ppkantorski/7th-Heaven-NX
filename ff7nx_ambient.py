@@ -372,15 +372,55 @@ def _set_safe_music_thread_name(space):
 #
 #     SEVENTH_NX_AMBIENT_RATE=48k     bring loops above 48 kHz down to it
 MAX_RATE = 48000
-RATE_ENV = 'SEVENTH_NX_AMBIENT_RATE'     # `48k` converts; default stages as shipped
+RATE_ENV = 'SEVENTH_NX_AMBIENT_RATE'     # `48k` converts all above 48 kHz,
+                                         # `native` none; default: above 96k
 CONVERT_RECIPE = 'AMBIENT-48K-V2 ar=48000 exact-length vorbis-q6 LOOPSTART=0'
 CONVERT_QUALITY = '6'                    # ~192 kbps stereo; the sources run
                                          # 128-190 kbps, so this loses nothing
 CONVERTED = []                           # (ogg id, source rate) this build
 
 
+# BUILD 617b. THE ONE LOOP ABOVE 96 kHz. `1525.ogg` is 192 kHz -- the only
+# one of the 105 -- and it is the bed Cosmo Memory maps to field_144
+# (mds7st1), field_145 (mds7st2), bat_3 and bat_392..403. Its PCM ring is
+# 192000 * 2 * 6 = 2,304,000 bytes out of the 32 MB g_WaveBufferAllocator
+# pool, twice any loop that has ever played on hardware ("96 kHz loops have
+# played in the Sector 7 fields for months", above), on top of the station's
+# music and three voice lines. The pool's failure path is SoundBufferImpl's
+# exit() -- no crash report -- which is exactly the mds7st1 report: the game
+# closes on entry and on loading a save there, every time. So by default a
+# loop ABOVE the proven 96 kHz ceiling is brought down TO 96 kHz (617c: the
+# proven rate, an exact 2:1 step, the same ring every working loop has);
+# everything at or below it still ships byte for byte. `native` restores the old
+# behaviour, `48k` converts every loop above 48 kHz.
+SAFE_RATE = 96000
+
+
+def convert_threshold():
+    """Loops above this rate are converted (to convert_target()), or None."""
+    v = os.environ.get(RATE_ENV, '').strip().lower()
+    if v in ('48k', '48000'):
+        return MAX_RATE
+    if v in ('native', 'off', 'none', '0'):
+        return None
+    return SAFE_RATE
+
+
+def convert_target():
+    """The rate a converted loop is staged at.
+
+    By default a loop above SAFE_RATE is brought down to SAFE_RATE itself --
+    96 kHz, the rate 42 loops already play at on hardware -- not further:
+    192 -> 96 is an exact 2:1 decimation, the ring halves to 1,152,000 bytes
+    (the size every proven loop already has), and nothing else about the
+    file moves. `48k` still means 48 kHz for everything above it.
+    """
+    limit = convert_threshold()
+    return MAX_RATE if limit == MAX_RATE else SAFE_RATE
+
+
 def convert_enabled():
-    return os.environ.get(RATE_ENV, '').strip().lower() in ('48k', '48000')
+    return convert_threshold() is not None
 
 
 def _rate_channels(path):
@@ -395,12 +435,14 @@ def _cache_dir():
     return os.path.join(here, 'cache', '_ambient_ogg')
 
 
-def _converted_copy(source):
+def _converted_copy(source, rate=None):
     """A 48 kHz Vorbis copy of `source` in the build cache, made once.
 
     Keyed on the source's CONTENT, the recipe and the encoder, so an unchanged
-    loop is never re-encoded and a changed one always is.
+    loop is never re-encoded and a changed one always is. `rate` defaults to
+    MAX_RATE (48 kHz); BUILD 617c brings the 192 kHz loop to SAFE_RATE.
     """
+    rate = MAX_RATE if rate is None else rate
     import hashlib
     import subprocess
     import tempfile
@@ -417,12 +459,14 @@ def _converted_copy(source):
         for chunk in iter(lambda: handle.read(1 << 20), b''):
             digest.update(chunk)
     digest.update(('|%s|%s' % (CONVERT_RECIPE, encoder)).encode())
+    if rate != MAX_RATE:
+        digest.update(('|ar=%d' % rate).encode())
     cache = _cache_dir()
     os.makedirs(cache, exist_ok=True)
     out = os.path.join(cache, digest.hexdigest()[:24] + '.ogg')
     if os.path.exists(out):
         try:
-            if _rate_channels(out)[0] == MAX_RATE:
+            if _rate_channels(out)[0] == rate:
                 return out
         except Exception:                                     # noqa: BLE001
             pass
@@ -435,14 +479,14 @@ def _converted_copy(source):
     with open(source, 'rb') as handle:
         data = handle.read()
     src_rate = voice_ogg._identification(data)[0]
-    want = int(round(voice_ogg._last_granule(data) * MAX_RATE
+    want = int(round(voice_ogg._last_granule(data) * rate
                      / float(src_rate)))
     handle, tmp = tempfile.mkstemp(prefix='.amb.', suffix='.ogg', dir=cache)
     os.close(handle)
     try:
         base = [ffmpeg, '-hide_banner', '-nostdin', '-loglevel', 'error',
                 '-y', '-i', source, '-af',
-                'aresample=%d,atrim=end_sample=%d' % (MAX_RATE, want)]
+                'aresample=%d,atrim=end_sample=%d' % (rate, want)]
         if oggenc:
             wav = subprocess.run(base + ['-map_metadata', '-1', '-f', 'wav',
                                          '-'], stdout=subprocess.PIPE,
@@ -466,9 +510,10 @@ def _converted_copy(source):
         if run.returncode:
             raise ValueError('ambient: could not encode %s: %s' % (
                 source, (run.stderr or b'').decode('utf-8', 'replace')[:200]))
-        rate, _channels = _rate_channels(tmp)
-        if rate != MAX_RATE:
-            raise ValueError('ambient: %s came out at %d Hz' % (source, rate))
+        got_rate, _channels = _rate_channels(tmp)
+        if got_rate != rate:
+            raise ValueError('ambient: %s came out at %d Hz' % (source,
+                                                             got_rate))
         with open(tmp, 'rb') as handle:
             got = voice_ogg._last_granule(handle.read())
         if abs(got - want) > 1:
@@ -504,13 +549,14 @@ def stage_loops(oggs, dest_dir, ogg_ids):
             missing.append(ogg_id)
             continue
         target = os.path.join(dest_dir, '%04d.ogg' % ogg_id)
-        if convert_enabled():
+        limit = convert_threshold()
+        if limit is not None:
             try:
                 rate = _rate_channels(source)[0]
             except Exception:                                 # noqa: BLE001
                 rate = 0                  # unreadable header: ship as-is
-            if rate > MAX_RATE:
-                source = _converted_copy(source)
+            if rate > limit:
+                source = _converted_copy(source, convert_target())
                 CONVERTED.append((ogg_id, rate))
         src_stat = os.stat(source)
         total += src_stat.st_size

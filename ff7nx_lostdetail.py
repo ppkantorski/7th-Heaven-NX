@@ -50,6 +50,7 @@ SCALE = 3
 PX = TILE * 16 * SCALE           # 768
 MAX_COMPONENT = TD.MAX_COMPONENT
 EDGE_CELLS = (-160, 144)          # the cells either side of the 4:3 edge
+BACKDROP_OFF_ENV = 'SEVENTH_NX_NO_BACKDROP_KEY'
 
 
 class LostDetailError(Exception):
@@ -137,7 +138,152 @@ def plan_section9(name, sec9, cosmos9, provider):
                 plans.append((slot, cx, cy, comp, art_block.copy()))
                 st['units'] += len(comp)
                 st['components'] += 1
+    if not backdrop_disabled():
+        try:
+            _plan_backdrop(name, sec9, cosmos9, provider, pages, lb, lc,
+                           opened, plans, st)
+        except LostDetailError as exc:
+            st['backdrop_refused'] = str(exc)
     return plans, st
+
+
+def backdrop_disabled():
+    return os.environ.get(BACKDROP_OFF_ENV, '').strip().lower() in (
+        '1', 'true', 'yes', 'on')
+
+
+def _plan_backdrop(name, sec9, cosmos9, provider, pages, lb, lc, opened,
+                   plans, st):
+    """BUILD 617. Layer 3 -- the backdrop -- gets its keyed holes filled.
+
+    The dense conversion keys every texel the 1997 page leaves at index 0,
+    on layer 3 as on the others. Layer 3 is the bottom of the picture (the
+    dense repack's PARALLAX ATLAS MARGIN rests on the same fact), so a keyed
+    texel there shows the clear colour: trnad_2's sky had a 78-unit grey blob
+    and specks where the 1997 sky has index-0 pixels and Cosmos paints
+    opaque cloud (hardware video, build 382). No size limit is needed for
+    that reason -- nothing drawn behind the backdrop can be revealed -- but
+    every other guard stays strict:
+
+      * the field has no layer 4 at all;
+      * the cell is sampled by opaque layer-3 records ONLY (no layer 1/2
+        record and no FX record anywhere reads it);
+      * every Cosmos-aligned record on the cell names the same Cosmos
+        pixels (parallax-fill copies of a record agree by construction);
+      * a unit is restored only if all its texels are keyed here and all of
+        Cosmos's are opaque (alpha >= 128, ``PageArt.hmask``).
+    """
+    if lb.get(4):
+        # Conservative: with a layer 4 in the field, "nothing is behind
+        # layer 3" is not proven here, so the field is left alone.
+        return
+    readers = {}
+    for layer, offs in lb.items():
+        for o in offs:
+            use_fx = sec9[o + 28]
+            for sl in ((sec9[o + 32], sec9[o + 34]) if use_fx
+                       else (sec9[o + 32],)):
+                page = pages.get(sl)
+                if page is None:
+                    continue
+                grid = 8 if page.size_flag else 16
+                step = page.px // grid
+                if use_fx and sl == sec9[o + 34]:
+                    u, v = struct.unpack_from('<II', sec9, o + 42)
+                else:
+                    u, v = struct.unpack_from('<II', sec9, o + 42)
+                key = (sl, int(round(u / TD.UV_SCALE * grid)) * step,
+                       int(round(v / TD.UV_SCALE * grid)) * step)
+                readers.setdefault(key, set()).add(
+                    'fx' if use_fx else layer)
+    ob, oc = lb.get(3, []), lc.get(3, [])
+    if not ob or not oc:
+        return
+    if len(ob) < len(oc):
+        raise LostDetailError('layer 3 lost records')
+    cells = {}
+    for o, q in zip(ob, oc):
+        if _key(sec9, o) != _key(cosmos9, q):
+            raise LostDetailError('layer 3 record order drifted')
+        if (struct.unpack_from('<H', sec9, o + 28)[0]
+                or struct.unpack_from('<H', cosmos9, q + 28)[0]):
+            continue
+        c = TD._cell(sec9, o, pages)
+        if c is None:
+            continue
+        slot, cx, cy, step = c
+        page = pages[slot]
+        if page.depth != 2 or page.px != PX:
+            continue
+        if readers.get((slot, cx, cy)) != {3}:
+            cells[(slot, cx, cy)] = None
+            continue
+        cslot, cpal = cosmos9[q + 32], cosmos9[q + 22]
+        sel = XP._selected_palette(provider, name, cslot, cpal)
+        art = opened(cslot, sel) if sel is not None else None
+        if art is None or art.px != PX:
+            cells[(slot, cx, cy)] = None
+            continue
+        sx = struct.unpack_from('<H', cosmos9, q + 10)[0] * SCALE
+        sy = struct.unpack_from('<H', cosmos9, q + 12)[0] * SCALE
+        abuf = np.frombuffer(art.buf, '<u2').reshape(PX, PX)
+        blk = abuf[sy:sy + step, sx:sx + step]
+        hm = np.asarray(art.hmask).reshape(PX, PX)[sy:sy + step,
+                                                   sx:sx + step]
+        if blk.shape != (step, step):
+            cells[(slot, cx, cy)] = None
+            continue
+        prev = cells.get((slot, cx, cy), False)
+        if prev is None:
+            continue
+        if prev is not False and not np.array_equal(prev[0], blk):
+            cells[(slot, cx, cy)] = None
+            continue
+        cells[(slot, cx, cy)] = (blk.copy(), hm.copy())
+    fixed = {}
+    for (slot, cx, cy), got in sorted(cells.items(),
+                                      key=lambda kv: kv[0]):
+        if not got:
+            continue
+        blk, hm = got
+        step = blk.shape[0]
+        n = step // SCALE
+        block = np.frombuffer(pages[slot].data, '<u2').reshape(PX, PX)[
+            cy:cy + step, cx:cx + step]
+        keyed = (block == FN.EMPTY).reshape(n, SCALE, n, SCALE).all(
+            axis=(1, 3))
+        opaque = (hm & (blk != FN.EMPTY)).reshape(n, SCALE, n, SCALE).all(
+            axis=(1, 3))
+        cand = keyed & opaque
+        if not cand.any():
+            continue
+        comp = [tuple(p) for p in np.argwhere(cand)]
+        plans.append((slot, cx, cy, comp, blk))
+        fixed[block.tobytes()] = (comp, blk)
+        st['backdrop_units'] = st.get('backdrop_units', 0) + len(comp)
+        st['backdrop_cells'] = st.get('backdrop_cells', 0) + 1
+    # Widescreen/parallax fill tiles sample COPIES of those cells, often on
+    # another page (ff7nx_parallaxwide). They have no Cosmos-aligned record,
+    # so a copy is repaired only when it is byte-identical to a cell repaired
+    # above and is itself read only by opaque layer-3 records.
+    if not fixed:
+        return
+    for (slot, cx, cy), who in sorted(readers.items(), key=lambda kv: kv[0]):
+        if who != {3} or (slot, cx, cy) in cells:
+            continue
+        page = pages.get(slot)
+        if page is None or page.depth != 2 or page.px != PX:
+            continue
+        for comp, blk in fixed.values():
+            step = blk.shape[0]
+            block = np.frombuffer(page.data, '<u2').reshape(PX, PX)[
+                cy:cy + step, cx:cx + step]
+            if block.shape == blk.shape and block.tobytes() in fixed \
+                    and fixed[block.tobytes()][1] is blk:
+                plans.append((slot, cx, cy, comp, blk))
+                st['backdrop_units'] = st.get('backdrop_units', 0) + len(comp)
+                st['backdrop_copies'] = st.get('backdrop_copies', 0) + 1
+                break
 
 
 def apply_plans(sec9, plans):
@@ -149,7 +295,8 @@ def apply_plans(sec9, plans):
             p = pages[slot]
             arrays[slot] = np.frombuffer(p.data, '<u2').reshape(
                 p.px, p.px).copy()
-        dst = arrays[slot][cy:cy + TILE * SCALE, cx:cx + TILE * SCALE]
+        span = art_block.shape[0]
+        dst = arrays[slot][cy:cy + span, cx:cx + span]
         for uy, ux in comp:
             ys = slice(uy * SCALE, (uy + 1) * SCALE)
             xs = slice(ux * SCALE, (ux + 1) * SCALE)
@@ -230,6 +377,11 @@ def apply_to_flevel(archive, payloads, art, cosmos_chunk=None, encode=None,
         total['fields'] += 1
         total['pages'] += npages
         total['units'] += st['units']
+        total['backdrop_units'] = total.get('backdrop_units', 0) + st.get(
+            'backdrop_units', 0)
+        if st.get('backdrop_units'):
+            total.setdefault('backdrop_names', []).append(
+                '%s:%d' % (name, st['backdrop_units']))
         total['components'] += st['components']
         total['skipped_large'] += st['skipped_large']
         total['names'].append('%s:%d' % (name, st['units']))
@@ -237,13 +389,23 @@ def apply_to_flevel(archive, payloads, art, cosmos_chunk=None, encode=None,
 
 
 def summarise(st):
-    if not st.get('fields') and not st.get('refused'):
+    if not st.get('fields') and not st.get('refused') \
+            and not st.get('backdrop_units'):
         return ''
     line = ('  lost Cosmos detail restored: %d unit(s) in %d component(s), '
             '%d field(s) [%s]; %d unit(s) in large regions off the 4:3 edge '
             'left alone (%s=1 disables)'
             % (st['units'], st['components'], st['fields'],
                ', '.join(st['names'][:30]), st['skipped_large'], OFF_ENV))
+    if st.get('backdrop_units'):
+        line += ('\n  BACKDROP KEY (BUILD 617): %d keyed layer-3 unit(s) '
+                 'that Cosmos paints opaque were filled with its art (%s) -- '
+                 'layer 3 is the bottom of the picture, so a keyed texel '
+                 'there is a hole showing the clear colour (trnad_2 sky). '
+                 'Cells read only by opaque layer-3 records. %s=1 disables.'
+                 % (st['backdrop_units'],
+                    ', '.join(st.get('backdrop_names', [])[:12]),
+                    BACKDROP_OFF_ENV))
     if st.get('refused'):
         line += ('\n  ! lost detail: %d field(s) unchanged (%s)'
                  % (len(st['refused']), ', '.join(

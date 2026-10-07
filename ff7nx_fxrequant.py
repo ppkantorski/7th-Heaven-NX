@@ -84,7 +84,30 @@ UNAUDITED = (OP_RTPAL, OP_RTPAL2, OP_ADPAL2)
 # Cosmos art may be repainted, not relit.  Mean premultiplied brightness of
 # the centre cells must stay within this ratio of the 1997 centre.
 MAX_BRIGHTNESS_RATIO = 1.8
+# BUILD 618u: single-source palette groups (see single_source_group) are
+# requantised only for fields reviewed one by one. mtnvl3: the 4:3 mist was
+# 1997 art and the widescreen strips Cosmos art (two squares at the bottom-
+# left corner, hardware 10-03); both are now Cosmos art in palette 9's
+# entries, still pulsed by the script. Other archive matches: blackbg2,
+# gidun_1, jtempl, kuro_1, rcktbas2, semkin_8, trnad_2 (kuro_1/trnad_2 are
+# hardware-confirmed and stay as they are).
+GROUP_FIELDS = frozenset(('mtnvl3',))
 EMPTY = 3            # premultiplied max channel below this -> index 0
+# BUILD 620i. ghotel, hardware 10-07: "the light fog effects at the bottom of
+# the screen glow in what look like contours, very uneven". The fog stays a
+# 256px paletted page so the script's pulse keeps every frame (light2:
+# MPPAL v 40..62, a uniform multiply; 23 levels x 348 cells cannot be stored
+# in truecolor), and its 255 entries are 5-bit per channel. Mapping Cosmos's
+# smooth fog to the NEAREST entry texel by texel turned its gradients into
+# flat bands. These fields are mapped with Floyd-Steinberg error diffusion
+# instead (serpentine, per 16x16 cell, never into key texels) -- the way the
+# 1997 fog itself was dithered. Opt-in per field: the fields already
+# confirmed on hardware keep their nearest-colour pages.
+# BUILD 620j: per-cell dithering left square seams (hardware 10-07) and
+# did not remove the bands. ghotel is now split by ff7nx_palstates (a static
+# truecolor base + the paletted pulse at a quarter of the step), so its
+# palette goes back to nearest-colour; the dither path stays for reference.
+DITHER_FIELDS = frozenset()
 
 
 class RequantError(Exception):
@@ -110,6 +133,7 @@ def uniform_palettes(script_section):
     import echo_s_flevel as ES
     loads = {}
     blocks_seen = []
+    stored = set()       # BUILD 618t: palettes copied INTO the buffer
     try:
         blocks = ES._routine_blocks(script_section)
     except Exception:                                          # noqa: BLE001
@@ -130,11 +154,68 @@ def uniform_palettes(script_section):
                     return {}
                 loads.setdefault(script_section[off + 3], set()).add(count)
             else:
+                if op in (OP_STPAL, OP_STPLS):
+                    if script_section[off + 1] & 0xF0:
+                        return {}
+                    stored.add(script_section[off + 2])
                 blocks_seen.append(count)
     sizes = {c for cs in loads.values() for c in cs}
     if any(c not in sizes for c in blocks_seen):
         return {}
+    # BUILD 618t. mtnvl3 (Mt Nibel bridge), hardware 10-03: a washed-out
+    # rectangle with a ghost of the bridge over the lower screen. The script
+    # stores palette 9 (STPLS 9), offsets the copy (ADPAL) and loads it into
+    # palettes 9 AND 10, so at run time palette 10 IS palette 9's colours.
+    # Requantising palette 10's cells into palette 10's own entries therefore
+    # drew those indices through palette 9: garbage. "Any choice of base
+    # colours pulses as 1997" only holds for a palette the script copies
+    # FROM ITSELF, so a loaded palette must also be a stored one.
+    # And palette 9's own entries feed palette 10, so changing them breaks
+    # palette 10's untouched cells too: any cross-palette load refuses the
+    # whole field.
+    # Only whole-palette loads (255) are refused this way: a short load
+    # (uutai1, 15 entries; hardware-accepted) leaves the requantised
+    # entries above it alone.
+    if any(pal not in stored and 255 in cs for pal, cs in loads.items()):
+        return {}
     return {pal: next(iter(cs)) for pal, cs in loads.items() if len(cs) == 1}
+
+
+def single_source_group(script_section):
+    """BUILD 618u. (S, {palettes}) when the field stores exactly ONE palette
+    S into the buffer, loads only whole palettes, and every load comes from
+    that buffer -- so at run time every loaded palette IS palette S's colours
+    (after the same uniform add/multiply). mtnvl3: STPLS 9 -> ADPAL ->
+    LDPAL 9 and 10. Else None."""
+    import echo_s_flevel as ES
+    stored, loads = set(), set()
+    try:
+        blocks = ES._routine_blocks(script_section)
+    except Exception:                                          # noqa: BLE001
+        return None
+    for start, end in blocks:
+        stream, _trunc = ES._decode_block(script_section, start, end)
+        for off, op, size in stream:
+            if op in UNAUDITED:
+                return None
+            at = COUNT_AT.get(op)
+            if at is None:
+                continue
+            if size <= at or script_section[off + at] != 255:
+                return None
+            if op in (OP_LDPAL, OP_LDPLS):
+                if script_section[off + 1] & 0x0F:
+                    return None
+                loads.add(script_section[off + 3])
+            elif op in (OP_STPAL, OP_STPLS):
+                if script_section[off + 1] & 0xF0:
+                    return None
+                stored.add(script_section[off + 2])
+    if len(stored) != 1 or not loads or not (stored <= loads):
+        return None
+    if loads == stored:
+        return None
+    return next(iter(stored)), loads
 
 
 # ------------------------------------------------------------------- the art
@@ -214,6 +295,32 @@ def _quantise(samples, n_colours):
     return centres.astype(np.float32)
 
 
+def _dither(t, rgb, entry0_key):
+    """(TILE, TILE) palette indices (1-based) for premultiplied target `t`,
+    Floyd-Steinberg, serpentine. Key texels (target below EMPTY) stay 0 and
+    neither take nor pass on error."""
+    work = t.astype(np.float64).copy()
+    key = (t.max(-1) < EMPTY) if entry0_key else np.zeros(t.shape[:2], bool)
+    out = np.zeros(t.shape[:2], np.uint8)
+    pal = rgb.astype(np.float64)
+    for y in range(TILE):
+        xs = range(TILE) if y % 2 == 0 else range(TILE - 1, -1, -1)
+        step = 1 if y % 2 == 0 else -1
+        for x in xs:
+            if key[y, x]:
+                continue
+            want = np.clip(work[y, x], 0.0, 255.0)
+            j = int(((pal - want) ** 2).sum(1).argmin())
+            out[y, x] = j + 1
+            err = want - pal[j]
+            for dx, dy, f in ((step, 0, 7 / 16.0), (-step, 1, 3 / 16.0),
+                              (0, 1, 5 / 16.0), (step, 1, 1 / 16.0)):
+                nx, ny = x + dx, y + dy
+                if 0 <= nx < TILE and ny < TILE and not key[ny, nx]:
+                    work[ny, nx] += err * f
+    return out
+
+
 def _to_code(rgb, stp):
     q = np.clip(np.round(rgb / 255.0 * 31), 0, 31).astype(np.uint16)
     code = q[:, 0] | (q[:, 1] << 5) | (q[:, 2] << 10)
@@ -235,8 +342,13 @@ def plan_field(name, parts, art):
     stats = {'palettes': [], 'cells': 0, 'tiles': 0, 'err_before': 0.0,
              'err_after': 0.0}
     uniform = uniform_palettes(parts[SECTION_SCRIPT])
+    group = None
     if not uniform:
-        return None, stats
+        group = (single_source_group(parts[SECTION_SCRIPT])
+                 if name in GROUP_FIELDS else None)
+        if group is None:
+            return None, stats
+        uniform = {group[0]: 255}
     sec9 = parts[SECTION9]
     surv = DC.survey(sec9)
     pages_list, tex_start, tex_end = FN.parse_texture_block(
@@ -270,7 +382,11 @@ def plan_field(name, parts, art):
     for P in sorted(uniform):
         if P >= npg:
             continue
-        mine = [(o, l, f) for o, l, f in recs if sec9[o + T_PAL] == P]
+        members = group[1] if group else {P}
+        mine = [(o, l, f) for o, l, f in recs if sec9[o + T_PAL] in members
+                # a non-FX record on a truecolor page never reads a palette
+                and (f or getattr(pages.get(sec9[o + T_TEX]), 'depth', 1)
+                     != 2)]
         if not mine:
             continue
         # every record additive FX on a 256px paletted FX page
@@ -300,7 +416,7 @@ def plan_field(name, parts, art):
                 for c in cells)
             if not (margin or multi):
                 continue
-            if any(cell_pals[c] != {P} for c in cells):
+            if any(not cell_pals[c] <= members for c in cells):
                 raise RequantError('palette %d shares a cell with another '
                                    'palette' % P)
             # Every P record has use_fx set (checked above), so its base
@@ -308,7 +424,7 @@ def plan_field(name, parts, art):
             # not a script toggle -- BGON/BGOFF switch param/state only.
             _requant_palette(name, P, cells, sec9, pages, new_pages, cols,
                              hdr, cpp, palbuf, provider, stats, mine,
-                             uniform[P])
+                             uniform[P], also=sorted(members - {P}))
             continue
         # loop broke: some record is not an additive paletted FX record
         continue
@@ -330,7 +446,7 @@ def plan_field(name, parts, art):
 
 
 def _requant_palette(name, P, cells, sec9, pages, new_pages, cols, hdr, cpp,
-                     palbuf, provider, stats, mine, last=255):
+                     palbuf, provider, stats, mine, last=255, also=()):
     arts = {}
     targets = {}
     for slot, sx, sy in sorted(cells):
@@ -387,11 +503,14 @@ def _requant_palette(name, P, cells, sec9, pages, new_pages, cols, hdr, cpp,
         old_idx = arr[sy:sy + TILE, sx:sx + TILE]
         old_c = np.where(old_idx[..., None] == 0, 0, old_rgb[old_idx])
         flat = t.reshape(-1, 3)
-        d = ((flat[:, None, :] - rgb[None, :, :]) ** 2).sum(-1)
-        idx = d.argmin(1).astype(np.uint8) + 1
-        if entry0_key:
-            idx[flat.max(1) < EMPTY] = 0
-        idx = idx.reshape(TILE, TILE)
+        if name in DITHER_FIELDS:
+            idx = _dither(t, rgb, entry0_key)
+        else:
+            d = ((flat[:, None, :] - rgb[None, :, :]) ** 2).sum(-1)
+            idx = d.argmin(1).astype(np.uint8) + 1
+            if entry0_key:
+                idx[flat.max(1) < EMPTY] = 0
+            idx = idx.reshape(TILE, TILE)
         new_c = np.where(idx[..., None] == 0, 0,
                          rgb[np.maximum(idx.astype(np.int32) - 1, 0)])
         err_b += float(np.abs(old_c - t).mean())
@@ -399,9 +518,12 @@ def _requant_palette(name, P, cells, sec9, pages, new_pages, cols, hdr, cpp,
         arr[sy:sy + TILE, sx:sx + TILE] = idx
         new_pages[slot] = arr.tobytes()
 
-    poff = hdr + 2 * P * cpp
-    for j, value in enumerate(codes, 1):
-        struct.pack_into('<H', palbuf, poff + 2 * j, int(value))
+    # a group (618u): every member palette gets the same entries -- at run
+    # time they are all palette P's buffer anyway
+    for Q in [P] + list(also):
+        poff = hdr + 2 * Q * cpp
+        for j, value in enumerate(codes, 1):
+            struct.pack_into('<H', palbuf, poff + 2 * j, int(value))
     n = len(targets)
     stats['palettes'].append(P)
     stats['cells'] += n

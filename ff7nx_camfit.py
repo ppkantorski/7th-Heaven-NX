@@ -227,6 +227,32 @@ def _live_columns(sec9, off, pages, prgbs, npg):
     return [bool(colsum[k * sc:(k + 1) * sc].any()) for k in range(TILE)]
 
 
+def _inner_run(x, live):
+    """(start, end) of a margin tile's live columns CONTIGUOUS WITH THE
+    PICTURE -- the run that touches the tile's inner side.
+
+    BUILD 617, fship_22: Cosmos's art for that field stops at +/-213.5 and
+    the last 10 units of each margin tile are black filler, but a handful
+    of stray lit units sit in the outermost column of four tiles. Taking
+    first-live to last-live counted the black between them as art, the run
+    read -224..224, the camera kept +/-10 units of travel, and hardware
+    showed a black strip down the right edge. A speck separated from the
+    picture by filler is not the picture's edge.
+    """
+    idx = [k for k, v in enumerate(live) if v]
+    if x + TILE / 2 >= 0:                   # right side: inner edge is left
+        a = idx[0]
+        b = a
+        while b + 1 < TILE and live[b + 1]:
+            b += 1
+        return (x + a, x + b + 1)
+    b = idx[-1]                              # left side: inner edge is right
+    a = b
+    while a - 1 >= 0 and live[a - 1]:
+        a -= 1
+    return (x + a, x + b + 1)
+
+
 def _cell_luma(sec9, off, pages, prgbs, npg):
     """Mean luminance 0..255 of the page cell one tile samples, or None."""
     import diag_common as DC
@@ -287,7 +313,7 @@ def art_run(sec9, midpoint, parts=None):
             pages = {p.slot: p for p in surv['pages']}
         except Exception:                                      # noqa: BLE001
             prgbs, npg, pages = [], 0, {}
-    iv = []
+    iv, iv_span = [], []
     for layer, offs in DC.walk_layers(sec9, surv['back_start'],
                                       surv['tex_start']):
         if layer not in (1, 2):
@@ -303,21 +329,32 @@ def art_run(sec9, midpoint, parts=None):
                 if live is not None:
                     if not any(live):
                         continue
-                    iv.append((x + live.index(True),
-                               x + TILE - live[::-1].index(True)))
+                    iv.append(_inner_run(x, live))
+                    iv_span.append((x + live.index(True),
+                                    x + TILE - live[::-1].index(True)))
                     continue
             iv.append((x, x + TILE))
+            iv_span.append((x, x + TILE))
     if not iv:
         return None
-    iv.sort()
-    runs = []
-    for a, b in iv:
-        if runs and a <= runs[-1][1]:
-            runs[-1] = (runs[-1][0], max(runs[-1][1], b))
-        else:
-            runs.append((a, b))
-    return (next((r for r in runs if r[0] <= midpoint <= r[1]), None)
-            or max(runs, key=lambda r: r[1] - r[0]))
+
+    def _run(iv):
+        iv = sorted(iv)
+        runs = []
+        for a, b in iv:
+            if runs and a <= runs[-1][1]:
+                runs[-1] = (runs[-1][0], max(runs[-1][1], b))
+            else:
+                runs.append((a, b))
+        return (next((r for r in runs if r[0] <= midpoint <= r[1]), None)
+                or max(runs, key=lambda r: r[1] - r[0]))
+    new, old = _run(iv), _run(iv_span)
+    # Never let the stricter edge reading take a field out of the fit: a
+    # run it makes shorter than the window would be LEFT ALONE, which is
+    # more travel, not less. Only tightening is allowed here.
+    if new[1] - new[0] < NEEDED <= old[1] - old[0]:
+        return old
+    return new
 
 
 VIEW_HALF_Y = 120       # the frame is game-y 0..480 = 240 field units

@@ -64,8 +64,53 @@ def read_entries(f):
     return version, flags, entries
 
 
+def is_folder_mod(src):
+    """A mod shipped as an unpacked folder (mod.xml at its root) instead of
+    an .iro -- 7th Heaven PC loads both. BUILD 619."""
+    return os.path.isdir(src)
+
+
+def _folder_entries(src):
+    out = []
+    for base, dirs, files in os.walk(src):
+        dirs.sort()
+        for fn in sorted(files):
+            if fn.startswith('.'):
+                continue
+            rel = os.path.relpath(os.path.join(base, fn), src)
+            out.append(rel.replace(os.sep, '\\'))
+    return out
+
+
+def folder_path(src, wanted):
+    """Case-insensitive lookup of an entry path inside a folder mod (the
+    mods are authored on Windows); None when absent."""
+    path = src
+    for part in wanted.replace('\\', '/').split('/'):
+        if not part:
+            continue
+        cand = os.path.join(path, part)
+        if not os.path.exists(cand):
+            try:
+                hit = next((e for e in os.listdir(path)
+                            if e.lower() == part.lower()), None)
+            except OSError:
+                return None
+            if hit is None:
+                return None
+            cand = os.path.join(path, hit)
+        path = cand
+    return path if os.path.isfile(path) else None
+
+
 def read_one(src, wanted):
     """Pull a single entry out of an .iro without extracting the rest."""
+    if is_folder_mod(src):
+        hit = folder_path(src, wanted)
+        if hit is None:
+            return None
+        with open(hit, 'rb') as f:
+            return f.read()
     filesize = os.path.getsize(src)
     target = wanted.lower().replace('\\', '/')
     with open(src, 'rb') as f:
@@ -87,6 +132,8 @@ def list_entries(src):
     """Just the entry paths inside an .iro (original case, as stored), read
     from the directory listing only -- no decompression, no disk writes.
     Cheap enough to call for every mod on UI startup."""
+    if is_folder_mod(src):
+        return _folder_entries(src)
     with open(src, 'rb') as f:
         _, _, entries = read_entries(f)
     return [name for name, _eflags, _offset, _size in entries]
@@ -104,6 +151,12 @@ def extract(src, dest, progress=None, skip=None):
     `skipped` (which means "already on disk"), because the two want very
     different things said about them.
     """
+    if is_folder_mod(src):
+        # Already unpacked: a folder mod IS its own cache (build.Mod points
+        # there and never extracts or deletes it).
+        if os.path.realpath(src) != os.path.realpath(dest):
+            raise ValueError('a folder mod is not extracted elsewhere')
+        return 0, len(_folder_entries(src)), [], 0
     filesize = os.path.getsize(src)
     written = skipped = excluded = 0
     failures = []
@@ -318,8 +371,20 @@ class Manifest:
         self.raw = text
         head = text[:text.find('<ConfigOption')] if '<ConfigOption' in text \
             else text
-        fields = dict(_FIELD.findall(head))
+        # FIRST occurrence wins (7th Heaven reads /ModInfo/Name with
+        # SelectSingleNode). Idle Animations comments out only the TAGS of an
+        # old ConfigOption, so its inner <Name>A-Pose Fix</Name> sits in the
+        # header after the real name; last-wins showed the mod as
+        # "A-Pose Fix". BUILD 619.
+        fields = {}
+        for k, v in _FIELD.findall(head):
+            fields.setdefault(k, v)
         self.mod_id = fields.get('ID', '').strip().lower()
+        # 7th Heaven mod IDs are GUIDs. A stray <ID> from a half-commented
+        # option block (Idle Animations' `A-Pose_Fix`) is not one.
+        if not re.fullmatch(r'[0-9a-f]{8}(-?[0-9a-f]{4}){3}-?[0-9a-f]{12}',
+                            self.mod_id):
+            self.mod_id = ''
         self.name = fields.get('Name', '').strip()
         self.author = fields.get('Author', '').strip()
         self.version = fields.get('Version', '').strip()

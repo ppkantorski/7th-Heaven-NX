@@ -881,7 +881,23 @@ def build_speak_cave(cave, addr, bss):
     MESSAGE opcode handler knows who but not whether anything sounds. This is
     the one byte that joins them, taken at the handler's entry where
     `current_entity_id` is still the entity running the script. Stored as
-    model+1 so a zeroed BSS cannot read as "Cloud is speaking".
+    model+1 so a zeroed BSS cannot read as "Cloud is speaking"; 0 = nobody.
+
+    BUILD 613/613b -- two ways the entity is NOT the speaker:
+      * the entity has no model (an announcer, a director): nobody;
+      * the LINE says it is not the entity's: tin_1's "Type A security
+        alert" is issued from TIFA's own script. FF7 centres system text
+        with leading spaces, and a spoken line never starts with one unless
+        it is a name header (" Yuffie\n{B2}...", mtcrl_0). So a string
+        whose first byte is a space (0x00) is nobody's, unless its first
+        line break is followed by an opening quote (0xE7 0xB2). Measured on
+        the shipped flevel: of 10,650 MESSAGE lines issued by entities with
+        a model, 17 start with a space; 16 of those are system text,
+        announcements, tutorials and inner monologue, and the rule keeps
+        the 17th (Yuffie's).
+    The string is read where the handler itself will read it: section-1 base
+    [0xCBF5E8] + its string table (u16 at +4), string id = the MES opcode's
+    second operand at base + ip + 2. Every byte is translated on its own.
     """
     a = Asm(cave, addr)
     AC.save_host(a, 0x80)
@@ -892,14 +908,64 @@ def build_speak_cave(cave, addr, bss):
     a.emit(A.add_reg(9, 9, 23))
     a.emit(A.mov_reg(0, 9))
     a.emit(A.bl(a.pc(), GUEST_TRANSLATE))
-    a.emit(A.ldrb(23, 0, 0))
-    a.emit(A.cmp_imm(23, MAX_MODELS))
-    a.bcond('out', HS)
-    a.emit(A.add_imm(23, 23, 1))
-    a.emit(A.str_(23, 24, HDR_SPEAKER))
-    a.label('out')
+    a.emit(A.ldrb(25, 0, 0))                    # model
+    a.emit(A.movz(26, 0))                       # speaker: nobody
+    a.emit(A.cmp_imm(25, MAX_MODELS))
+    a.bcond('store', HS)
+    # ---- the line itself
+    _gld32_imm(a, G_SCRIPT_CODE, 20)            # section-1 base
+    AC.mov32(a, 9, G_SCRIPT_IP)
+    a.emit(A.add_reg_lsl(0, 9, 23, 1))
+    a.emit(A.bl(a.pc(), GUEST_TRANSLATE))
+    a.emit(A.ldrh(21, 0, 0))                    # ip (u16, 2-aligned)
+    a.emit(A.add_reg(21, 20, 21))
+    _gld8(a, 21, 2, 22)                         # string id
+    _gld8(a, 20, 4, 27)                         # string table offset, lo
+    _gld8(a, 20, 5, 9)
+    a.emit(orr_lsl8(27, 27, 9))
+    a.emit(A.add_reg(27, 20, 27))               # table
+    a.emit(A.add_reg_lsl(28, 27, 22, 1))
+    _gld8(a, 28, 2, 21)                         # entry lo
+    _gld8(a, 28, 3, 9)
+    a.emit(orr_lsl8(21, 21, 9))
+    a.emit(A.add_reg(28, 27, 21))               # the string
+    _gld8(a, 28, 0, 9)
+    a.cbnz(9, 'speaker')                        # no leading space: spoken
+    a.emit(A.movz(21, 1))                       # k
+    a.label('scan')
+    a.emit(A.add_reg(0, 28, 21))
+    a.emit(A.bl(a.pc(), GUEST_TRANSLATE))
+    a.emit(A.ldrb(9, 0, 0))
+    a.emit(A.cmp_imm(9, 0xFF))
+    a.bcond('store', A.EQ)                      # end of string: nobody
+    a.emit(A.cmp_imm(9, 0xE7))
+    a.bcond('next', NE)
+    a.emit(A.add_imm(0, 28, 1))
+    a.emit(A.add_reg(0, 0, 21))
+    a.emit(A.bl(a.pc(), GUEST_TRANSLATE))
+    a.emit(A.ldrb(9, 0, 0))
+    a.emit(A.cmp_imm(9, 0xB2))
+    a.bcond('speaker', A.EQ)                    # " Name\n{B2}": spoken
+    a.b('store')                                # system text: nobody
+    a.label('next')
+    a.emit(A.add_imm(21, 21, 1))
+    a.emit(A.cmp_imm(21, NAME_SCAN))
+    a.bcond('scan', LO)
+    a.b('store')
+    a.label('speaker')
+    a.emit(A.add_imm(26, 25, 1))
+    a.label('store')
+    a.emit(A.str_(26, 24, HDR_SPEAKER))
     _epilogue(a, SPEAK_ORIG, SPEAK_RESUME, restore_esp=False)
     return a.resolve()
+
+
+NAME_SCAN = 26                        # a name header fits in 25 bytes
+
+
+def orr_lsl8(rd, rn, rm):
+    """ORR Wd, Wn, Wm, LSL #8."""
+    return A.orr_lsl(rd, rn, rm, 8)
 
 
 def build_load_cave(cave, addr, bss, mload_entry, gen_entry):

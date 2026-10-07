@@ -399,6 +399,13 @@ class IroReader:
         import iro
         self._iro = iro
         self.path = path
+        self.folder = iro.is_folder_mod(path)
+        if self.folder:                     # BUILD 619: an unpacked folder mod
+            self.size = 0
+            self.by_name = {n.lower().replace('\\', '/'): n
+                            for n in iro.list_entries(path)}
+            self._fh = None
+            return
         with open(path, 'rb') as f:
             _ver, _flags, entries = iro.read_entries(f)
         self.size = os.path.getsize(path)
@@ -407,6 +414,8 @@ class IroReader:
         self._fh = None
 
     def __enter__(self):
+        if self.folder:
+            return self
         self._fh = open(self.path, 'rb')
         return self
 
@@ -419,6 +428,10 @@ class IroReader:
         rec = self.by_name.get(name.lower().replace('\\', '/'))
         if rec is None:
             return None
+        if self.folder:
+            with open(os.path.join(self.path, rec.replace('\\', os.sep)),
+                      'rb') as f:
+                return f.read()
         flags, off, size = rec
         f = self._fh or open(self.path, 'rb')
         try:

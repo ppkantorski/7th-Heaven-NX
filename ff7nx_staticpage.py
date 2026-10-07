@@ -25,8 +25,9 @@ page count, slot set, texture allocation and animation are unchanged.
 
 Both mechanisms are deliberately fingerprinted.  Every structural fact is
 rechecked at build time and a mismatch refuses the field instead of guessing.
-fship_22 is intentionally absent: its layer 1 is already completely 768px and
-its remaining paletted page belongs to layer 2.
+fship_22 is the exception to the layer-1 rule: its remaining paletted page
+(slot 2) holds 74 opaque LAYER-2 cells, repacked, so BUILD 617 rebuilds it
+cell by cell from each record's own 1997 page/cell (`L2_TARGETS`).
 """
 from __future__ import annotations
 
@@ -124,6 +125,26 @@ CELL_TARGETS = {
 
 class StaticPageError(ValueError):
     """The field is no longer the exact layout this correction proves safe."""
+
+
+# BUILD 617. fship_22 -- the one Highwind bridge variant whose last paletted
+# page belongs to LAYER 2. The dense repack leaves 74 cells on a 256px page
+# in every variant; in fship_2/_23/_24/_25 they are layer-1 cells on slot 0
+# (promoted above), in fship_22 they are opaque layer-2 cells repacked onto
+# slot 2 (the "low quality squares" on the consoles and the upper-left
+# glass). That page is a REPACK, not the 1997 page, so it cannot take one
+# Cosmos image wholesale: every cell is rebuilt from the Cosmos art of the
+# record's own 1997 page and cell, which the record order still names
+# (the first N records are the vanilla records, in order). Colour key =
+# Cosmos's own alpha (PageArt writes 0x0000 where the mod paints nothing),
+# which is what fship_24 got for the same 74 cells from the dense repack.
+# Same slot, same page count; the field then weighs exactly what the other
+# four variants weigh after the slot-0 promotion.
+L2_TARGETS = {
+    'fship_22': {'slot': 2, 'refs': 74},
+}
+L2_CELL = 16
+L2_SCALE = PAGE_PX // 256
 
 
 def enabled():
@@ -383,8 +404,125 @@ def _relocate_cell(name, parts, art):
                  'after_bytes': before, 'relocated': 1}
 
 
-def improve_field(name, parts, art):
+def _promote_layer2_page(name, parts, art, vanilla):
+    """fship_22's repacked layer-2 page -> 768px truecolour, cell by cell."""
+    plan = L2_TARGETS[name]
+    slot = plan['slot']
+    if vanilla is None:
+        raise StaticPageError('the vanilla field is unavailable')
+    sec9 = parts[SECTION9]
+    pages, tex_start, tex_end, page_px = DC.parse_pages(sec9)
+    if page_px != PAGE_PX:
+        raise StaticPageError('truecolour page size is %dpx' % page_px)
+    page = pages[slot] if slot < len(pages) else None
+    if page is None or page.size_flag != 0:
+        raise StaticPageError('slot %d is not a size-0 page' % slot)
+
+    back = sec9.find(b'BACK')
+    rows = [(layer, off) for layer, offs in DC.walk_layers(sec9, back,
+                                                           tex_start)
+            for off in offs]
+    users = [(i, layer, off) for i, (layer, off) in enumerate(rows)
+             if sec9[off + T_BASE] == slot or sec9[off + T_FX] == slot]
+    if len(users) != plan['refs']:
+        raise StaticPageError('slot %d has %d reference(s), expected %d'
+                              % (slot, len(users), plan['refs']))
+    v9 = vanilla[SECTION9]
+    vpages, vts, _vte, _vpx = DC.parse_pages(v9)
+    vrows = [(layer, off) for layer, offs in DC.walk_layers(
+        v9, v9.find(b'BACK'), vts) for off in offs]
+
+    provider = getattr(art, 'provider', None)
+    if provider is None:
+        raise StaticPageError('the exact Cosmos art provider is unavailable')
+    getter = provider.open(name)
+    arts = {}
+    grid = 256 // L2_CELL
+    cells = {}
+    for i, layer, off in users:
+        use_fx, = struct.unpack_from('<H', sec9, off + T_USE_FX)
+        if (layer != 2 or use_fx or sec9[off + T_BLEND] or sec9[off + T_PARAM]
+                or sec9[off + T_STATE] or sec9[off + T_BASE] != slot):
+            raise StaticPageError('slot %d is not only opaque static layer-2 '
+                                  'records' % slot)
+        if i >= len(vrows):
+            raise StaticPageError('record %d has no vanilla counterpart' % i)
+        vlayer, voff = vrows[i]
+        if (vlayer != layer or v9[voff + 2:voff + 6] != sec9[off + 2:off + 6]
+                or v9[voff + T_PAL] != sec9[off + T_PAL]
+                or v9[voff + T_BLEND] or v9[voff + T_PARAM]):
+            raise StaticPageError('record %d no longer matches vanilla' % i)
+        vpage = v9[voff + T_BASE]
+        sx, sy = struct.unpack_from('<HH', v9, voff + 10)
+        if sx % L2_CELL or sy % L2_CELL or sx > 240 or sy > 240:
+            raise StaticPageError('vanilla source %d,%d is off the grid'
+                                  % (sx, sy))
+        bx, by = struct.unpack_from('<II', sec9, off + T_BIG_X)
+        cu = int(round(bx / UV_SCALE * grid))
+        cv = int(round(by / UV_SCALE * grid))
+        if (cu * UV_SCALE // grid != bx or cv * UV_SCALE // grid != by
+                or not (0 <= cu < grid and 0 <= cv < grid)):
+            raise StaticPageError('record %d UV is not a whole cell' % i)
+        if vpage not in arts:
+            if set(provider.by_page.get((name, vpage), ())) != {PAGE_PAL} \
+                    or (name, vpage, PAGE_PAL) in provider.ambiguous_slots:
+                raise StaticPageError('page %d does not have exactly one '
+                                      'palette-0 Cosmos image' % vpage)
+            pa = getter(vpage, PAGE_PAL)
+            if pa is None or pa.px != PAGE_PX:
+                raise StaticPageError('page %d Cosmos art is missing' % vpage)
+            arts[vpage] = np.frombuffer(pa.buf, '<u2').reshape(PAGE_PX,
+                                                               PAGE_PX)
+        c = L2_CELL * L2_SCALE
+        block = arts[vpage][sy * L2_SCALE:sy * L2_SCALE + c,
+                            sx * L2_SCALE:sx * L2_SCALE + c]
+        prev = cells.get((cu, cv))
+        if prev is not None and not np.array_equal(prev, block):
+            raise StaticPageError('cell %d,%d is shared by two different '
+                                  'Cosmos cells' % (cu, cv))
+        cells[(cu, cv)] = block
+
+    before = _field_bytes(pages)
+    c = L2_CELL * L2_SCALE
+    if page.depth == 2 and page.px == PAGE_PX:
+        cur = np.frombuffer(page.data, '<u2').reshape(PAGE_PX, PAGE_PX)
+        if all(np.array_equal(cur[cv * c:(cv + 1) * c, cu * c:(cu + 1) * c],
+                              blk) for (cu, cv), blk in cells.items()):
+            return None, {'already': 1, 'tiles': len(users),
+                          'before_bytes': before, 'after_bytes': before}
+        raise StaticPageError('slot %d is truecolour but not this promotion'
+                              % slot)
+    if page.depth != 1 or page.px != 256 or len(page.data) != 256 * 256:
+        raise StaticPageError('slot %d is not a 256px paletted page' % slot)
+    out_px = np.zeros((PAGE_PX, PAGE_PX), '<u2')
+    for (cu, cv), blk in cells.items():
+        out_px[cv * c:(cv + 1) * c, cu * c:(cu + 1) * c] = blk
+    data = out_px.tobytes()
+    new_pages = list(pages)
+    new_pages[slot] = FN.Page(slot, page.size_flag, 2, data, PAGE_PX)
+    after = _field_bytes(new_pages)
+    if after > int(MAX_FIELD_MB * 1048576):
+        raise StaticPageError('promotion would use %.4f MiB, over %.1f MiB'
+                              % (after / 1048576.0, MAX_FIELD_MB))
+    prefix = sec9[:tex_start]
+    old_slots = tuple(i for i, p in enumerate(pages) if p is not None)
+    new9 = FN.replace_texture_block(sec9, new_pages, tex_start, tex_end)
+    parsed, new_start, _new_end, new_px = DC.parse_pages(new9)
+    if new9[:new_start] != prefix:
+        raise StaticPageError('tile records changed while replacing a page')
+    if (tuple(i for i, p in enumerate(parsed) if p is not None) != old_slots
+            or new_px != PAGE_PX or parsed[slot].data != data):
+        raise StaticPageError('promoted page did not round-trip exactly')
+    out = list(parts)
+    out[SECTION9] = new9
+    return out, {'already': 0, 'tiles': len(users),
+                 'before_bytes': before, 'after_bytes': after}
+
+
+def improve_field(name, parts, art, vanilla=None):
     """Return (new parts or None, measurements) for one admitted field."""
+    if name in L2_TARGETS:
+        return _promote_layer2_page(name, parts, art, vanilla)
     if name in CELL_TARGETS:
         return _relocate_cell(name, parts, art)
     if name not in TARGETS:
@@ -450,7 +588,7 @@ def apply_to_flevel(archive, payloads, art, encode=None, log=lambda *_: None):
     if not enabled() or art is None:
         return stats
     encode = encode or archive.encode_field
-    for name in tuple(TARGETS) + tuple(CELL_TARGETS):
+    for name in tuple(TARGETS) + tuple(CELL_TARGETS) + tuple(L2_TARGETS):
         entry = archive.index.get(name)
         if entry is None or not archive.is_field(entry):
             continue
@@ -459,7 +597,10 @@ def apply_to_flevel(archive, payloads, art, encode=None, log=lambda *_: None):
             raw = (lgp.lzs_decompress(payload[4:]) if payload
                    else archive.decompressed(entry))
             parts = lgp.split_sections(raw)
-            out, st = improve_field(name, parts, art)
+            vanilla = None
+            if name in L2_TARGETS:
+                vanilla = lgp.split_sections(archive.decompressed(entry))
+            out, st = improve_field(name, parts, art, vanilla)
             if out is None:
                 stats['already'] += st.get('already', 0)
                 continue
@@ -480,7 +621,7 @@ def apply_to_flevel(archive, payloads, art, encode=None, log=lambda *_: None):
 def summarise(stats):
     if not stats.get('fields'):
         return ''
-    return ('  STATIC RESOLUTION COMPLETION: %d layer-1 cell(s) across %d '
+    return ('  STATIC RESOLUTION COMPLETION: %d layer-1/2 cell(s) across %d '
             'field(s) moved 256 -> 768: %d exclusive page(s) promoted in '
             'place and %d isolated tile(s) seated in unused cells on existing '
             'opaque pages. No page or slot was added; shared FX pages, '

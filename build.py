@@ -34,6 +34,7 @@ import sfxmod
 import ff7nx_worldsteps
 import ff7nx_fieldsteps
 import ff7nx_fieldsteps_data
+import ff7nx_stepsextra
 import ff7nx_sfxshuffle
 import ff7nx_sfxbattle
 import ff7nx_ambient
@@ -82,6 +83,8 @@ import ff7nx_minifade
 import ff7nx_minipace
 import ff7nx_snowdraw
 import ff7nx_snowface
+import ff7nx_snowmouth
+import ff7nx_snowtifa
 import ff7nx_coasterworld
 import ff7nx_deferredvt
 import ff7nx_subgrid
@@ -97,6 +100,31 @@ import ff7nx_fxsplit
 import ff7nx_palanim
 import ff7nx_fxrequant
 import ff7nx_lostdetail
+import ff7nx_fxseam
+import ff7nx_siblingmargin
+import ff7nx_tvnotch
+import ff7nx_glowfill
+import ff7nx_lampfill
+import ff7nx_beams
+import ff7nx_cutout
+import ff7nx_debugwarp
+import ff7nx_fxpalfix
+import ff7nx_fieldshift
+import ff7nx_cosmosrestore
+import ff7nx_fxhdlift
+import ff7nx_fxpcstatic
+import ff7nx_chunkparallax
+import ff7nx_trnad1fx
+import ff7nx_l4offset
+import ff7nx_scrvclip
+import ff7nx_animdetail
+import ff7nx_underfill
+import ff7nx_fxtrial
+import ff7nx_fxsmooth
+import ff7nx_fxcomplete
+import ff7nx_shakepad
+import ff7nx_trainlower
+import ff7nx_texpatch
 import ff7nx_worldsphere
 import ff7nx_chardds
 import ff7nx_vanillatc
@@ -122,9 +150,41 @@ import ff7nx_marginart
 import ff7nx_palrange
 import field_bg_native
 import field_bg_repack
+import diag_common
 import field_bg_compact
 import field_bg_pagecap
 import field_bg_shadow
+import ff7nx_fxd1art
+import ff7nx_palstates
+import ff7nx_palauto
+import ff7nx_edgeclean
+import ff7nx_fxrestore
+import ff7nx_fxholes
+import ff7nx_bandbake
+import ff7nx_beamhd
+import ff7nx_bgscr60
+import ff7nx_wishift
+import ff7nx_specks
+import ff7nx_floorclip
+import ff7nx_fxcut
+import ff7nx_glowhd
+import ff7nx_ghostedge
+import ff7nx_artpatch
+import ff7nx_hrepeat
+import ff7nx_edgesmooth
+import ff7nx_wheelfix
+import ff7nx_ripplefade
+import ff7nx_scenemodel
+import ff7nx_easteregg
+import ff7nx_idleanim
+import ff7nx_catshades
+import ff7nx_destrobe
+import ff7nx_floordepth
+import ff7nx_difix
+import ff7nx_bgmoviefield
+import ff7nx_moviepace
+import ff7nx_subparallax
+import ff7nx_opbanks  # noqa: F401  (operand layouts for ff7nx_palauto)
 
 # Largest DECOMPRESSED field file this build wrote. apply_field_bg
 # needs it: the game decompresses a field into a fixed 2,000,000-byte
@@ -591,9 +651,17 @@ class Mod:
 
     def __init__(self, path, cache_root):
         self.path = path
-        self.filename = os.path.basename(path)
-        self.stem = os.path.splitext(self.filename)[0]
-        self.cache = os.path.join(cache_root, self.stem)
+        self.filename = os.path.basename(os.path.normpath(path))
+        # BUILD 619. A mod can also be an unpacked FOLDER (mod.xml at its
+        # root), as 7th Heaven PC accepts. It is read in place: the folder is
+        # its own cache, never extracted, written to or deleted.
+        self.is_folder = iro.is_folder_mod(path)
+        if self.is_folder:
+            self.stem = self.filename
+            self.cache = path
+        else:
+            self.stem = os.path.splitext(self.filename)[0]
+            self.cache = os.path.join(cache_root, self.stem)
         self.manifest = None
         self.error = None
         self._entries = None
@@ -615,6 +683,11 @@ class Mod:
         return self._entries
 
     def ensure_extracted(self, log=lambda *_: None, progress=None):
+        if self.is_folder:
+            self.skipped_images = sum(
+                1 for e in self.entries() if _no_switch_loader(e))
+            self._load_manifest()
+            return False
         # The stamp is three lines now: the .iro signature, how many entries
         # _no_switch_loader() held back, and the extraction-policy version.
         # Line two is what lets the
@@ -701,6 +774,19 @@ class Mod:
         return True
 
     def _load_manifest(self):
+        if self.is_folder:
+            path = iro.folder_path(self.path, 'mod.xml')
+            if path is None:
+                self.error = 'no mod.xml in folder'
+                self.manifest = None
+                return
+            try:
+                self.manifest = iro.Manifest(path)
+                self.error = None
+            except Exception as exc:
+                self.manifest = None
+                self.error = f'mod.xml unreadable: {exc}'
+            return
         path = os.path.join(self.cache, 'mod.xml')
         if not os.path.exists(path):
             # Pull just mod.xml straight out of the .iro so the UI can show
@@ -787,6 +873,12 @@ class Mod:
         subdirectories like fb/char and fb/high) share it, so they are not
         treated as conflicting.
         """
+        # BUILD 619. [Tsunamods] Idle Animations is applied by
+        # ff7nx_idleanim (field-gated loader repointing + new char.lgp
+        # names), never file by file: its FieldID gates and its whole-section
+        # chunk.3 copies have no build-time equivalent here.
+        if ff7nx_idleanim.handles(self):
+            return []
         folders = iro.active_folders(self.manifest, settings,
                                      read=read, log=log) \
             if self.manifest else []
@@ -1196,6 +1288,30 @@ def build_plan(mods, settings_by_mod, catalogs, log=lambda *_: None,
     plan = Plan()
     plan.mod_rank = {mod.filename: i for i, mod in enumerate(mods)}
 
+    # BUILD 619. [Tsunamods] Idle Animations (a folder mod): what its options
+    # select, for the flevel and char.lgp passes. Echo-S's presence answers
+    # the mod's own exe-byte gate between its loader variants.
+    ff7nx_idleanim.CURRENT = None
+    for mod in mods:
+        if ff7nx_idleanim.handles(mod) and not ff7nx_idleanim.disabled():
+            _echo = any(getattr(getattr(m, 'manifest', None), 'mod_id', '')
+                        .lower() == ECHO_S_MOD_ID for m in mods)
+            try:
+                ff7nx_idleanim.CURRENT = ff7nx_idleanim.plan_for(
+                    mod, settings_by_mod.get(mod.filename, {}), _echo,
+                    read=runtime_read, log=log)
+            except Exception as exc:                           # noqa: BLE001
+                log('! idle animations: not applied -- %s' % exc)
+                continue
+            _cur = ff7nx_idleanim.CURRENT
+            log('%s: %d character clip(s) (%s)%s -- applied by the idle '
+                'animation pass, not file by file'
+                % (mod.display_name, len(_cur['chars']),
+                   ', '.join('%s %s->%s' % c[:3] for c in _cur['chars'])
+                   or 'none',
+                   '; Cloud ORIC via %s' % os.path.basename(_cur['cloud'][1])
+                   if _cur['cloud'] else '; Cloud: none'))
+
     # FFNx textures held back at extraction (see _no_switch_loader) never
     # reach the walk below, so they are counted in here to keep the
     # "FFNx textures : N (skipped, no Switch loader)" line honest.
@@ -1395,6 +1511,25 @@ def build_plan(mods, settings_by_mod, catalogs, log=lambda *_: None,
                     ungated.append(os.path.join(dirpath, fn))
         for full in ungated + gated:
             plan.hext_files.append((full, mod))
+    # BUILD 620. Double Input Bugfix: its HEXT files patch x86 CODE, which
+    # this port does not run; ff7nx_difix translates them to ARM64 words in
+    # exefs/main instead (apply_difix), so they leave the exe list here.
+    ff7nx_difix.CURRENT = None
+    _di = [(f, m) for f, m in plan.hext_files if ff7nx_difix.handles(m)]
+    if _di and not ff7nx_difix.disabled():
+        try:
+            ff7nx_difix.CURRENT = ff7nx_difix.plan_from_hext(
+                [f for f, _m in _di])
+            plan.hext_files = [(f, m) for f, m in plan.hext_files
+                               if not ff7nx_difix.handles(m)]
+            log('%s: %s -- translated to ARM64 (exefs/main), not baked into '
+                'the exe' % (_di[0][1].display_name,
+                             ff7nx_difix.describe(ff7nx_difix.CURRENT)))
+        except Exception as exc:                               # noqa: BLE001
+            ff7nx_difix.CURRENT = None
+            log('! double-input fix: its HEXT files are not the ones this '
+                'build knows (%s); left to the exe path, which skips code '
+                'patches' % exc)
     if plan.hext_files:
         log(f'found {len(plan.hext_files)} HEXT exe-patch file(s) '
             '(will bake into ff7 exe if a base exe is provided)')
@@ -6687,6 +6822,9 @@ def _convert_field_backgrounds(archive, payloads, log, dds_sources=(),
     return nf, npg, grew
 
 
+D1_LIFT_PROVEN_MB = 37.44   # del3 / las0_3 on hardware, BUILD 618q
+
+
 def _lift_depth1_payloads(archive, payloads, log=lambda *_: None):
     """
     Rewrite every depth-1 page in every payload at `field_bg_native.D1_PAGE_PX`.
@@ -6718,6 +6856,7 @@ def _lift_depth1_payloads(archive, payloads, log=lambda *_: None):
         px = field_bg_native.VANILLA_PX
     n_fields = n_pages = 0
     refused, failed, untouched = [], [], 0
+    heavy = []
     biggest = 0
     # EVERY FIELD IN THE ARCHIVE, not just the ones this build changed.
     #
@@ -6742,9 +6881,21 @@ def _lift_depth1_payloads(archive, payloads, log=lambda *_: None):
             untouched += 1
         try:
             parts = lgp.split_sections(raw)
+            # BUILD 618v: palette-animated FX pages get Cosmos-guided 2x
+            # index art on top of the shadow art (ff7nx_fxd1art).
+            _d1art = ff7nx_fxd1art.compose(
+                name, parts, base=field_bg_shadow.lift_art(name))
             new9, k = field_bg_native.lift_depth1(
-                parts[8], px, field_bg_native.VANILLA_PX, dst,
-                art=field_bg_shadow.lift_art(name))
+                parts[8], px, field_bg_native.VANILLA_PX, dst, art=_d1art)
+            try:
+                _pl = diag_common.parse_pages(parts[8])[0]
+                _mb = sum(field_bg_repack._page_bytes(
+                    dst if q.depth == 1 else q.px, q.depth)
+                    for q in _pl if q is not None) / 1048576.0
+                if _mb > D1_LIFT_PROVEN_MB:
+                    heavy.append((name, _mb))
+            except Exception:                                  # noqa: BLE001
+                pass
             if not k:
                 continue
             parts[8] = new9
@@ -6774,6 +6925,15 @@ def _lift_depth1_payloads(archive, payloads, log=lambda *_: None):
     _sh = field_bg_shadow.summarise()
     if _sh:
         log(_sh)
+    _fa = ff7nx_fxd1art.summarise()
+    if _fa:
+        log(_fa)
+    if heavy:
+        heavy.sort(key=lambda t: -t[1])
+        log('  ! DEPTH-1 LIFT MEMORY (BUILD 618v): %d field(s) now above the '
+            'hardware-proven %.2f MB -- watch them for black squares: %s'
+            % (len(heavy), D1_LIFT_PROVEN_MB, ', '.join(
+                '%s %.1f' % t for t in heavy)))
     # A PARTIAL LIFT IS NOT A DEGRADED BUILD, IT IS A BROKEN ONE, so this
     # raises rather than logging and carrying on. A field left at 256 while
     # the module reads 0x40000 per paletted page desynchronises its TEXTURE
@@ -6795,6 +6955,41 @@ def _lift_depth1_payloads(archive, payloads, log=lambda *_: None):
                ff7nx_fieldbg.D1_PX_ENV))
 
 
+def _field_payload_matches(payload, raw):
+    """True when a stored field payload decodes to exactly ``raw``."""
+    try:
+        if len(payload) < 4 or struct.unpack_from('<I', payload, 0)[0] != len(payload) - 4:
+            return False
+        return lgp.lzs_decompress(payload[4:]) == raw
+    except Exception:                                          # noqa: BLE001
+        return False
+
+
+def field_payload_integrity(payloads, names=None):
+    """[(name, reason)] for field payloads whose stream or section table is
+    inconsistent -- the check that would have caught build 382's mtcrl_1."""
+    bad = []
+    for name in sorted(names if names is not None else payloads):
+        payload = payloads.get(name)
+        if not payload or '.' in name:
+            continue
+        try:
+            if struct.unpack_from('<I', payload, 0)[0] != len(payload) - 4:
+                bad.append((name, 'stored length mismatch'))
+                continue
+            raw = lgp.lzs_decompress(payload[4:])
+            if raw[:2] != b'\0\0' or struct.unpack_from('<I', raw, 2)[0] != 9:
+                continue                      # not a field file
+            ptrs = struct.unpack_from('<9I', raw, 6)
+            end = ptrs[8] + 4 + struct.unpack_from('<I', raw, ptrs[8])[0]
+            if end > len(raw):
+                bad.append((name, 'section 9 runs %+d bytes past the data'
+                            % (end - len(raw))))
+        except Exception as exc:                               # noqa: BLE001
+            bad.append((name, '%s: %s' % (type(exc).__name__, str(exc)[:60])))
+    return bad
+
+
 def _encode_field_cached(archive, raw):
     """
     archive.encode_field() with the result cached by content.
@@ -6813,7 +7008,15 @@ def _encode_field_cached(archive, raw):
             hashlib.sha1(b'FIELDLZS-V1-' + raw).hexdigest())
         if os.path.exists(path):
             with open(path, 'rb') as f:
-                return f.read()
+                cached = f.read()
+            # BUILD 617. Verify the hit, do not trust it. Build 382 shipped
+            # mtcrl_1 with exactly 16 KiB (one Apple-silicon page) of zeros
+            # inside its stored LZS stream while this cache held the correct
+            # bytes; lost detail and stack order then failed to parse it and
+            # the field went to the SD card broken. The native decoder makes
+            # this check cheap; a mismatch is re-encoded and rewritten.
+            if _field_payload_matches(cached, raw):
+                return cached
     except OSError:
         path = None
     out = archive.encode_field(raw)
@@ -7058,6 +7261,118 @@ def _snowboard_face(name, mod_files, van, log):
             os.replace(dest + '.tmp', dest)
         out[low] = (dest, mod)
         log('  %s: %s (BUILD 547)' % (name, note))
+    return out
+
+
+SNOWMOUTH_CACHE = os.path.join(HERE, 'cache', '_snowmouth')
+
+
+def _snowboard_mouth(name, mod_files, van, log):
+    """BUILD 617. A mouth on Cloud's snowboard face (both TMDs, drawn into
+    eyes.tex's free corner) and his right eye mapped as the mirror of his
+    left. After _snowboard_face, so it sees the lifted face. See
+    ff7nx_snowmouth. Anything not in the expected layout passes through."""
+    if not name.lower().startswith('snowboard') or \
+            not ff7nx_snowmouth.enabled():
+        return mod_files
+    out = dict(mod_files)
+    staged = {}
+    for low in ff7nx_snowmouth.TMD_NAMES + (ff7nx_snowmouth.TEX_NAME,):
+        src = out[low][0] if low in out else (van or {}).get(low)
+        mod = out[low][1] if low in out else None
+        if not src:
+            continue
+        try:
+            data = open(src, 'rb').read()
+        except OSError:
+            continue
+        if low == ff7nx_snowmouth.TEX_NAME:
+            new, note = ff7nx_snowmouth.patch_tex(data)
+        else:
+            try:
+                new, note = ff7nx_snowmouth.patch_tmd(low, data)
+            except ValueError as exc:
+                new, note = data, '%s: %s -- no mouth' % (low, exc)
+        staged[low] = (new, data, mod, note)
+    # all or nothing: a mouth on the model without its texels, or texels
+    # without the triangles, would be worse than neither
+    if len(staged) != 3 or any(n == d for n, d, _m, _t in staged.values()):
+        for low, (_n, _d, _m, note) in sorted(staged.items()):
+            log('  %s: %s' % (name, note))
+        if staged:
+            log('  %s: snowboard mouth left out (every part must apply)'
+                % name)
+        return mod_files
+    os.makedirs(SNOWMOUTH_CACHE, exist_ok=True)
+    for low, (new, _data, mod, note) in sorted(staged.items()):
+        dest = os.path.join(SNOWMOUTH_CACHE, '%s.%s.%s' % (
+            name, low, hashlib.sha1(new).hexdigest()[:16]))
+        if not os.path.exists(dest):
+            with open(dest + '.tmp', 'wb') as f:
+                f.write(new)
+            os.replace(dest + '.tmp', dest)
+        out[low] = (dest, mod)
+        log('  %s: %s (BUILD 617)' % (name, note))
+    return out
+
+
+SNOWTIFA_CACHE = os.path.join(HERE, 'cache', '_snowtifa')
+
+
+def _snowboard_tifa(name, mod_files, van, log):
+    """BUILD 618. Tifa's snowboard face (for_gs.tmd objects 264/279 over
+    tifaeye.tex): lifted off her head so the port's depth test stops making
+    her eyes blink, plus a mouth drawn like Cloud's. After _snowboard_mouth,
+    so it sees Cloud's patched file. The lift applies on its own; the mouth
+    only with both its triangles and its texels. See ff7nx_snowtifa."""
+    if not name.lower().startswith('snowboard') or \
+            not ff7nx_snowtifa.enabled():
+        return mod_files
+    out = dict(mod_files)
+
+    def src_of(low):
+        src = out[low][0] if low in out else (van or {}).get(low)
+        mod = out[low][1] if low in out else None
+        if not src:
+            return None, None, mod
+        try:
+            return src, open(src, 'rb').read(), mod
+        except OSError:
+            return None, None, mod
+    _s, tmd, tmd_mod = src_of(ff7nx_snowtifa.TMD_NAME)
+    _s, tex, tex_mod = src_of(ff7nx_snowtifa.TEX_NAME)
+    if tmd is None:
+        return mod_files
+    new_tex, tex_note = (tex, 'no %s' % ff7nx_snowtifa.TEX_NAME)
+    if tex is not None and ff7nx_snowtifa.mouth_enabled():
+        new_tex, tex_note = ff7nx_snowtifa.patch_tex(tex)
+    mouth = (tex is not None and ff7nx_snowtifa.mouth_enabled()
+             and (new_tex != tex or 'already' in tex_note))
+    try:
+        new_tmd, tmd_note = ff7nx_snowtifa.patch_tmd(tmd, mouth=mouth)
+    except ValueError as exc:
+        new_tmd, tmd_note = ff7nx_snowtifa.patch_tmd(tmd, mouth=False)
+        tmd_note += ' (mouth left out: %s)' % exc
+        mouth = False
+    staged = [(ff7nx_snowtifa.TMD_NAME, new_tmd, tmd, tmd_mod, tmd_note)]
+    if mouth:
+        staged.append((ff7nx_snowtifa.TEX_NAME, new_tex, tex, tex_mod,
+                       tex_note))
+    else:
+        log('  %s: %s' % (name, tex_note))
+    os.makedirs(SNOWTIFA_CACHE, exist_ok=True)
+    for low, new, data, mod, note in staged:
+        if new == data:
+            log('  %s: %s' % (name, note))
+            continue
+        dest = os.path.join(SNOWTIFA_CACHE, '%s.%s.%s' % (
+            name, low, hashlib.sha1(new).hexdigest()[:16]))
+        if not os.path.exists(dest):
+            with open(dest + '.tmp', 'wb') as f:
+                f.write(new)
+            os.replace(dest + '.tmp', dest)
+        out[low] = (dest, mod)
+        log('  %s: %s (BUILD 618)' % (name, note))
     return out
 
 
@@ -8051,6 +8366,8 @@ def _build_model_archive(name, archive_path, mod_files, romfs, pack_lgp,
     mod_files = _debleed_textures(name, mod_files, van, log)
     mod_files = _psx_colour_contract(name, mod_files, van, log)
     mod_files = _snowboard_face(name, mod_files, van, log)
+    mod_files = _snowboard_mouth(name, mod_files, van, log)
+    mod_files = _snowboard_tifa(name, mod_files, van, log)
     mod_files = _coaster_world(name, mod_files, van, log)
 
     # Does this mod actually change the archive? Track new entries and whether
@@ -8350,6 +8667,16 @@ def _bake_widescreen_ranges(archive, payloads, widescreen, log):
         table_path=os.path.join(WIDESCREEN_CACHE, 'widescreen_fields.py'),
         log=log)
 
+    # BUILD 618l. FFNx subtracts the config's h_offset from every layer-4
+    # tile (background.cpp field_layer4_shift_tile_position); the range bake
+    # above only moves the camera. zcoal_1 / zcoal_3. See ff7nx_l4offset.
+    l4_stats = ff7nx_l4offset.apply_to_flevel(
+        archive, payloads, config,
+        encode=lambda raw: _encode_field_cached(archive, raw), log=log)
+    l4_line = ff7nx_l4offset.summarise(l4_stats)
+    if l4_line:
+        log(l4_line)
+
     log(f'  widescreen: {stats.get("total", 0)} field(s), '
         f'{stats.get("wide", 0)} would be wide '
         f'({100.0 * stats.get("wide", 0) / max(1, stats.get("total", 1)):.1f}%'
@@ -8637,6 +8964,11 @@ def _build_flevel(archive_path, chunks, field_files, romfs, log,
                    echo_s_flevel.HOUR_PICKER_MAX + 1,
                    echo_s_flevel.HOUR_PICKER_MAX,
                    ', '.join(sorted(extended))))
+        hoisted = echo_s_flevel.HOISTED_TIME_CHANGES
+        if hoisted:
+            log('  Echo-S: the scene clock change now happens while the '
+                'screen is still black, before the fade-in (BUILD 615): %s'
+                % ', '.join(sorted(hoisted)))
         kept = echo_s_flevel.KEPT_STOCK_MVIEF_WAITS
         if kept:
             log('  Echo-S: the same wait is in the STOCK script of %s and was '
@@ -8798,6 +9130,7 @@ def _build_flevel(archive_path, chunks, field_files, romfs, log,
                 '4:3 picture too, on layer 1' if _ma_scope == 'all'
                 else 'MARGIN ONLY -- the 4:3 picture is not touched'))
             _bc_art = ff7nx_marginart.provider_source(_art)
+            ff7nx_fxd1art.arm(_bc_art)     # BUILD 618v, only used by the 512 lift
             # ---- ARM THE 512px SHADOW. BUILD 109, HANDOFF-224.
             #
             # HERE and not earlier, because this is the first pass that has
@@ -9017,6 +9350,60 @@ def _build_flevel(archive_path, chunks, field_files, romfs, log,
                ', '.join('%s: %s' % r
                          for r in sp_stats['refused'][:4])))
 
+    # BUILD 617 (post-384). fxpages ran before the dense repack and
+    # budgeted against a projected scenery reserve most fields never use,
+    # so some effects came out half truecolor, half 256px paletted (las4_0's
+    # steam: pages 15-18 converted, 19-21 -- its bottom rows and its whole
+    # 16:9 margin -- left; dirty squares and a margin that drew in only some
+    # animation states on hardware). With the page decision final, finish
+    # exactly those effects against the REAL remaining budget, through the
+    # same fxpages vetoes. See ff7nx_fxpages.complete_mixed_effects.
+    if _bc_art is not None and os.environ.get(
+            'SEVENTH_NX_NO_FX_COMPLETE', '').strip() != '1':
+        _cm_pages, _cm_names, _cm_veto = 0, [], {}
+        for _name in archive.names():
+            _entry = archive.index.get(_name)
+            if _entry is None or not archive.is_field(_entry):
+                continue
+            try:
+                _payload = payloads.get(_name)
+                _raw = (lgp.lzs_decompress(_payload[4:]) if _payload
+                        else archive.decompressed(_entry))
+                _parts = list(lgp.split_sections(_raw))
+                if _parts[8].find(b'BACK') < 0 or \
+                        not ff7nx_fxpages.mixed_effect_slots(_parts[8]):
+                    continue
+                _pl, _ts, _te, _px = diag_common.parse_pages(_parts[8])
+                _runtime = sum(field_bg_repack._page_bytes(p.px, p.depth)
+                               for p in _pl if p is not None)
+                _new9, _cst = ff7nx_fxpages.complete_mixed_effects(
+                    _name, _parts[8], _bc_art, _px,
+                    max_raw_delta=max(0, FIELD_BG_RAW_CAP - len(_raw)),
+                    max_runtime_delta=max(0, int(
+                        field_bg_dense.FIELD_MB_CAP * 1048576.0) - _runtime),
+                    animated=ff7nx_palanim.animated_palettes(_parts[0]))
+                for _k, _v in _cst.items():
+                    if _k.endswith('_veto') and _v:
+                        _cm_veto[_k] = _cm_veto.get(_k, 0) + _v
+                if not _cst.get('pages'):
+                    continue
+                _parts[8] = _new9
+                payloads[_name] = _encode_field_cached(
+                    archive, lgp.join_sections(_parts))
+                _cm_pages += _cst['pages']
+                _cm_names.extend(_cst.get('page_names', []))
+            except Exception as exc:                           # noqa: BLE001
+                log('  ! FX effect completion: %s left unchanged -- %s: %s'
+                    % (_name, type(exc).__name__, str(exc)[:80]))
+        if _cm_pages:
+            log('  FX EFFECT COMPLETION (BUILD 617): %d leftover 256px FX '
+                'page(s) of half-converted effects made truecolor against the '
+                'final page budget (%s); still paletted: %s. '
+                'SEVENTH_NX_NO_FX_COMPLETE=1 disables.'
+                % (_cm_pages, ', '.join(_cm_names[:24]),
+                   ', '.join('%s %d' % kv for kv in sorted(_cm_veto.items()))
+                   or 'none'))
+
     # ------------------------------------------ DEPTH-1 RESOLUTION LIFT
     # FINDINGS-223. DEAD LAST, and that is the design rather than a
     # convenience: every pass above -- marginart, both blackcells,
@@ -9028,7 +9415,9 @@ def _build_flevel(archive_path, chunks, field_files, romfs, log,
     # per-page size field, so the engine infers a depth-1 page's dimension
     # from a patched constant; a single 256px page left behind would be read
     # as 512px and desynchronise the whole TEXTURE walk from that slot on.
-    _lift_depth1_payloads(archive, payloads, log)
+    # BUILD 618v: MOVED to after every page pass (before the debug warp).
+    # ~45 passes were added below this point since build 108, and each of
+    # them parses depth-1 pages at 256; lifting here fed them 512px pages.
 
     # Cosmos itself paints an isolated near-black wedge into the left margin
     # of fship_1 and its scene twin fship_12.  It is one disconnected
@@ -9084,6 +9473,8 @@ def _build_flevel(archive_path, chunks, field_files, romfs, log,
             % (len(pf_stats['refused']),
                ', '.join('%s: %s' % r for r in pf_stats['refused'][:3])))
 
+    # BUILD 618g: kuro_1 joins them (its two animated overlay records are
+    # carried through the 2x2 repeat); ff7nx_parallaxwide then skips it.
     # Twenty-one fields use an exact seamless 352x256 scrolling grid: trnad_4
     # layer 3, the Great Glacier hyou* set and the six move_* fields on layer
     # 4. The generic vertical fill duplicates residues past the 256-unit wrap.
@@ -9226,6 +9617,310 @@ def _build_flevel(archive_path, chunks, field_files, romfs, log,
     if fb_line:
         log(fb_line)
 
+    # BUILD 617. fship_22 is the one Highwind-bridge variant whose camera
+    # never moves, so Cosmos left its last ~10 units per side opaque black.
+    # Complete that strip from fship_24 (same room, same records), graded
+    # to the night palette per tile row; ff7nx_ws then gives it fship_24's
+    # camera travel and camfit re-checks the art. See ff7nx_siblingmargin.
+    sm_stats = ff7nx_siblingmargin.apply_to_flevel(
+        archive, payloads,
+        encode=lambda raw: _encode_field_cached(archive, raw), log=log)
+    sm_line = ff7nx_siblingmargin.summarise(sm_stats)
+    if sm_line:
+        log(sm_line)
+
+    # BUILD 617. mktpb's paletted TV picture has stepped-off corners that
+    # read as sharp notches against Cosmos's HD bezel. See ff7nx_tvnotch.
+    tn_stats = ff7nx_tvnotch.apply_to_flevel(
+        archive, payloads,
+        encode=lambda raw: _encode_field_cached(archive, raw), log=log)
+    tn_line = ff7nx_tvnotch.summarise(tn_stats)
+    if tn_line:
+        log(tn_line)
+
+    # BUILD 617. sninn_2's window glow has a hole stepped out of its bottom
+    # and steps at the 4:3 edge; at night the tinted snow shows through as a
+    # missing patch. Fill it with the glow's peak. See ff7nx_glowfill.
+    gf_stats = ff7nx_glowfill.apply_to_flevel(
+        archive, payloads, art=_bc_art,
+        encode=lambda raw: _encode_field_cached(archive, raw), log=log)
+    gf_line = ff7nx_glowfill.summarise(gf_stats)
+    if gf_line:
+        log(gf_line)
+
+    # BUILD 617. An additive light masked to an opaque cut-out fades out a
+    # few native pixels before the silhouette, leaving a ring of unlit
+    # background (trnad_2's blue rim on the rock tops). Carry the light up to
+    # the silhouette -- only increases, only exclusive static additive cells
+    # on truecolor pages. See ff7nx_fxseam.
+    if _bc_art is not None:
+        fs_stats = ff7nx_fxseam.apply_to_flevel(
+            archive, payloads, _bc_art,
+            encode=lambda raw: _encode_field_cached(archive, raw), log=log)
+        fs_line = ff7nx_fxseam.summarise(fs_stats)
+        if fs_line:
+            log(fs_line)
+
+    # BUILD 617. games (Wonder Square): the lamp heads are dark holes cut
+    # out of their own halo. Light the egg-shaped heads (not the poles) with
+    # one peak colour. After fxseam, which carries the halo up to the
+    # silhouette. See ff7nx_lampfill.
+    lf_stats = ff7nx_lampfill.apply_to_flevel(
+        archive, payloads,
+        encode=lambda raw: _encode_field_cached(archive, raw), log=log)
+    lf_line = ff7nx_lampfill.summarise(lf_stats)
+    if lf_line:
+        log(lf_line)
+
+    # BUILD 617c. colne_6's three laser cones stop at the 4:3 edge on a
+    # low-res paletted page. Redraw them from a fitted cone model at 3x on a
+    # truecolor page and carry them along their own rays to the screen edges.
+    # See ff7nx_beams.
+    bm_stats = ff7nx_beams.apply_to_flevel(
+        archive, payloads,
+        encode=lambda raw: _encode_field_cached(archive, raw), log=log)
+    bm_line = ff7nx_beams.summarise(bm_stats)
+    if bm_line:
+        log(bm_line)
+
+    # BUILD 618. Hand-trimmed silhouettes: junbin21's chair-back was an
+    # opaque box with a rim traced round it over the parallax sea; the user's
+    # own trim is applied texel for texel. See ff7nx_cutout.
+    co_stats = ff7nx_cutout.apply_to_flevel(
+        archive, payloads,
+        encode=lambda raw: _encode_field_cached(archive, raw), log=log)
+    co_line = ff7nx_cutout.summarise(co_stats)
+    if co_line:
+        log(co_line)
+
+    # BUILD 618. Cosmos's 16:9 tiles of cosmo2's animated sky name palette
+    # 6 of 6 (FFNx ignores it, the Switch applies it): move them onto the
+    # palettes the field script animates, cells from Cosmos art. See
+    # ff7nx_fxpalfix.
+    fp_stats = ff7nx_fxpalfix.apply_to_flevel(
+        archive, payloads, _bc_art,
+        encode=lambda raw: _encode_field_cached(archive, raw), log=log)
+    fp_line = ff7nx_fxpalfix.summarise(fp_stats)
+    if fp_line:
+        log(fp_line)
+
+    # BUILD 618b. cosmo2's 16:9 base cells held a low-detail fill instead of
+    # the art Cosmos painted for them: restored from Cosmos's sheet at the
+    # cells its chunk.9 names. See ff7nx_cosmosrestore.
+    cr_stats = ff7nx_cosmosrestore.apply_to_flevel(
+        archive, payloads, _bc_art,
+        encode=lambda raw: _encode_field_cached(archive, raw), log=log)
+    cr_line = ff7nx_cosmosrestore.summarise(cr_stats)
+    if cr_line:
+        log(cr_line)
+
+    # BUILD 618c. bugin3's Meteor (additive FX tiles on 1x paletted pages)
+    # looked pixellated: its cells copied from Cosmos's HD sheets onto a new
+    # truecolor page in a free additive slot. See ff7nx_fxhdlift.
+    hl_stats = ff7nx_fxhdlift.apply_to_flevel(
+        archive, payloads, _bc_art,
+        encode=lambda raw: _encode_field_cached(archive, raw), log=log)
+    hl_line = ff7nx_fxhdlift.summarise(hl_stats)
+    if hl_line:
+        log(hl_line)
+
+    # BUILD 618d. ancnt2's light overlay stayed 1997 paletted art (dither
+    # holes, 4:3 only, a missing patch): the installed Cosmos folder ships
+    # one static page per FX slot, so the whole effect becomes those pages
+    # in place, inside the field caps. See ff7nx_fxpcstatic.
+    ps_stats = ff7nx_fxpcstatic.apply_to_flevel(
+        archive, payloads, _bc_art,
+        encode=lambda raw: _encode_field_cached(archive, raw),
+        mb_cap=field_bg_dense.FIELD_MB_CAP, raw_cap=FIELD_BG_RAW_CAP,
+        log=log)
+    ps_line = ff7nx_fxpcstatic.summarise(ps_stats)
+    if ps_line:
+        log(ps_line)
+
+    # BUILD 618t. The archive-wide pass: every additive FX page still 256px
+    # paletted that a hardware-proven rule can convert (pulse <= 2.7x at its
+    # median Cosmos frame, multi-sheet composite, single sheet), field by
+    # field inside the memory cap; fades, palette permutations, cycles and
+    # confirmed fields are left alone. See ff7nx_fxcomplete.
+    fc_stats = ff7nx_fxcomplete.apply_to_flevel(
+        archive, payloads, _bc_art,
+        encode=lambda raw: _encode_field_cached(archive, raw),
+        mb_cap=field_bg_dense.FIELD_MB_CAP, raw_cap=FIELD_BG_RAW_CAP,
+        log=log)
+    fc_line = ff7nx_fxcomplete.summarise(fc_stats)
+    if fc_line:
+        log(fc_line)
+
+    # BUILD 618w. Palette-animated effects (junbin5's lamps, eals_1's
+    # waterfall and spray) made truecolor with their animation kept: one set
+    # of HD cells per Cosmos palette state, switched by BGON/BGOFF from the
+    # field script in place of the palette ops. See ff7nx_palstates.
+    pst_stats = ff7nx_palstates.apply_to_flevel(
+        archive, payloads, _bc_art,
+        encode=lambda raw: _encode_field_cached(archive, raw),
+        mb_cap=max(field_bg_dense.FIELD_MB_CAP, 35.3),
+        raw_cap=FIELD_BG_RAW_CAP, log=log)
+    pst_line = ff7nx_palstates.summarise(pst_stats)
+    if pst_line:
+        log(pst_line)
+
+    # BUILD 618x. The same, found and proven automatically for every field
+    # whose palette effect is one variable driving one brightness op: states
+    # from the script's own bounds, matched one-to-one to Cosmos's frames,
+    # one background parameter (or one per state) per effect. See
+    # ff7nx_palauto.
+    pau_stats = ff7nx_palauto.apply_to_flevel(
+        archive, payloads, _bc_art,
+        encode=lambda raw: _encode_field_cached(archive, raw),
+        mb_cap=field_bg_dense.FIELD_MB_CAP, raw_cap=FIELD_BG_RAW_CAP,
+        log=log)
+    pau_line = ff7nx_palauto.summarise(pau_stats)
+    if pau_line:
+        log(pau_line)
+    # BUILD 618z14. The pond ripples of las2_2 / las2_3: truecolor HD
+    # frames, the palette fade-out kept as brightness levels switched by the
+    # field script. See ff7nx_ripplefade.
+    rf_stats = ff7nx_ripplefade.apply_to_flevel(
+        archive, payloads, _bc_art,
+        encode=lambda raw: _encode_field_cached(archive, raw),
+        mb_cap=field_bg_dense.FIELD_MB_CAP, raw_cap=FIELD_BG_RAW_CAP,
+        log=log)
+    rf_line = ff7nx_ripplefade.summarise(rf_stats)
+    if rf_line:
+        log(rf_line)
+
+    # BUILD 618y. las4_2's stepping stones are drawn over the background
+    # movie, so their hard-keyed cut-out edges (Cosmos cut them from frames
+    # with the green waterfall behind) show as dark/teal specks. Specks
+    # keyed, the rim recoloured from the stone's interior. See
+    # ff7nx_edgeclean.
+    ec_stats = ff7nx_edgeclean.apply_to_flevel(
+        archive, payloads,
+        encode=lambda raw: _encode_field_cached(archive, raw), log=log,
+        art=_bc_art)
+    ec_line = ff7nx_edgeclean.summarise(ec_stats)
+    if ec_line:
+        log(ec_line)
+    # BUILD 618z. A background-movie field (BGMOVIE 1) loses the black
+    # layer-1 placeholder tiles Cosmos put in its 16:9 margins (las4_3), so
+    # the movie ff7nx_moviealign zooms to 16:9 shows there.
+    bmf_stats = ff7nx_bgmoviefield.apply_to_flevel(
+        archive, payloads,
+        encode=lambda raw: _encode_field_cached(archive, raw), log=log)
+    bmf_line = ff7nx_bgmoviefield.summarise(bmf_stats)
+    if bmf_line:
+        log(bmf_line)
+
+    # BUILD 618k. crater_1's sky and crater wall (layers 3/4) redrawn from
+    # Cosmos's widescreen chunk.9 and HD sheets: complete to the 16:9 edge,
+    # every page truecolor, inside the field caps. See ff7nx_chunkparallax.
+    cp_stats = ff7nx_chunkparallax.apply_to_flevel(
+        archive, payloads, _bc_art,
+        encode=lambda raw: _encode_field_cached(archive, raw),
+        mb_cap=field_bg_dense.FIELD_MB_CAP, raw_cap=FIELD_BG_RAW_CAP,
+        log=log)
+    cp_line = ff7nx_chunkparallax.summarise(cp_stats)
+    if cp_line:
+        log(cp_line)
+
+    # BUILD 618l. trnad_1's lifestream transition copy: HD over the full
+    # 16:9 cave at full strength (the user's choice), and its light-shaft
+    # pages truecolor. See ff7nx_trnad1fx.
+    t1_stats = ff7nx_trnad1fx.apply_to_flevel(
+        archive, payloads,
+        encode=lambda raw: _encode_field_cached(archive, raw),
+        mb_cap=field_bg_dense.FIELD_MB_CAP, raw_cap=FIELD_BG_RAW_CAP,
+        art=_bc_art, log=log)
+    t1_line = ff7nx_trnad1fx.summarise(t1_stats)
+    if t1_line:
+        log(t1_line)
+
+    # BUILD 618m. sea's water ripples: Cosmos painted the six frames as one
+    # picture; the motion is restored from vanilla (detail transfer). The
+    # `archive` here is the untouched game flevel. See ff7nx_animdetail.
+    ad_stats = ff7nx_animdetail.apply_to_flevel(
+        archive, payloads, archive,
+        encode=lambda raw: _encode_field_cached(archive, raw),
+        mb_cap=field_bg_dense.FIELD_MB_CAP, raw_cap=FIELD_BG_RAW_CAP,
+        log=log)
+    ad_line = ff7nx_animdetail.summarise(ad_stats)
+    if ad_line:
+        log(ad_line)
+
+    # BUILD 618q. las0_3's sky animation: Cosmos's frames re-ordered to
+    # vanilla's phase, and the 4-frame "no state" gap shows frame 0 instead
+    # of Cosmos's dirty layer-1 sky. See ff7nx_underfill.
+    uf_stats = ff7nx_underfill.apply_to_flevel(
+        archive, payloads,
+        encode=lambda raw: _encode_field_cached(archive, raw), log=log)
+    uf_line = ff7nx_underfill.summarise(uf_stats)
+    if uf_line:
+        log(uf_line)
+
+    # BUILD 618q. del3 / las0_3: the one additive FX page the 35 MB ceiling
+    # left paletted goes truecolor under a 37.5 MB per-field TRIAL ceiling.
+    # See ff7nx_fxtrial.
+    ft_stats = ff7nx_fxtrial.apply_to_flevel(
+        archive, payloads, _bc_art,
+        encode=lambda raw: _encode_field_cached(archive, raw),
+        raw_cap=FIELD_BG_RAW_CAP, log=log)
+    ft_line = ff7nx_fxtrial.summarise(ft_stats)
+    if ft_line:
+        log(ft_line)
+    # BUILD 618z7: las0_2's trial grows the field past the old 12.8 MB raw
+    # cap; the field decompression buffer must be sized from it.
+    global FIELD_BG_MAX_RAW
+    if ft_stats.get('max_raw', 0) > FIELD_BG_MAX_RAW:
+        FIELD_BG_MAX_RAW = ft_stats['max_raw']
+        log('  fx trial: largest field is now %s bytes -- the field buffer '
+            'patch grows to %s bytes' % (
+                format(FIELD_BG_MAX_RAW, ','),
+                format(ff7nx_fieldbg.field_buffer_bytes(FIELD_BG_MAX_RAW),
+                       ',')))
+
+    # BUILD 618r. del3's surf outline: Cosmos's binary-alpha staircase and
+    # the dithered half-lit fringe anti-aliased, outline only. See
+    # ff7nx_fxsmooth.
+    fs_stats = ff7nx_fxsmooth.apply_to_flevel(
+        archive, payloads,
+        encode=lambda raw: _encode_field_cached(archive, raw), log=log)
+    fs_line = ff7nx_fxsmooth.summarise(fs_stats)
+    if fs_line:
+        log(fs_line)
+
+    # BUILD 618m. The coal train shakes and its art ends exactly at the
+    # bottom of the 240-unit view: one row of art added below it on its own
+    # page. See ff7nx_shakepad.
+    sp_stats = ff7nx_shakepad.apply_to_flevel(
+        archive, payloads,
+        encode=lambda raw: _encode_field_cached(archive, raw),
+        mb_cap=field_bg_dense.FIELD_MB_CAP, raw_cap=FIELD_BG_RAW_CAP,
+        log=log)
+    sp_line = ff7nx_shakepad.summarise(sp_stats)
+    if sp_line:
+        log(sp_line)
+
+    # BUILD 618e. md_e1's models stood above the floor: the camera is tilted
+    # a fraction of a degree so every model draws lower, background and 2D
+    # world coordinate untouched (618b's pan moved the whole field on the
+    # Switch). md_e1 only. See ff7nx_fieldshift.
+    fs_stats = ff7nx_fieldshift.apply_to_flevel(
+        archive, payloads,
+        encode=lambda raw: _encode_field_cached(archive, raw), log=log)
+    fs_line = ff7nx_fieldshift.summarise(fs_stats)
+    if fs_line:
+        log(fs_line)
+
+    # BUILD 617. Hand-painted texture edits (texture_edits/<name>/): a
+    # painted PNG is the truth for a small box of one field. After every
+    # rule-based pass, before stack order. See ff7nx_texpatch.
+    tp_stats = ff7nx_texpatch.apply_to_flevel(
+        archive, payloads,
+        encode=lambda raw: _encode_field_cached(archive, raw), log=log)
+    tp_line = ff7nx_texpatch.summarise(tp_stats)
+    if tp_line:
+        log(tp_line)
+
     # BUILD 608. LAST of the background passes, so no later pass can move a
     # cell after it: tiles stacked on one spot at one depth get the winner
     # the mod draws back (zz2's chest). See ff7nx_stackorder.
@@ -9236,11 +9931,257 @@ def _build_flevel(archive_path, chunks, field_files, romfs, log,
     if so_line:
         log(so_line)
 
+    # BUILD 617. After stackorder, so no background pass sees the moved x.
+    # The port reduces the layer position with C's truncating `%`, so the
+    # 704-unit exact repeat above sweeps bg.x over two periods; five of the
+    # Glacier snow/wind grid's own columns move by exactly one period so the
+    # single wrap covers all of it (the left-edge band). See ff7nx_trnad4.
+    ge_stats = ff7nx_trnad4.apply_edge_to_flevel(
+        archive, payloads,
+        encode=lambda raw: _encode_field_cached(archive, raw), log=log)
+    ge_line = ff7nx_trnad4.summarise_edge(ge_stats)
+    if ge_line:
+        log(ge_line)
+    if ge_stats.get('refused'):
+        log('  ! Great Glacier snow/wind left edge: %d field(s) unchanged (%s)'
+            % (len(ge_stats['refused']),
+               ', '.join('%s: %s' % r for r in ge_stats['refused'][:3])))
+
     # AFTER that, so the camera range is the last thing written into section
     # 8 and cannot be reverted by a field the background pass rebuilt. The
     # two passes touch different sections (8 vs 9) and both go through the
     # content-keyed encode cache, so ordering costs nothing but correctness.
     ws_stats = _bake_widescreen_ranges(archive, payloads, widescreen, log)
+
+    # BUILD 618l. Scripted camera stops that were flush with the art in the
+    # 224-unit view and show past it in the 240-unit one (trnad_1's top
+    # band) are moved <= 8 units. Needs the final camera ranges, so it runs
+    # after the bake and before the debug warp. See ff7nx_scrvclip.
+    sv_stats = ff7nx_scrvclip.apply_to_flevel(
+        archive, payloads,
+        encode=lambda raw: _encode_field_cached(archive, raw), log=log)
+    sv_line = ff7nx_scrvclip.summarise(sv_stats)
+    if sv_line:
+        log(sv_line)
+
+    # BUILD 618n. The shaking coal train (zcoal_1): layers 1/2/4 and the 3D
+    # models (camera tilt) lowered by the shake amplitude so the bounce never
+    # reveals the edge; the mountains stay put. After the range bake and the
+    # layer-4 h_offset. See ff7nx_trainlower.
+    tl_stats = ff7nx_trainlower.apply_to_flevel(
+        archive, payloads,
+        encode=lambda raw: _encode_field_cached(archive, raw), log=log)
+    tl_line = ff7nx_trainlower.summarise(tl_stats)
+    if tl_line:
+        log(tl_line)
+
+    # BUILD 618y. Effect cells the pipeline lost (whitein's beams: cells the
+    # compactor moved, then filled from the wrong Cosmos sheet by slot) are
+    # put back from Cosmos, only where vanilla drew light and Cosmos paints
+    # the cell; then pinholes in paletted effect art (woa_1's haze dashes)
+    # are filled. Last texture passes. See ff7nx_fxrestore, ff7nx_fxholes.
+    frs_stats = ff7nx_fxrestore.apply_to_flevel(
+        archive, payloads, _bc_art,
+        encode=lambda raw: _encode_field_cached(archive, raw), log=log)
+    frs_line = ff7nx_fxrestore.summarise(frs_stats)
+    if frs_line:
+        log(frs_line)
+    fh_stats = ff7nx_fxholes.apply_to_flevel(
+        archive, payloads,
+        encode=lambda raw: _encode_field_cached(archive, raw), log=log)
+    fh_line = ff7nx_fxholes.summarise(fh_stats)
+    if fh_line:
+        log(fh_line)
+    # BUILD 618z. whitein's searchlight beams: rebuilt from Cosmos's brightest
+    # frame into dithered beam palettes (pulse untouched); the 16:9 margin
+    # continues the new beam (paletted param-1 cells only).
+    bh_stats = ff7nx_beamhd.apply_to_flevel(
+        archive, payloads, _bc_art,
+        encode=lambda raw: _encode_field_cached(archive, raw), log=log)
+    bh_line = ff7nx_beamhd.summarise(bh_stats)
+    if bh_line:
+        log(bh_line)
+    # BUILD 618z (2nd). whitein: the camera moves so the city is centred in
+    # 16:9; the strip it uncovers at the left is the ocean mirrored, the
+    # beams moved with the camera. After beamhd, BEFORE the band bake: the
+    # mirror refills the ribbon's black cut-out from the ocean, which needs
+    # the cut-out (the overlay) still in place.
+    wsh_stats = ff7nx_wishift.apply_to_flevel(
+        archive, payloads,
+        encode=lambda raw: _encode_field_cached(archive, raw), log=log)
+    wsh_line = ff7nx_wishift.summarise(wsh_stats)
+    globals()['_WSH_DONE'] = list(wsh_stats.get('names') or ())
+    if wsh_line:
+        log(wsh_line)
+    # BUILD 618z. whitein's glass band: the static additive overlay is baked
+    # into layer 1's black hole under it (same picture, no hardware seam).
+    bb_stats = ff7nx_bandbake.apply_to_flevel(
+        archive, payloads,
+        encode=lambda raw: _encode_field_cached(archive, raw), log=log)
+    bb_line = ff7nx_bandbake.summarise(bb_stats)
+    if bb_line:
+        log(bb_line)
+    # BUILD 618z. woa_1: the floor's 16:9 continuation moves to layer 2 (cut
+    # along its edge) so the haze stays behind it, as inside 4:3.
+    fc_stats = ff7nx_floorclip.apply_to_flevel(
+        archive, payloads,
+        encode=lambda raw: _encode_field_cached(archive, raw), log=log)
+    fc_line = ff7nx_floorclip.summarise(fc_stats)
+    if fc_line:
+        log(fc_line)
+    # BUILD 618z8. psdun_4: the 1x animated glow redrawn in true colour
+    # (smooth edges, its 6 frames kept). Where it did, fxcut is skipped.
+    gh_stats = ff7nx_glowhd.apply_to_flevel(
+        archive, payloads,
+        encode=lambda raw: _encode_field_cached(archive, raw), log=log)
+    gh_line = ff7nx_glowhd.summarise(gh_stats)
+    if gh_line:
+        log(gh_line)
+    # BUILD 618z7. psdun_4: the 1x animated glow ends at the HD rock edge
+    # (rock redrawn over it on layer 2; glow grown / brightened at its edge).
+    # Now only the fallback when glowhd is off or refused.
+    fxc_stats = ff7nx_fxcut.apply_to_flevel(
+        archive, payloads,
+        encode=lambda raw: _encode_field_cached(archive, raw), log=log,
+        skip=gh_stats.get('done', ()))
+    fxc_line = ff7nx_fxcut.summarise(fxc_stats)
+    if fxc_line:
+        log(fxc_line)
+    # BUILD 618z. trnad_4: layer 1's pale rim of the old rock silhouette and
+    # stray specks in the gaps beside the rocks (under the lifestream).
+    ge_stats = ff7nx_ghostedge.apply_to_flevel(
+        archive, payloads,
+        encode=lambda raw: _encode_field_cached(archive, raw), log=log)
+    ge_line = ff7nx_ghostedge.summarise(ge_stats)
+    if ge_line:
+        log(ge_line)
+    # BUILD 618z10. The user's own retouches of field art (mds7pb_1's L
+    # edge beside the TV): only the pixels they painted are shipped.
+    ap_stats = ff7nx_artpatch.apply_to_flevel(
+        archive, payloads,
+        encode=lambda raw: _encode_field_cached(archive, raw), log=log)
+    ap_line = ff7nx_artpatch.summarise(ap_stats)
+    if ap_line:
+        log(ap_line)
+    # BUILD 618z (2nd). Scripted layer scrolls (BGSCR) at their 30 fps pace,
+    # as FFNx divides them at 60; woa_2/woa_3's band no longer snaps back in
+    # view. Script operands only.
+    bs_stats = ff7nx_bgscr60.apply_to_flevel(
+        archive, payloads,
+        encode=lambda raw: _encode_field_cached(archive, raw), log=log)
+    bs_line = ff7nx_bgscr60.summarise(bs_stats)
+    if bs_line:
+        log(bs_line)
+    # BUILD 618z. Stray bright specks removed by hand (las4_3). See
+    # ff7nx_specks.
+    sp_stats = ff7nx_specks.apply_to_flevel(
+        archive, payloads,
+        encode=lambda raw: _encode_field_cached(archive, raw), log=log)
+    sp_line = ff7nx_specks.summarise(sp_stats)
+    if sp_line:
+        log(sp_line)
+    # BUILD 618z11. ztruck: its scrolling sky/desert (352-unit period) made
+    # one exact 704-unit period instead of the folding generic-fill copies,
+    # and the camera pinned on the art (the field is zoomed like FFNx's
+    # WM_ZOOM by ff7nx_fieldzoom). After every page pass and the widescreen
+    # camera bake, before the debug warp copies it.
+    hr_stats = ff7nx_hrepeat.apply_to_flevel(
+        archive, payloads,
+        encode=lambda raw: _encode_field_cached(archive, raw), log=log)
+    hr_line = ff7nx_hrepeat.summarise(hr_stats)
+    if hr_line:
+        log(hr_line)
+    # BUILD 618z12. ztruck: the rocks' and the truck's cut-out staircases
+    # redrawn as curves at HD resolution, the matte fringe and the rock
+    # layer's period-seam slit removed. After hrepeat.
+    es_stats = ff7nx_edgesmooth.apply_to_flevel(
+        archive, payloads,
+        encode=lambda raw: _encode_field_cached(archive, raw), log=log)
+    es_line = ff7nx_edgesmooth.summarise(es_stats)
+    if es_line:
+        log(es_line)
+    # BUILD 618z14. ztruck's turning rear wheel: its animation frames keep
+    # only the tyre, so the paint around it stops shimmering.
+    wf_stats = ff7nx_wheelfix.apply_to_flevel(
+        archive, payloads,
+        encode=lambda raw: _encode_field_cached(archive, raw), log=log)
+    wf_line = ff7nx_wheelfix.summarise(wf_stats)
+    if wf_line:
+        log(wf_line)
+    # BUILD 618z11. Per-scene model variants (ztruck / midgal: no dynamic
+    # weapon on Cloud, Zack carries the Buster Sword in ztruck only). The
+    # field half: model loaders repointed, eye textures copied.
+    sm_stats = ff7nx_scenemodel.apply_to_flevel(
+        archive, payloads,
+        encode=lambda raw: _encode_field_cached(archive, raw), log=log)
+    sm_line = ff7nx_scenemodel.summarise(sm_stats)
+    if sm_line:
+        log(sm_line)
+    # BUILD 618z14. Echo-S's mds7_w2 (Tsuna's crates): the port developer's
+    # orange cat (utmin1's model) grooming on top of the centre crate.
+    eg_stats = ff7nx_easteregg.apply_to_flevel(
+        archive, payloads,
+        encode=lambda raw: _encode_field_cached(archive, raw), log=log)
+    eg_line = ff7nx_easteregg.summarise(eg_stats)
+    if eg_line:
+        log(eg_line)
+    # BUILD 619. [Tsunamods] Idle Animations: model-loader animation entries
+    # repointed to the idle clips' new names in the fields the mod's FieldID
+    # gates allow, and Cloud's slot 0 -> ORIC where its loader variant says.
+    # After scenemodel (ZNAA records are not AAAA) and the cat.
+    ia_stats = ff7nx_idleanim.apply_to_flevel(
+        archive, payloads,
+        encode=lambda raw: _encode_field_cached(archive, raw), log=log)
+    ia_line = ff7nx_idleanim.summarise(ia_stats)
+    if ia_line:
+        log(ia_line)
+    # BUILD 620f. anfrst_1's light beams (and jail1's mist) strobed every
+    # frame (ADPAL -1 / 0 loop on paletted FX): held at full brightness.
+    # Section 1 only, in place. See ff7nx_destrobe.
+    ds_stats = ff7nx_destrobe.apply_to_flevel(
+        archive, payloads,
+        encode=lambda raw: _encode_field_cached(archive, raw), log=log)
+    ds_line = ff7nx_destrobe.summarise(ds_stats)
+    if ds_line:
+        log(ds_line)
+    # BUILD 620h. mds7pb_1's floor squares get the floor's depth (layer 1 ->
+    # layer 2, pixels unchanged) so Cloud's weapon no longer shows through
+    # the floor on the pinball lift. See ff7nx_floordepth.
+    fd_stats = ff7nx_floordepth.apply_to_flevel(
+        archive, payloads,
+        encode=lambda raw: _encode_field_cached(archive, raw), log=log)
+    fd_line = ff7nx_floordepth.summarise(fd_stats)
+    if fd_line:
+        log(fd_line)
+
+    # ------------------------------------------ DEPTH-1 RESOLUTION LIFT
+    # BUILD 618v: now really dead last among the page passes (see the note
+    # where it used to run). No-op unless SEVENTH_NX_FIELD_BG_D1_PX=512.
+    _lift_depth1_payloads(archive, payloads, log)
+
+    # BUILD 618 / 618i. DEBUG ONLY, off unless SEVENTH_NX_DEBUG_WARP=src=dst
+    # is set: entering `src` shows `dst` (for fields with no normal way in,
+    # such as cosmo2). 618i: this USED to run before texpatch, stackorder,
+    # the Glacier edge pass and the widescreen camera-range bake, so the
+    # copy in `src` missed all four -- every Glacier field probed through
+    # the warp still had the pre-617 left-edge layout (the strip hardware
+    # kept showing), and the camera range baked into `src` was `src`'s own
+    # config applied to `dst`'s data. It now copies `dst` after EVERY pass.
+    dw_stats = ff7nx_debugwarp.apply_to_flevel(
+        archive, payloads,
+        encode=lambda raw: _encode_field_cached(archive, raw), log=log)
+    dw_line = ff7nx_debugwarp.summarise(dw_stats)
+    if dw_line:
+        log(dw_line)
+    _warped = {a for a, _b in ff7nx_debugwarp.pairs()} if dw_stats.get(
+        'pairs') else set()
+    if _warped and ws_stats and ws_stats.get('plan'):
+        ws_stats = dict(ws_stats)
+        ws_stats['plan'] = {k: v for k, v in ws_stats['plan'].items()
+                            if k not in _warped}
+        ws_stats['before'] = {k: v for k, v in
+                              (ws_stats.get('before') or {}).items()
+                              if k not in _warped}
 
     # A NAME FLEVEL DOES NOT ALREADY HAVE IS NOW ADDED, NOT REFUSED.
     # ==============================================================
@@ -9272,6 +10213,14 @@ def _build_flevel(archive_path, chunks, field_files, romfs, log,
             % (len(added), sum(n for _f, n in added_raw) / 1e6,
                len(archive.entries) - len(added)))
         log('    e.g. %s' % ', '.join(sorted(added)[:4]))
+    # BUILD 617: last look before the archive is written (see
+    # _field_payload_matches). Detection only -- it names the field loudly.
+    _bad_fields = field_payload_integrity(payloads)
+    if _bad_fields:
+        log('  ! FIELD INTEGRITY: %d field payload(s) are corrupt and will '
+            'not load correctly (%s). Rebuild; the encode cache verifies its '
+            'hits now.' % (len(_bad_fields), ', '.join(
+                '%s: %s' % r for r in _bad_fields[:6])))
     try:
         archive.replace(payloads)
     except lgp.NewEntriesRequired as exc:
@@ -9294,6 +10243,21 @@ def _build_flevel(archive_path, chunks, field_files, romfs, log,
     if ws_stats and ws_stats.get('plan'):
         ok, problems = ff7nx_ws.verify_flevel(
             dest, ws_stats['before'], ws_stats['plan'])
+        # BUILD 618z: ff7nx_wishift moves a field's left/right camera range
+        # on purpose (whitein: the city centred). Those two lines are the
+        # pass, not a lost bake: accept exactly `wanted + shift`.
+        moved = {n.split(':')[0]: ff7nx_wishift.FIELDS[n.split(':')[0]]
+                 for n in (globals().get('_WSH_DONE') or ())}
+        if moved and problems:
+            import re as _re
+
+            def _expected(p):
+                m = _re.match(r'(\S+): (left|right) is (-?\d+), wanted '
+                              r'(-?\d+)$', p.strip())
+                return bool(m and m.group(1) in moved and int(m.group(3))
+                            == int(m.group(4)) + moved[m.group(1)])
+            problems = [p for p in problems if not _expected(p)]
+            ok = not problems
         if ok:
             log(f'  widescreen: verified -- all '
                 f'{len(ws_stats["plan"])} camera range(s) are in the '
@@ -9627,7 +10591,9 @@ def _emplace_movies(plan, romfs, sdout, dump, log, progress, produced):
                    target_fps,
                    fit,
                    colour,
-                   movie_convert.audio_key_part(music, voice)))
+                   movie_convert.audio_key_part(music, voice))
+                + ('|' + movie_convert.LOOP_CLOSE_TAG
+                   if movie_convert.loop_close_wanted(stem) else ''))
             tag = stem if reldir == movie_convert.MOVIE_DIR else \
                 '%s.%s' % (reldir.replace('/', '_'), stem)
             cached_file = os.path.join(cache, f'{tag}.{key}.mp4')
@@ -9680,6 +10646,14 @@ def _emplace_movies(plan, romfs, sdout, dump, log, progress, produced):
             # copy first means an interrupted build leaves the cache correct
             # and sdout missing a file, rather than the other way round.
             t0 = time.time()
+            # BUILD 618z7: last4_2 / last4_3 are re-timed so their 39-frame
+            # loop has no double step at the wrap (movies.loop_close); the
+            # key above carries the tag.
+            if movie_convert.loop_close_wanted(stem):
+                closed = movie_convert.loop_close(src, cache, log=log,
+                                                  stem=stem)
+                if closed:
+                    src = closed
             r = movie_convert.convert(src, cached_file, vanilla=vanilla,
                                       quality=quality, target_fps=target_fps,
                                       fit=fit, colour=colour,
@@ -10140,9 +11114,16 @@ def _emplace_sfx(plan, romfs, sdout, dump, log, produced):
                 'entries -- field steps stay on the stock SFX 159 row')
         else:
             try:
+                # BUILD 618s: routes Cosmo lacks (del3's sea -> wading set),
+                # appended after the mod's configs. See ff7nx_stepsextra.
+                _steps_extra = ff7nx_stepsextra.config_text(oggs)
                 plan.field_footsteps = ff7nx_fieldsteps_data.prepare(
-                    entries, configs, oggs, flevel_src,
+                    entries, list(configs) + ([_steps_extra] if _steps_extra
+                                              else []),
+                    oggs, flevel_src,
                     cache_dir=os.path.join(cache_root, 'sfx-fieldsteps'))
+                if _steps_extra:
+                    log(ff7nx_stepsextra.summary())
             except (ValueError, audio_dat.MissingFFmpeg) as exc:
                 log('! field footsteps: %s -- terrain shuffle skipped' % exc)
 
@@ -10994,20 +11975,19 @@ def _emplace_ambient(plan, romfs, log, produced):
     # loop's ring is rate * channels * 6 bytes. Say what was brought down.
     conv = list(ff7nx_ambient.CONVERTED)
     if conv:
-        saved = sum((r - ff7nx_ambient.MAX_RATE) * 2 * 6 for _i, r in conv)
-        log('         %d loop(s) above 48 kHz staged at 48 kHz (%s) -- each '
-            'loop\'s PCM ring comes from the 32 MB audio pool, and the '
-            'console mixes at 48 kHz anyway; the largest ring drops by up '
-            'to %.2f MB' % (len(conv), ', '.join(
-                '%d Hz x%d' % (r, sum(1 for _j, q in conv if q == r))
-                for r in sorted({q for _j, q in conv})),
-                max((r - ff7nx_ambient.MAX_RATE) * 2 * 6 for _i, r in conv)
-                / 1048576.0))
+        tgt = ff7nx_ambient.convert_target()
+        log('         %d loop(s) above %d kHz staged at %d kHz (%s) -- each '
+            'loop\'s PCM ring comes from the 32 MB audio pool; the largest '
+            'ring drops by %.2f MB' % (
+                len(conv), ff7nx_ambient.convert_threshold() // 1000,
+                tgt // 1000, ', '.join(
+                    '%d Hz x%d' % (r, sum(1 for _j, q in conv if q == r))
+                    for r in sorted({q for _j, q in conv})),
+                max((r - tgt) * 2 * 6 for _i, r in conv) / 1048576.0))
     elif not ff7nx_ambient.convert_enabled():
-        log('         loops staged at their shipped rate (%s=48k brings the '
-            'ones above 48 kHz down, halving their share of the 32 MB audio '
-            'pool -- opt-in until its loop seam is proven)'
-            % ff7nx_ambient.RATE_ENV)
+        log('         loops staged at their shipped rate (%s=native; the '
+            'default brings loops above 96 kHz down to 48 kHz -- 1525.ogg '
+            'at 192 kHz closed the game in mds7st1)' % ff7nx_ambient.RATE_ENV)
     if field_table and not battle_table:
         log('         battle ambience is not in this build -- the active '
             'option set selects the field-only folder')
@@ -11387,6 +12367,7 @@ MAIN_ONLY_ENV = frozenset((
     'SEVENTH_NX_TEXSCALE',       # ff7nx_texscale  exefs/main only
     'SEVENTH_NX_WORLD_OWNWINDOW', # ff7nx_worldfar 606: the far field draws the 5x5 window
     'SEVENTH_NX_SHADOWDEPTH',    # ff7nx_shadowdepth  exefs/main only
+    'SEVENTH_NX_SUBPARALLAX',    # ff7nx_subparallax  exefs/main only
     ff7nx_calendar.LAYOUT_ENV,   # ff7nx_calendar  ... and its columns
     'SEVENTH_NX_VOICE_WORKERS',  # voice_ogg  encoder parallelism
     'SEVENTH_NX_NO_VOICE',       # ff7nx_voice   the whole half, off
@@ -11408,6 +12389,8 @@ MAIN_ONLY_ENV = frozenset((
     ff7nx_daynight.FREEZE_ENV,
     ff7nx_daynight.STRENGTH_ENV,   # how hard the tint lands; module-only too
     ff7nx_daynight.CONDOR_ENV,     # BUILD 572: Fort Condor minigame tint
+    ff7nx_daynight.SNOW_ENV,       # BUILD 617: snowboard story-run tint
+    ff7nx_daynight.SNOW_HUD_ENV,   # BUILD 617b: snowboard HUD kept white
     ff7nx_daynight.FORCE_OUTDOOR_ENV,  # BUILD 572: convil_2 treated outdoor
     ff7nx_worldsphere.ENV,         # BUILD 584: world sphere on/off (main)
     'SEVENTH_NX_WORLD_FAR',        # BUILD 585: world far field on/off
@@ -11476,6 +12459,10 @@ MAIN_ONLY_MODULES = frozenset((
     'ff7nx_texscale.py',
     # BUILD 604. One word + a padding cave in exefs/main only.
     'ff7nx_shadowdepth.py',
+    # BUILD 620j. 12 hook words + padding caves + 4 BSS bytes, exefs/main.
+    'ff7nx_subparallax.py',
+    # BUILD 620. Double Input Bugfix: in-place words in exefs/main only.
+    'ff7nx_difix.py',
     'ff7nx_camclamp.py',
     'ff7nx_daynight.py',
     # BUILD 584. World-map sphere: two words + a stub in exefs/main.
@@ -11556,12 +12543,15 @@ MOVIECAM_ONLY_ENV = frozenset((MOVIECAM_INTERP_ENV,
                                ff7nx_campos.FACE_ENV,
                                # BUILD 611: exefs/main only (the arrow table
                                # is READ from the built flevel).
-                               *ff7nx_pointers.ENVS))
+                               *ff7nx_pointers.ENVS,
+                               # BUILD 612: exefs/main only.
+                               ff7nx_moviebars.CREDITS_ENV))
 MOVIECAM_ONLY_MODULES = frozenset(('ff7nx_moviecam.py',
                                    'ff7nx_frameprobe.py',
                                    'ff7nx_campreserve.py',
                                    'ff7nx_campos.py',
                                    'ff7nx_pointers.py',
+                                   'ff7nx_moviebars.py',
                                    'ff7nx_deadspace.py'))
 
 # This setting changes only SYW minigame TEX. Its value is included in the
@@ -11701,6 +12691,7 @@ def _archive_fingerprint(name, archive_path, files, extra):
         # build.py included.
         if fn.endswith('.py') and fn not in ARCHIVE_NEUTRAL_MODULES:
             h.update(('%s|%r' % (fn, _stat_sig(os.path.join(HERE, fn)))).encode())
+    _texture_edits_sig(h, name)
     h.update(repr(extra).encode())
     return h.hexdigest()
 
@@ -11755,8 +12746,23 @@ def _archive_inputs_fingerprint(name, archive_path, files, extra):
                 and k != iro.FACIAL_ENV
                 and k not in ARCHIVE_NEUTRAL_ENV):
             h.update(('%s=%s\0' % (k, os.environ[k])).encode())
+    _texture_edits_sig(h, name)
     h.update(repr(extra).encode())
     return h.hexdigest()
+
+
+def _texture_edits_sig(h, name):
+    """BUILD 617: painted texture_edits/ PNGs are flevel INPUTS."""
+    if name != 'flevel.lgp':
+        return
+    te = os.path.join(HERE, 'texture_edits')
+    if not os.path.isdir(te):
+        return
+    for root, _dirs, fns in sorted(os.walk(te)):
+        for fn in sorted(fns):
+            p = os.path.join(root, fn)
+            h.update(('%s|%r' % (os.path.relpath(p, HERE),
+                                 _stat_sig(p))).encode())
 
 
 def _archive_record(name):
@@ -12214,6 +13220,18 @@ def apply_plan(plan, archive_paths, sdout, log=lambda *_: None,
             and 'coaster.lgp' in archive_paths
             and 'coaster.lgp' not in plan.archive_files):
         plan.archive_files['coaster.lgp'] = {}
+    # BUILD 619: the idle clips live in char.lgp, so it is built even when
+    # no other mod touches it.
+    if (ff7nx_idleanim.CURRENT is not None and 'char.lgp' in archive_paths
+            and 'char.lgp' not in plan.archive_files):
+        plan.archive_files['char.lgp'] = {}
+    # BUILD 620e: the easter cat's sunglasses copy (NKDA) is added to char.lgp
+    # by a post-pass, so char.lgp has to be a target even when no mod
+    # touches it.
+    if (ff7nx_catshades.wanted() and 'char.lgp' in archive_paths
+            and 'char.lgp' not in plan.archive_files):
+        plan.archive_files['char.lgp'] = {}
+    ff7nx_catshades.READY = False
     model_targets = sorted(a for a in plan.archive_files if a != 'flevel.lgp')
     flevel_fields = plan.archive_files.get('flevel.lgp', {})
     do_flevel = bool(plan.chunks) or bool(flevel_fields) or bool(plan.echo_fields)
@@ -12245,7 +13263,12 @@ def apply_plan(plan, archive_paths, sdout, log=lambda *_: None,
             # meant merely DROPPING a flag whose effect was already overridden
             # invalidated a 1.5 GB archive whose bytes had not moved. What
             # changes flevel is whether the art ships, so that is the key.
-            bool(getattr(plan, 'facial_art', False)))
+            bool(getattr(plan, 'facial_art', False)),
+            # BUILD 619: the idle-animation selection (clip contents + gates)
+            ff7nx_idleanim.fingerprint(),
+            # BUILD 620e: which HRC the easter cat names (NKDA / BDGA)
+            ('catshades', bool(ff7nx_catshades.wanted()
+                              and 'char.lgp' in archive_paths)))
         ffp = _archive_fingerprint(
             'flevel.lgp', archive_paths['flevel.lgp'], dict(flevel_fields),
             flevel_extra)
@@ -12377,6 +13400,39 @@ def apply_plan(plan, archive_paths, sdout, log=lambda *_: None,
                 name, dest, fp,
                 os.environ.get(WORLD_GAIA_SPECIAL_ENV, '')
                 if name == 'world_us.lgp' else '')
+
+    # BUILD 618z11. The char.lgp half of ff7nx_scenemodel: the per-scene
+    # model variants (ZNxx.hrc / ZNBS.rsd, made from this char.lgp's own
+    # entries) added to the finished archive -- built, cache-hit or kept by
+    # SEVENTH_NX_REUSE_CHAR alike. Idempotent; the reuse record is
+    # re-signed so the next reuse accepts the file.
+    if 'char.lgp' in model_targets:
+        _cdest = os.path.join(romfs, ARCHIVES['char.lgp'])
+        if os.path.exists(_cdest):
+            _sm = ff7nx_scenemodel.apply_to_char(_cdest, log)
+            if _sm.get('written'):
+                _archive_restat('char.lgp', _cdest, log,
+                                'the scene-model pass')
+            _sm_line = ff7nx_scenemodel.summarise_char(_sm)
+            if _sm_line:
+                log(_sm_line)
+            # BUILD 619. The idle clips under their new names.
+            _ia = ff7nx_idleanim.apply_to_char(_cdest, log)
+            if _ia.get('written'):
+                _archive_restat('char.lgp', _cdest, log,
+                                'the idle-animation pass')
+            _ia_line = ff7nx_idleanim.summarise_char(_ia)
+            if _ia_line:
+                log(_ia_line)
+            # BUILD 620e. The easter cat's sunglasses (NKDA/NKDB/NKDC).
+            # Sets ff7nx_catshades.READY, which the flevel pass below reads.
+            _cs = ff7nx_catshades.apply_to_char(_cdest, log)
+            if _cs.get('written'):
+                _archive_restat('char.lgp', _cdest, log,
+                                'the cat-sunglasses pass')
+            _cs_line = ff7nx_catshades.summarise_char(_cs)
+            if _cs_line:
+                log(_cs_line)
 
     if do_flevel and not reuse_flevel:
         progress(step, total, 'flevel.lgp')
@@ -13485,6 +14541,56 @@ def apply_shadowdepth(sdout, dump, log=lambda *_: None, produced=()):
     return [dest] if not built else []
 
 
+def apply_difix(sdout, dump, log=lambda *_: None, produced=()):
+    """
+    BUILD 620. Double Input Bugfix (Dig / potus-barret): the mod's x86 HEXT
+    patches as ARM64 words in exefs/main -- see ff7nx_difix. Two words for
+    the fix, one each for a non-default repeat rate / delay. Only when the
+    mod is enabled; SEVENTH_NX_NO_DIFIX=1 leaves input stock.
+    """
+    cur = ff7nx_difix.CURRENT
+    if cur is None or ff7nx_difix.disabled():
+        return []
+    if not (cur.get('difix') or cur.get('rate') is not None
+            or cur.get('delay') is not None):
+        return []
+    if dump is None or not dump.nso:
+        log('! double-input fix: needs exefs/main from a full game dump; '
+            'skipped')
+        return []
+    dest = os.path.join(sdout, 'atmosphere', 'contents', TITLE_ID, 'exefs',
+                        'main')
+    fresh = {os.path.normpath(os.path.abspath(p)) for p in produced}
+    built = os.path.normpath(os.path.abspath(dest)) in fresh
+    src = dest if built else dump.nso
+    log('')
+    log('input: %s ...' % ff7nx_difix.describe(cur))
+    if not built and os.path.exists(dest):
+        try:
+            same = (os.path.getsize(dest) == os.path.getsize(dump.nso)
+                    and open(dest, 'rb').read() == open(dump.nso, 'rb').read())
+        except OSError:
+            same = False
+        if not same:
+            log(f'! double-input fix: {dest}')
+            log('  already holds a module this build did not produce. Basing '
+                "on the dump's stock copy would throw those patches away, so "
+                'nothing was written. Delete sdout/ and rebuild.')
+            return []
+    log(f'  base main   {src}'
+        + ('   (previous patch output)' if built else '   (from dump)'))
+    tmp = dest + '.difix-tmp'
+    if not ff7nx_difix.apply_to_nso(src, tmp, cur, log):
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        return []
+    os.replace(tmp, dest)
+    log('  DOUBLE INPUT FIX (BUILD 620): %s -- translated 0x41B099/0x41B108 '
+        'words in exefs/main. %s=1 disables.'
+        % (ff7nx_difix.describe(cur), ff7nx_difix.OFF_ENV))
+    return [dest] if not built else []
+
+
 def apply_spelluv(sdout, dump, log=lambda *_: None, produced=(), needed=False):
     """Install the per-TEX logical-texel bridge used by resized SYW art."""
     if not needed:
@@ -13768,7 +14874,8 @@ def apply_pointers(sdout, dump, plan, log=lambda *_: None, produced=()):
     P = ff7nx_pointers
     smooth, wide, arrow = (P._on(P.ENV_SMOOTH), P._on(P.ENV_WIDE),
                            P._on(P.ENV_ARROW))
-    if not (smooth or wide or arrow):
+    rail = P._on(P.ENV_RAIL)
+    if not (smooth or wide or arrow or rail):
         log('')
         log('pointer hand / exit arrows: stock (%s)' % ', '.join(
             '%s=0' % e for e in P.ENVS))
@@ -13789,7 +14896,8 @@ def apply_pointers(sdout, dump, plan, log=lambda *_: None, produced=()):
     log('pointer hand / exit arrows ...')
     tmp = dest + '.pointers-tmp'
     try:
-        rep = P.apply_to_nso(src, tmp, dump.nso, flevel, smooth, wide, arrow)
+        rep = P.apply_to_nso(src, tmp, dump.nso, flevel, smooth, wide, arrow,
+                             rail)
     except Exception as exc:                                   # noqa: BLE001
         if os.path.exists(tmp):
             os.remove(tmp)
@@ -13810,7 +14918,85 @@ def apply_pointers(sdout, dump, plan, log=lambda *_: None, produced=()):
                           ', '.join(sorted(fields)[:6]), P.ENV_ARROW))
     else:
         log('  exit arrows: stock (%s=0 or no flevel)' % P.ENV_ARROW)
+    log('  diagonal camera rail (header +0x14 = 1/2, e.g. mds5_3): %s'
+        % ('projected from the real camera point, rounded (no forward/back '
+           'steps)' if rep['rail'] else 'stock (%s=0)' % P.ENV_RAIL))
     log('  %d words in dead space' % rep['words'])
+    return [dest] if not built else []
+
+
+def apply_subparallax(sdout, dump, log=lambda *_: None, produced=()):
+    """BUILD 620j. Layers 3/4 keep the fraction of speed*camera/256 the
+    engine's integer division drops, so they scroll in sub-unit steps as on
+    PC (FFNx computes the same position in float). anfrst_4's beams and the
+    21 other fields of FIELD-TRACKER 2h. See ff7nx_subparallax.
+
+    Grows BSS by 4 bytes (+ tail slack), so it runs AFTER the voice runtime,
+    next to moviepace, for the same reason moviepace does.
+    """
+    if not ff7nx_subparallax.enabled():
+        log('')
+        log('sub-unit parallax: OFF (%s=0)' % ff7nx_subparallax.ENV)
+        return []
+    src, built = _audio_bridge_base(sdout, dump, log, produced,
+                                    'sub-unit parallax')
+    if src is None:
+        return []
+    dest = os.path.join(sdout, 'atmosphere', 'contents', TITLE_ID, 'exefs',
+                        'main')
+    log('')
+    log('sub-unit parallax (layers 3/4) ...')
+    tmp = dest + '.subparallax-tmp'
+    try:
+        shutil.copyfile(src, tmp)
+        rc = ff7nx_subparallax.apply(tmp, log=log)
+    except Exception as exc:                                   # noqa: BLE001
+        rc = 1
+        log('! sub-unit parallax: %s: %s' % (type(exc).__name__, exc))
+    if rc:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        log('! sub-unit parallax: NOT INSTALLED')
+        return []
+    os.replace(tmp, dest)
+    return [dest] if not built else []
+
+
+def apply_moviepace(sdout, dump, log=lambda *_: None, produced=()):
+    """BUILD 618z. A background-movie field (las4_2/las4_3) runs at 60 and
+    its movie at its own rate. See ff7nx_moviepace.
+
+    A stage of its own, AFTER the Echo-S voice runtime and facial passes,
+    because it grows BSS by 8 bytes plus the tail slack: run before the
+    voice pass (it used to sit in apply_field_frame) it pushed the voice
+    block out of the page the pre-existing BSS ended in, and the voice
+    runtime refused to install (build 387: no voice acting at all).
+    """
+    if not ff7nx_moviepace.enabled():
+        log('')
+        log('background-movie 60 fps: OFF (%s=0)' % ff7nx_moviepace.ENV)
+        return []
+    src, built = _audio_bridge_base(sdout, dump, log, produced,
+                                    'background-movie 60 fps')
+    if src is None:
+        return []
+    dest = os.path.join(sdout, 'atmosphere', 'contents', TITLE_ID, 'exefs',
+                        'main')
+    log('')
+    log('background-movie 60 fps ...')
+    tmp = dest + '.moviepace-tmp'
+    try:
+        shutil.copyfile(src, tmp)
+        rc = ff7nx_moviepace.apply(tmp, log=log)
+    except Exception as exc:                                   # noqa: BLE001
+        rc = 1
+        log('! background-movie 60 fps: %s: %s' % (type(exc).__name__, exc))
+    if rc:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        log('! background-movie 60 fps: NOT INSTALLED')
+        return []
+    os.replace(tmp, dest)
     return [dest] if not built else []
 
 
@@ -14144,7 +15330,14 @@ def apply_field_zoom(sdout, dump, log=lambda *_: None, produced=()):
     try:
         if not flevel or not os.path.exists(flevel):
             raise ValueError('the dump\'s flevel.lgp was not found')
-        index = ff7nx_fieldzoom.maplist_index(flevel, names)
+        # BUILD 618z11: a debug-warp door showing a zoomed field is zoomed
+        # too (the zoom keys on the field id, and the door keeps its own).
+        import ff7nx_debugwarp
+        zoom_of = {n: ff7nx_fieldzoom.factor(n) for n in names}
+        for door, dst in ff7nx_debugwarp.pairs():
+            if dst in zoom_of and door not in zoom_of:
+                zoom_of[door] = zoom_of[dst]
+        index = ff7nx_fieldzoom.maplist_index(flevel, sorted(zoom_of))
     except Exception as exc:                                   # noqa: BLE001
         log('! field zoom: NOT installed (%s)' % exc)
         return []
@@ -14154,17 +15347,19 @@ def apply_field_zoom(sdout, dump, log=lambda *_: None, produced=()):
     log('')
     log('field zoom ...')
     try:
-        report = ff7nx_fieldzoom.apply_to_nso(src, tmp, sorted(index.values()),
-                                              log, stock=dump.nso)
+        report = ff7nx_fieldzoom.apply_to_nso(
+            src, tmp, sorted((i, zoom_of[n]) for n, i in index.items()),
+            log, stock=dump.nso)
     except Exception as exc:                                   # noqa: BLE001
         if os.path.exists(tmp):
             os.remove(tmp)
         log('! field zoom: NOT installed (%s)' % exc)
         return []
     os.replace(tmp, dest)
-    log('  zoomed 4/3 to fill 16:9 (FFNx WM_ZOOM): %s (%d words written; '
+    log('  zoomed to fill 16:9 (FFNx WM_ZOOM): %s (%d words written; '
         'BUILD 569: carried by every draw\'s projection, BSS flag at +0x%X)'
-        % (', '.join('%s #%d' % kv for kv in sorted(index.items())),
+        % (', '.join('%s #%d x%.4f' % (n, i, zoom_of[n])
+                     for n, i in sorted(index.items())),
            report['words'], report['bss']))
     return [dest] if not built else []
 
@@ -14947,7 +16142,7 @@ def apply_daynight(sdout, dump, plan, log=lambda *_: None, produced=()):
             src, tmp, bitmap, fps=_field_tick_hz(),
             freeze_hour=ff7nx_daynight.freeze_hour_from_env(),
             strength=ff7nx_daynight.strength_from_env(),
-            sky_rows=sky_rows, world_sphere=_ws_sphere)
+            sky_rows=sky_rows, world_sphere=_ws_sphere, stock=dump.nso)
     except Exception as exc:                                   # noqa: BLE001
         report = None
         log('! day/night: %s: %s' % (type(exc).__name__, exc))
@@ -14958,6 +16153,7 @@ def apply_daynight(sdout, dump, plan, log=lambda *_: None, produced=()):
             'build is affected and the game looks exactly as it did')
         return []
     os.replace(tmp, dest)
+    log('  caves: %s' % report.get('caves_from', 'the padding pool'))
     log('  clock: minutes/hours/days/months in field variable bank 1 at '
         '+0x0A..+0x0F, the same bytes the mod\'s own config names -- savemap '
         '+0x0BAE, inside the script variable banks, so the TIME OF DAY IS '
@@ -15003,6 +16199,12 @@ def apply_daynight(sdout, dump, plan, log=lambda *_: None, produced=()):
         'units are tinted, the sprite lists -- gauges, cursor, text, banner '
         '-- are not (BUILD 572)' if report.get('condor')
         else 'not tinted (%s=0)' % ff7nx_daynight.CONDOR_ENV))
+    log('  snowboard: %s' % (
+        'the story run down the Great Glacier follows the clock (always '
+        'outdoors); sky, course, board, Cloud and in-world sprites are '
+        'tinted, the HUD and result screens are not. The Wonder Square '
+        'arcade version is never tinted (BUILD 617)' if report.get('snow')
+        else 'not tinted (%s=0)' % ff7nx_daynight.SNOW_ENV))
     _dn_night = ff7nx_daynight.as_the_shader_multiplies(
         ff7nx_daynight.NIGHT_RGB, report['strength'])
     log('  strength: %d%%%s -- night multiplies by %s (FFNx\'s own 100%% is '
@@ -15940,7 +17142,9 @@ def apply_field_frame(sdout, dump, log=lambda *_: None, produced=()):
         # running it first would place the top and bottom bars 24 px away from
         # the picture they are supposed to meet.
         #
-        # FMV ONLY. A credits arm was tried and ROLLED BACK -- HANDOFF-104
+        # BUILD 612: plus the side bars while FF7's _mode (0xCBF9DC) is
+        # CREDITS (27) -- a mode word, not the sticky [0xF4F454] below.
+        # Before 612: FMV ONLY. A credits arm was tried and ROLLED BACK -- HANDOFF-104
         # s5.1. Its gate read [0xF4F454], which looked like "the credits are
         # running" from its three write sites but is sticky: the clear sits
         # inside one arm of a jump-table sub-state machine, so once the intro
@@ -15948,6 +17152,13 @@ def apply_field_frame(sdout, dump, log=lambda *_: None, produced=()):
         # margins are still handled, but by ff7nx_credits' colour clear, not
         # by this.
         rc |= ff7nx_moviebars.apply(dest, log=log)
+        # BUILD 618z: the background-movie 60 fps pass (ff7nx_moviepace) is
+        # NOT here any more. It grows BSS, and this stage runs before the
+        # Echo-S voice runtime, whose block must end in the page the
+        # pre-existing BSS ended in: build 387's 0x330 bytes pushed it 800
+        # bytes past that page and the voice runtime refused to install (no
+        # voice acting). It is its own stage, `apply_moviepace`, after
+        # apply_pointers.
     else:
         log('  movie margin bars: OFF -- models will draw over the black '
             'margins during an FMV. '
