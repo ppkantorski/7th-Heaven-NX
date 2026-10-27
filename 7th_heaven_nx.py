@@ -948,11 +948,12 @@ SCALER_BY_LABEL = {v: k for k, v in SCALER_CHOICES}
 
 # BUILD 805. The background scaler's black point, in 255ths, written into the
 # sdout copy of the shader (ff7nx_shaders.BLACK_POINT_ENV). It can only lower
-# a shader's own value, so 12, the HD sets' value, is both the top and the
-# default and leaves the files untouched.
+# a shader's own value, so 12, the HD sets' value, is the top (it leaves the
+# files untouched). BUILD 822: the default is 11 (nxsettings.LOCKED and
+# ff7nx_shaders.BLACK_POINT_DEFAULT).
 BLACK_POINT_CHOICES = [
-    (12, 'Black level: 12/255 (current, max)'),
-    (11, 'Black level: 11/255'),
+    (12, 'Black level: 12/255 (max)'),
+    (11, 'Black level: 11/255 (default)'),
     (10, 'Black level: 10/255'),
     (9, 'Black level: 9/255'),
     (8, 'Black level: 8/255'),
@@ -3010,8 +3011,8 @@ def launch_ui():
              _choices(BLACK_POINT_CHOICES),
              'How much the background upscaling shader pulls down to pure '
              'black, in 255ths. Written into the shader copied to sdout; '
-             'only the HD upscaling options use it. 12 is the tested value '
-             'and the most it can be.', False),
+             'only the HD upscaling options use it. 11 is the tested value; '
+             '12 is the most it can be.', False),
         ]),
         ('Developer — field backgrounds', [
             ('combo', 'Preset', fpre_var,

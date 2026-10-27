@@ -86,7 +86,7 @@ LOCKED = {
     'movie_fit': 'native',
     'movie_colour': 'bt709',
     # background scaler
-    'hd_black_point': 12,           # BUILD 805: 255ths; the HD shaders' own
+    'hd_black_point': 11,           # BUILD 805: 255ths; BUILD 822: 11 (was 12, the HD shaders' own)
 }
 
 assert not USER_KEYS & set(LOCKED), 'a key cannot be both user and locked'

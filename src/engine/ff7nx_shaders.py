@@ -91,7 +91,10 @@ VIDEO_ENV = 'SEVENTH_NX_VIDEO_SHADER'
 # byte-identical to its source, `sharp` included.
 BLACK_POINT_ENV = 'SEVENTH_NX_HD_BLACK_POINT'
 BLACK_POINT_MAX = 12
-BLACK_POINT_DEFAULT = BLACK_POINT_MAX
+# BUILD 822: 11 by default (was 12, the max). Since BUILD 816 nmkin_5's dark
+# cells no longer need 12 to hide black squares, and 12 crushes dark
+# detail in other fields. 12 stays the max: it is the shaders' own value.
+BLACK_POINT_DEFAULT = 11
 _BLACK_POINT_RE = re.compile(
     r'^(const float HD_BLACK_POINT = )([0-9.]+);.*$', re.M)
 
