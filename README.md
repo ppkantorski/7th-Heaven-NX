@@ -118,7 +118,7 @@ Where FFNx already solves a problem (field camera ranges, shadow rules, effect i
   |---|---|---|
   | 1428 MHz | 844 MHz | 1600 MHz |
 
-  Use an overclocking tool such as [sys-clk](https://github.com/retronx-team/sys-clk). Below these clocks the game still runs, but 60 FPS may not hold in busier scenes.
+  Use an overclocking tool such as [sys-clk](https://github.com/ppkantorski/sys-clk). Below these clocks the game still runs, but 60 FPS may not hold in busier scenes.
 
 ---
 
