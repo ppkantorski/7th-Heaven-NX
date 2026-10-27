@@ -7,7 +7,7 @@
 [![GitHub Downloads](https://img.shields.io/github/downloads/ppkantorski/7th-Heaven-NX/total?color=6f42c1)](https://somsubhra.github.io/github-release-stats/?username=ppkantorski&repository=7th-Heaven-NX&page=1&per_page=300)
 [![GitHub issues](https://img.shields.io/github/issues/ppkantorski/7th-Heaven-NX?color=222222)](https://github.com/ppkantorski/7th-Heaven-NX/issues)
 [![GitHub stars](https://img.shields.io/github/stars/ppkantorski/7th-Heaven-NX)](https://github.com/ppkantorski/7th-Heaven-NX/stargazers)
-[![Discord](https://img.shields.io/badge/discord-7th%20Heaven%20NX-5865F2?logo=discord&logoColor=white)](https://discord.gg/r6zJPPfqtr)
+[![Discord](https://img.shields.io/badge/discord-7HNX-5865F2?logo=discord&logoColor=white)](https://discord.gg/r6zJPPfqtr)
 
 **7th Heaven NX** brings PC 7th Heaven mods to **Final Fantasy VII on Nintendo Switch**. You point it at your own game dump, pick your mods, and it builds an Atmosphère LayeredFS folder you copy straight onto your SD card.
 
