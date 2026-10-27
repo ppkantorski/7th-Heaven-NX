@@ -70,6 +70,31 @@ def read_entries(f):
     return version, flags, entries
 
 
+class IncompleteIro(ValueError):
+    """The .iro ends before its own directory says its data does: a
+    download or copy that was cut short."""
+
+
+def _mb(n):
+    return '%.1f MB' % (n / 1048576.0)
+
+
+def check_complete(src, entries, filesize=None):
+    """Raise IncompleteIro when an entry runs past the end of the file. In
+    every complete .iro the last entry ends exactly at the end of the file,
+    so this costs nothing and catches a truncated mod before a read with a
+    negative length fails somewhere far less clear."""
+    if filesize is None:
+        filesize = os.path.getsize(src)
+    need = max((o + s for _n, _f, o, s in entries), default=0)
+    if need > filesize:
+        raise IncompleteIro(
+            '%s is incomplete: the file is %s but its contents run to %s, '
+            'so its download or copy was cut short. Delete it from mods/ '
+            'and download it again (Install Mods can do that).'
+            % (os.path.basename(src), _mb(filesize), _mb(need)))
+
+
 def is_folder_mod(src):
     """A mod shipped as an unpacked folder (mod.xml at its root) instead of
     an .iro -- 7th Heaven PC loads both. BUILD 619."""
@@ -121,6 +146,7 @@ def read_one(src, wanted):
     target = wanted.lower().replace('\\', '/')
     with open(src, 'rb') as f:
         _, _, entries = read_entries(f)
+        check_complete(src, entries, filesize)
         for name, eflags, offset, size in entries:
             if name.lower().replace('\\', '/') != target:
                 continue
@@ -168,6 +194,7 @@ def extract(src, dest, progress=None, skip=None):
     failures = []
     with open(src, 'rb') as f:
         _, _, entries = read_entries(f)
+        check_complete(src, entries, filesize)
         for i, (name, eflags, offset, size) in enumerate(entries):
             if progress and i % 200 == 0:
                 progress(i, len(entries))

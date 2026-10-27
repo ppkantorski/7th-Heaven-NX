@@ -36,6 +36,10 @@ Copyright (c) 2026 ppkantorski
 
 import decimal
 import html.parser
+import http.client
+import socket
+import threading
+import time
 import json
 import os
 import re
@@ -64,6 +68,13 @@ CATALOG_CACHE = os.path.join(nxpaths.ROOT, 'cache', '_catalogs')
 USER_AGENT = ('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
               'AppleWebKit/537.36 (KHTML, like Gecko) 7thHeavenNX')
 CHUNK = 1 << 20
+# BUILD 832: retry, resume and parallel pieces.
+RETRIES = 5                     # per link (per piece when split)
+BACKOFF = (2, 4, 8, 16, 30)     # seconds before retry 1, 2, ...
+READ_TIMEOUT = 30               # a connection silent this long is dead
+SEGMENTS = 4                    # pieces for one big file
+SEGMENT_MIN = 64 << 20          # files smaller than this stay one stream
+PARALLEL_MODS = 3               # Install all runs this many at once
 
 IRO_SIG = b'IROS'
 SEVENZ_SIG = b"7z\xbc\xaf'\x1c"
@@ -109,7 +120,7 @@ def _context():
         return ssl.create_default_context()
 
 
-def _open(url, headers=None, timeout=60):
+def _open(url, headers=None, timeout=READ_TIMEOUT):
     req = urllib.request.Request(url, headers=dict(
         {'User-Agent': USER_AGENT}, **(headers or {})))
     try:
@@ -240,28 +251,261 @@ def _gdrive_response(file_id):
     return resp
 
 
-def _fetch(link, dest, progress, cancel, expect=0):
+# Errors worth another try: the network, not the request. A 4xx other than
+# 408/429 means the link itself is wrong, and retrying it only wastes time.
+def _retryable(exc):
+    if isinstance(exc, urllib.error.HTTPError):
+        # 403/410 mid-download: a mirror's signed link expired; the retry
+        # opens the link afresh
+        return exc.code in (403, 408, 410, 429) or exc.code >= 500
+    return isinstance(exc, (OSError, urllib.error.URLError, socket.timeout,
+                            http.client.HTTPException, _Short))
+
+
+class _Short(Exception):
+    """A response that ended before the bytes it promised."""
+
+
+def _resolve(link):
+    """(response, url, headers) for `link`: the first response, plus the
+    final URL (after redirects and Google Drive's confirm page) and the
+    headers that fetch it again, so a retry or a range can go straight
+    there."""
     kind, url = parse_link(link)
     if kind == 'Url':
         resp = _open(url)
-    elif kind == 'GDrive':
+        return resp, resp.geturl(), {}
+    if kind == 'GDrive':
         resp = _gdrive_response(url)
-    else:
-        raise DownloadError('%s links need a browser: %s' % (kind, url))
-    total = int(resp.headers.get('Content-Length') or 0) or expect
-    done = 0
-    with resp, open(dest, 'wb') as f:
-        while True:
+        return resp, resp.geturl(), {'Referer': 'https://drive.google.com/'}
+    raise DownloadError('%s links need a browser: %s' % (kind, url))
+
+
+def _open_range(url, headers, start, end=None):
+    """A response for bytes start..end (inclusive), or None when the server
+    ignores ranges and would send the whole file again."""
+    rng = 'bytes=%d-%s' % (start, '' if end is None else end)
+    resp = _open(url, headers=dict(headers, Range=rng))
+    if resp.status != 206:
+        resp.close()
+        return None
+    return resp
+
+
+def _supports_ranges(resp, url, headers):
+    if (resp.headers.get('Accept-Ranges') or '').lower() == 'bytes':
+        return True
+    try:                            # many servers serve ranges unannounced
+        probe = _open_range(url, headers, 0, 0)
+    except Exception:                                          # noqa: BLE001
+        return False
+    if probe is None:
+        return False
+    probe.close()
+    return True
+
+
+class _Progress:
+    """Bytes received across every piece, reported as one number."""
+
+    def __init__(self, progress, total):
+        self.cb, self.total, self.done = progress, total, 0
+        self.lock = threading.Lock()
+
+    def add(self, n):
+        with self.lock:
+            self.done += n
+            done = self.done
+        self.cb(done, self.total)
+
+    def take_back(self, n):         # a piece restarting from its beginning
+        with self.lock:
+            self.done -= n
+
+
+def _wait(seconds, cancel):
+    end = time.monotonic() + seconds
+    while time.monotonic() < end:
+        if cancel():
+            raise Cancelled()
+        time.sleep(0.2)
+
+
+def _copy(resp, f, want, prog, cancel, pos):
+    """Stream resp into f until `want` bytes (None: until it ends).
+    `pos` is a one-item list advanced as each chunk is written, so whatever
+    arrived before a failure is kept and a retry resumes after it. Raises
+    _Short when the response ends before `want`."""
+    got = 0
+    with resp:
+        while want is None or got < want:
             if cancel():
                 raise Cancelled()
-            chunk = resp.read(CHUNK)
+            chunk = resp.read(CHUNK if want is None
+                              else min(CHUNK, want - got))
             if not chunk:
                 break
             f.write(chunk)
-            done += len(chunk)
-            progress(done, total)
-    if not done:
+            got += len(chunk)
+            pos[0] += len(chunk)
+            prog.add(len(chunk))
+    if want is not None and got < want:
+        raise _Short('%d of %d bytes' % (got, want))
+
+
+def _fetch(link, dest, progress, cancel, expect=0,
+           log=lambda *_: None, status=lambda *_: None):
+    """Download `link` to `dest`, retrying with resume (BUILD 832).
+
+    A file the server sizes, on a server that serves byte ranges, is
+    fetched as SEGMENTS pieces at once when it is big -- mirrors cap each
+    connection, so this is most of the speed-up -- and every piece resumes
+    from its own last byte when its connection drops. Without ranges a
+    failed attempt starts over. Each attempt that fails waits BACKOFF and
+    says so through `status` ("Retrying (2 of 5)"); after RETRIES the link
+    is given up and the next one (if the catalog has one) is tried."""
+    resp, url, headers = _resolve(link)
+    total = int(resp.headers.get('Content-Length') or 0)
+    ranges = bool(total) and _supports_ranges(resp, url, headers)
+    prog = _Progress(progress, total or expect)
+    try:
+        if ranges and total >= SEGMENT_MIN:
+            resp.close()
+            _fetch_pieces(link, url, headers, dest, total, prog, cancel, log,
+                          status)
+        else:
+            _fetch_stream(link, resp, url, headers, dest, total, ranges,
+                          prog, cancel, log, status)
+    except (_Short, OSError, http.client.HTTPException) as exc:
+        if isinstance(exc, urllib.error.HTTPError):
+            raise
+        raise DownloadError('the connection kept dropping; gave up after '
+                            '%d retries (%s)' % (RETRIES, exc))
+    size = os.path.getsize(dest)
+    if not size:
         raise DownloadError('empty download')
+    if total and size != total:
+        raise DownloadError('the download was cut short (%d of %d bytes)'
+                            % (size, total))
+
+
+def _retry_wait(attempt, exc, what, cancel, log, status):
+    """Raise `exc` when it is final; otherwise say so and wait."""
+    if not _retryable(exc) or attempt > RETRIES:
+        raise exc
+    delay = BACKOFF[min(attempt, len(BACKOFF)) - 1]
+    log('%sconnection lost (%s); retry %d of %d in %ds'
+        % (what, exc, attempt, RETRIES, delay))
+    status('Retrying (%d of %d)…' % (attempt, RETRIES))
+    _wait(delay, cancel)
+
+
+def _fetch_stream(link, resp, url, headers, dest, total, ranges, prog,
+                  cancel, log, status):
+    """One connection. A drop resumes from the last byte when the server
+    serves ranges, else the file starts over."""
+    pos = [0]
+    attempt = 0
+    expired = False
+    while True:
+        try:
+            if resp is None:
+                if expired:
+                    fresh, url, headers = _resolve(link)
+                    fresh.close()
+                    expired = False
+                if pos[0] and ranges:
+                    resp = _open_range(url, headers, pos[0])
+                if resp is None:            # no ranges, or the link expired
+                    if pos[0]:
+                        log('cannot resume here; starting the file over')
+                        prog.take_back(pos[0])
+                        pos[0] = 0
+                    resp, url, headers = _resolve(link)
+            with open(dest, 'r+b' if pos[0] else 'wb') as f:
+                f.seek(pos[0])
+                _copy(resp, f, (total - pos[0]) if total else None, prog,
+                      cancel, pos)
+            return
+        except Cancelled:
+            raise
+        except Exception as exc:                               # noqa: BLE001
+            resp = None
+            expired = (isinstance(exc, urllib.error.HTTPError)
+                       and exc.code in (403, 410))
+            attempt += 1
+            _retry_wait(attempt, exc, '', cancel, log, status)
+
+
+def _fetch_pieces(link, url, headers, dest, total, prog, cancel, log,
+                  status):
+    """SEGMENTS byte ranges at once into one preallocated file, each with
+    its own retries and resume point."""
+    with open(dest, 'wb') as f:
+        f.truncate(total)
+    step = -(-total // SEGMENTS)
+    pieces = [(i * step, min(total, (i + 1) * step) - 1)
+              for i in range(SEGMENTS) if i * step < total]
+    errors = []
+    stop = threading.Event()
+    urlref = [url, headers]
+    lock = threading.Lock()
+
+    def stopped():
+        return stop.is_set() or cancel()
+
+    def refresh_url():
+        # a mirror's signed redirect can expire mid-download: one fresh
+        # resolve, shared by every piece
+        with lock:
+            r, u, h = _resolve(link)
+            r.close()
+            urlref[:] = [u, h]
+
+    def piece(start, end):
+        pos, attempt = [start], 0
+        while pos[0] <= end:
+            try:
+                resp = _open_range(urlref[0], urlref[1], pos[0], end)
+                if resp is None:
+                    refresh_url()
+                    resp = _open_range(urlref[0], urlref[1], pos[0], end)
+                    if resp is None:
+                        raise _Short('the server stopped serving ranges')
+                with open(dest, 'r+b') as f:
+                    f.seek(pos[0])
+                    _copy(resp, f, end - pos[0] + 1, prog, stopped, pos)
+            except Cancelled:
+                return
+            except Exception as exc:                           # noqa: BLE001
+                attempt += 1
+                try:
+                    _retry_wait(attempt, exc, 'piece %d/%d: '
+                                % (pieces.index((start, end)) + 1,
+                                   len(pieces)), stopped, log, status)
+                except Cancelled:
+                    return
+                except Exception as final:                     # noqa: BLE001
+                    errors.append(final)
+                    stop.set()
+                    return
+                if isinstance(exc, urllib.error.HTTPError) and \
+                        exc.code in (403, 410):
+                    try:
+                        refresh_url()
+                    except Exception:                          # noqa: BLE001
+                        pass
+
+    threads = [threading.Thread(target=piece, args=p, daemon=True)
+               for p in pieces]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    if cancel():
+        raise Cancelled()
+    if errors:
+        raise errors[0]
 
 
 # ------------------------------------------------------------ install
@@ -308,8 +552,13 @@ def _extract(archive, dest, log):
 
 
 def _valid_iro(path):
+    # a readable directory is not enough: it sits near the start of the
+    # file, so a download cut short still lists fine
     try:
-        return bool(iro.list_entries(path))
+        with open(path, 'rb') as f:
+            _, _, entries = iro.read_entries(f)
+        iro.check_complete(path, entries)
+        return bool(entries)
     except Exception:                                          # noqa: BLE001
         return False
 
@@ -376,7 +625,8 @@ def install(download, mods_dir, file_name, log=lambda *_: None):
 
 
 def download_and_install(cmod, mods_dir, file_name, progress=lambda *_: None,
-                         cancel=lambda: False, log=lambda *_: None):
+                         cancel=lambda: False, log=lambda *_: None,
+                         status=lambda *_: None):
     """Fetch `cmod` (trying each of its links) and install it as
     `file_name`. progress(done, total) during the download."""
     if not cmod.links:
@@ -389,7 +639,7 @@ def download_and_install(cmod, mods_dir, file_name, progress=lambda *_: None,
     try:
         for link in cmod.links:
             try:
-                _fetch(link, tmp, progress, cancel, cmod.size)
+                _fetch(link, tmp, progress, cancel, cmod.size, log, status)
                 return install(tmp, mods_dir, file_name, log)
             except Cancelled:
                 raise

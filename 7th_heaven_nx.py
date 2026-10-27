@@ -46,7 +46,7 @@ HERE = nxpaths.ROOT
 
 # Shown in the header, nearest the title. Single source of truth --
 # anything else that needs it should import this rather than repeat it.
-VERSION = '1.0.0'
+VERSION = '1.0.1'
 sys.path.insert(0, HERE)
 
 import build  # noqa: E402
@@ -133,10 +133,11 @@ def _global_setting(key, default):
 #   AppWrapper/VFile.cs            MapFile() returns the FIRST override
 #                                    found for a file
 #
-# First match wins. BUILD 753: like 7H, the list is the profile's order
-# (settings.json ``mod_load_order``) and survives mod updates; the category
-# auto-sort places mods the profile does not list yet (see
-# apply_profile_order).
+# First match wins. BUILD 831: the supported mods always take the tested
+# order of data/mod_sources.json (the Install Mods and README order), however
+# they were installed; other mods follow in the category auto-sort (see
+# apply_reference_order). The saved order no longer decides it: with no drag
+# or Auto-sort here, a mod installed last could never leave the bottom.
 #
 # build.build_plan() applies its input later-wins, so run_build() hands it
 # this order reversed.
@@ -1232,7 +1233,68 @@ def discover_mods(order=None):
             # the category is known before we sort.
             mod._load_manifest()
             found.append(mod)
-    return apply_profile_order(_autosort_7h(found), order)
+    return apply_reference_order(_autosort_7h(found))
+
+
+def _reference_sources():
+    """data/mod_sources.json's mods, in its order: the tested load order."""
+    try:
+        import ff7nx_download
+        return ff7nx_download.load_sources()
+    except Exception:                                          # noqa: BLE001
+        return []
+
+
+def apply_reference_order(mods, sources=None):
+    """BUILD 831. The list, and so the build's priority, in the TESTED order.
+
+    data/mod_sources.json lists the supported mods in the order they were
+    played through on hardware, highest priority first; it is also the
+    Install Mods window's order and the README's table. Every mod it lists
+    takes that place, however and whenever it was installed.
+
+    This replaces keeping the saved order (BUILD 753's profile order): that
+    copied 7th Heaven, where a new mod goes to the BOTTOM until you press
+    Auto-sort or drag it. This program has neither, so a mod installed later
+    simply stayed last -- Echo-S downloaded last ended up with the lowest
+    priority, in the list and in the build -- and nothing could move it.
+
+    A mod is matched to its source by the file name Install Mods gives it,
+    then by stem (an .iro replaced by the same mod as a folder, or the
+    reverse), then by its mod.xml ID against the catalog ID (the same mod
+    saved under another name). Mods the file does not list keep 7th Heaven's
+    category auto-sort among themselves, below the supported ones."""
+    if sources is None:
+        sources = _reference_sources()
+    if not sources:
+        return list(mods)
+
+    def stem(name):
+        return (name[:-4] if name.lower().endswith('.iro')
+                else name).casefold()
+
+    by_file, by_stem, by_id = {}, {}, {}
+    for i, src in enumerate(sources):
+        f = src.get('file') or ''
+        by_file.setdefault(f.casefold(), i)
+        by_stem.setdefault(stem(f), i)
+        if src.get('id'):
+            by_id.setdefault(str(src['id']).strip().lower(), i)
+    known, other = [], []
+    taken = set()
+    for m in mods:
+        r = by_file.get(m.filename.casefold())
+        if r is None:
+            r = by_stem.get(stem(m.filename))
+        if r is None:
+            r = by_id.get(_manifest_id(m))
+        if r is not None and r not in taken:
+            taken.add(r)
+            known.append((r, m))
+        else:
+            other.append(m)
+    known.sort(key=lambda t: t[0])
+    return [m for _r, m in known] + other
 
 
 def apply_profile_order(mods, order):
@@ -2193,6 +2255,51 @@ def launch_ui():
 
     root = tk.Tk()
     root.title('7th Heaven NX')
+    # BUILD 834: the same sizes and faces as macOS, which the whole layout
+    # is designed on. Tk sizes fonts in POINTS: macOS draws 1 pt as 1 px,
+    # Windows and Linux as 96/72 = 1.33 px, so every font -- and everything
+    # measured from one, check boxes and row heights included -- came out a
+    # third larger there. Scaling 1.0 is macOS's own value. Windows still
+    # enlarges the whole window for a 125%/150% display setting, as it does
+    # every app that does not declare its own DPI handling, so the layout
+    # keeps its macOS proportions at any setting.
+    # Helvetica and Menlo are macOS fonts; elsewhere Tk would substitute on
+    # its own (Menlo usually becomes Courier), so name the nearest match:
+    # Arial shares Helvetica's metrics, Consolas is Windows' Menlo.
+    UI_FONT, MONO_FONT = 'Helvetica', 'Menlo'
+    if sys.platform != 'darwin':
+        try:
+            root.tk.call('tk', 'scaling', 1.0)
+        except tk.TclError:
+            pass
+        try:
+            _fams = {f.lower(): f for f in tkfont.families(root)}
+        except tk.TclError:
+            _fams = {}
+
+        def _pick(*names):
+            return next((_fams[n.lower()] for n in names
+                         if n.lower() in _fams), names[0])
+        UI_FONT = _pick('Helvetica', 'Arial', 'Liberation Sans',
+                        'Nimbus Sans', 'Nimbus Sans L', 'Arimo',
+                        'Helvetica Neue', 'DejaVu Sans')
+        MONO_FONT = _pick('Menlo', 'Consolas', 'DejaVu Sans Mono',
+                          'Liberation Mono', 'Cascadia Mono', 'Courier New')
+        # the defaults Tk's own widgets use (entries, menus, dialogs), at
+        # the sizes macOS's Tk gives them
+        for _name, _size in (('TkDefaultFont', 13), ('TkTextFont', 13),
+                             ('TkMenuFont', 13), ('TkHeadingFont', 13),
+                             ('TkCaptionFont', 13), ('TkTooltipFont', 11)):
+            try:
+                tkfont.nametofont(_name).configure(family=UI_FONT,
+                                                   size=_size)
+            except tk.TclError:
+                pass
+        try:
+            tkfont.nametofont('TkFixedFont').configure(family=MONO_FONT,
+                                                       size=11)
+        except tk.TclError:
+            pass
     # Default layout (Patrick's, Oct 2026): 1090x1128 with the Mods column
     # at ~42.5% of the width and the log at the bottom ~26% (WIN_SPLIT_*).
     # On a smaller screen the window shrinks to fit, either way, and the
@@ -2252,32 +2359,32 @@ def launch_ui():
                         fieldbackground=BG_ROW, bordercolor=BORDER,
                         darkcolor=BG_APP, lightcolor=BG_APP,
                         troughcolor=BG_ROW, focuscolor=ACCENT,
-                        font=('Helvetica', 11))
+                        font=(UI_FONT, 11))
         style.configure('TFrame', background=BG_APP)
         style.configure('TLabel', background=BG_APP, foreground=TEXT_PRIMARY)
         style.configure('TLabelframe', background=BG_APP, bordercolor=BORDER,
                         relief='solid', borderwidth=1)
         style.configure('TLabelframe.Label', background=BG_APP,
-                        foreground=TEXT_SECONDARY, font=('Helvetica', 10, 'bold'))
+                        foreground=TEXT_SECONDARY, font=(UI_FONT, 10, 'bold'))
         style.configure('TPanedwindow', background=BG_APP)
         style.configure('TSeparator', background=BORDER)
 
-        style.configure('Header.TLabel', font=('Helvetica', 18, 'bold'),
+        style.configure('Header.TLabel', font=(UI_FONT, 18, 'bold'),
                         foreground=TEXT_PRIMARY)
         style.configure('Sub.TLabel', foreground=TEXT_SECONDARY)
         # BUILD 814b: an Install Mods row whose check box is off
         style.configure('GetModOff.TLabel', foreground=TEXT_MUTED)
-        style.configure('ModName.TLabel', font=('Helvetica', 12),
+        style.configure('ModName.TLabel', font=(UI_FONT, 12),
                         background=BG_ROW, foreground=TEXT_PRIMARY)
-        style.configure('ModNameSelected.TLabel', font=('Helvetica', 12, 'bold'),
+        style.configure('ModNameSelected.TLabel', font=(UI_FONT, 12, 'bold'),
                         background=BG_ROW_SEL, foreground=ACCENT_SOFT)
         style.configure('Link.TLabel', foreground=ACCENT_SOFT,
-                        font=('Helvetica', 11, 'underline'))
-        style.configure('ColHeader.TLabel', font=('Helvetica', 9, 'bold'),
+                        font=(UI_FONT, 11, 'underline'))
+        style.configure('ColHeader.TLabel', font=(UI_FONT, 9, 'bold'),
                         foreground=TEXT_MUTED)
-        style.configure('Archive.TLabel', font=('Helvetica', 11),
+        style.configure('Archive.TLabel', font=(UI_FONT, 11),
                         foreground=ARCHIVE_EXACT)
-        style.configure('ArchiveEst.TLabel', font=('Helvetica', 11),
+        style.configure('ArchiveEst.TLabel', font=(UI_FONT, 11),
                         foreground=ARCHIVE_EST)
 
         # Settings' checkboxes. Without these clam paints a light grey box behind
@@ -2302,7 +2409,7 @@ def launch_ui():
         style.map('TButton',
                   background=[('active', BG_ROW_HOVER), ('disabled', BG_APP)],
                   foreground=[('disabled', TEXT_MUTED)])
-        style.configure('Build.TButton', font=('Helvetica', 13, 'bold'),
+        style.configure('Build.TButton', font=(UI_FONT, 13, 'bold'),
                         padding=(18, 9), background=ACCENT, foreground=ON_ACCENT,
                         bordercolor=ACCENT)
         style.map('Build.TButton',
@@ -2331,7 +2438,7 @@ def launch_ui():
         root.option_add('*TCombobox*Listbox.foreground', TEXT_PRIMARY)
         root.option_add('*TCombobox*Listbox.selectBackground', ACCENT)
         root.option_add('*TCombobox*Listbox.selectForeground', ON_ACCENT)
-        root.option_add('*TCombobox*Listbox.font', ('Helvetica', 11))
+        root.option_add('*TCombobox*Listbox.font', (UI_FONT, 11))
 
         for pbstyle in ('TProgressbar', 'Horizontal.TProgressbar'):
             style.configure(pbstyle, background=ACCENT, troughcolor=BG_ROW,
@@ -2454,18 +2561,128 @@ def launch_ui():
 
     count_label = ttk.Label(header, text=_count_text(), style='Sub.TLabel')
     count_label.pack(side='left', padx=(12, 0))
-    # Dump status, checked once here (build.check_game_dump reads headers
-    # and one small hash, ~0.1 s). Not found: click to open the folder the
-    # dump goes in. Invalid: click to put the reasons in the log.
-    dump_problems = build.check_game_dump(DUMP)
-    if DUMP is None:
-        dump_text, dump_fg = 'game dump not found', WARN
-    elif dump_problems:
-        dump_text, dump_fg = 'game dump found - INVALID', WARN
-    else:
-        dump_text, dump_fg = 'game dump found - VALID', GOOD
-    dump_lbl = ttk.Label(header, text=dump_text, foreground=dump_fg)
+    # Dump status. Checked here (build.check_game_dump reads headers, the
+    # archives' directories and one small hash, ~0.1 s) and again whenever
+    # the refresh icon beside it is clicked, so a dump added while the
+    # program is open is picked up without a restart. Not found: click the
+    # label to open the folder the dump goes in. Invalid: click to put the
+    # reasons in the log.
+    # set while a build runs: the dump must not change under it
+    build_busy = {'active': False}
+    dump_state = {'problems': []}
+    dump_lbl = ttk.Label(header, text='')
     dump_lbl.pack(side='left', padx=(4, 0))
+
+    def _dump_status():
+        dump_state['problems'] = build.check_game_dump(DUMP)
+        if DUMP is None:
+            text, fg = 'game dump not found', WARN
+        elif dump_state['problems']:
+            text, fg = 'game dump found - INVALID', WARN
+        else:
+            text, fg = 'game dump found - VALID', GOOD
+        dump_lbl.configure(text=text, foreground=fg)
+
+    _dump_status()
+
+    def _refresh_image():
+        """A circular arrow drawn with Pillow (4x supersampled), so it looks
+        the same on every platform instead of depending on a font having
+        the glyph. None without ImageTk; the caller falls back to text.
+
+        The image is exactly as tall as the label's line (ascent + descent)
+        and the arrow is centred on the middle of the CAP height inside it,
+        not the middle of the image. Tk centres both labels on their line
+        box, so with equal heights the arrow lands on the letters' visual
+        centre whatever font the platform uses."""
+        try:
+            from PIL import Image, ImageDraw, ImageTk
+        except Exception:
+            return None
+        import math
+        try:
+            f = tkfont.Font(font=dump_lbl.cget('font') or
+                            ttk.Style().lookup('TLabel', 'font') or
+                            'TkDefaultFont')
+            asc, desc = f.metrics('ascent'), f.metrics('descent')
+            act = f.actual()
+            cap = _cap_height((act['family'], abs(int(act['size'])) or 11),
+                              asc, desc)
+        except Exception:                                  # noqa: BLE001
+            asc, desc, cap = 14, 4, 10
+        ss = 4
+        n = max(12, cap + 3)                    # the arrow's own size
+        W, H = n, asc + desc
+        # draw the arrow on its own square, then crop to its ink
+        S = n * ss
+        art = Image.new('RGBA', (S, S), (0, 0, 0, 0))
+        d = ImageDraw.Draw(art)
+        col = TEXT_SECONDARY
+        pad, w = 2 * ss, int(1.6 * ss)
+        d.arc([pad, pad, S - pad, S - pad], start=-60, end=250,
+              fill=col, width=w)
+        cx = cy = S / 2.0
+        rad = (S - 2 * pad) / 2.0
+        ang = math.radians(-60)
+        tx, ty = cx + rad * math.cos(ang), cy + rad * math.sin(ang)
+        h = 3.2 * ss
+        d.polygon([(tx + h, ty - h * 0.2), (tx - h * 0.6, ty - h * 0.9),
+                   (tx - h * 0.1, ty + h * 0.9)], fill=col)
+        box = art.getbbox()
+        if box:
+            art = art.crop(box)
+        # centre the ink on the cap band: its middle is at asc - cap/2
+        im = Image.new('RGBA', (W * ss, H * ss), (0, 0, 0, 0))
+        mid = (asc - cap / 2.0) * ss
+        im.paste(art, (int(round((W * ss - art.width) / 2.0)),
+                       int(round(mid - art.height / 2.0))))
+        return ImageTk.PhotoImage(im.resize((W, H), Image.LANCZOS))
+
+    dump_refresh = ttk.Label(header, cursor='hand2', padding=0)
+    dump_refresh.pack(side='left', padx=(6, 0))
+
+    def _redraw_refresh():
+        img = _refresh_image()
+        if img is not None:
+            dump_refresh.configure(image=img, text='')
+            dump_refresh.image = img
+        else:
+            dump_refresh.configure(text='\u21bb', foreground=TEXT_SECONDARY)
+
+    # after the window is built: _cap_height is defined further down
+    dump_refresh.configure(text='\u21bb', foreground=TEXT_SECONDARY)
+    root.after_idle(_redraw_refresh)
+
+    def _dump_refresh(_evt=None):
+        """Look for the dump again, as at startup."""
+        global DUMP, WORKINGDIR
+        if build_busy['active']:
+            log_write('Wait for the build to finish before checking the '
+                      'game dump again.')
+            return 'break'
+        DUMP = build.find_game_dump(HERE)
+        WORKINGDIR = (DUMP.workingdir if DUMP
+                      else os.path.join(HERE, 'workingdir'))
+        _dump_status()
+        # the "modifies:" notes read archive names from the dump
+        catalogs.clear()
+        if os.path.isdir(WORKINGDIR):
+            try:
+                catalogs.update(build.load_catalogs(WORKINGDIR)[0])
+            except Exception:                              # noqa: BLE001
+                pass
+        if DUMP is None:
+            log_write('Game dump: still not found in %s'
+                      % os.path.join(HERE, 'dump'))
+        elif dump_state['problems']:
+            log_write('Game dump at %s is not usable yet:' % DUMP.root)
+            for why in dump_state['problems']:
+                log_write('  ! ' + why)
+        else:
+            log_write('Game dump at %s: valid.' % DUMP.root)
+        return 'break'
+
+    dump_refresh.bind('<Button-1>', _dump_refresh)
 
     def _dump_click(_evt=None):
         """Opens the dump folder, whatever its state; says why when it is
@@ -2474,12 +2691,12 @@ def launch_ui():
             target = os.path.join(HERE, 'dump')
             os.makedirs(target, exist_ok=True)
             log_write('Put your Switch game dump in %s (romfs/ and exefs/ '
-                      'inside it), then restart.' % target)
+                      'inside it), then press the refresh icon.' % target)
         else:
             target = DUMP.root
-            if dump_problems:
+            if dump_state['problems']:
                 log_write('Game dump at %s:' % DUMP.root)
-                for why in dump_problems:
+                for why in dump_state['problems']:
                     log_write('  ! ' + why)
         try:
             _reveal(target)
@@ -2489,9 +2706,9 @@ def launch_ui():
     dump_lbl.configure(cursor='hand2')
     dump_lbl.bind('<Button-1>', _dump_click)
     dump_lbl.bind('<Enter>', lambda _e: dump_lbl.configure(
-        font=('Helvetica', 11, 'underline')))
+        font=(UI_FONT, 11, 'underline')))
     dump_lbl.bind('<Leave>', lambda _e: dump_lbl.configure(
-        font=('Helvetica', 11)))
+        font=(UI_FONT, 11)))
     # short: the header buttons are packed after this and get only the
     # width that is left, so a long label clips "Install Mods"
     # BUILD 814: the "·  DEV" tag beside this label is gone -- it no longer
@@ -3291,7 +3508,7 @@ def launch_ui():
         # not the label's line box, which ttk.Checkbutton centres and which
         # reads low. `text_y` is exposed so a note in the same row (Default /
         # Modified) sits on the same band.
-        CHK_FONT = ('Helvetica', 11)        # the ttk default ('.') it replaces
+        CHK_FONT = (UI_FONT, 11)        # the ttk default ('.') it replaces
 
         def _settings_check(parent, text, var, disabled=False):
             f = tkfont.Font(font=CHK_FONT)
@@ -3605,7 +3822,7 @@ def launch_ui():
 
         top = ttk.Frame(win, padding=(16, 14, 16, 6))
         top.pack(side='top', fill='x')
-        ttk.Label(top, text='Supported mods', font=('Helvetica', 13, 'bold')
+        ttk.Label(top, text='Supported mods', font=(UI_FONT, 13, 'bold')
                   ).pack(side='left')
         catalog_lbl = ttk.Label(top, text='', style='Sub.TLabel')
         catalog_lbl.pack(side='left', padx=12)
@@ -3716,9 +3933,11 @@ def launch_ui():
             sel_vars[src['id']] = var
             # takefocus=False: a clicked box would otherwise keep Tk's
             # dotted focus ring around itself (BUILD 814b)
-            ttk.Checkbutton(table, variable=var, takefocus=False,
-                            command=lambda s=src: on_select(s)).grid(
-                row=r, column=0, sticky='w', padx=(0, 4), pady=3)
+            # the main list's own rounded box with a tick (ttk's clam
+            # Checkbutton draws an X)
+            _Check(table, var, BG_APP,
+                   command=lambda s=src: on_select(s)).grid(
+                row=r, column=0, sticky='w', padx=(0, 6), pady=3)
             # an unchecked mod's name is dimmed (BUILD 814b)
             name = ttk.Label(table, text=src['name'],
                              style='TLabel' if selected_src(src)
@@ -3805,31 +4024,54 @@ def launch_ui():
             threading.Thread(target=worker_catalog, daemon=True).start()
 
         def worker_install(jobs):
-            for n, src in enumerate(jobs):
-                if state['cancel']:
-                    break
-                cat = state['catalog'][src['id']]
-                msgs.put(('job', (n, len(jobs), src)))
+            # BUILD 832: dl.PARALLEL_MODS downloads at once -- the mirrors
+            # cap each connection, so the small mods finish while the big
+            # ones are still coming -- each with its own retries
+            pending = list(enumerate(jobs))
+            plock = threading.Lock()
 
-                def prog(done, total, src=src):
-                    msgs.put(('bytes', (src, done, total)))
-                try:
-                    path = dl.download_and_install(
-                        cat, MODS_DIR, src['file'], prog,
-                        cancel=lambda: state['cancel'],
-                        log=lambda s: msgs.put(('log', s)))
-                    msgs.put(('installed', (src, path)))
-                except dl.Cancelled:
-                    msgs.put(('failed', (src, 'cancelled')))
-                    break
-                except Exception as exc:                       # noqa: BLE001
-                    msgs.put(('failed', (src, str(exc))))
+            def one():
+                while True:
+                    with plock:
+                        if state['cancel'] or not pending:
+                            return
+                        n, src = pending.pop(0)
+                    cat = state['catalog'][src['id']]
+                    msgs.put(('job', (n, len(jobs), src)))
+
+                    def prog(done, total, src=src):
+                        msgs.put(('bytes', (src, done, total)))
+                    try:
+                        path = dl.download_and_install(
+                            cat, MODS_DIR, src['file'], prog,
+                            cancel=lambda: state['cancel'],
+                            log=lambda s, src=src: msgs.put(
+                                ('log', '%s: %s' % (src['name'], s))),
+                            status=lambda t, src=src: msgs.put(
+                                ('status', (src, t))))
+                        msgs.put(('installed', (src, path)))
+                    except dl.Cancelled:
+                        msgs.put(('failed', (src, 'cancelled')))
+                        return
+                    except Exception as exc:                   # noqa: BLE001
+                        msgs.put(('failed', (src, str(exc))))
+
+            workers = [threading.Thread(target=one, daemon=True)
+                       for _ in range(max(1, min(dl.PARALLEL_MODS,
+                                                 len(jobs))))]
+            for t in workers:
+                t.start()
+            for t in workers:
+                t.join()
             msgs.put(('finished', None))
 
         def start(jobs):
             if state['busy'] or not jobs:
                 return
-            state.update(busy=True, cancel=False, jobs=list(jobs))
+            state.update(busy=True, cancel=False, jobs=list(jobs),
+                         bytes={}, started=0, ended=0, total=len(jobs),
+                         sizes=sum(getattr(state['catalog'].get(j['id']),
+                                           'size', 0) or 0 for j in jobs))
             gm_bar.stop()
             gm_bar.configure(mode='determinate', maximum=1, value=0)
             refresh()
@@ -3840,6 +4082,14 @@ def launch_ui():
             state['cancel'] = True
             all_btn.state(['disabled'])
             gm_status.configure(text='Cancelling…')
+
+        def _gm_count():
+            # several run at once, so say how many are done and running
+            # rather than which one is "current"
+            done = state.get('ended', 0)
+            running = state.get('started', 0) - done
+            gm_status.configure(text='%d of %d done · %d downloading' % (
+                done, state.get('total', 0), running))
 
         def pump_getmods():
             if not win.winfo_exists():
@@ -3868,13 +4118,23 @@ def launch_ui():
                         refresh()
                     elif kind == 'job':
                         n, total, src = p
-                        gm_status.configure(text='%d of %d: %s' % (
-                            n + 1, total, src['name']))
+                        state['started'] = state.get('started', 0) + 1
+                        state['total'] = total
+                        _gm_count()
                         show_row(src, 'Starting…')
+                    elif kind == 'status':
+                        src, text = p
+                        show_row(src, text)
                     elif kind == 'bytes':
                         src, done, total = p
+                        # one bar for the whole run, over every mod in it
+                        got = state.setdefault('bytes', {})
+                        got[src['id']] = done
+                        allb = sum(got.values())
+                        gm_bar.configure(
+                            maximum=max(state.get('sizes') or 0, allb, 1),
+                            value=allb)
                         if total:
-                            gm_bar.configure(maximum=total, value=done)
                             text = 'Downloading %d%%' % (100 * done // total)
                         else:
                             text = 'Downloading %s' % size_text(done)
@@ -3892,6 +4152,8 @@ def launch_ui():
                             del versions[k]
                         if src in state['jobs']:
                             state['jobs'].remove(src)
+                        state['ended'] = state.get('ended', 0) + 1
+                        _gm_count()
                         log_write('Install Mods: installed %s -> %s'
                                   % (src['name'], os.path.relpath(path, HERE)))
                         show_row(src, 'Installed')
@@ -3901,6 +4163,8 @@ def launch_ui():
                         src, why = p
                         if src in state['jobs']:
                             state['jobs'].remove(src)
+                        state['ended'] = state.get('ended', 0) + 1
+                        _gm_count()
                         log_write('Install Mods: %s failed -- %s'
                                   % (src['name'], why))
                         show_row(src, 'Cancelled' if why == 'cancelled'
@@ -3957,7 +4221,7 @@ def launch_ui():
     # rows (see "optical vertical centring" below), and the icon is centred
     # on the same pixel. Without an icon, or without Pillow, a button is its
     # label alone.
-    BTN_FONT = ('Helvetica', 11)        # the ttk default ('.') it replaces
+    BTN_FONT = (UI_FONT, 11)        # the ttk default ('.') it replaces
     BTN_ICON = 16
     BTN_PAD_X, BTN_GAP = 10, 6
     BTN_H = (BTN_ICON + 2 * 7) | 1      # odd -> a centre pixel exists
@@ -4110,11 +4374,11 @@ def launch_ui():
             c.create_image(side // 2, side // 2, image=av)
         else:
             c.create_text(side // 2, side // 2, text=DEV_NAME[:1].upper(),
-                          font=('Helvetica', 40, 'bold'), fill=TEXT_PRIMARY)
+                          font=(UI_FONT, 40, 'bold'), fill=TEXT_PRIMARY)
         tk.Label(left, text=DEV_NAME, bg=BG_ROW, fg=TEXT_PRIMARY,
-                 font=('Helvetica', 17, 'bold')).pack(pady=(12, 0))
+                 font=(UI_FONT, 17, 'bold')).pack(pady=(12, 0))
         tk.Label(left, text='7HNX Developer', bg=BG_ROW, fg=TEXT_SECONDARY,
-                 font=('Helvetica', 11)).pack(pady=(2, 0))
+                 font=(UI_FONT, 11)).pack(pady=(2, 0))
 
         tk.Frame(card, bg=BORDER, width=1).grid(row=0, column=1, sticky='ns',
                                                  pady=24)
@@ -4124,7 +4388,7 @@ def launch_ui():
 
         def heading(text, top, parent=None, **grid):
             lbl = tk.Label(parent or right, text=text, bg=BG_ROW,
-                           fg=TEXT_MUTED, font=('Helvetica', 9, 'bold'))
+                           fg=TEXT_MUTED, font=(UI_FONT, 9, 'bold'))
             if grid:
                 lbl.grid(sticky='w', pady=(top, 4), **grid)
             else:
@@ -4133,13 +4397,13 @@ def launch_ui():
         def url_label(parent, url, **grid):
             lbl = tk.Label(parent, text=url.split('://', 1)[1], bg=BG_ROW,
                            fg=ACCENT_SOFT, cursor='hand2',
-                           font=('Helvetica', 12, 'underline'))
+                           font=(UI_FONT, 12, 'underline'))
             lbl.grid(sticky='w', **grid)
             lbl.bind('<Button-1>', lambda _e: webbrowser.open(url))
 
         heading('ABOUT', 0)
         tk.Label(right, text=DEV_BIO, bg=BG_ROW, fg=TEXT_PRIMARY,
-                 font=('Helvetica', 12), wraplength=300, justify='left'
+                 font=(UI_FONT, 12), wraplength=300, justify='left'
                  ).pack(anchor='w')
         # GitHub and Ko-fi side by side, each heading over its link.
         links = tk.Frame(right, bg=BG_ROW)
@@ -4150,7 +4414,7 @@ def launch_ui():
         url_label(links, KOFI_URL, row=1, column=1)
         heading('CREDITS', 16)
         tk.Label(right, text=DEV_CREDITS, bg=BG_ROW, fg=TEXT_SECONDARY,
-                 font=('Helvetica', 11), wraplength=300, justify='left'
+                 font=(UI_FONT, 11), wraplength=300, justify='left'
                  ).pack(anchor='w')
 
         foot = ttk.Frame(win, padding=(20, 0, 20, 20))
@@ -4448,7 +4712,7 @@ def launch_ui():
     # while you are at the bottom, wheel and scrollbar, drag to select whole
     # lines, Cmd/Ctrl+C to copy them, Cmd/Ctrl+A for everything, and a
     # right-click Copy / Copy all.
-    LOG_FONT = tkfont.Font(family='Menlo', size=11)
+    LOG_FONT = tkfont.Font(family=MONO_FONT, size=11)
     LOG_LH = LOG_FONT.metrics('linespace')
     LOG_PAD = 4
     logbox = tk.Canvas(logframe, background=LOG_BG, highlightthickness=0,
@@ -4760,7 +5024,7 @@ def launch_ui():
     # is sized to its own wrapped line count, so it scrolls with the panel
     # and never on its own.
     _URL = re.compile(r'(?:https?://|www\.)[^\s<>"\']+')
-    DETAIL_FONT = ('Helvetica', 11)
+    DETAIL_FONT = (UI_FONT, 11)
 
     def open_url(url):
         import webbrowser
@@ -4863,7 +5127,7 @@ def launch_ui():
             return
         m = mod.manifest
         ttk.Label(options_body, text=m.name or mod.stem,
-                  font=('Helvetica', 13, 'bold')).pack(anchor='w')
+                  font=(UI_FONT, 13, 'bold')).pack(anchor='w')
         meta = ' · '.join(x for x in (
             m.author, m.version, m.category,
             m.release_date and 'released ' + m.release_date) if x)
@@ -4880,7 +5144,7 @@ def launch_ui():
         summary_lbl = ttk.Label(summary, wraplength=460, justify='left')
         summary_lbl.grid(row=0, column=1, sticky='w')
         summary_note = ttk.Label(summary, style='Sub.TLabel',
-                                 font=('Helvetica', 9), wraplength=600,
+                                 font=(UI_FONT, 9), wraplength=600,
                                  justify='left')
 
         def refresh_summary():
@@ -5055,14 +5319,21 @@ def launch_ui():
             _chk_cache[key] = None
             return None
         n, r, ss = _CHK_SIZE, _CHK_RADIUS, _CHK_SS
+        r = r * n / 13.0                # the corner scales with the box too
         S = n * ss
         im = Image.new('RGB', (S, S), bg)
         d = ImageDraw.Draw(im)
         if on:
             d.rounded_rectangle([0, 0, S - 1, S - 1], radius=r * ss,
                                 fill=ACCENT)
-            d.line([(x * ss, y * ss) for x, y in _CHK_TICK],
-                   fill=CHECK_TICK, width=2 * ss, joint='curve')
+            # BUILD 833: _CHK_TICK is drawn for the 13px macOS box. The box
+            # follows the font's cap height, so on Windows it is ~16px and an
+            # unscaled tick sat small and thin in its top-left corner. Scale
+            # the tick, its stroke and the corner about the box instead.
+            k = n / 13.0
+            d.line([(x * k * ss, y * k * ss) for x, y in _CHK_TICK],
+                   fill=CHECK_TICK, width=max(2 * ss, int(round(2 * k * ss))),
+                   joint='curve')
         else:
             d.rounded_rectangle([0, 0, S - 1, S - 1], radius=r * ss,
                                 fill=bg, outline=TEXT_SECONDARY,
@@ -5133,7 +5404,7 @@ def launch_ui():
         chk.set_bg(bg)
         ver.configure(bg=bg)
         label.configure(bg=bg, fg=fg,
-                        font=('Helvetica', 12, 'bold' if bold else 'normal'))
+                        font=(UI_FONT, 12, 'bold' if bold else 'normal'))
 
     def _restyle(filename):
         if filename not in rows:
@@ -5182,7 +5453,7 @@ def launch_ui():
             return ''
         return v if v[:1].lower() == 'v' else 'v' + v
 
-    ROW_FONT = ('Helvetica', 12)
+    ROW_FONT = (UI_FONT, 12)
     _rowf = tkfont.Font(font=ROW_FONT)
     _asc = _rowf.metrics('ascent')
     _desc = _rowf.metrics('descent')
@@ -5258,8 +5529,8 @@ def launch_ui():
     _label_y = _cap_band_y(ROW_FONT)
 
     # Version, right-aligned. Same size and colour as the version line in the
-    # options panel, which is Sub.TLabel over the default ('Helvetica', 11).
-    VER_FONT = ('Helvetica', 11)
+    # options panel, which is Sub.TLabel over the default (UI_FONT, 11).
+    VER_FONT = (UI_FONT, 11)
     _ver_y = _cap_band_y(VER_FONT)
     VER_PAD_R = 10
     _verf = tkfont.Font(font=VER_FONT)
@@ -5495,6 +5766,10 @@ def launch_ui():
                 walk(str(child))
 
         walk('.')
+        try:
+            _redraw_refresh()
+        except tk.TclError:
+            pass
         _chk_cache.clear()
         for chk in list(_all_checks):
             try:
@@ -5857,6 +6132,7 @@ def launch_ui():
 
         def worker():
             ok = False
+            build_busy['active'] = True
             try:
                 ok = run_build(
                     mods,
@@ -5871,6 +6147,7 @@ def launch_ui():
                 messages.put(('log', 'ERROR: ' + str(exc)))
                 messages.put(('log', traceback.format_exc()))
             finally:
+                build_busy['active'] = False
                 messages.put(('done', ok))
 
         threading.Thread(target=worker, daemon=True).start()
@@ -5896,9 +6173,9 @@ def launch_ui():
             pass
     root.after(50, _initial_splits)
 
-    if DUMP is not None and dump_problems:
+    if DUMP is not None and dump_state['problems']:
         log_write('The game dump does not look right -- builds may fail:')
-        for why in dump_problems:
+        for why in dump_state['problems']:
             log_write('  ! ' + why)
     if not mods:
         log_write(f'No .iro files found in {MODS_DIR}')

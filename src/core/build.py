@@ -3910,6 +3910,31 @@ REQUIRED_DUMP_FILES = ('data/field/char.lgp', 'data/field/flevel.lgp',
                        'data/sound/audio.fmt')
 
 
+def lgp_short_by(path):
+    """How many bytes an LGP is missing, from its own directory: 0 when it
+    is whole. The entry with the highest offset holds a 24-byte header (20
+    name bytes, uint32 length) then its data, and in a complete archive
+    that data ends inside the file. Reads the directory and one header."""
+    size = os.path.getsize(path)
+    with open(path, 'rb') as f:
+        head = f.read(16)
+        if len(head) < 16:
+            return 16 - len(head)
+        count = struct.unpack('<i', head[12:16])[0]
+        toc = f.read(27 * count)
+        if len(toc) < 27 * count:
+            return 27 * count - len(toc)
+        last = max((struct.unpack_from('<I', toc, 27 * i + 20)[0]
+                    for i in range(count)), default=0)
+        if not last:
+            return 0
+        if last + 24 > size:
+            return last + 24 - size
+        f.seek(last + 20)
+        length = struct.unpack('<I', f.read(4))[0]
+    return max(0, last + 24 + length - size)
+
+
 def check_game_dump(dump):
     """
     Is `dump` the game this project builds for? Returns a list of problems,
@@ -3933,6 +3958,14 @@ def check_game_dump(dump):
                 continue
             if not head.endswith(b'SQUARESOFT'):
                 problems.append('%s is not an LGP archive' % rel)
+                continue
+            try:
+                short = lgp_short_by(path)
+            except (OSError, struct.error):
+                short = 1
+            if short:
+                problems.append('%s is incomplete (copy it from the dump '
+                                'again)' % rel)
     if dump.kind != 'dump':
         problems.append('only a workingdir -- exefs/main, the exe and the '
                         'shaders come from a full dump')

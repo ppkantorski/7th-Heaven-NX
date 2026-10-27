@@ -139,3 +139,47 @@ class ProfileOrder(unittest.TestCase):
     def test_no_saved_order_is_the_auto_sort(self):
         auto = [self.M('x'), self.M('y')]
         self.assertEqual(self.names(nx.apply_profile_order(auto, [])), ['x', 'y'])
+
+
+class ReferenceOrder(unittest.TestCase):
+    """BUILD 831: supported mods always take data/mod_sources.json's tested
+    order, whatever order they were installed in; others follow."""
+
+    class M:
+        def __init__(self, filename, mod_id=''):
+            self.filename = filename
+            self.manifest = type('Mf', (), {'mod_id': mod_id})()
+
+    SOURCES = [{'id': 'a1', 'file': 'Cosmo.iro'},
+               {'id': 'b2', 'file': 'Nitpick.iro'},
+               {'id': 'c3', 'file': 'Echo-s.iro'},
+               {'id': 'd4', 'file': 'ESUI-rel2'}]
+
+    def order(self, mods):
+        return [m.filename for m in
+                nx.apply_reference_order(mods, self.SOURCES)]
+
+    def test_installed_last_still_takes_its_place(self):
+        mods = [self.M('Nitpick.iro'), self.M('Cosmo.iro'),
+                self.M('Echo-s.iro')]
+        self.assertEqual(self.order(mods),
+                         ['Cosmo.iro', 'Nitpick.iro', 'Echo-s.iro'])
+
+    def test_unlisted_mods_follow_in_their_own_order(self):
+        mods = [self.M('Z.iro'), self.M('Echo-s.iro'), self.M('Y.iro'),
+                self.M('Cosmo.iro')]
+        self.assertEqual(self.order(mods),
+                         ['Cosmo.iro', 'Echo-s.iro', 'Z.iro', 'Y.iro'])
+
+    def test_folder_for_iro_and_renamed_by_id(self):
+        mods = [self.M('Echo-s'), self.M('ESUI-rel2.iro'),
+                self.M('my cosmo copy.iro', mod_id='A1')]
+        self.assertEqual(self.order(mods),
+                         ['my cosmo copy.iro', 'Echo-s', 'ESUI-rel2.iro'])
+
+    def test_real_sources_file_is_the_default(self):
+        import ff7nx_download
+        files = [s['file'] for s in ff7nx_download.load_sources()]
+        mods = [self.M(f) for f in reversed(files)]
+        self.assertEqual([m.filename for m in nx.apply_reference_order(mods)],
+                         files)
