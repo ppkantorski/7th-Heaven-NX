@@ -1,0 +1,3 @@
+fn 5bcd42..5bcf9d  arm 7cb110..7cb860  anchors(calls) 4
+5bce17: add dx, word ptr [ecx + 0xbfc3a8] -> add dx, word ptr [ecx + 0xbff3a8]
+      UNMAPPED  value 0xbfc3a8 (0 cands)

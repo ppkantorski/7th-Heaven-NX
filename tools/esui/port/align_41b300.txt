@@ -1,0 +1,5 @@
+fn 41b300..41b577  arm 8cdf0..8d590  anchors(calls) 10
+41b4e2: mov dword ptr [0x9a89e4], 0x4a -> mov dword ptr [0x9a89e4], 0
+      DEF?branch['8d370->8d3e0', '8d394->8d3e0']  arm 8d3dc  mov w20, #0x4a               -> mov w20, #0x0                52800954 52800014 (=)
+41b514: mov dword ptr [0x9aad68], 0x14c -> mov dword ptr [0x9aad68], 0x1e0
+      DEF?branch['8d370->8d3e0', '8d394->8d3e0']  arm 8d3cc  mov w26, #0x14c              -> mov w26, #0x1e0              5280299a 52803c1a (=)

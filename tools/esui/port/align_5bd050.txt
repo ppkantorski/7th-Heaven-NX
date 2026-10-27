@@ -1,0 +1,13 @@
+fn 5bd050..5bd290  arm 7cbbe0..7cc4c0  anchors(calls) 4
+5bd094: imul eax, eax, 0x32 -> imul eax, eax, 0x64
+      OK  arm 7cbcc4  mov w9, #0x32                -> mov w9, #0x64                52800649 52800c89 (=)
+5bd0d5: imul edx, edx, 0x21 -> imul edx, edx, 0x42
+      UNMAPPED  value 0x21 (0 cands)
+5bd0f3: imul eax, eax, 0x32 -> imul eax, eax, 0x64
+      OK  arm 7cbe5c  mov w9, #0x32                -> mov w9, #0x64                52800649 52800c89 (=)
+5bd10e: add esp, 0x14 -> add esp, 0x18
+      UNMAPPED  value 0x14 (0 cands)
+5bd12a: imul edx, edx, 0x21 -> imul edx, edx, 0x12
+      UNMAPPED  value 0x21 (0 cands)
+5bd14e: imul ecx, ecx, 0x21 -> imul ecx, ecx, 0
+      UNMAPPED  value 0x21 (0 cands)

@@ -1,0 +1,3 @@
+fn 41c0bb..41ccb2  arm 91b10..93eb0  anchors(calls) 14
+STRUCT-BLOCK old 41c4c0: and ecx, 0xfffffff  ->  new 41c4c0: nop ; 41c4c1: nop ; 41c4c2: nop ; 41c4c3: nop ; 41c4c4: nop ; 41c4c5: nop 
+STRUCT-BLOCK old 41c5b9: and eax, 0xfffffff  ->  new 41c5b9: nop ; 41c5ba: nop ; 41c5bb: nop ; 41c5bc: nop ; 41c5bd: nop 

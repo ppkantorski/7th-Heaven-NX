@@ -1,0 +1,1013 @@
+"""
+Reading and writing FF7 LGP archives, and FF7 field files.
+
+Layout:
+    12  creator "\\0\\0SQUARESOFT"
+    4   file count
+        TOC: count x 27  (20 name, 4 offset, 1 check, 2 conflict)
+    3600 lookup table
+    2   conflict table entry count
+        data blocks: 20 name, 4 length, payload
+    14  terminator "FINAL FANTASY7"
+
+The lookup table holds TOC indices rather than file offsets, so it can be
+carried over verbatim when entries are replaced but none are added or
+removed. Adding entries would require regenerating it, which this module
+deliberately refuses to do -- see Archive.replace().
+
+Licensed under GPLv3
+Copyright (c) 2026 ppkantorski
+"""
+
+import nxpaths  # BUILD 755: project paths (src/nxpaths.py)
+import os
+import struct
+
+CREATOR_LEN = 12
+TOC_ENTRY_LEN = 27
+LOOKUP_LEN = 3600
+TERMINATOR = b'FINAL FANTASY7'
+FIELD_HEADER_LEN = 42
+N_SECTIONS = 9
+
+
+class NewEntriesRequired(Exception):
+    """Raised when a merge would add filenames not present in the archive."""
+
+    def __init__(self, names):
+        self.names = names
+        super().__init__(f'{len(names)} new entries required')
+
+
+class ConflictTableInTheWay(Exception):
+    """Raised when adding entries to an archive whose names collide."""
+
+
+# ---------------------------------------------------- the name lookup table
+#
+# The 3,600 bytes at the head of `middle` are NOT padding. They are a
+# 30x30 table of {u16 first TOC index (1-based), u16 count}, bucketed by the
+# first two characters of the name, and the TOC is sorted so each bucket is
+# one contiguous run. Add an entry and every index after it shifts, so the
+# table has to be rebuilt -- which is why `replace()` refuses new names.
+#
+# DERIVED FROM THE SHIPPED ARCHIVES, NOT FROM A SPEC. `build_lookup_table`
+# reproduces the existing table BYTE FOR BYTE for flevel.lgp (741), char.lgp
+# (12,649), battle.lgp (11,119), magic.lgp (5,252) and menu_us.lgp (50).
+# `test_lgp_add.py` runs that check, so a wrong mapping cannot pass quietly.
+#
+# Digits share buckets with letters ('0' with 'a', '1' with 'b', ...) and '_'
+# shares with 'k'. That is what the shipped tables do; it is a hint table, not
+# a hash, and a bucket only has to bracket the run the game then scans.
+
+def _lookup_first(char):
+    """Bucket row for a name's first character, or None if it has no row."""
+    char = char.lower()
+    if 'a' <= char <= 'z':
+        return ord(char) - ord('a')
+    if '0' <= char <= '9':
+        return ord(char) - ord('0')
+    return None
+
+
+def _lookup_second(char):
+    """Bucket column for a name's second character. One-based; 0 if absent."""
+    if not char:
+        return 0
+    char = char.lower()
+    if 'a' <= char <= 'z':
+        return ord(char) - ord('a') + 1
+    if '0' <= char <= '9':
+        return ord(char) - ord('0') + 1
+    if char == '_':
+        return 11
+    return 0
+
+
+def build_lookup_table(names):
+    """The 3,600-byte table for `names`, which must be in TOC order."""
+    table = [[0, 0] for _ in range(900)]
+    for index, name in enumerate(names):
+        row = _lookup_first(name[0])
+        if row is None:
+            continue
+        bucket = row * 30 + _lookup_second(name[1] if len(name) > 1 else '')
+        if table[bucket][1] == 0:
+            table[bucket][0] = index + 1
+        table[bucket][1] += 1
+    out = bytearray()
+    for first, count in table:
+        out += struct.pack('<HH', first, count)
+    return bytes(out)
+
+
+# ------------------------------------------------------------------ LZS
+
+def lzs_decompress(data):
+    """
+    BUILD 118: same dialect, same bytes, 2.2x faster.
+
+    The previous form appended ONE BYTE AT A TIME through the whole archive --
+    measured at 2,975,030 `bytearray.append` calls for three fields. Every
+    fast path below is an algebraic rewrite of that loop, not a new decoder,
+    and the byte-for-byte fallback is still there for what they do not cover.
+
+      * `ctrl == 0xFF` is eight literals in a row -- one slice instead of
+        eight appends. Section 9 pixel data is largely incompressible, so
+        this is the common control byte.
+      * a back-reference whose distance `d` is at least `length` reads a
+        region that is already complete and cannot overlap what is being
+        written, so it is one slice copy.
+      * `d == 0` means `start == len(out)`, so every `p` is out of range and
+        the original appends `length` zero bytes. Kept exactly.
+      * `0 < d < length` is the overlapping RLE case: the source is `d` bytes
+        and repeats with period `d`, which `(chunk * reps)[:length]`
+        reproduces exactly.
+      * `start < 0`, reachable only in the first 18 bytes of a stream, falls
+        through to the original byte loop untouched.
+
+    VERIFIED over all 741 fields of flevel.lgp -- 270.4 MB decompressed --
+    against the original: zero byte differences.
+    """
+    out = bytearray()
+    i, n = 0, len(data)
+    while i < n:
+        ctrl = data[i]
+        i += 1
+        if ctrl == 0xFF and i + 8 <= n:
+            out += data[i:i + 8]
+            i += 8
+            continue
+        for bit in range(8):
+            if i >= n:
+                break
+            if ctrl & (1 << bit):
+                out.append(data[i])
+                i += 1
+            else:
+                if i + 1 >= n:
+                    break
+                b1, b2 = data[i], data[i + 1]
+                i += 2
+                offset = b1 | ((b2 & 0xF0) << 4)
+                length = (b2 & 0x0F) + 3
+                cur = len(out)
+                d = (cur - 18 - offset) & 0xFFF
+                start = cur - d
+                if d == 0:
+                    out += bytes(length)
+                elif start < 0:
+                    for k in range(length):
+                        p = start + k
+                        out.append(out[p] if 0 <= p < len(out) else 0)
+                elif d >= length:
+                    out += out[start:start + length]
+                else:
+                    chunk = bytes(out[start:cur])          # exactly d bytes
+                    out += (chunk * (length // d + 1))[:length]
+    return bytes(out)
+
+
+def lzs_store(data):
+    """Valid LZS with every byte literal. ~12.5% larger, always correct."""
+    out = bytearray()
+    for i in range(0, len(data), 8):
+        chunk = data[i:i + 8]
+        out.append((1 << len(chunk)) - 1)
+        out += chunk
+    return bytes(out)
+
+
+def lzs_append_literals(wrapped, suffix):
+    """Append raw decompressed bytes to an LZS-wrapped field payload.
+
+    Field files end in an ordinary LZS token stream with no terminator token.
+    Recompressing a multi-megabyte field merely to add a few private trailing
+    bytes is costly and changes unrelated compressed data.  Parse the final
+    control group, complete any unused literal bits there, then append normal
+    literal-only groups.  The original decoded bytes are untouched and the
+    result is validated by callers against :func:`lzs_decompress`.
+
+    ``wrapped`` is the LGP field payload shape ``u32 compressed_length`` plus
+    the raw LZS stream, as returned by :meth:`Archive.encode_field`.
+    """
+    if not suffix:
+        return wrapped
+    if len(wrapped) < 4:
+        raise ValueError('short LZS field payload')
+    stored, = struct.unpack('<I', wrapped[:4])
+    data = bytearray(wrapped[4:])
+    if stored != len(data):
+        raise ValueError('LZS field payload length header is inconsistent')
+    p = 0
+    last_ctrl = last_used = None
+    while p < len(data):
+        ctrl_pos = p
+        ctrl = data[p]
+        p += 1
+        used = 0
+        for bit in range(8):
+            if p >= len(data):
+                break
+            if ctrl & (1 << bit):
+                p += 1
+            else:
+                if p + 1 >= len(data):
+                    raise ValueError('truncated LZS back-reference')
+                p += 2
+            used += 1
+        last_ctrl, last_used = ctrl_pos, used
+    if p != len(data) or last_ctrl is None or not last_used:
+        raise ValueError('invalid LZS token stream')
+
+    suffix = memoryview(suffix)
+    pos = 0
+    if last_used < 8:
+        take = min(8 - last_used, len(suffix))
+        data[last_ctrl] |= ((1 << take) - 1) << last_used
+        data.extend(suffix[:take])
+        pos += take
+    while pos < len(suffix):
+        take = min(8, len(suffix) - pos)
+        data.append((1 << take) - 1)
+        data.extend(suffix[pos:pos + take])
+        pos += take
+    return struct.pack('<I', len(data)) + data
+
+# Reference encoding, derived from lzs_decompress() above rather than from a
+# spec, so the two cannot drift apart:
+#
+#     start = len(out) - ((len(out) - 18 - offset) & 0xFFF)
+#
+# With `i` bytes already emitted and a match at absolute position `p`, the
+# distance is `d = i - p`, and the equation is satisfied for
+#
+#     offset = (i - 18 - d) & 0xFFF = (p - 18) & 0xFFF
+#
+# `& 0xFFF` makes that valid for p < 18 too -- the arithmetic is modular on
+# both sides. d must be 1..4095: d == 4096 would encode as 0 and decode to
+# start == len(out), which is not a back-reference at all.
+MAX_MATCH = 18
+MIN_MATCH = 3
+WINDOW = 4095
+
+
+def lzs_compress(data, max_chain=24):
+    """
+    Real LZS compression in the exact dialect lzs_decompress() reads.
+
+    WHY THIS EXISTS
+    ---------------
+    Every field written back to flevel.lgp used to go through lzs_store(),
+    which is literal-only and therefore ~12.5% LARGER than the raw data.
+    Vanilla's own entries are properly compressed at roughly 2.4:1, so
+    re-encoding a field cost about 2.8x its stored size EVEN IF THE MOD
+    CHANGED NOTHING ABOUT IT. With one or two fields that is invisible; with
+    Cosmos Limit Break, which replaces the background section of 683 of the
+    741 fields, flevel.lgp went from 131 MB to 333 MB.
+
+    Greedy matching with a hash chain on 3-byte prefixes. `max_chain` bounds
+    how many candidate positions are tried per byte -- the whole point is to
+    stay fast enough to run over a few hundred MB of field data, so this
+    trades a little ratio for a lot of speed. Measured on Cosmos Limit
+    Break's fields: ~0.31 of raw (better than vanilla's own encoder) at
+    ~1.4 MB/s.
+
+    NOT verified here on purpose: the caller checks the round trip (see
+    Archive.encode_field), because "the output decompresses to exactly the
+    input" is the only property that matters and it is cheap to assert.
+    """
+    n = len(data)
+    out = bytearray()
+    chains = {}
+    i = 0
+    bit = 8
+    ctrl = 0
+    ctrl_idx = 0
+    while i < n:
+        if bit == 8:
+            ctrl_idx = len(out)
+            out.append(0)
+            ctrl = 0
+            bit = 0
+        best_len = 0
+        best_pos = 0
+        if i + MIN_MATCH <= n:
+            chain = chains.get(data[i:i + MIN_MATCH])
+            if chain:
+                floor = i - WINDOW
+                if floor < 0:
+                    floor = 0
+                limit = n - i
+                if limit > MAX_MATCH:
+                    limit = MAX_MATCH
+                tried = 0
+                for p in reversed(chain):
+                    if p < floor:
+                        break
+                    tried += 1
+                    if tried > max_chain:
+                        break
+                    length = MIN_MATCH
+                    while length < limit and data[p + length] == data[i + length]:
+                        length += 1
+                    if length > best_len:
+                        best_len = length
+                        best_pos = p
+                        if length == limit:
+                            break
+        if best_len >= MIN_MATCH:
+            enc = (best_pos - 18) & 0xFFF
+            out.append(enc & 0xFF)
+            out.append(((enc >> 4) & 0xF0) | (best_len - MIN_MATCH))
+            step = best_len
+        else:
+            ctrl |= 1 << bit            # set = literal
+            out.append(data[i])
+            step = 1
+        out[ctrl_idx] = ctrl
+        end = i + step
+        j = i
+        while j < end:
+            if j + MIN_MATCH <= n:
+                chains.setdefault(data[j:j + MIN_MATCH], []).append(j)
+            j += 1
+        i = end
+        bit += 1
+    return bytes(out)
+
+
+# ----------------------------------------------------------- field files
+
+def split_sections(raw):
+    blank = struct.unpack('<H', raw[0:2])[0]
+    count = struct.unpack('<I', raw[2:6])[0]
+    if blank != 0 or count != N_SECTIONS:
+        raise ValueError('not a field file')
+    pointers = struct.unpack('<9I', raw[6:FIELD_HEADER_LEN])
+    sections = []
+    for p in pointers:
+        length = struct.unpack('<I', raw[p:p + 4])[0]
+        sections.append(raw[p + 4:p + 4 + length])
+    return sections
+
+
+def join_sections(sections):
+    pointers = []
+    offset = FIELD_HEADER_LEN
+    for s in sections:
+        pointers.append(offset)
+        offset += 4 + len(s)
+    out = bytearray()
+    out += struct.pack('<H', 0)
+    out += struct.pack('<I', N_SECTIONS)
+    out += struct.pack('<9I', *pointers)
+    for s in sections:
+        out += struct.pack('<I', len(s))
+        out += s
+    return bytes(out)
+
+
+# --------------------------------------------------------------- archive
+
+class Archive:
+    def __init__(self, path):
+        self.path = path
+        with open(path, 'rb') as f:
+            self.creator = f.read(CREATOR_LEN)
+            if not self.creator.endswith(b'SQUARESOFT'):
+                raise ValueError(f'{path} is not an LGP archive')
+            count = struct.unpack('<i', f.read(4))[0]
+            toc = []
+            for _ in range(count):
+                e = f.read(TOC_ENTRY_LEN)
+                name = e[:20].split(b'\0')[0].decode('ascii', 'replace')
+                offset, check, conflict = struct.unpack('<IBH', e[20:27])
+                toc.append((name, offset, check, conflict))
+            # Everything between the TOC and the first data block -- the
+            # 3600-byte lookup table AND the variable-length conflict table.
+            # Reading it as one verbatim blob is format-agnostic: the
+            # conflict table's length varies with how many filenames collide,
+            # and truncating it (e.g. reading only the 2-byte count) corrupts
+            # the archive for any game LGP that has conflicts. flevel.lgp has
+            # none, which masked this; battle.lgp and char.lgp do have them.
+            mid_start = f.tell()
+            first_data = min(offset for _, offset, _, _ in toc)
+            self.middle = f.read(first_data - mid_start)
+            self.entries = []
+            for name, offset, check, conflict in toc:
+                f.seek(offset)
+                block = f.read(24)
+                size = struct.unpack('<I', block[20:24])[0]
+                self.entries.append({
+                    'name': name,
+                    'raw_name': block[:20],
+                    'check': check,
+                    'conflict': conflict,
+                    'payload': f.read(size),
+                })
+        self.index = {e['name'].lower(): e for e in self.entries}
+
+    def names(self):
+        """
+        Entry names, SORTED. Never a set.
+
+        THIS RETURNED A SET, AND IT MADE THE WHOLE BUILD NON-REPRODUCIBLE.
+
+        Python randomises string hashing per process (PYTHONHASHSEED), so a
+        set of names iterates in a different order in every run. Eleven passes
+        walk `names()` directly -- `ff7nx_marginart`, `ff7nx_marginpage`,
+        `ff7nx_palkey`, `ff7nx_ws`, `ff7nx_bgkey`, `ff7nx_vclip` and more --
+        and at least `ff7nx_palkey` carries state across fields, so the order
+        changed its decisions.
+
+        MEASURED across four builds, the palette key's own counter:
+
+            build 33  3,796 palette(s) LEFT ALONE
+            build 34  3,847
+            build 35  3,861
+            build 36  3,883        <- and build 36 changed ONE LOG LINE
+
+        Build 36 altered no archive logic whatsoever and still moved it by 22.
+        Two builds of identical settings did not produce identical archives,
+        which means part of every log diff this project has ever done was
+        noise, and a different set of ~20 palettes got de-fringed each time.
+
+        It also explains the note in `field_bg_pagecap.clamp_palettes`: "a
+        second reading of the same archive with the same call reported 0 tiles
+        repointed where the first reported 14, which means my own measurement
+        of this is not stable". It was not the measurement. It was this.
+
+        Sorted is the fix. No caller does set algebra on the result -- every
+        one of them either iterates it or immediately sorts it -- so a list is
+        a straight superset of what they used.
+        """
+        return sorted(self.index)
+
+    def is_field(self, entry):
+        p = entry['payload']
+        return len(p) >= 4 and struct.unpack('<I', p[:4])[0] == len(p) - 4
+
+    def decompressed(self, entry):
+        return lzs_decompress(entry['payload'][4:])
+
+    def encode_field(self, raw, compress=True):
+        """
+        Wrap raw field bytes as a stored LGP payload.
+
+        Compressed by default, and VERIFIED: the compressor's output is
+        decompressed with the same routine the game's format demands and
+        compared against the input. Anything short of an exact match falls
+        back to lzs_store(), which is literal-only and cannot be wrong. So
+        the worst case of a compressor bug is the old file size, never a
+        corrupt field.
+        """
+        enc = None
+        if compress:
+            try:
+                cand = lzs_compress(raw)
+                if lzs_decompress(cand) == raw:
+                    enc = cand
+            except Exception:                                  # noqa: BLE001
+                enc = None
+        if enc is None:
+            enc = lzs_store(raw)
+        return struct.pack('<I', len(enc)) + enc
+
+    def replace(self, payloads):
+        """
+        Stage replacement payloads keyed by lowercase name. Raises
+        NewEntriesRequired if any name is absent, since regenerating the
+        lookup table is not supported.
+        """
+        missing = sorted(n for n in payloads if n not in self.index)
+        if missing:
+            raise NewEntriesRequired(missing)
+        for name, data in payloads.items():
+            self.index[name]['payload'] = data
+
+    def add(self, name, payload):
+        """
+        Append a NEW entry, keeping the TOC sorted and rebuilding the lookup
+        table. `replace()` still refuses new names; this is the deliberate
+        path for adding them.
+
+        REFUSED when the archive has a conflict table. Those entries index the
+        TOC by position to tell duplicate names apart (magic.lgp: 652 of
+        them), so re-sorting would silently point them at the wrong files.
+        Nothing this build adds to goes anywhere near one -- flevel, char,
+        battle and menu all have zero -- and refusing is better than carrying
+        an untested rewrite of a table we have no failing case for.
+        """
+        low = name.lower()
+        if low in self.index:
+            raise ValueError('%s is already in %s' % (low, self.path))
+        if len(low.encode('ascii', 'replace')) > 19:
+            raise ValueError('%s does not fit an LGP name field' % low)
+        if len(self.middle) > LOOKUP_LEN + 2:
+            raise ConflictTableInTheWay(
+                '%s has a conflict table (%d bytes past the lookup table); '
+                'entries cannot be added to it'
+                % (self.path, len(self.middle) - LOOKUP_LEN - 2))
+        entry = {
+            'name': low,
+            'raw_name': low.encode('ascii', 'replace').ljust(20, b'\0'),
+            # 14 in every entry of every shipped archive measured: flevel,
+            # char, battle and menu_us, 24,559 entries, no other value.
+            'check': 14,
+            'conflict': 0,
+            'payload': payload,
+        }
+        # THE INVARIANT IS BUCKET CONTIGUITY, NOT SORT ORDER. Measured on the
+        # shipped archives: flevel, battle, menu_us and magic are NOT sorted
+        # by name at all, and char.lgp only happens to be -- but in all five,
+        # every bucket occupies ONE unbroken run, which is what an
+        # {index, count} table can describe. So a new entry goes at the end
+        # of its own bucket's run and every existing entry keeps its exact
+        # position. Sorting the whole TOC would "look" tidier and would
+        # reorder 12,649 entries for no reason.
+        bucket = self._bucket_of(low)
+        at = len(self.entries)
+        for index, existing in enumerate(self.entries):
+            if self._bucket_of(existing['name']) == bucket:
+                at = index + 1
+        self.entries.insert(at, entry)
+        self.index[low] = entry
+        self.middle = (build_lookup_table([e['name'] for e in self.entries])
+                       + self.middle[LOOKUP_LEN:])
+        return entry
+
+    @staticmethod
+    def _bucket_of(name):
+        row = _lookup_first(name[0])
+        if row is None:
+            return None
+        return row * 30 + _lookup_second(name[1] if len(name) > 1 else '')
+
+    def write(self, dest, data_order=None):
+        """
+        Write the archive. The TOC (and so the name lookup table) is always
+        in `self.entries` order; `data_order` only decides where each
+        payload is PLACED in the file -- every reader, the game's included,
+        finds a payload through its TOC offset, never by position.
+
+        BUILD 666. flevel.lgp defaults to `loose_first_order`: the loose
+        textures (the facial eye/mouth set) go right after the header, see
+        that function for why.
+        """
+        count = len(self.entries)
+        if data_order is None:
+            data_order = default_data_order(self, dest)
+        if data_order is None:
+            data_order = list(range(count))
+        if sorted(data_order) != list(range(count)):
+            raise ValueError('data_order is not a permutation of the entries')
+        offset = (CREATOR_LEN + 4 + count * TOC_ENTRY_LEN
+                  + len(self.middle))
+        at = [0] * count
+        for i in data_order:
+            at[i] = offset
+            offset += 24 + len(self.entries[i]['payload'])
+        toc = bytearray()
+        for i, e in enumerate(self.entries):
+            toc += struct.pack('<20sIBH', e['raw_name'], at[i],
+                               e['check'], e['conflict'])
+        os.makedirs(os.path.dirname(os.path.abspath(dest)), exist_ok=True)
+        with open(dest, 'wb') as f:
+            f.write(self.creator)
+            f.write(struct.pack('<i', count))
+            f.write(toc)
+            f.write(self.middle)
+            for i in data_order:
+                e = self.entries[i]
+                f.write(e['raw_name'])
+                f.write(struct.pack('<I', len(e['payload'])))
+                f.write(e['payload'])
+            f.write(TERMINATOR)
+
+
+# ------------------------------------------------- BUILD 666: data placement
+#
+# THE FIELD DIP WHEN A MODEL FIRST COMES INTO VIEW IS A SEEK INTO A 1.4 GB FILE.
+# Measured on hardware (PROBE 665f/g/h): a model's first blink loads its
+# closed-eye textures from flevel.lgp, and each nn::fs read the first one
+# makes costs 85-100 ms -- the 236-byte TEX header as much as the pixels. A
+# read that follows straight on from the previous one is cheap; a read that
+# jumps back into the middle of the file is not, because the SD card's FAT
+# has to be walked from the start of the file to the target cluster. The
+# facial set sat in the middle of a 1.4 GB archive.
+#
+# So in flevel.lgp the loose entries (everything with a '.' in its name: the
+# eye/mouth textures, .tut, .siz, .XOne) are placed FIRST, blink textures
+# ahead of the rest, and the fields follow in TOC order. Nothing about the
+# TOC or the lookup table changes.
+LOOSE_FIRST_ENV = 'SEVENTH_NX_FLEVEL_LOOSE_FIRST'
+LOOSE_FIRST_ARCHIVES = ('flevel.lgp',)
+
+
+def loose_rank(name):
+    """0 = blink/closed-eye art, 1 = other facial art, 2 = other loose."""
+    import re
+    low = name.lower()
+    stem = low.rsplit('.', 1)[0]
+    facial = (low.startswith(('eye_', 'mouth_', 'chi_red'))
+              or re.match(r'^[a-z]{1,3}_(eye2|mouth)', low) is not None)
+    if not facial:
+        return 2
+    m = re.search(r'_(\d+)$', stem)
+    if m is None or m.group(1) == '2':
+        return 0
+    return 1
+
+
+def loose_first_order(archive):
+    """Data placement: loose entries by rank, then the rest, TOC order kept."""
+    loose, rest = [], []
+    for i, e in enumerate(archive.entries):
+        (loose if '.' in e['name'] else rest).append(i)
+    loose.sort(key=lambda i: (loose_rank(archive.entries[i]['name']), i))
+    return loose + rest
+
+
+def default_data_order(archive, dest):
+    # Matches the temporaries too (flevel.lgp.fieldsteps-tmp, ...): every
+    # pass that rewrites flevel goes through write(), and each must keep it.
+    base = os.path.basename(str(dest)).lower()
+    if not any(base == a or base.startswith(a + '.')
+               for a in LOOSE_FIRST_ARCHIVES):
+        return None
+    if os.environ.get(LOOSE_FIRST_ENV, '1').strip().lower() in (
+            '0', 'off', 'no', 'false'):
+        return None
+    return loose_first_order(archive)
+
+
+def verify_roundtrip(path):
+    """True if reading and rewriting an archive reproduces it byte for byte."""
+    a = Archive(path)
+    tmp = path + '.roundtrip'
+    try:
+        a.write(tmp)
+        with open(path, 'rb') as f1, open(tmp, 'rb') as f2:
+            return f1.read() == f2.read()
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+
+# ----------------------------------------------------------- native LZS
+#
+# BUILD 583. Both LZS routines are pure Python, and the flevel build calls
+# them per field in every section-9 pass: ~0.3 s to decompress an HD field,
+# and ~1.4 MB/s to compress one -- a 5 MB field takes seconds, and every
+# field a pass changes is compressed (and verify-decompressed) again.
+#
+# The C below is a byte-for-byte transcription of `lzs_decompress` and
+# `lzs_compress` above. It is compiled on first use with the system C
+# compiler into cache/lzs_native/, loaded with ctypes, and SELF-TESTED
+# against the Python originals on every run before either is used; any
+# failure (no compiler, load error, one differing byte) falls back to the
+# Python routines silently. Output is therefore identical either way -- the
+# only difference is time. SEVENTH_NX_NO_NATIVE_LZS=1 forces Python.
+
+_NATIVE_SRC = r'''
+/* lzs_native.c -- byte-exact C twins of lgp.lzs_decompress / lgp.lzs_compress.
+ *
+ * Built on demand by lgp.py (cc -O2 -shared) and loaded with ctypes. lgp.py
+ * self-tests both against the pure-Python originals before using them and
+ * falls back to Python if the compiler, the load, or the test fails.
+ */
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+
+/* Returns the number of bytes written, or -1 if `cap` would be exceeded. */
+long lzs_decompress(const uint8_t *in, long n, uint8_t *out, long cap)
+{
+    long i = 0, o = 0;
+    while (i < n) {
+        unsigned ctrl = in[i++];
+        for (int bit = 0; bit < 8; bit++) {
+            if (i >= n)
+                break;
+            if (ctrl & (1u << bit)) {
+                if (o >= cap) return -1;
+                out[o++] = in[i++];
+            } else {
+                if (i + 1 >= n)
+                    break;
+                unsigned b1 = in[i], b2 = in[i + 1];
+                i += 2;
+                long offset = (long)(b1 | ((b2 & 0xF0u) << 4));
+                long length = (long)(b2 & 0x0Fu) + 3;
+                long d = (o - 18 - offset) & 0xFFF;
+                long start = o - d;
+                if (o + length > cap) return -1;
+                if (d == 0) {
+                    memset(out + o, 0, (size_t)length);
+                    o += length;
+                } else {
+                    /* byte by byte: identical to the Python fast paths
+                       (slice copy, periodic repeat) and to its start<0
+                       fallback, where a position before 0 reads 0. */
+                    for (long k = 0; k < length; k++) {
+                        long p = start + k;
+                        out[o] = (p >= 0) ? out[p] : 0;
+                        o++;
+                    }
+                }
+            }
+        }
+    }
+    return o;
+}
+
+#define MIN_MATCH 3
+#define MAX_MATCH 18
+#define WINDOW 4095
+#define NKEYS (1u << 24)
+
+/* Greedy hash-chain matcher, exactly lgp.lzs_compress: every position j
+ * with j+3 <= n is appended to the chain of its 3-byte key after it is
+ * consumed; candidates are tried newest first, stopping at the window floor
+ * or after `max_chain` tries; the first strictly longest match wins.
+ * Returns bytes written or -1 on allocation failure / capacity. */
+long lzs_compress(const uint8_t *data, long n, uint8_t *out, long cap,
+                  int max_chain)
+{
+    int32_t *head = (int32_t *)malloc(sizeof(int32_t) * NKEYS);
+    int32_t *prev = (int32_t *)malloc(sizeof(int32_t) * (n > 0 ? n : 1));
+    if (!head || !prev) { free(head); free(prev); return -1; }
+    memset(head, 0xFF, sizeof(int32_t) * NKEYS);      /* -1 */
+
+    long i = 0, o = 0;
+    int bit = 8;
+    unsigned ctrl = 0;
+    long ctrl_idx = 0;
+    while (i < n) {
+        if (bit == 8) {
+            if (o >= cap) goto fail;
+            ctrl_idx = o;
+            out[o++] = 0;
+            ctrl = 0;
+            bit = 0;
+        }
+        long best_len = 0, best_pos = 0;
+        if (i + MIN_MATCH <= n) {
+            uint32_t key = ((uint32_t)data[i] << 16) |
+                           ((uint32_t)data[i + 1] << 8) | data[i + 2];
+            long floor = i - WINDOW;
+            if (floor < 0) floor = 0;
+            long limit = n - i;
+            if (limit > MAX_MATCH) limit = MAX_MATCH;
+            int tried = 0;
+            for (long p = head[key]; p >= 0; p = prev[p]) {
+                if (p < floor)
+                    break;
+                tried++;
+                if (tried > max_chain)
+                    break;
+                long length = MIN_MATCH;
+                while (length < limit && data[p + length] == data[i + length])
+                    length++;
+                if (length > best_len) {
+                    best_len = length;
+                    best_pos = p;
+                    if (length == limit)
+                        break;
+                }
+            }
+        }
+        long step;
+        if (best_len >= MIN_MATCH) {
+            unsigned enc = (unsigned)((best_pos - 18) & 0xFFF);
+            if (o + 2 > cap) goto fail;
+            out[o++] = (uint8_t)(enc & 0xFF);
+            out[o++] = (uint8_t)(((enc >> 4) & 0xF0) | (best_len - MIN_MATCH));
+            step = best_len;
+        } else {
+            ctrl |= 1u << bit;
+            if (o >= cap) goto fail;
+            out[o++] = data[i];
+            step = 1;
+        }
+        out[ctrl_idx] = (uint8_t)ctrl;
+        long end = i + step;
+        for (long j = i; j < end; j++) {
+            if (j + MIN_MATCH <= n) {
+                uint32_t key = ((uint32_t)data[j] << 16) |
+                               ((uint32_t)data[j + 1] << 8) | data[j + 2];
+                prev[j] = head[key];
+                head[key] = (int32_t)j;
+            }
+        }
+        i = end;
+        bit++;
+    }
+    free(head); free(prev);
+    return o;
+fail:
+    free(head); free(prev);
+    return -1;
+}
+
+'''
+
+_native = None
+_native_tried = False
+_py_lzs_decompress = lzs_decompress
+_py_lzs_compress = lzs_compress
+
+
+def _native_lib():
+    global _native, _native_tried
+    if _native_tried:
+        return _native
+    _native_tried = True
+    if os.environ.get('SEVENTH_NX_NO_NATIVE_LZS', '').strip() == '1':
+        return None
+    try:
+        import subprocess
+        tag = _native_tag()
+        # A release build ships the library prebuilt (tools/release.py), so
+        # users without a C compiler still get it. Same self-test either way.
+        lib_path = _prebuilt_native(tag)
+        if lib_path is None:
+            base = os.path.join(nxpaths.ROOT,
+                                'cache', 'lzs_native')
+            os.makedirs(base, exist_ok=True)
+            lib_path = os.path.join(base, 'lzs_%s.so' % tag[:16])
+        if not os.path.exists(lib_path):
+            src = os.path.join(base, 'lzs_%s.c' % tag[:16])
+            with open(src, 'w') as f:
+                f.write(_NATIVE_SRC)
+            tmp = lib_path + '.part'
+            for cc in (os.environ.get('CC') or 'cc', 'clang', 'gcc'):
+                try:
+                    r = subprocess.run([cc, '-O2', '-shared', '-fPIC', '-o',
+                                        tmp, src], capture_output=True,
+                                       timeout=120)
+                except (OSError, subprocess.SubprocessError):
+                    continue
+                if r.returncode == 0 and os.path.exists(tmp):
+                    os.replace(tmp, lib_path)
+                    break
+            if not os.path.exists(lib_path):
+                return None
+        _native = _load_native(lib_path)
+        if not _native_selftest():
+            _native = None
+    except Exception:                                          # noqa: BLE001
+        _native = None
+    return _native
+
+
+def _load_native(path):
+    import ctypes
+    lib = ctypes.CDLL(path)
+    lib.lzs_decompress.restype = ctypes.c_long
+    lib.lzs_decompress.argtypes = [ctypes.c_char_p, ctypes.c_long,
+                                   ctypes.c_void_p, ctypes.c_long]
+    lib.lzs_compress.restype = ctypes.c_long
+    lib.lzs_compress.argtypes = [ctypes.c_char_p, ctypes.c_long,
+                                 ctypes.c_void_p, ctypes.c_long,
+                                 ctypes.c_int]
+    return lib
+
+
+def _native_tag():
+    import hashlib
+    import sys
+    return hashlib.sha1((_NATIVE_SRC + sys.platform).encode()).hexdigest()
+
+
+# native/lzs/ in the program's own files: where a release build keeps the
+# library it was built with, one per platform it was built on.
+PREBUILT_DIR = os.path.join(nxpaths.APP, 'native', 'lzs')
+PREBUILT_EXT = {'win32': '.dll', 'darwin': '.dylib'}
+
+
+def _prebuilt_name(tag=None):
+    import sys
+    return 'lzs_%s%s' % ((tag or _native_tag())[:16],
+                         PREBUILT_EXT.get(sys.platform, '.so'))
+
+
+def _prebuilt_native(tag):
+    path = os.path.join(PREBUILT_DIR, _prebuilt_name(tag))
+    return path if os.path.isfile(path) else None
+
+
+def build_native(dest_dir, compilers=None, log=print):
+    """
+    Compile the LZS library into `dest_dir` under the name `_native_lib`
+    looks for, for release builds. Returns the path, or None when no
+    compiler worked (the release then uses the Python routines, which give
+    the same bytes, slower). The library is self-tested after it is built.
+    """
+    import subprocess
+    import sys
+    import tempfile
+    os.makedirs(dest_dir, exist_ok=True)
+    out = os.path.join(dest_dir, _prebuilt_name())
+    src_text = _NATIVE_SRC
+    if sys.platform == 'win32':
+        # MSVC-style linkers export nothing unless told to
+        src_text = ('#include <stdint.h>\n'
+                    '__declspec(dllexport) long lzs_decompress(const uint8_t *,'
+                    ' long, uint8_t *, long);\n'
+                    '__declspec(dllexport) long lzs_compress(const uint8_t *,'
+                    ' long, uint8_t *, long, int);\n' + src_text)
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, 'lzs_native.c')
+        with open(src, 'w') as f:
+            f.write(src_text)
+        for cc in compilers or (os.environ.get('CC') or 'cc', 'clang', 'gcc'):
+            cmd = [cc, '-O2', '-shared', '-o', out, src]
+            if sys.platform != 'win32':
+                cmd.insert(2, '-fPIC')
+            try:
+                r = subprocess.run(cmd, capture_output=True, timeout=300)
+            except (OSError, subprocess.SubprocessError):
+                continue
+            if r.returncode == 0 and os.path.isfile(out):
+                log('LZS library: built with %s' % cc)
+                break
+            log('LZS library: %s failed: %s'
+                % (cc, (r.stderr or b'').decode(errors='replace')[-400:]))
+        else:
+            return None
+    global _native, _native_tried
+    saved = _native, _native_tried
+    try:
+        _native, _native_tried = _load_native(out), True
+        ok = _native_selftest()
+    finally:
+        _native, _native_tried = saved
+    if not ok:
+        log('LZS library: self-test FAILED, not shipping it')
+        os.remove(out)
+        return None
+    return out
+
+
+def _native_selftest():
+    import random
+    rnd = random.Random(583)
+    samples = [b'', b'a', b'\0' * 5000, bytes(range(256)) * 40,
+               bytes(rnd.randrange(4) for _ in range(20000)),
+               bytes(rnd.randrange(256) for _ in range(9000)),
+               (b'FF7 field ' * 700) + bytes(rnd.randrange(256)
+                                             for _ in range(3000))]
+    for s in samples:
+        c = _native_compress(s, 24)
+        if c is None or c != _py_lzs_compress(s):
+            return False
+        if _native_decompress(c) != _py_lzs_decompress(c):
+            return False
+        if _py_lzs_decompress(c) != s:
+            return False
+    # decoder corner cases: truncated streams, zero-distance refs
+    for s in (b'\x00\x00', b'\x00\x12\x0f\xff', b'\xfe\x41\x00\x00\x00',
+              bytes(rnd.randrange(256) for _ in range(5000))):
+        if _native_decompress(s) != _py_lzs_decompress(s):
+            return False
+    return True
+
+
+def _native_decompress(data):
+    import ctypes
+    data = bytes(data)
+    cap = 9 * len(data) + 64
+    buf = ctypes.create_string_buffer(cap)
+    k = _native.lzs_decompress(data, len(data), buf, cap)
+    if k < 0:
+        return None
+    return ctypes.string_at(buf, k)
+
+
+def _native_compress(data, max_chain):
+    import ctypes
+    data = bytes(data)
+    cap = len(data) + len(data) // 8 + 64
+    buf = ctypes.create_string_buffer(cap)
+    k = _native.lzs_compress(data, len(data), buf, cap, int(max_chain))
+    if k < 0:
+        return None
+    return ctypes.string_at(buf, k)
+
+
+def lzs_decompress(data):                                      # noqa: F811
+    if _native_lib() is not None:
+        out = _native_decompress(data)
+        if out is not None:
+            return out
+    return _py_lzs_decompress(data)
+
+
+def lzs_compress(data, max_chain=24):                          # noqa: F811
+    if _native_lib() is not None:
+        out = _native_compress(data, max_chain)
+        if out is not None:
+            return out
+    return _py_lzs_compress(data, max_chain)

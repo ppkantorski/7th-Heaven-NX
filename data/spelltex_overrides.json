@@ -1,0 +1,20 @@
+{
+ "_about": "BUILD 807. Hand-reviewed SYW magic.lgp pairings the shape test cannot judge. Each is an OPAQUE SURFACE texture (rock, flame wash, crater, gas) that SYW redrew rather than upscaled, so the dark texels of the vanilla surface read as a silhouette the redraw can never line up with (scores 0-17%). Reviewed side by side in _scratch/807 (zero_*.png, isi.png): same subject, same colour, same aspect, mod folder names the entry. route() applies one only to an entry left vanilla, only from a set left unused, and refuses it if the vanilla entry has ANY keyed (transparent) texel, if the palette set is incomplete, or if the TOC name no longer matches. SEVENTH_NX_SPELL_OVERRIDES=0 turns the table off. Left out on purpose: bomb, bombtex, isi club2 (vanilla has transparent holes the opaque redraw would fill); nova_3 (aspect 2:1 vs 3:2); hatena_2 (the ? sits elsewhere); cosmo_1, s_bomber, queig00, 1.tex (a different picture or layout).",
+ "pairs": [
+  {"toc": 415,  "name": "bio_z.tex",   "folder": "",                              "why": "Bio gas cloud"},
+  {"toc": 714,  "name": "comet_1.tex", "folder": "ff7/data/battle/limit2/meteo_r", "why": "Meteor Rain crater surface"},
+  {"toc": 1339, "name": "flea_2.tex",  "folder": "ff7/data/battle/blue/sflea",     "why": "Flea ring on grey; light-grey field defeats the background veto"},
+  {"toc": 2046, "name": "honou7.tex",  "folder": "ff7/data/battle/special/club2",  "why": "violet flame wash"},
+  {"toc": 2058, "name": "honou7.tex",  "folder": "ff7/data/battle/special/kueisa", "why": "violet flame wash"},
+  {"toc": 2079, "name": "honou7.tex",  "folder": "ff7/data/battle/special/reiki",  "why": "violet flame wash"},
+  {"toc": 2256, "name": "isi.tex",     "folder": "ff7/data/battle/limit3/e_r",     "why": "red rock surface"},
+  {"toc": 2278, "name": "isi.tex",     "folder": "ff7/data/battle/special/geki2",  "why": "grey rock surface"},
+  {"toc": 2296, "name": "isi.tex",     "folder": "ff7/data/battle/special/kueisa", "why": "grey rock surface"},
+  {"toc": 2309, "name": "isi.tex",     "folder": "ff7/data/battle/special/netu",   "why": "grey rock surface"},
+  {"toc": 2328, "name": "isi.tex",     "folder": "ff7/data/battle/special/re_do",  "why": "grey rock surface"},
+  {"toc": 2340, "name": "isi.tex",     "folder": "ff7/data/battle/special/syaku",  "why": "grey rock surface"},
+  {"toc": 2337, "name": "isi1.tex",    "folder": "ff7/data/battle/special/saikyo", "why": "olive rock surface"},
+  {"toc": 2349, "name": "isi1.tex",    "folder": "ff7/data/battle/special/s_bless","why": "olive rock surface"},
+  {"toc": 2352, "name": "isi1.tex",    "folder": "ff7/data/battle/special/tyokyu", "why": "olive rock surface"}
+ ]
+}

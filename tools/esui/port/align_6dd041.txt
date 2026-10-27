@@ -1,0 +1,179 @@
+fn 6dd041..6dda14  arm d3eae0..d41600  anchors(calls) 22
+STRUCT-BLOCK old 6dd048: mov dword ptr [ebp - 4], 0xdba498  ->  new 6dd048: call 0x914b3f; 6dd04d: nop ; 6dd04e: nop 
+STRUCT-BLOCK old 6dd170: je 0x6dd1cc  ->  new 6dd170: nop ; 6dd171: nop 
+STRUCT-BLOCK old 6dd182: je 0x6dd1cc  ->  new 6dd182: nop ; 6dd183: nop 
+STRUCT-BLOCK old 6dd194: je 0x6dd1cc  ->  new 6dd194: nop ; 6dd195: nop 
+STRUCT-BLOCK old 6dd1a6: je 0x6dd1cc  ->  new 6dd1a6: nop ; 6dd1a7: nop 
+STRUCT-BLOCK old 6dd24c: jne 0x6dd27f  ->  new 6dd24c: nop ; 6dd24d: nop 
+STRUCT-BLOCK old 6dd71e: je 0x6dd7d2  ->  new 6dd71e: nop ; 6dd71f: nop ; 6dd720: nop ; 6dd721: nop ; 6dd722: nop ; 6dd723: nop 
+STRUCT-BLOCK old 6dd80e: je 0x6dd8e6  ->  new 6dd80e: nop ; 6dd80f: nop ; 6dd810: nop ; 6dd811: nop ; 6dd812: nop ; 6dd813: nop 
+6dd064: push 1 -> push 7
+      OK  arm d3ebc8  mov w8, #1                   -> mov w8, #0x7                 320003e8 528000e8 (=)
+6dd06e: push 0x152 -> push 0x183
+      OK  arm d3ec60  mov w8, #0x152               -> mov w8, #0x183               52802a48 52803068 (=)
+6dd073: push 0x22e -> push 0x233
+      OK  arm d3ec78  mov w8, #0x22e               -> mov w8, #0x233               528045c8 52804668 (=)
+6dd08b: push 1 -> push 7
+      NEEDCAVE(def d3ecec shared by 5)  arm d3ecf0  str w24, [x0]  (=, new 0x7)
+6dd095: push 0x152 -> push 0x183
+      NEEDCAVE(def d3ed60 shared by 5)  arm d3ed64  str w25, [x0]  (=, new 0x183)
+6dd09a: push 0x22e -> push 0x233
+      UNIQ-fallback value 0x22e
+      OK  arm d3ec78  mov w8, #0x22e               -> mov w8, #0x233               528045c8 52804668 (=)
+6dd0bd: push 0x152 -> push 0x183
+      NEEDCAVE(def d3ed60 shared by 5)  arm d3ee44  str w25, [x0]  (=, new 0x183)
+6dd0c2: push 0x1c -> push 0x1a
+      UNMAPPED  value 0x1c (4 cands)
+6dd0df: push 0x152 -> push 0x183
+      NEEDCAVE(def d3ed60 shared by 5)  arm d3ef24  str w25, [x0]  (=, new 0x183)
+6dd0e4: push 0x120 -> push 0x184
+      UNMAPPED  value 0x120 (3 cands)
+6dd104: push 0x152 -> push 0x183
+      NEEDCAVE(def d3ed60 shared by 5)  arm d3f008  str w25, [x0]  (=, new 0x183)
+6dd109: push 0x1a4 -> push 0x1b7
+      UNIQ-fallback value 0x1a4
+      OK  arm d3ef38  mov w8, #0x1a4               -> mov w8, #0x1b7               52803488 528036e8 (=)
+6dd129: push 0x152 -> push 0x183
+      NEEDCAVE(def d3ed60 shared by 5)  arm d3f0ec  str w25, [x0]  (=, new 0x183)
+6dd12e: push 0x1e0 -> push 0x253
+      UNIQ-fallback value 0x1e0
+      OK  arm d3f01c  mov w8, #0x1e0               -> mov w8, #0x253               321b0fe8 52804a68 (=)
+6dd14e: push 0x152 -> push 0x183
+      UNMAPPED  value 0x152 (2 cands)
+6dd153: push 0xba -> push 0x1e3
+      UNIQ-fallback value 0xba
+      OK  arm d3f100  mov w8, #0xba                -> mov w8, #0x1e3               52801748 52803c68 (=)
+6dd2a4: mov ecx, 0x1b -> mov ecx, 0x20
+      UNMAPPED  value 0x1b (2 cands)
+6dd31b: mov dword ptr [ebp - 0x3c], 0xe -> mov dword ptr [ebp - 0x3c], 0x14
+      OK  arm d3fa34  mov w8, #0xe                 -> mov w8, #0x14                321f0be8 52800288 (=)
+6dd3b6: shl eax, 5 -> imul eax, eax, 0x18
+      UNMAPPED  value 0x5 (1 cands)
+6dd3b9: add eax, 0x15c -> add eax, 0x18c
+      OK  arm d3fc20  add w20, w8, #0x15c          -> add w20, w8, #0x18c          11057114 11063114 (=)
+6dd418: and eax, 1 -> and eax, 2
+      UNMAPPED  value 0x1 (3 cands)
+6dd448: shl ecx, 5 -> imul ecx, ecx, 0x18
+      UNMAPPED  value 0x5 (1 cands)
+6dd44b: add ecx, 0x15c -> add ecx, 0x18c
+      UNIQ-fallback value 0x15c
+      OK  arm d3f650  add w20, w8, #0x15c          -> add w20, w8, #0x18c          11057114 11063114 (=)
+6dd452: push 0x1c -> push 0x1a
+      UNMAPPED  value 0x1c (4 cands)
+6dd496: shl eax, 5 -> imul eax, eax, 0x18
+      UNMAPPED  value 0x5 (1 cands)
+6dd499: add eax, 0x15c -> add eax, 0x18c
+      OK  arm d3ff44  add w20, w8, #0x15c          -> add w20, w8, #0x18c          11057114 11063114 (=)
+6dd49f: push 0x1c -> push 0x1a
+      OK  arm d3ff70  mov w8, #0x1c                -> mov w8, #0x1a                321e0be8 52800348 (=)
+6dd50b: push 0xc -> push 7
+      OK  arm d401a0  mov w8, #0xc                 -> mov w8, #0x7                 321e07e8 528000e8 (=)
+6dd534: shl edx, 5 -> imul edx, edx, 0x18
+      OK  arm d402ac  sub w0, w8, #4               -> sub w0, w8, #0x17            51001100 51005d00 (-o+1)
+6dd537: add edx, 0x160 -> add edx, 0x18f
+      OK  arm d40318  add w20, w8, #0x160          -> add w20, w8, #0x18f          11058114 11063d14 (=)
+6dd53e: push 0x230 -> push 0x235
+      OK  arm d40344  mov w8, #0x230               -> mov w8, #0x235               52804608 528046a8 (=)
+6dd557: push 0xc -> push 7
+      UNMAPPED  value 0xc (7 cands)
+6dd580: shl eax, 5 -> imul eax, eax, 0x18
+      UNMAPPED  value 0x5 (1 cands)
+6dd583: add eax, 0x160 -> add eax, 0x18f
+      UNMAPPED  value 0x160 (2 cands)
+6dd589: push 0x230 -> push 0x235
+      UNIQ-fallback value 0x230
+      OK  arm d40344  mov w8, #0x230               -> mov w8, #0x235               52804608 528046a8 (=)
+6dd5a8: push 0xc -> push 7
+      UNMAPPED  value 0xc (7 cands)
+6dd5d1: shl edx, 5 -> imul edx, edx, 0x18
+      UNMAPPED  value 0x5 (1 cands)
+6dd5d4: add edx, 0x160 -> add edx, 0x18f
+      UNMAPPED  value 0x160 (2 cands)
+6dd5db: push 0x230 -> push 0x235
+      UNMAPPED  value 0x230 (0 cands)
+6dd5f1: push 1 -> push 7
+      UNMAPPED  value 0x1 (3 cands)
+6dd5ff: shl eax, 5 -> imul eax, eax, 0x18
+      UNMAPPED  value 0x5 (1 cands)
+6dd602: add eax, 0x15e -> add eax, 0x18c
+      OK  arm d40424  add w20, w8, #0x15e          -> add w20, w8, #0x18c          11057914 11063114 (=)
+6dd608: push 0x22a -> push 0x22f
+      OK  arm d40450  mov w8, #0x22a               -> mov w8, #0x22f               52804548 528045e8 (=)
+6dd692: push 0xc -> push 7
+      OK  arm d405f0  mov w8, #0xc                 -> mov w8, #0x7                 321e07e8 528000e8 (=)
+6dd6b9: shl eax, 5 -> imul eax, eax, 0x18
+      UNMAPPED  value 0x5 (1 cands)
+6dd6bc: add eax, 0x160 -> add eax, 0x199
+      OK  arm d40688  add w20, w8, #0x160          -> add w20, w8, #0x199          11058114 11066514 (=)
+6dd6c2: push 0x1e2 -> push 0x235
+      OK  arm d406b4  mov w8, #0x1e2               -> mov w8, #0x235               52803c48 528046a8 (=)
+6dd6d8: push 1 -> push 7
+      NEEDCAVE(def d3f56c shared by 8)  arm d40718  str w23, [x0]  (=, new 0x7)
+6dd6e6: shl ecx, 5 -> imul ecx, ecx, 0x18
+      UNMAPPED  value 0x5 (1 cands)
+6dd6e9: add ecx, 0x15e -> add ecx, 0x196
+      OK  arm d4078c  add w20, w8, #0x15e          -> add w20, w8, #0x196          11057914 11065914 (=)
+6dd6f0: push 0x1dc -> push 0x22f
+      OK  arm d407b8  mov w8, #0x1dc               -> mov w8, #0x22f               52803b88 528045e8 (=)
+6dd74c: shl eax, 5 -> imul eax, eax, 0x18
+      UNMAPPED  value 0x5 (1 cands)
+6dd74f: add eax, 0x15e -> add eax, 0x18e
+      OK  arm d40974  add w20, w8, #0x15e          -> add w20, w8, #0x18e          11057914 11063914 (=)
+6dd755: push 0xc4 -> push 0x1ec
+      NEEDCAVE(def d409a0 shared by 2)  arm d409a4  str w19, [x0]  (=, new 0x1ec)
+6dd78a: shl ecx, 5 -> imul ecx, ecx, 0x18
+      UNMAPPED  value 0x5 (1 cands)
+6dd78d: add ecx, 0x168 -> add ecx, 0x198
+      OK  arm d40a7c  add w20, w8, #0x168          -> add w20, w8, #0x198          1105a114 11066114 (=)
+6dd794: push 0xc4 -> push 0x1ec
+      NEEDCAVE(def d409a0 shared by 2)  arm d40aa8  str w19, [x0]  (=, new 0x1ec)
+6dd7bb: shl edx, 5 -> imul edx, edx, 0x18
+      UNMAPPED  value 0x5 (1 cands)
+6dd7be: add edx, 0x15c -> add edx, 0x18c
+      OK  arm d40b94  add w20, w8, #0x15c          -> add w20, w8, #0x18c          11057114 11063114 (=)
+6dd7c5: push 0xbe -> push 0x1e6
+      OK  arm d40bc0  mov w8, #0xbe                -> mov w8, #0x1e6               528017c8 52803cc8 (=)
+6dd86a: shl edx, 5 -> imul edx, edx, 0x18
+      UNMAPPED  value 0x5 (1 cands)
+6dd86d: add edx, 0x15c -> add edx, 0x18c
+      OK  arm d40f18  add w20, w8, #0x15c          -> add w20, w8, #0x18c          11057114 11063114 (=)
+6dd874: push 0x120 -> push 0x182
+      OK  arm d40f44  mov w8, #0x120               -> mov w8, #0x182               52802408 52803048 (=)
+6dd89f: shl edx, 5 -> imul edx, edx, 0x18
+      UNMAPPED  value 0x5 (1 cands)
+6dd8a2: add edx, 0x15c -> add edx, 0x18c
+      UNMAPPED  value 0x15c (0 cands)
+6dd8a9: push 0x120 -> push 0x182
+      UNMAPPED  value 0x120 (3 cands)
+6dd8bf: push 1 -> push 7
+      NEEDCAVE(def d40ae8 shared by 5)  arm d40fb0  str w23, [x0]  (=, new 0x7)
+6dd8d0: shl eax, 5 -> imul eax, eax, 0x18
+      UNMAPPED  value 0x5 (1 cands)
+6dd8d3: add eax, 0x15c -> add eax, 0x48c
+      OK  arm d41020  add w20, w8, #0x15c          -> add w20, w8, #0x48c          11057114 11123114 (=)
+6dd8d9: push 0x158 -> push 0x175
+      OK  arm d4104c  mov w8, #0x158               -> mov w8, #0x175               52802b08 52802ea8 (=)
+6dd952: shl eax, 5 -> imul eax, eax, 0x18
+      UNMAPPED  value 0x5 (1 cands)
+6dd955: add eax, 0x15c -> add eax, 0x48c
+      OK  arm d412c0  add w20, w8, #0x15c          -> add w20, w8, #0x48c          11057114 11123114 (=)
+6dd95b: push 0x160 -> push 0x17d
+      OK  arm d412ec  mov w8, #0x160               -> mov w8, #0x17d               52802c08 52802fa8 (=)
+6dd9be: shl edx, 5 -> imul edx, edx, 0x18
+      UNMAPPED  value 0x5 (1 cands)
+6dd9c1: add edx, 0x15c -> add edx, 0x18c
+      OK  arm d414ec  add w20, w8, #0x15c          -> add w20, w8, #0x18c          11057114 11063114 (=)
+6dd9c8: push 0x1a0 -> push 0x1b6
+      OK  arm d41518  mov w8, #0x1a0               -> mov w8, #0x1b6               52803408 528036c8 (=)
+6dd9f3: shl edx, 5 -> imul edx, edx, 0x18
+      UNMAPPED  value 0x5 (1 cands)
+6dd9f6: add edx, 0x15c -> add edx, 0x18c
+      UNMAPPED  value 0x15c (0 cands)
+6dd9fd: push 0x1a0 -> push 0x1b6
+      UNIQ-fallback value 0x1a0
+      OK  arm d41518  mov w8, #0x1a0               -> mov w8, #0x1b6               52803408 528036c8 (=)
+UNRESOLVED def d3ecec uses ['0xd3ecf0', '0xd3eddc', '0xd3eebc', '0xd3ef9c', '0xd3f080'] patched ['0xd3ecf0'] navs {7}
+GROUP  def d3ed60 for x86 6dd095,6dd0bd,6dd0df,6dd104,6dd129: mov w25, #0x152 -> mov w25, #0x183  52802a59 52803079
+UNRESOLVED def d3f56c uses ['0xd3f744', '0xd3f8e8', '0xd3fd10', '0xd40008', '0xd403b0', '0xd404a8', '0xd40718', '0xd407e0'] patched ['0xd40718'] navs {7}
+GROUP  def d409a0 for x86 6dd755,6dd794: mov w19, #0xc4 -> mov w19, #0x1ec  52801893 52803d93
+UNRESOLVED def d40ae8 uses ['0xd40b1c', '0xd40c38', '0xd40c6c', '0xd40fb0', '0xd41110'] patched ['0xd40fb0'] navs {7}

@@ -1,0 +1,17 @@
+fn 6dc976..6dca90  arm d72740..d72b80  anchors(calls) 2
+6dc983: mov word ptr [ebp - 0x18], 0x120 -> mov word ptr [ebp - 0x18], 0x184
+      OK  arm d7279c  mov w8, #0x120               -> mov w8, #0x184               52802408 52803088 (=)
+6dc98d: shl eax, 5 -> imul eax, eax, 0x18
+      UNMAPPED  value 0x5 (0 cands)
+6dc990: add eax, 0x16c -> add eax, 0x19d
+      OK  arm d727b8  add w20, w8, #0x16c          -> add w20, w8, #0x19d          1105b114 11067514 (=)
+6dc999: mov word ptr [ebp - 0x14], 0x78 -> mov word ptr [ebp - 0x14], 0x2b
+      OK  arm d727dc  mov w8, #0x78                -> mov w8, #0x2b                321d0fe8 52800568 (=)
+6dca07: mov word ptr [ebp - 0x18], 0x19e -> mov word ptr [ebp - 0x18], 0x1b8
+      OK  arm d72978  mov w8, #0x19e               -> mov w8, #0x1b8               528033c8 52803708 (=)
+6dca11: shl edx, 5 -> imul edx, edx, 0x18
+      UNMAPPED  value 0x5 (0 cands)
+6dca14: add edx, 0x16c -> add edx, 0x19d
+      OK  arm d72994  add w23, w8, #0x16c          -> add w23, w8, #0x19d          1105b117 11067517 (=)
+6dca1e: mov word ptr [ebp - 0x14], 0x3c -> mov word ptr [ebp - 0x14], 0x2b
+      OK  arm d729b8  mov w8, #0x3c                -> mov w8, #0x2b                321e0fe8 52800568 (=)

@@ -1,0 +1,7 @@
+fn 6e3135..6e33ed  arm d499b0..d4a450  anchors(calls) 4
+STRUCT-BLOCK old 6e3162: mov dl, byte ptr [0xdc3bac]  ->  new 6e3162: call 0x91444e; 6e3167: nop 
+6e316c: push 0x162 -> push 0x172
+      OK  arm d49ad4  mov w8, #0x162               -> mov w8, #0x172               52802c48 52802e48 (=)
+6e3257: lea ecx, [ecx + eax*8 + 0x144] -> lea ecx, [ecx + eax*8 + 0x154]
+      UNIQ-fallback value 0x144
+      OK  arm d49ed0  add w19, w8, #0x144          -> add w19, w8, #0x154          11051113 11055113 (=)

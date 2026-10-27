@@ -1,0 +1,2 @@
+fn 6dac2d..6daef0  arm d6ad30..d6b710  anchors(calls) 0
+STRUCT-BLOCK old 6daed2: cdq ; 6daed3: sub eax, edx  ->  new 6daed2: add ecx, 4

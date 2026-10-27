@@ -1,0 +1,8 @@
+fn 6e2170..6e26b4  arm d48750..d499b0  anchors(calls) 4
+STRUCT-BLOCK old 6e2447: mov bl, byte ptr [ecx + edx + 0x91e9d8]  ->  new 6e2447: call 0x91445d; 6e244c: nop ; 6e244d: nop 
+6e2181: push 0x64 -> push 0x6a
+      OK  arm d487e4  mov w8, #0x64                -> mov w8, #0x6a                52800c88 52800d48 (=)
+6e2188: push 0x162 -> push 0x16f
+      OK  arm d48814  mov w8, #0x162               -> mov w8, #0x16f               52802c48 52802de8 (=)
+6e2426: lea edx, [ecx + eax + 0x104] -> lea edx, [ecx + eax + 0x117]
+      OK  arm d48f94  add w27, w9, #0x104          -> add w27, w9, #0x117          1104113b 11045d3b (=)

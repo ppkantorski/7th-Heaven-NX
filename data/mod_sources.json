@@ -1,0 +1,100 @@
+{
+  "_comment": "The mods the Switch build supports, for the Install Mods window (ff7nx_download). id is the 7th Heaven catalog ID; file is the name the mod has in mods/, which settings.json keys it by, so downloads and updates land there. Kept in load order.",
+  "mods": [
+    {
+      "id": "2e4c6623-97b9-4d5c-b2f3-b4f24f06a911",
+      "name": "[Tsunamods] Cosmo Memory",
+      "file": "[Tsunamods]_Cosmo_Memory.iro"
+    },
+    {
+      "id": "8c1020f8-562c-4a1e-87ab-dd328c0aa567",
+      "name": "[Tsunamods] Wizard Staff",
+      "file": "[Tsunamods]_Modern_Spell_Names.iro"
+    },
+    {
+      "id": "7ac77aef-8732-4e9a-8321-bec5c016456c",
+      "name": "Nitpick",
+      "file": "Nitpick.iro"
+    },
+    {
+      "id": "2b49d831-6556-41df-9ddb-d1a6e937f548",
+      "name": "[Tsunamods] Enhanced Stock UI",
+      "file": "Enhanced Stock UI-rel2"
+    },
+    {
+      "id": "09e81530-3f09-46b9-831b-df431b8f319c",
+      "name": "[Tsunamods] Echo-S",
+      "file": "Echo-s.iro"
+    },
+    {
+      "id": "4309613f-d6b3-4e0a-a5c7-6af71da34d7d",
+      "name": "Cosmos FMV (30 fps)",
+      "file": "CosmosFMV30.iro"
+    },
+    {
+      "id": "22ed7aef-254c-49cf-923f-32c146f1597f",
+      "name": "Double Input Bugfix (and menu input Qol)",
+      "file": "Double-input-fix"
+    },
+    {
+      "id": "22b8d4ec-603f-46cd-9a70-20f2fcd7aea4",
+      "name": "[Tsunamods] Idle Animations - 60fps",
+      "file": "Tsunamods__Idle_Animations_2.2_60fps"
+    },
+    {
+      "id": "c0d1e191-a251-465d-8a3c-a3be5366d849",
+      "name": "60/30 FPS Gameplay",
+      "file": "ff7-60fps-mod.iro"
+    },
+    {
+      "id": "3b25060c-c60e-426e-ac46-f85479e983e5",
+      "name": "Ninostyle Chibi Fixes and Additions",
+      "file": "Ninostyle Chibi Fixes and Additions v2.5.iro"
+    },
+    {
+      "id": "2b25060c-c60e-426e-ac46-f85439e903e3",
+      "name": "NinoStyle Battle Models",
+      "file": "Ninostyle Battle.iro"
+    },
+    {
+      "id": "c33191b1-439d-4536-9c70-cc5f6957dfa2",
+      "name": "[Tsunamods] Avalanche Arisen Battle Scenes",
+      "file": "[Tsunamods] Avalanche Arisen Battle Scenes 1.0.DDS.iro"
+    },
+    {
+      "id": "d9f9ff17-666c-4b5f-8292-4835888a1358",
+      "name": "AxlRose's Blender v1",
+      "file": "[AxlRose]_Blender_v1.iro"
+    },
+    {
+      "id": "2b25060c-c60e-426e-ac46-f85439e903e2",
+      "name": "NinoStyle Chibi Field Models",
+      "file": "Ninostyle Chibi.iro"
+    },
+    {
+      "id": "7c6a0289-ae89-411d-836a-531e78938401",
+      "name": "Cosmos Limit Break",
+      "file": "CosmosLimitBreak.iro"
+    },
+    {
+      "id": "ed5a8c57-56bf-4cf1-acfa-8e5347f27463",
+      "name": "[Tsunamods] Arranged Soundtrack",
+      "file": "[Tsunamods]-Arranged-Soundtrack.iro"
+    },
+    {
+      "id": "50000000-5555-ff75-5775-720000000004",
+      "name": "[Tsunamods] SYW Unified Minigame Textures",
+      "file": "[Tsunamods].SYW.Unified.MiniGames.Textures.V1.04.iro"
+    },
+    {
+      "id": "50000000-5555-ff75-5775-700000000003",
+      "name": "[Tsunamods] SYW Unified Spells Textures",
+      "file": "[Tsunamods].SYW.Unified.Spells.Textures.V1.03.iro"
+    },
+    {
+      "id": "1970dd4b-cd94-410e-a3af-f9c7086c6699",
+      "name": "Cosmos Gaia",
+      "file": "CosmosGaia.iro"
+    }
+  ]
+}

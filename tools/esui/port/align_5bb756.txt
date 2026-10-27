@@ -1,0 +1,9 @@
+fn 5bb756..5bb9c9  arm 7c5c30..7c6850  anchors(calls) 5
+5bb846: push 0xa -> push 0x15
+      UNMAPPED  value 0xa (3 cands)
+5bb848: push 0x20 -> push 0x30
+      UNMAPPED  value 0x20 (4 cands)
+5bb991: shl edx, 3 -> imul edx, edx, 6
+      UNMAPPED  value 0x3 (2 cands)
+5bb9b8: imul ecx, ecx, 9 -> imul ecx, ecx, 7
+      UNMAPPED  value 0x9 (0 cands)

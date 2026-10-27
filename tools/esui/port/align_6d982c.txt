@@ -1,0 +1,3 @@
+fn 6d982c..6d98e3  arm d641e0..d644c0  anchors(calls) 0
+6d9882: mov dword ptr [eax + 0xc], 3 -> mov dword ptr [eax + 0xc], 4
+      OK  arm d64340  mov w8, #3                   -> mov w8, #0x4                 320007e8 52800088 (=)

@@ -1,0 +1,87 @@
+# Builds the Python-free release zips (tools/release.py) on one runner per
+# target -- PyInstaller cannot cross-compile -- and attaches them to a DRAFT
+# GitHub release for the pushed tag. Review the draft, then publish it.
+#
+#   git tag v1.0.0 && git push origin v1.0.0
+#
+# The tag must match VERSION in 7th_heaven_nx.py. Run it by hand from the
+# Actions tab (workflow_dispatch) to get the zips as artifacts without a
+# release.
+#
+# Licensed under GPLv3
+# Copyright (c) 2026 ppkantorski
+
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      # one platform failing (e.g. a package with no wheel yet) must not
+      # cancel the other five
+      fail-fast: false
+      matrix:
+        include:
+          - { target: windows-x64,   runner: windows-2025 }
+          - { target: windows-arm64, runner: windows-11-arm }
+          - { target: macos-arm64,   runner: macos-15 }
+          - { target: macos-x64,     runner: macos-15-intel }
+          # 22.04: the oldest glibc still offered, so the zip runs on more distros
+          - { target: linux-x64,     runner: ubuntu-22.04 }
+          - { target: linux-arm64,   runner: ubuntu-22.04-arm }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Upgrade pip
+        run: python -m pip install --upgrade pip
+
+      # capstone publishes no Windows arm64 wheel, so pip builds it from
+      # source there, which needs CMake (the runner has the MSVC tools)
+      - name: CMake for capstone (Windows arm64)
+        if: matrix.target == 'windows-arm64'
+        run: python -m pip install cmake
+
+      - name: Build
+        shell: bash
+        run: >-
+          python tools/release.py
+          ${{ startsWith(github.ref, 'refs/tags/') && format('--tag {0}', github.ref_name) || '' }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: 7th-Heaven-NX-${{ matrix.target }}
+          path: |
+            release/*.zip
+            release/*.zip.sha256
+          if-no-files-found: error
+
+  release:
+    needs: build
+    # publish whatever built, even if one platform failed
+    if: ${{ !cancelled() && startsWith(github.ref, 'refs/tags/') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          name: 7th Heaven NX ${{ github.ref_name }}
+          files: dist/*
+          fail_on_unmatched_files: true

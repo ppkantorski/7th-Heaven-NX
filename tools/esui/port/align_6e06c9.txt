@@ -1,0 +1,22 @@
+fn 6e06c9..6e0842  arm d44700..d44d50  anchors(calls) 3
+STRUCT-BLOCK old   ->  new 6e0762: mov word ptr [ebp - 0x30], 5; 6e0768: jmp 0x6e0770
+STRUCT-BLOCK old 6e0768: jmp 0x6e0770; 6e076a: mov word ptr [ebp - 0x30], 3  ->  new 
+6e0702: mov word ptr [ebp - 0x28], 3 -> mov word ptr [ebp - 0x28], 4
+      NEEDCAVE(def d447e0 shared by 2)  arm d447e4  strh w19, [x0]  (=, new 0x4)
+6e0719: mov word ptr [ebp - 0x22], 0x1dc -> mov word ptr [ebp - 0x22], 0xc3
+      OK  arm d4483c  mov w8, #0x1dc               -> mov w8, #0xc3                52803b88 52801868 (=)
+6e071f: mov word ptr [ebp - 0x20], 0x162 -> mov word ptr [ebp - 0x20], 0x178
+      OK  arm d44850  mov w8, #0x162               -> mov w8, #0x178               52802c48 52802f08 (=)
+6e0725: mov word ptr [ebp - 0x1e], 0x14 -> mov word ptr [ebp - 0x1e], 7
+      OK  arm d44864  mov w8, #0x14                -> mov w8, #0x7                 52800288 528000e8 (=)
+6e0806: shl edx, 5 -> imul edx, edx, 0x18
+      UNMAPPED  value 0x5 (0 cands)
+6e0809: lea eax, [ecx + edx + 0x168] -> lea eax, [ecx + edx + 0x17a]
+      OK  arm d44c3c  add w24, w8, #0x168          -> add w24, w8, #0x17a          1105a118 1105e918 (=)
+6e0811: push 0x70 -> push 0x26
+      DEF?branch['d44c88->d449b0']  arm d449a0  mov w23, #0x70               -> mov w23, #0x26               321c0bf7 528004d7 (=)
+6e0822: push 0x15c -> push 0x172
+      OK  arm d44cb4  mov w8, #0x15c               -> mov w8, #0x172               52802b88 52802e48 (=)
+6e0827: push 0x210 -> push 0xd3
+      OK  arm d44ccc  mov w8, #0x210               -> mov w8, #0xd3                52804208 52801a68 (=)
+UNRESOLVED def d447e0 uses ['0xd447e4', '0xd44958'] patched ['0xd447e4'] navs {4}

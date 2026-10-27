@@ -1,0 +1,3 @@
+fn 6e6c30..6e6c56  arm d857a0..d858d0  anchors(calls) 0
+6e6c50: mov byte ptr [eax + 3], 0x80 -> mov byte ptr [eax + 3], 0xbf
+      OK  arm d8588c  mov w8, #0x80                -> mov w8, #0xbf                321903e8 528017e8 (=)

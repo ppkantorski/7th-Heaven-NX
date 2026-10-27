@@ -1,0 +1,46 @@
+fn 6de3db..6de7f4  arm d41600..d428c0  anchors(calls) 6
+6de4bd: imul edx, edx, 0x58 -> imul edx, edx, 0x48
+      UNIQ-fallback value 0x58
+      DEFSHARED5  arm d419f0  mov w25, #0x58               -> mov w25, #0x48               52800b19 52800919 (=)
+6de4ca: lea ecx, [edx + eax + 0x9c] -> lea ecx, [edx + eax + 0x76]
+      OK  arm d41b6c  add w22, w9, #0x9c           -> add w22, w9, #0x76           11027136 1101d936 (=)
+6de5dd: imul eax, eax, 0x18 -> imul eax, eax, 0x16
+      UNMAPPED  value 0x18 (1 cands)
+6de5e0: add eax, 0x15e -> add eax, 0x17e
+      OK  arm d41f34  add w22, w8, #0x15e          -> add w22, w8, #0x17e          11057916 1105f916 (=)
+6de669: imul eax, eax, 0x18 -> imul eax, eax, 0x16
+      UNMAPPED  value 0x18 (1 cands)
+6de66c: add eax, 0x15e -> add eax, 0x17e
+      OK  arm d42240  add w22, w8, #0x15e          -> add w22, w8, #0x17e          11057916 1105f916 (=)
+6de675: imul ecx, ecx, 0x58 -> imul ecx, ecx, 0x48
+      UNMAPPED  value 0x58 (0 cands)
+6de682: lea eax, [ecx + edx + 0x9c] -> lea eax, [ecx + edx + 0x76]
+      OK  arm d422a0  add w22, w8, #0x9c           -> add w22, w8, #0x76           11027116 1101d916 (=)
+6de6af: imul edx, edx, 0x18 -> imul edx, edx, 0x16
+      UNMAPPED  value 0x18 (1 cands)
+6de6b2: add edx, 0x15e -> add edx, 0x17e
+      OK  arm d423e0  add w22, w8, #0x15e          -> add w22, w8, #0x17e          11057916 1105f916 (=)
+6de6bc: imul eax, eax, 0x58 -> imul eax, eax, 0x48
+      UNMAPPED  value 0x58 (0 cands)
+6de6c9: lea edx, [eax + ecx + 0x9c] -> lea edx, [eax + ecx + 0x76]
+      OK  arm d4243c  add w22, w9, #0x9c           -> add w22, w9, #0x76           11027136 1101d936 (=)
+6de717: imul edx, edx, 0x18 -> imul edx, edx, 0x16
+      OK  arm d42564  sub w0, w9, #0x18            -> sub w0, w9, #0x16            51006120 51005920 (neg)
+6de71a: add edx, 0x15e -> add edx, 0x17e
+      UNIQ-fallback value 0x15e
+      OK  arm d425e0  add w22, w8, #0x15e          -> add w22, w8, #0x17e          11057916 1105f916 (=)
+6de724: imul eax, eax, 0x58 -> imul eax, eax, 0x48
+      UNMAPPED  value 0x58 (0 cands)
+6de731: lea edx, [eax + ecx + 0x9c] -> lea edx, [eax + ecx + 0x76]
+      UNIQ-fallback value 0x9c
+      OK  arm d4263c  add w22, w9, #0x9c           -> add w22, w9, #0x76           11027136 1101d936 (=)
+6de7a7: push 2 -> push 7
+      OK  arm d42750  mov w8, #2                   -> mov w8, #0x7                 321f03e8 528000e8 (=)
+6de7b7: imul edx, edx, 0x18 -> imul edx, edx, 0x16
+      UNMAPPED  value 0x18 (1 cands)
+6de7ba: add edx, 0x162 -> add edx, 0x184
+      OK  arm d427c0  add w22, w8, #0x162          -> add w22, w8, #0x184          11058916 11061116 (=)
+6de7c4: imul eax, eax, 0x58 -> imul eax, eax, 0x48
+      UNMAPPED  value 0x58 (0 cands)
+6de7d6: lea eax, [ecx + edx + 0x98] -> lea eax, [ecx + edx + 0x73]
+      OK  arm d42838  add w22, w8, #0x98           -> add w22, w8, #0x73           11026116 1101cd16 (=)

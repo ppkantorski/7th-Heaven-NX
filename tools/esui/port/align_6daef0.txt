@@ -1,0 +1,2 @@
+fn 6daef0..6db0bc  arm d6b710..d6bd50  anchors(calls) 0
+STRUCT  6daf0c: movsx eax, word ptr [eax + edx + 4] -> call 0x91446d

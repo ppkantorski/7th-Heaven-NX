@@ -1,0 +1,923 @@
+#!/usr/bin/env python3
+"""
+ff7nx_camfit.py -- stop the camera scrolling off the edge of the art.
+
+    python3 ff7nx_camfit.py <flevel.lgp>            report, writes nothing
+    python3 ff7nx_camfit.py <flevel.lgp> las4_1 md8_1
+
+THE BUG THIS EXISTS FOR
+=======================
+`ff7nx_ws.clamped_range` bakes FFNx's camera clamp into section 8 through an
+identity: the stock code only ever uses the range as `left + 160` and
+`right - 160`, so pulling the edges in by `d` moves the clamp by `d`.
+
+That identity is exact. What it does NOT know is how wide the VIEW is. The
+port's own arithmetic assumes 320 units (`#0xa0` twice). This build's framing
+stage widens it:
+
+    frame:  game-x -106.67 .. 746.67   ->   426.67 field units, half 213.33
+
+So a field whose clamp lets the camera reach `range.left + 160` shows the
+window from `left` to `left + 426.67` -- **106.67 units wider than the code
+that computed the clamp believed.** If the art stops before that, the extra
+53.33 units per side are BLACK.
+
+MEASURED on build 79, all 709 fields (`diag_fieldcover.py`):
+
+    OK                 479
+    CAMERA WALKS OFF   108      <- this
+    ART ABSENT          69
+    ART SHORT           32
+    PAGES BLANK         21
+
+`las4_1`, the bottom of the Northern Cave, is one of the 108:
+
+    camera range  -192 .. 192  (384)   clamped to -32 .. 32
+    contiguous art  -224 .. 224  (448)
+    CAMERA WALKS OFF (22 units bare at the extremes)
+
+At camera -32 the window starts at -245 and the art starts at -224: a black
+bar on the LEFT. Run right to camera +32 and the same bar appears on the
+RIGHT. Both were reported from hardware.
+
+`clamped_range` cannot fix this on its own, because the number it needs is
+not in section 8. It is in section 9 -- where the tiles actually are.
+
+WHAT THIS DOES
+==============
+For every field whose contiguous art is at least 428 units wide (i.e. the art
+CAN cover a 16:9 window), tighten the baked clamp so the window stays inside
+the art:
+
+    clamp_lo = max(current_lo, art_left  + 214)
+    clamp_hi = min(current_hi, art_right - 214)
+
+then write it back through the same `+/-160` identity.
+
+**It only ever TIGHTENS.** A field that already fits comes out a no-op by
+construction: `worst_band == 0` means `current_lo >= art_left + 214` and
+`current_hi <= art_right - 214` already, so both `max`/`min` pick the current
+value. No field can gain reach it did not have, so nothing that renders
+correctly today can start rendering incorrectly.
+
+Fields with less than 428 units of art are LEFT ALONE. They cannot fill the
+frame at any camera position and re-centring them is a separate decision with
+its own trade-off; `diag_fieldcover` already reports them as ART SHORT /
+ART ABSENT.
+
+WHAT FFNx DOES, FOR COMPARISON
+==============================
+`field_clip_with_camera_range_float` (background.cpp:417) clamps to
+`left + half_width .. right - half_width` with
+
+    half_width = 160 + std::min(53, cameraRangeSize / 2 - 160)
+
+capped at 213, and its comment says "This centers the background if
+necessary". For `las4_1` that gives `half_width = 191` and pins the camera at
+0, which also keeps the 427-unit window inside the 448 units of art. So FFNx
+does not show the bar either -- it just gets there by pinning, where this
+gets there by tightening, and tightening leaves the field 20 units of travel
+FFNx does not have. Simulated over the 108: FFNx's rule fixes 97 of them and
+leaves a mean 47.6 units of travel; this rule fixes 108 and leaves 67.9.
+
+Licensed under GPLv3
+Copyright (c) 2026 ppkantorski
+"""
+
+from __future__ import annotations
+
+import os as _nx_os, sys as _nx_sys  # BUILD 755: run directly, find src/
+_nx_root = _nx_os.path.dirname(_nx_os.path.abspath(__file__))
+while not _nx_os.path.isfile(_nx_os.path.join(_nx_root, '7th_heaven_nx.py')) and _nx_root != _nx_os.path.dirname(_nx_root):
+    _nx_root = _nx_os.path.dirname(_nx_root)
+if _nx_os.path.join(_nx_root, 'src') not in _nx_sys.path:
+    _nx_sys.path.insert(0, _nx_os.path.join(_nx_root, 'src'))
+import nxpaths  # noqa: E402
+nxpaths.install()
+import os
+import struct
+import sys
+
+_HERE = nxpaths.ROOT
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+
+NEEDED = 428            # 16:9 window in field units, as diag_fieldcover
+VIEW_HALF = NEEDED // 2  # 214
+STOCK_HALF = 160        # the port's hardwired `#0xa0`
+TILE = 16
+SECTION_TRIGGERS = 7
+SECTION_BACKGROUND = 8
+
+
+def disabled():
+    """SEVENTH_NX_NO_CAMFIT=1 turns the pass off without a code edit."""
+    return os.environ.get('SEVENTH_NX_NO_CAMFIT') == '1'
+
+
+# A column of cells whose every texel is our own black filler is NOT art.
+#
+# `field_bg_native.NEAR_BLACK` is 0x0841 -- RGB(8, 8, 8), mean luminance
+# exactly 8.0. It is the 0.9/255 lift the promotion applies to a fully black
+# cell, because 0x0000 has to mean TRANSPARENT on a depth-2 page. So a black
+# cell that has been promoted reads back as "has content" to any test that
+# only asks whether a texel is non-zero.
+#
+# MEASURED on build 81, the leftmost 16-unit column of three unrelated fields:
+#
+#     md8_1    x -224..-208   mean luminance 8.0 / 255
+#     md8_3    x -224..-208   mean luminance 8.0 / 255
+#     las4_1   x -224..-208   mean luminance 8.0 / 255
+#
+# Exactly 8.0 in three fields is not a picture. Counting it let the camera
+# travel into 16 units of filler, which is the black pillar reported from
+# hardware on `md8_1`: "it is assuming the map is wider than it is visually".
+#
+# The floor sits just above NEAR_BLACK so that lift alone can never qualify.
+# A column is kept if ANY tile covering it is above the floor, so real art
+# that merely sits beside black is never dropped.
+LIT_FLOOR = 10.0
+
+# THE 2-D LIT COVERAGE CONSTRAINT -- OFF. IT SHIPPED IN BUILD 86 AND WAS A
+# REGRESSION. Opt in with SEVENTH_NX_LITCOVER=1; do not turn it on by default
+# again without reading the next paragraph.
+#
+# `lit_travel` rasterises every layer AT ITS HOME OFFSET and calls a texel
+# unlit if no layer draws there. That is right for layers 1 and 2 and WRONG
+# for 3 and 4, and the code comment that justified it had the mechanism
+# backwards. It said "as the camera moves away the backdrop LAGS and covers
+# LESS, never more", so measuring at home was conservative.
+#
+# Layers 3 and 4 WRAP RATHER THAN CULL -- `ff7nx_ws` line 167 and
+# `ff7nx_fieldwide` say so explicitly, and it is why `parallax_right` exists.
+# A wrapping backdrop is ALWAYS covering the screen; what changes with the
+# camera is which part of it you see, not whether it is there. So the far left
+# and right of the field canvas read as "unlit" here while at runtime the sky
+# is on screen the whole time.
+#
+# MEASURED, build 86, on hardware: `mtcrl_4`'s camera range went -490..490 to
+# -246..374, i.e. travel -330..330 to -86..214. The camera sat at a boundary,
+# the player started off screen, and Mt. Corel stopped scrolling. Reported as
+# "the camera doesnt even move ... i cant even see myself when the page loads".
+#
+# The vertical arm (`mtcrl_5` -240..224 -> -100..80) rests on the same faulty
+# measurement and goes with it. If this is ever revived it must ask the
+# parallax layers where they are AT THAT CAMERA POSITION, not at home -- or
+# restrict itself to layers 1 and 2, which do cull and do stay put.
+LIT_COVER = os.environ.get('SEVENTH_NX_LITCOVER') == '1'
+
+# Below this much camera travel, pin instead. See `fit`.
+#
+# 24 WAS TOO WIDE, AND `bugin2` IS THE MEASUREMENT -- 2026-09-23.
+#
+# This rule exists for `md8_1`, whose lit art is 432 units against a 427
+# window: FIVE units of slack, imperceptible as motion and very perceptible
+# as the picture sliding off its own edge. Pinning it was right.
+#
+# `bugin2` (Cosmo Canyon, the observatory) has TWENTY, and 20 <= 24, so it
+# was pinned too. That is not a sliver -- it is exactly the travel FFNx
+# gives it:
+#
+#     bugin2 vanilla -224..224
+#       FFNx  half_width = 160 + min(53, 446/2 - 160) = 213 -> [-10, 10]
+#       ours  clamped_range() -> -170..170             -> [-10, 10]   SAME
+#       camfit pinned it to -160..160                  -> [  0,  0]
+#
+# And a pinned range is not merely a still camera: `ff7nx_camclamp` clamps
+# the SCRIPTED camera to it, so a script that pans the observatory gets
+# yanked to dead centre and snapped back when it ends. That is the abrupt
+# x jump reported on hardware when the planet cries start, and it is the
+# same shape as the 7th Heaven bar snap. FFNx has no camfit, which is
+# exactly why FFNx does not do it.
+#
+# 8 keeps md8_1's five units pinned and gives bugin2 its twenty back.
+# SEVENTH_NX_PIN_SLACK overrides it for an A/B without editing this file.
+PIN_SLACK = int(os.environ.get('SEVENTH_NX_PIN_SLACK') or 8)
+
+
+INTERIOR = 160          # inside this is the 4:3 picture; it is always art
+
+
+def _live_columns(sec9, off, pages, prgbs, npg):
+    """
+    Which of a tile's 16 destination columns contain PICTURE, as a bool list.
+
+    "Picture" is any texel that is neither transparent nor NEAR_BLACK. The
+    distinction is the whole point: Cosmos pads its widescreen art out to the
+    16-unit tile grid with flat filler, and that filler is indistinguishable
+    from art to anything that counts tiles.
+    """
+    import numpy as np
+    import field_bg_native as FN
+    import field_bg_repack as RP
+
+    page = pages.get(sec9[off + RP.T_TEXID])
+    if page is None:
+        return None
+    n = len(page.data) // (2 if page.depth == 2 else 1)
+    side = int(round(n ** 0.5))
+    if side * side != n:
+        return None
+    u, v = struct.unpack_from('<II', sec9, off + RP.T_SRC_X_BIG)
+    cx = int(round(u / 1e7 * side))
+    cy = int(round(v / 1e7 * side))
+    sc = max(1, side // 256)
+    if cx + TILE * sc > side or cy + TILE * sc > side:
+        return None
+    if page.depth == 2:
+        blk = np.frombuffer(page.data, '<u2').reshape(side, side)
+        blk = blk[cy:cy + TILE * sc, cx:cx + TILE * sc]
+        real = (blk != FN.EMPTY) & (blk != FN.NEAR_BLACK)
+    else:
+        pal = sec9[off + RP.T_PALETTE]
+        if pal >= npg or not prgbs:
+            return None
+        idx = np.frombuffer(page.data, np.uint8).reshape(side, side)
+        idx = idx[cy:cy + TILE * sc, cx:cx + TILE * sc]
+        real = prgbs[pal][idx].sum(axis=2) > 26      # > RGB(8,8,8) summed
+    colsum = real.sum(axis=0)
+    return [bool(colsum[k * sc:(k + 1) * sc].any()) for k in range(TILE)]
+
+
+def _inner_run(x, live):
+    """(start, end) of a margin tile's live columns CONTIGUOUS WITH THE
+    PICTURE -- the run that touches the tile's inner side.
+
+    BUILD 617, fship_22: Cosmos's art for that field stops at +/-213.5 and
+    the last 10 units of each margin tile are black filler, but a handful
+    of stray lit units sit in the outermost column of four tiles. Taking
+    first-live to last-live counted the black between them as art, the run
+    read -224..224, the camera kept +/-10 units of travel, and hardware
+    showed a black strip down the right edge. A speck separated from the
+    picture by filler is not the picture's edge.
+    """
+    idx = [k for k, v in enumerate(live) if v]
+    if x + TILE / 2 >= 0:                   # right side: inner edge is left
+        a = idx[0]
+        b = a
+        while b + 1 < TILE and live[b + 1]:
+            b += 1
+        return (x + a, x + b + 1)
+    b = idx[-1]                              # left side: inner edge is right
+    a = b
+    while a - 1 >= 0 and live[a - 1]:
+        a -= 1
+    return (x + a, x + b + 1)
+
+
+def _cell_luma(sec9, off, pages, prgbs, npg):
+    """Mean luminance 0..255 of the page cell one tile samples, or None."""
+    import diag_common as DC
+    import field_bg_repack as RP
+    import numpy as np
+
+    page = pages.get(sec9[off + RP.T_TEXID])
+    if page is None:
+        return None
+    n = len(page.data) // (2 if page.depth == 2 else 1)
+    side = int(round(n ** 0.5))
+    if side * side != n:
+        return None
+    u, v = struct.unpack_from('<II', sec9, off + RP.T_SRC_X_BIG)
+    cx = int(round(u / 1e7 * side))
+    cy = int(round(v / 1e7 * side))
+    if cx + TILE > side or cy + TILE > side:
+        return None
+    if page.depth == 2:
+        arr = np.frombuffer(page.data, '<u2').reshape(side, side)
+        blk = arr[cy:cy + TILE, cx:cx + TILE]
+        r = ((blk >> 11) & 31).astype(np.float32) * 8
+        g = ((blk >> 5) & 63).astype(np.float32) * 4
+        b = (blk & 31).astype(np.float32) * 8
+        return float((r + g + b).mean() / 3.0)
+    idx = np.frombuffer(page.data, np.uint8).reshape(side, side)
+    pal = sec9[off + RP.T_PALETTE]
+    if pal >= npg or not prgbs:
+        return None
+    return float(prgbs[pal][idx[cy:cy + TILE, cx:cx + TILE]]
+                 .astype(np.float32).mean())
+
+
+def art_run(sec9, midpoint, parts=None):
+    """
+    (left, right) of the contiguous LIT layer-1/2 art run containing
+    `midpoint`.
+
+    Same measurement as `diag_fieldcover.merged_columns`, and deliberately
+    NOT the bounding box: a single stray tile ten thousand units away makes a
+    512-unit field measure 10,272, and a clamp built on that number would be
+    built on sand. Returns None if the field has no layer 1/2 tiles.
+
+    `parts` is the whole field. Given it, a tile whose cell is entirely black
+    filler is dropped -- see LIT_FLOOR. Without it the old behaviour (every
+    tile counts) is kept, so the CLI still works on a bare section 9.
+    """
+    import diag_common as DC
+
+    surv = DC.survey(sec9)
+    prgbs, npg, pages = [], 0, {}
+    if parts is not None:
+        try:
+            import ff7nx_marginart as MA
+            import ff7nx_marginblack as MB
+            cols, _hdr, npg, _cpp = MB.palette_colours(parts[3])
+            prgbs = [MA.palette_rgb(cols[i]) for i in range(npg)]
+            pages = {p.slot: p for p in surv['pages']}
+        except Exception:                                      # noqa: BLE001
+            prgbs, npg, pages = [], 0, {}
+    iv, iv_span = [], []
+    for layer, offs in DC.walk_layers(sec9, surv['back_start'],
+                                      surv['tex_start']):
+        if layer not in (1, 2):
+            continue
+        for o in offs:
+            x = struct.unpack_from('<h', sec9, o + DC.TILE_DST_X)[0]
+            # PIXEL GRANULARITY AT THE EDGES, TILE GRANULARITY INSIDE.
+            # Only the outermost tiles decide where the run ends, and they are
+            # the only ones that can be part filler, so the expensive test is
+            # confined to them. Inside +/-160 is the 4:3 picture by definition.
+            if pages and (x + TILE > INTERIOR or x < -INTERIOR):
+                live = _live_columns(sec9, o, pages, prgbs, npg)
+                if live is not None:
+                    if not any(live):
+                        continue
+                    iv.append(_inner_run(x, live))
+                    iv_span.append((x + live.index(True),
+                                    x + TILE - live[::-1].index(True)))
+                    continue
+            iv.append((x, x + TILE))
+            iv_span.append((x, x + TILE))
+    if not iv:
+        return None
+
+    def _run(iv):
+        iv = sorted(iv)
+        runs = []
+        for a, b in iv:
+            if runs and a <= runs[-1][1]:
+                runs[-1] = (runs[-1][0], max(runs[-1][1], b))
+            else:
+                runs.append((a, b))
+        return (next((r for r in runs if r[0] <= midpoint <= r[1]), None)
+                or max(runs, key=lambda r: r[1] - r[0]))
+    new, old = _run(iv), _run(iv_span)
+    # Never let the stricter edge reading take a field out of the fit: a
+    # run it makes shorter than the window would be LEFT ALONE, which is
+    # more travel, not less. Only tightening is allowed here.
+    if new[1] - new[0] < NEEDED <= old[1] - old[0]:
+        return old
+    return new
+
+
+VIEW_HALF_Y = 120       # the frame is game-y 0..480 = 240 field units
+STOCK_HALF_Y = 120      # and the port's vertical clamp is `+/-120`
+INTERIOR_Y = 120
+
+
+def _live_rows(sec9, off, pages, prgbs, npg):
+    """`_live_columns`, transposed: which of a tile's 16 ROWS hold picture."""
+    import numpy as np
+    import field_bg_native as FN
+    import field_bg_repack as RP
+
+    page = pages.get(sec9[off + RP.T_TEXID])
+    if page is None:
+        return None
+    n = len(page.data) // (2 if page.depth == 2 else 1)
+    side = int(round(n ** 0.5))
+    if side * side != n:
+        return None
+    u, v = struct.unpack_from('<II', sec9, off + RP.T_SRC_X_BIG)
+    cx = int(round(u / 1e7 * side))
+    cy = int(round(v / 1e7 * side))
+    sc = max(1, side // 256)
+    if cx + TILE * sc > side or cy + TILE * sc > side:
+        return None
+    if page.depth == 2:
+        blk = np.frombuffer(page.data, '<u2').reshape(side, side)
+        blk = blk[cy:cy + TILE * sc, cx:cx + TILE * sc]
+        real = (blk != FN.EMPTY) & (blk != FN.NEAR_BLACK)
+    else:
+        pal = sec9[off + RP.T_PALETTE]
+        if pal >= npg or not prgbs:
+            return None
+        idx = np.frombuffer(page.data, np.uint8).reshape(side, side)
+        idx = idx[cy:cy + TILE * sc, cx:cx + TILE * sc]
+        real = prgbs[pal][idx].sum(axis=2) > 26
+    rowsum = real.sum(axis=1)
+    return [bool(rowsum[k * sc:(k + 1) * sc].any()) for k in range(TILE)]
+
+
+def art_run_y(sec9, midpoint, parts=None):
+    """(top, bottom) of the contiguous LIT run containing `midpoint`, in y."""
+    import diag_common as DC
+
+    surv = DC.survey(sec9)
+    prgbs, npg, pages = [], 0, {}
+    if parts is not None:
+        try:
+            import ff7nx_marginart as MA
+            import ff7nx_marginblack as MB
+            cols, _hdr, npg, _cpp = MB.palette_colours(parts[3])
+            prgbs = [MA.palette_rgb(cols[i]) for i in range(npg)]
+            pages = {p.slot: p for p in surv['pages']}
+        except Exception:                                      # noqa: BLE001
+            prgbs, npg, pages = [], 0, {}
+    iv = []
+    for layer, offs in DC.walk_layers(sec9, surv['back_start'],
+                                      surv['tex_start']):
+        if layer not in (1, 2):
+            continue
+        for o in offs:
+            y = struct.unpack_from('<h', sec9, o + DC.TILE_DST_X + 2)[0]
+            if pages and (y + TILE > INTERIOR_Y or y < -INTERIOR_Y):
+                live = _live_rows(sec9, o, pages, prgbs, npg)
+                if live is not None:
+                    if not any(live):
+                        continue
+                    iv.append((y + live.index(True),
+                               y + TILE - live[::-1].index(True)))
+                    continue
+            iv.append((y, y + TILE))
+    if not iv:
+        return None
+    iv.sort()
+    runs = []
+    for a, b in iv:
+        if runs and a <= runs[-1][1]:
+            runs[-1] = (runs[-1][0], max(runs[-1][1], b))
+        else:
+            runs.append((a, b))
+    return (next((r for r in runs if r[0] <= midpoint <= r[1]), None)
+            or max(runs, key=lambda r: r[1] - r[0]))
+
+
+def clamp_of_y(rng):
+    """
+    (lo, hi) -- the port's vertical clamp, AND IT CAN COME OUT INVERTED.
+
+    `field_clip_with_camera_range` applies the two comparisons in sequence:
+
+        if (y > bottom - 120) y = bottom - 120;
+        if (y < top + 120)    y = top + 120;
+
+    When `top + 120 > bottom - 120` the second wins and the camera lands on
+    `top + 120`. That is not a range, it is an accident of ordering -- and
+    `bugin1b`, Bugenhagen's observatory, is exactly that case: y -112..120
+    gives bounds 8..0, and which edge loses its 8 units of picture depends on
+    which comparison ran last. Returned unclamped so `fit_y` can see it.
+    """
+    return int(rng['top']) + STOCK_HALF_Y, int(rng['bottom']) - STOCK_HALF_Y
+
+
+def fit_y(rng, art):
+    """A copy of `rng` with top/bottom fitted to the art, or None."""
+    if art is None:
+        return None
+    a0, a1 = art
+    lo, hi = clamp_of_y(rng)
+    want_lo, want_hi = a0 + VIEW_HALF_Y, a1 - VIEW_HALF_Y
+    if want_lo > want_hi:                    # picture shorter than the frame
+        want_lo = want_hi = (a0 + a1) // 2   # -- centre it, best available
+    nlo, nhi = max(lo, want_lo), min(hi, want_hi)
+    if nlo > nhi:
+        if lo > hi:
+            # The field's own bounds are the inverted, order-dependent kind.
+            # There is nothing to preserve, so take what the picture asks for.
+            nlo = nhi = (want_lo + want_hi) // 2
+        else:
+            # They disagree but the field's range is sane -- stay inside it.
+            nlo = nhi = min(max((want_lo + want_hi) // 2, lo), hi)
+    if (nlo, nhi) == (lo, hi):
+        return None
+    out = dict(rng)
+    out['top'] = nlo - STOCK_HALF_Y
+    out['bottom'] = nhi + STOCK_HALF_Y
+    if not (-0x8000 <= out['top'] <= 0x7FFF
+            and -0x8000 <= out['bottom'] <= 0x7FFF):
+        return None
+    out['height'] = out['bottom'] - out['top']
+    return out
+
+
+def bare_y(lo, hi, art):
+    """Worst uncovered height over every reachable camera position."""
+    a0, a1 = art
+    if lo > hi:
+        lo = hi = lo              # what the port's ordering actually lands on
+    return max(max(0, a0 - (c - VIEW_HALF_Y)) + max(0, (c + VIEW_HALF_Y) - a1)
+               for c in (lo, hi, (lo + hi) // 2))
+
+
+def clamp_of(rng):
+    """(lo, hi) -- what the port's `+/-160` code makes of a written range."""
+    lo = int(rng['left']) + STOCK_HALF
+    hi = int(rng['right']) - STOCK_HALF
+    if lo > hi:
+        lo = hi = (lo + hi) // 2
+    return lo, hi
+
+
+def bare(lo, hi, art):
+    """Worst-case uncovered width over every reachable camera position."""
+    a0, a1 = art
+    return max(max(0, a0 - (c - VIEW_HALF)) + max(0, (c + VIEW_HALF) - a1)
+               for c in (lo, hi, (lo + hi) // 2))
+
+
+# ------------------------------------------------------- lit COVERAGE, 2-D
+# `art_run` IS A UNION OF TILE SPANS ON LAYERS 1 AND 2. THAT IS NOT COVERAGE,
+# AND ON A FIELD WHOSE BACKDROP IS LAYER 3 IT IS THE WRONG POPULATION.
+#
+# MEASURED on build 85, the two defects reported from hardware:
+#
+#   mtcrl_5   art_run_y (layers 1/2)   -360..360   the trestle, full height
+#             layer 3 (the sky)        -200..184
+#             shipped camera_y         -240..224
+#             frame unlit at cam_y -240: 27.9%   at +224: 29.1%
+#
+#   mtcrl_4   art_run   (layers 1/2)   -544..544   the trestle again
+#             shipped camera_x         -330..330
+#             frame unlit at cam_x +330: 21.0%, and 5,205 of the 7,680 texels
+#             in the RIGHTMOST 32 COLUMNS are unlit -- the black vertical bar
+#             at the right of the screen, with tiles appearing as the camera
+#             crosses back into the covered region.
+#
+# The trestle spans the whole field on both axes, so `art_run` reported plenty
+# of art and the fit left the range alone. What decides whether the player sees
+# black is whether ANY layer draws something LIT at that texel.
+#
+# HANDOFF-188 6 lists this mistake three times -- margin_blank until it was
+# split by layer, the art run until it was split by pixel, layer 2 until it was
+# split by coverage. This is the fourth, in the camera fit.
+#
+# PARALLAX IS A FLOOR, NOT A PROMISE. Layers 3 and 4 scroll at their own rate,
+# so their contribution is exact only at the home offset; as the camera moves
+# away the backdrop LAGS and covers LESS, never more. A limit derived here is
+# therefore an upper bound on safe travel, which is the direction that cannot
+# introduce a bar.
+LIT_TOL = 0.02          # of the frame; 2% of 428x240 is 2054 texels
+LIT_STEP = 4            # rasterise at 4-unit granularity -- 16x cheaper, and
+                        # the bands this exists for are 32 units and up
+
+
+def lit_travel(parts, tol=LIT_TOL):
+    """
+    ((cx_lo, cx_hi), (cy_lo, cy_hi)) -- camera positions whose whole frame is
+    lit to within `tol`. None on failure; an axis with no acceptable position
+    returns (None, None) for that axis and the caller leaves it alone.
+    """
+    import numpy as np
+
+    import diag_common as DC
+    import field_bg_native as FN
+    import field_bg_repack as RP
+
+    sec9 = parts[SECTION_BACKGROUND]
+    surv = DC.survey(sec9)
+    pages = {p.slot: p for p in surv['pages']}
+    try:
+        import ff7nx_marginart as MA
+        import ff7nx_marginblack as MB
+        cols, _hdr, npg, _cpp = MB.palette_colours(parts[3])
+        prgbs = [MA.palette_rgb(cols[i]) for i in range(npg)]
+    except Exception:                                          # noqa: BLE001
+        return None
+
+    todo, xs, ys = [], [], []
+    for layer, offs in DC.walk_layers(sec9, surv['back_start'],
+                                      surv['tex_start']):
+        for o in offs:
+            w, h = struct.unpack_from('<HH', sec9, o + 18)
+            n = max(w, h) if layer > 1 else TILE
+            if n not in (16, 32):
+                n = TILE
+            x, y = struct.unpack_from('<hh', sec9, o + DC.TILE_DST_X)
+            todo.append((o, x, y, n))
+            xs += [x, x + n]
+            ys += [y, y + n]
+    if not todo:
+        return None
+    S = LIT_STEP
+    x0, y0 = min(xs), min(ys)
+    W = -(-(max(xs) - x0) // S)
+    H = -(-(max(ys) - y0) // S)
+    if W <= 0 or H <= 0 or W * H > 8_000_000:
+        return None
+    grid_lit = np.zeros((H, W), bool)
+    arrays = {}
+    for o, x, y, n in todo:
+        slot = sec9[o + RP.T_TEXID]
+        p = pages.get(slot)
+        if p is None:
+            continue
+        if slot not in arrays:
+            try:
+                import field_bg_pagecap as PC
+                arrays[slot] = PC._page_array(p)
+            except Exception:                                  # noqa: BLE001
+                continue
+        g = 8 if p.size_flag else 16
+        step = (256 if p.depth == 1 else p.px) // g
+        u, v = struct.unpack_from('<II', sec9, o + RP.T_SRC_X_BIG)
+        cx = int(round(u / 1e7 * g))
+        cy = int(round(v / 1e7 * g))
+        blk = arrays[slot][cy * step:(cy + 1) * step,
+                           cx * step:(cx + 1) * step]
+        if blk.shape != (step, step):
+            continue
+        if p.depth == 2:
+            r = ((blk >> 11) & 31) << 3
+            g2 = ((blk >> 5) & 63) << 2
+            b = (blk & 31) << 3
+            live = np.maximum(np.maximum(r, g2), b) > LIT_FLOOR
+        else:
+            pi = sec9[o + RP.T_PALETTE]
+            if pi >= npg:
+                pi = npg - 1
+            live = (prgbs[pi][blk].max(-1) > LIT_FLOOR) & (blk != 0)
+        # to the tile's own destination edge, then to the S-unit grid
+        m = n // S
+        if live.shape[0] >= m and m:
+            f = live.shape[0] // m
+            live = live[:m * f, :m * f].reshape(m, f, m, f).any(axis=(1, 3))
+        else:
+            live = np.ones((max(1, m), max(1, m)), bool)
+        gy, gx = (y - y0) // S, (x - x0) // S
+        if gy < 0 or gx < 0 or gy + live.shape[0] > H \
+                or gx + live.shape[1] > W:
+            continue
+        grid_lit[gy:gy + live.shape[0], gx:gx + live.shape[1]] |= live
+
+    vw, vh = NEEDED // S, (VIEW_HALF_Y * 2) // S
+    if W < vw or H < vh:
+        return None
+    ii = np.pad(grid_lit.cumsum(0).cumsum(1), ((1, 0), (1, 0)))
+
+    def unlit(px, py):
+        s = (ii[py + vh, px + vw] - ii[py, px + vw]
+             - ii[py + vh, px] + ii[py, px])
+        return vw * vh - int(s)
+
+    lim = tol * vw * vh
+    # Each axis is swept with the other held at the position that is most
+    # likely to be legitimate -- the middle of the canvas. Sweeping the full
+    # 2-D product would be the honest thing and is not affordable per build;
+    # the middle is where the art is by construction, since Cosmos centres on
+    # 0 (HANDOFF-188 2.2b).
+    py_mid = max(0, min(H - vh, (H - vh) // 2))
+    px_mid = max(0, min(W - vw, (W - vw) // 2))
+    okx = [px for px in range(W - vw + 1) if unlit(px, py_mid) <= lim]
+    oky = [py for py in range(H - vh + 1) if unlit(px_mid, py) <= lim]
+    cx_lo = (okx[0] * S + x0 + NEEDED // 2) if okx else None
+    cx_hi = (okx[-1] * S + x0 + NEEDED // 2) if okx else None
+    cy_lo = (oky[0] * S + y0 + VIEW_HALF_Y) if oky else None
+    cy_hi = (oky[-1] * S + y0 + VIEW_HALF_Y) if oky else None
+    return (cx_lo, cx_hi), (cy_lo, cy_hi)
+
+
+def narrow(run, lo, hi, half):
+    """
+    `run` intersected with the art run a camera travel of [lo, hi] implies.
+
+    Expressing the coverage limit AS AN ART RUN is what makes this safe: every
+    guard in `fit`/`fit_y` -- art-shorter-than-the-window, the scripted-range
+    refusal, PIN_SLACK, the int16 bounds -- then applies to it unchanged, and a
+    field this cannot measure keeps exactly the behaviour it has today.
+
+    `half` IS PER AXIS AND SO IS THE MINIMUM. The window is 428 units wide and
+    240 tall; testing the vertical run against 428 refused every vertical
+    narrowing there was, silently, and `mtcrl_5` came out unchanged on the axis
+    the defect is on. `2 * half` is the window on whichever axis this is.
+    """
+    if run is None or lo is None or hi is None:
+        return run
+    a0, a1 = run
+    n0, n1 = max(a0, lo - half), min(a1, hi + half)
+    if n1 - n0 < 2 * half:               # never hand `fit` a shorter run than
+        return run                       # it would refuse anyway -- say
+    return (n0, n1)                      # nothing rather than something wrong
+
+
+def fit(rng, art):
+    """
+    A tightened copy of `rng`, or None to leave it exactly as it is.
+
+    None is returned -- and this is the safety property -- whenever the field
+    already fits, when the art is too narrow to fit at any position, or when
+    the result would leave int16.
+    """
+    if art is None:
+        return None
+    a0, a1 = art
+    if a1 - a0 < NEEDED:
+        return None                      # ART SHORT / ABSENT: not ours
+    # A range far larger than the art plus one window is not DESCRIBING this
+    # art -- it belongs to a scripted camera that goes somewhere the tiles in
+    # section 9 do not. `startmap` is the case: range -970..970 (1940 units)
+    # against 512 units of art in a single run. Tightening it to +/-42 would
+    # be acting on a number that was never about the background, so refuse
+    # and let the caller say so out loud.
+    if int(rng['right']) - int(rng['left']) > (a1 - a0) + NEEDED:
+        return None
+    lo, hi = clamp_of(rng)
+    nlo = max(lo, a0 + VIEW_HALF)
+    nhi = min(hi, a1 - VIEW_HALF)
+    if nlo > nhi:                        # the art window sits outside the
+        nlo = nhi = min(max((a0 + a1) // 2, lo), hi)   # reachable range
+    elif nhi - nlo <= PIN_SLACK:
+        # A SLIVER OF TRAVEL IS WORSE THAN NONE.
+        #
+        # When the art is barely wider than the window, what is left after
+        # tightening is a few units of scroll. That is imperceptible AS
+        # MOTION and very perceptible as the picture sliding off its own edge
+        # -- and it puts the field one rounding error from a bar.
+        #
+        # `md8_1` (Sector 8, before Aerith) is the case, reported from
+        # hardware: "during the cutscene the background looks correct, after
+        # it the camera moves and reveals black bars on the side. It should
+        # not trigger scrolling here." Its lit art is 432 units against a 427
+        # window -- five units of slack. Pinning to the art's own midpoint
+        # centres the window in the picture and stops the scroll dead.
+        nlo = nhi = min(max((a0 + a1) // 2, nlo), nhi)
+    if (nlo, nhi) == (lo, hi):
+        return None
+    out = dict(rng)
+    out['left'] = nlo - STOCK_HALF
+    out['right'] = nhi + STOCK_HALF
+    if not (-0x8000 <= out['left'] <= 0x7FFF
+            and -0x8000 <= out['right'] <= 0x7FFF):
+        return None
+    out['width'] = out['right'] - out['left']
+    return out
+
+
+def fit_plan(raw_of, ranges, log=lambda *_: None):
+    """
+    {field: tightened range} for the fields that need one.
+
+    `raw_of(field)` returns the DECOMPRESSED field bytes or None -- the
+    caller owns the decompression, because in a build it has them already.
+    `ranges` is {field: range} AFTER `ff7nx_ws.plan_ranges`, i.e. what is
+    about to be written.
+    """
+    import lgp
+
+    out = {}
+    stats = {'measured': 0, 'no_art': 0, 'short': 0, 'fitted': 0,
+             'worst_before': 0, 'worst_after': 0, 'scripted': [],
+             'fitted_y': 0, 'worst_y_before': 0, 'worst_y_after': 0,
+             'inverted': []}
+    for name in sorted(ranges):
+        raw = raw_of(name)
+        if raw is None:
+            continue
+        try:
+            parts = lgp.split_sections(raw)
+            sec9 = parts[SECTION_BACKGROUND]
+            rng = ranges[name]
+            mid = (int(rng['left']) + int(rng['right'])) // 2
+            art = art_run(sec9, mid, parts)
+        except Exception:                                      # noqa: BLE001
+            stats['no_art'] += 1
+            continue
+        if art is None:
+            stats['no_art'] += 1
+            continue
+        stats['measured'] += 1
+        if art[1] - art[0] < NEEDED:
+            stats['short'] += 1
+            continue
+        # ---- vertical, measured and fitted the same way
+        try:
+            arty = art_run_y(sec9, (int(rng['top']) + int(rng['bottom'])) // 2,
+                             parts)
+        except Exception:                                      # noqa: BLE001
+            arty = None
+        # ---- and both narrowed by what is actually LIT. See lit_travel().
+        #
+        # The layer-1/2 run says where TILES are; this says where the player
+        # sees PICTURE. Where they agree nothing changes, which is every field
+        # whose backdrop is layer 1 -- most of the game. Where they disagree it
+        # is because the backdrop is on a layer `art_run` does not read, and
+        # the disagreement is the black band.
+        if LIT_COVER:
+            try:
+                lt = lit_travel(parts)
+            except Exception:                                  # noqa: BLE001
+                lt = None
+            if lt is not None:
+                (cxl, cxh), (cyl, cyh) = lt
+                _a2 = narrow(art, cxl, cxh, VIEW_HALF)
+                if _a2 != art:
+                    stats['lit_x'] = stats.get('lit_x', 0) + 1
+                    stats.setdefault('lit_fields', []).append(name)
+                art = _a2
+                _y2 = narrow(arty, cyl, cyh, VIEW_HALF_Y)
+                if arty is not None and _y2 != arty:
+                    stats['lit_y'] = stats.get('lit_y', 0) + 1
+                    if name not in stats.get('lit_fields', []):
+                        stats.setdefault('lit_fields', []).append(name)
+                arty = _y2
+        if arty is not None:
+            vbefore = bare_y(*clamp_of_y(rng), arty)
+            inverted = clamp_of_y(rng)[0] > clamp_of_y(rng)[1]
+            # ONLY ACT WHERE THERE IS SOMETHING WRONG.
+            #
+            # Unlike the horizontal fit, a vertical tighten costs real camera
+            # travel in fields that climb, and `fit_y` will happily narrow a
+            # field whose window already sits inside its picture. MEASURED:
+            # acting on every field touched 115 of them; requiring a defect
+            # first confines it to the ones actually showing black plus the
+            # order-dependent ones.
+            newy = fit_y(rng, arty) if (vbefore or inverted) else None
+            if newy is not None:
+                vafter = bare_y(*clamp_of_y(newy), arty)
+                if vafter <= vbefore:
+                    rng = newy
+                    stats['fitted_y'] = stats.get('fitted_y', 0) + 1
+                    stats['worst_y_before'] = max(stats.get('worst_y_before', 0),
+                                                  vbefore)
+                    stats['worst_y_after'] = max(stats.get('worst_y_after', 0),
+                                                 vafter)
+                    if inverted:
+                        stats.setdefault('inverted', []).append(name)
+                    ranges[name] = rng
+                    out[name] = rng
+        before = bare(*clamp_of(rng), art)
+        new = fit(rng, art)
+        if new is None:
+            if before and (int(rng['right']) - int(rng['left'])
+                           > (art[1] - art[0]) + NEEDED):
+                stats['scripted'].append((name, before))
+            continue
+        after = bare(*clamp_of(new), art)
+        if after > before:                       # cannot happen; refuse anyway
+            log('  ! camfit: %s would get worse (%d -> %d), skipped'
+                % (name, before, after))
+            continue
+        out[name] = new
+        stats['fitted'] += 1
+        stats['worst_before'] = max(stats['worst_before'], before)
+        stats['worst_after'] = max(stats['worst_after'], after)
+    return out, stats
+
+
+# --------------------------------------------------------------------- CLI
+def main(argv=None):
+    import lgp
+
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if not argv:
+        sys.exit(__doc__)
+    path, wanted = argv[0], set(argv[1:])
+    import ff7nx_wsdata as W
+
+    archive = lgp.Archive(path)
+    ranges, raws = {}, {}
+    for name in archive.names():
+        entry = archive.index.get(name)
+        if entry is None or not archive.is_field(entry):
+            continue
+        if wanted and name not in wanted:
+            continue
+        try:
+            raw = archive.decompressed(entry)
+            parts = lgp.split_sections(raw)
+            ranges[name] = W.read_section8_range(parts[SECTION_TRIGGERS])
+            raws[name] = raw
+        except Exception:                                      # noqa: BLE001
+            continue
+    plan, stats = fit_plan(raws.get, ranges, log=print)
+    for name in sorted(plan):
+        rng, new = ranges[name], plan[name]
+        _p = lgp.split_sections(raws[name])
+        art = art_run(_p[SECTION_BACKGROUND],
+                      (int(rng['left']) + int(rng['right'])) // 2, _p)
+        print('%-14s art %5d..%-5d  range %5d..%-5d -> %5d..%-5d   '
+              'clamp %4d..%-4d -> %4d..%-4d   bare %3d -> %d'
+              % (name, art[0], art[1],
+                 rng['left'], rng['right'], new['left'], new['right'],
+                 *clamp_of(rng), *clamp_of(new),
+                 bare(*clamp_of(rng), art), bare(*clamp_of(new), art)))
+    if stats['scripted']:
+        print('\nLEFT ALONE -- range far wider than the art, so it is not '
+              'describing it (scripted camera):')
+        for nm, b in stats['scripted']:
+            print('   %-14s %d units bare' % (nm, b))
+    if stats.get('fitted_y'):
+        print('\nvertical: %d field(s) fitted, worst bare band %d -> %d units'
+              % (stats['fitted_y'], stats['worst_y_before'],
+                 stats['worst_y_after']))
+        if stats.get('inverted'):
+            print('   %d had INVERTED bounds (top+120 > bottom-120), where the '
+                  'camera landed on whichever clamp ran last: %s'
+                  % (len(stats['inverted']), ', '.join(stats['inverted'][:8])))
+    print('\nmeasured %(measured)d, tightened %(fitted)d, art too short '
+          '%(short)d, unreadable %(no_art)d; worst bare band %(worst_before)d '
+          '-> %(worst_after)d units' % stats)
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

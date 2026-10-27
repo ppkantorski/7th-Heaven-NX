@@ -1,0 +1,116 @@
+fn 6e1308..6e193b  arm d46b10..d48360  anchors(calls) 9
+6e139c: shl ecx, 5 -> imul ecx, ecx, 0x18
+      UNMAPPED  value 0x5 (2 cands)
+6e139f: add ecx, 0x174 -> add ecx, 0x1ff
+      OK  arm d46d44  add w23, w8, #0x174          -> add w23, w8, #0x1ff          1105d117 1107fd17 (=)
+6e13a6: push 0xb0 -> push 0x28
+      DEF?branch['d46d90->d46ba8']  arm d46ba0  mov w27, #0xb0               -> mov w27, #0x28               5280161b 5280051b (=)
+STRUCT  6e1412: cmp dword ptr [ebp - 0x24], 0 -> jmp 0x6e176f
+STRUCT  6e1416: je 0x6e1431 -> nop 
+6e1487: shl edx, 5 -> imul edx, edx, 0x18
+      OK  arm d47594  mov w8, #4                   -> mov w8, #0x17                321e03e8 528002e8 (-1)
+6e148a: add edx, 0x178 -> add edx, 0x190
+      OK  arm d475f0  add w23, w8, #0x178          -> add w23, w8, #0x190          1105e117 11064117 (=)
+6e1491: push 0x196 -> push 0x98
+      NEEDCAVE(def d47620 shared by 3)  arm d47624  str w24, [x0]  (=, new 0x98)
+6e14bc: shl edx, 5 -> imul edx, edx, 0x18
+      UNMAPPED  value 0x5 (2 cands)
+6e14bf: add edx, 0x178 -> add edx, 0x190
+      UNMAPPED  value 0x178 (0 cands)
+6e14c6: push 0x196 -> push 0x98
+      UNMAPPED  value 0x196 (3 cands)
+6e14dc: push 1 -> push 7
+      UNMAPPED  value 0x1 (7 cands)
+6e14ed: shl eax, 5 -> imul eax, eax, 0x18
+      UNMAPPED  value 0x5 (2 cands)
+6e14f0: add eax, 0x178 -> add eax, 0x190
+      OK  arm d476fc  add w23, w8, #0x178          -> add w23, w8, #0x190          1105e117 11064117 (=)
+6e14f6: push 0x1ce -> push 0xc5
+      OK  arm d4772c  mov w8, #0x1ce               -> mov w8, #0xc5                528039c8 528018a8 (=)
+6e1530: shl edx, 5 -> imul edx, edx, 0x18
+      UNMAPPED  value 0x5 (2 cands)
+6e1533: add edx, 0x178 -> add edx, 0x190
+      OK  arm d47818  add w23, w8, #0x178          -> add w23, w8, #0x190          1105e117 11064117 (=)
+6e153a: push 0x1d6 -> push 0xcd
+      OK  arm d47844  mov w8, #0x1d6               -> mov w8, #0xcd                52803ac8 528019a8 (=)
+6e1547: mov word ptr [ebp - 0x1c], 0x196 -> mov word ptr [ebp - 0x1c], 0x98
+      NEEDCAVE(def d47620 shared by 3)  arm d47870  strh w24, [x0]  (=, new 0x98)
+6e1551: shl eax, 5 -> imul eax, eax, 0x18
+      UNMAPPED  value 0x5 (2 cands)
+6e1554: add eax, 0x188 -> add eax, 0x1a0
+      OK  arm d47888  add w23, w8, #0x188          -> add w23, w8, #0x1a0          11062117 11068117 (=)
+6e155d: mov word ptr [ebp - 0x18], 0x78 -> mov word ptr [ebp - 0x18], 0x5f
+      OK  arm d478ac  mov w8, #0x78                -> mov w8, #0x5f                321d0fe8 52800be8 (=)
+6e1626: shl edx, 5 -> imul edx, edx, 0x18
+      UNMAPPED  value 0x5 (2 cands)
+6e1629: add edx, 0x178 -> add edx, 0x190
+      OK  arm d47a64  add w23, w8, #0x178          -> add w23, w8, #0x190          1105e117 11064117 (=)
+6e1630: push 0x196 -> push 0x99
+      NEEDCAVE(def d47a94 shared by 2)  arm d47a98  str w24, [x0]  (=, new 0x99)
+6e165b: shl edx, 5 -> imul edx, edx, 0x18
+      UNMAPPED  value 0x5 (2 cands)
+6e165e: add edx, 0x178 -> add edx, 0x190
+      UNMAPPED  value 0x178 (0 cands)
+6e1665: push 0x196 -> push 0x99
+      UNMAPPED  value 0x196 (3 cands)
+6e167b: push 1 -> push 7
+      UNMAPPED  value 0x1 (7 cands)
+6e168c: shl eax, 5 -> imul eax, eax, 0x18
+      UNMAPPED  value 0x5 (2 cands)
+6e168f: add eax, 0x178 -> add eax, 0x190
+      OK  arm d47b70  add w23, w8, #0x178          -> add w23, w8, #0x190          1105e117 11064117 (=)
+6e1695: push 0x1ce -> push 0xc6
+      OK  arm d47ba0  mov w8, #0x1ce               -> mov w8, #0xc6                528039c8 528018c8 (=)
+6e16cf: shl edx, 5 -> imul edx, edx, 0x18
+      UNMAPPED  value 0x5 (2 cands)
+6e16d2: add edx, 0x178 -> add edx, 0x190
+      OK  arm d47c8c  add w23, w8, #0x178          -> add w23, w8, #0x190          1105e117 11064117 (=)
+6e16d9: push 0x1d6 -> push 0xcd
+      OK  arm d47cb8  mov w8, #0x1d6               -> mov w8, #0xcd                52803ac8 528019a8 (=)
+6e16e6: mov word ptr [ebp - 0x1c], 0x196 -> mov word ptr [ebp - 0x1c], 0x9a
+      NEEDCAVE(def d47a94 shared by 2)  arm d47ce4  strh w24, [x0]  (=, new 0x9a)
+6e16f0: shl eax, 5 -> imul eax, eax, 0x18
+      UNMAPPED  value 0x5 (2 cands)
+6e16f3: add eax, 0x188 -> add eax, 0x1a0
+      OK  arm d47cfc  add w23, w8, #0x188          -> add w23, w8, #0x1a0          11062117 11068117 (=)
+6e16fc: mov word ptr [ebp - 0x18], 0x78 -> mov word ptr [ebp - 0x18], 0x5f
+      OK  arm d47d20  mov w8, #0x78                -> mov w8, #0x5f                321d0fe8 52800be8 (=)
+6e1790: and edx, 0xf -> and edx, 0x1f
+      UNMAPPED  value 0xf (0 cands)
+6e17fb: mov ecx, 0x1b -> mov ecx, 0x20
+      UNMAPPED  value 0x1b (1 cands)
+6e183e: push 0x3e9a1cac -> push 0x3f19999a
+      UNIQ-fallback value 0x3e9a1cac
+      DEFSHARED13  arm d46b34  mov w21, #0x1cac             -> movz w21, #0x999a            52839595 52933355 (=)
+      DEFSHARED13  arm d46b38  movk w21, #0x3e9a, lsl #16   -> movk w21, #0x3f19, lsl #16   72a7d355 72a7e335 (=)
+6e185e: shl edx, 5 -> imul edx, edx, 0x18
+      UNMAPPED  value 0x5 (2 cands)
+6e1861: add edx, 0x174 -> add edx, 0x18c
+      UNIQ-fallback value 0x174
+      OK  arm d47030  add w23, w8, #0x174          -> add w23, w8, #0x18c          1105d117 11063117 (=)
+6e1868: push 0x16c -> push 4
+      UNIQ-fallback value 0x16c
+      OK  arm d4705c  mov w8, #0x16c               -> mov w8, #0x4                 52802d88 52800088 (=)
+6e1890: push 0x16a -> push 0x1ff
+      NEEDCAVE(def d47fd8 shared by 2)  arm d47fdc  str w19, [x0]  (=, new 0x1ff)
+6e1895: push 0xac -> push 0x28
+      OK  arm d47ff0  mov w8, #0xac                -> mov w8, #0x28                52801588 52800508 (=)
+STRUCT  6e18ac: cmp dword ptr [ebp - 0x28], 0 -> jmp 0x6e190e
+STRUCT  6e18b0: je 0x6e18c0 -> nop 
+6e18d3: push 0x16a -> push 0x17d
+      NEEDCAVE(def d47fd8 shared by 2)  arm d481d4  str w19, [x0]  (=, new 0x17d)
+6e18d8: push 0x19e -> push 0x99
+      DEF?branch['d4835c->d481ec']  arm d481e8  mov w8, #0x19e               -> mov w8, #0x99                528033c8 52801328 (=)
+6e18fa: push 0x16a -> push 0x17d
+      UNIQ-fallback value 0x16a
+      DEFSHARED2  arm d47fd8  mov w19, #0x16a              -> mov w19, #0x17d              52802d53 52802fb3 (=)
+6e18ff: push 0x19e -> push 0x98
+      UNIQ-fallback value 0x19e
+      OK  arm d481e8  mov w8, #0x19e               -> mov w8, #0x98                528033c8 52801308 (=)
+6e1924: push 0x16a -> push 0x1ff
+      UNMAPPED  value 0x16a (0 cands)
+6e1929: push 0x164 -> push 0x8c
+      OK  arm d48358  mov w8, #0x164               -> mov w8, #0x8c                52802c88 52801188 (=)
+UNRESOLVED def d47620 uses ['0xd47624', '0xd47870', '0xd479f4'] patched ['0xd47870', '0xd47624'] navs {152}
+UNRESOLVED def d47a94 uses ['0xd47a98', '0xd47ce4'] patched ['0xd47a98', '0xd47ce4'] navs {153, 154}
+UNRESOLVED def d47fd8 uses ['0xd47fdc', '0xd481d4'] patched ['0xd481d4', '0xd47fdc'] navs {381, 511}

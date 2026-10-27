@@ -1,0 +1,31 @@
+fn 6e0d28..6e1017  arm d45a20..d46b10  anchors(calls) 4
+6e0d3a: push 0x168 -> push 0x178
+      OK  arm d45abc  mov w8, #0x168               -> mov w8, #0x178               52802d08 52802f08 (=)
+6e0d55: push 0x182 -> push 0x192
+      OK  arm d45b40  mov w8, #0x182               -> mov w8, #0x192               52803048 52803248 (=)
+6e0d5a: push 0x90 -> push 0x70
+      NEEDCAVE(def d45b58 shared by 3)  arm d45b5c  str w24, [x0]  (=, new 0x70)
+6e0d73: push 0x194 -> push 0x1aa
+      OK  arm d45bc0  mov w8, #0x194               -> mov w8, #0x1aa               52803288 52803548 (=)
+6e0d78: push 0x90 -> push 0x70
+      NEEDCAVE(def d45b58 shared by 3)  arm d45bd8  str w24, [x0]  (=, new 0x70)
+6e0d91: push 0x1b2 -> push 0x1c2
+      OK  arm d45c3c  mov w8, #0x1b2               -> mov w8, #0x1c2               52803648 52803848 (=)
+6e0d96: push 0x90 -> push 0x70
+      NEEDCAVE(def d45b58 shared by 3)  arm d45c54  str w24, [x0]  (=, new 0x70)
+6e0db2: push 0x186 -> push 0x196
+      OK  arm d45ce4  mov w8, #0x186               -> mov w8, #0x196               528030c8 528032c8 (=)
+6e0db7: push 0x108 -> push 0xd2
+      NEEDCAVE(def d45cfc shared by 3)  arm d45d00  str w25, [x0]  (=, new 0xd2)
+6e0dda: push 0x19e -> push 0x1ae
+      OK  arm d45da4  mov w8, #0x19e               -> mov w8, #0x1ae               528033c8 528035c8 (=)
+6e0ddf: push 0x108 -> push 0xd2
+      NEEDCAVE(def d45cfc shared by 3)  arm d45dbc  str w25, [x0]  (=, new 0xd2)
+6e0dfc: push 0x1b6 -> push 0x1c6
+      OK  arm d45e40  mov w8, #0x1b6               -> mov w8, #0x1c6               528036c8 528038c8 (=)
+6e0e01: push 0x108 -> push 0xd2
+      NEEDCAVE(def d45cfc shared by 3)  arm d45e58  str w25, [x0]  (=, new 0xd2)
+6e0e15: mov dword ptr [ebp - 0x18], 0x162 -> mov dword ptr [ebp - 0x18], 0x172
+      OK  arm d45e94  mov w8, #0x162               -> mov w8, #0x172               52802c48 52802e48 (=)
+GROUP  def d45b58 for x86 6e0d5a,6e0d78,6e0d96: mov w24, #0x90 -> mov w24, #0x70  52801218 52800e18
+GROUP  def d45cfc for x86 6e0db7,6e0ddf,6e0e01: mov w25, #0x108 -> mov w25, #0xd2  52802119 52801a59

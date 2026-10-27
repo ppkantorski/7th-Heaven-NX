@@ -1,0 +1,9 @@
+fn 6f9739..6f9c44  arm ce3e20..ce5c20  anchors(calls) 2
+6f984a: imul eax, eax, 0xc -> imul eax, eax, 0xb
+      OK  arm ce43e8  mov w9, #0xc                 -> mov w9, #0xb                 321e07e9 52800169 (=)
+6f985e: imul edx, edx, 0xe -> imul edx, edx, 0xb
+      OK  arm ce4418  mov w9, #0xe                 -> mov w9, #0xb                 321f0be9 52800169 (=)
+6f9a85: imul ecx, ecx, 0xc -> imul ecx, ecx, 0xb
+      OK  arm ce50d4  mov w9, #0xc                 -> mov w9, #0xb                 321e07e9 52800169 (=)
+6f9a99: imul eax, eax, 0xe -> imul eax, eax, 0xb
+      OK  arm ce5104  mov w9, #0xe                 -> mov w9, #0xb                 321f0be9 52800169 (=)

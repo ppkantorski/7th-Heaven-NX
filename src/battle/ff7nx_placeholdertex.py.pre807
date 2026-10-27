@@ -1,0 +1,234 @@
+#!/usr/bin/env python3
+"""ff7nx_placeholdertex.py -- spell art for magic.lgp entries the Switch
+port ships as a 1x1 placeholder. BUILD 765.
+
+WHAT WAS WRONG (hardware, 10-20: "we can see straight through the inside of
+Hades' cauldron")
+==================================================================
+Hades' cauldron (hadesdat.p45) has a 12-gon lid: group 2, 10 textured
+triangles, UVs on the unit disc, alpha-blended, drawn with hadesdat.t00.
+Of all 1,109 textures in the Switch magic.lgp that one ALONE is a 1x1
+placeholder: one texel, index 0, palette entry 0 = (0,0,0,0) with the
+colour key on. So the lid draws nothing and the inside of the pot shows the
+stage behind it.
+
+SYW Unified Spells ships the art: FF7SYWU\\Base\\magic\\limit\\
+HADESDAT_T00_00.dds, 256x256, the molten disc on clear corners. FFNx finds it
+because it names a non-.tex texture `<base>_<ext>` (hadesdat.t00 ->
+hadesdat_t00). This build only looked up `<stem>.tex`, so the file was
+counted as "no magic.lgp home" (PLAN-194) and dropped.
+
+WHAT THIS DOES
+==============
+* ffnx_alias(stem): `hadesdat_t00` -> `hadesdat.t00` (FFNx's naming for a
+  texture whose extension is not .tex).
+* For a magic.lgp entry whose vanilla TEX is a placeholder (at most 2x2
+  texels) and for which a mod ships palette 00 under either name, a fresh
+  TEX is built from the DDS: 1 palette x 256 colours at the art's own size
+  (capped at 256), clear corners on index 0 with the colour key -- the
+  battle module's hardware-proven paletted form (tex.convert_for_battle).
+  It carries NO logical-scale mark: the lid's UVs are normalised floats, so
+  the bigger texture is simply sampled where the 1x1 was. Nothing else in
+  magic.lgp is touched; the content-matching spell pipeline
+  (ff7nx_spelltex) cannot judge a 1-texel original and keeps doing all the
+  rest.
+
+SEVENTH_NX_PLACEHOLDER_TEX=0 leaves the placeholders stock.
+
+BUILD 783 -- THE LID IS SOLID
+=============================
+Hardware 10-22: "the surface of the inside of the cauldron ... is
+transparent when it shouldnt be". The lid's own render state
+(hadesdat.p45, hundred 1, the 10-triangle group 1) is alpha-blended with
+blend_mode 0 -- PSX AVERAGE, half the lid and half whatever is behind it.
+That is stock (FFNx draws BLEND_AVG at half alpha too); with the 1x1
+placeholder nothing was visible to notice. With the molten art restored, the
+pot's interior shows through it. When the lid art is rebuilt here, its
+hundred gets blend_mode 4 (none, the pot body's own) -- only after checking
+the stock bytes exactly. The art is solid where the 12-gon samples it (302
+of 49,616 texels are the clear index, coloured like the rim).
+SEVENTH_NX_HADES_LID_SOLID=0 keeps the stock average blend.
+
+Licensed under GPLv3
+Copyright (c) 2026 ppkantorski
+"""
+
+import hashlib
+import os
+import re
+import struct
+
+ENV = 'SEVENTH_NX_PLACEHOLDER_TEX'
+MAX_TEXELS = 4                  # a 1x1 or 2x2 entry is a placeholder
+CAP = 256
+VERSION = b'placeholder-tex-1'
+_ALIAS = re.compile(r'^(.+)_([a-z]\d\d)$')
+
+
+def enabled():
+    return os.environ.get(ENV, '1').strip().lower() not in (
+        '0', 'off', 'no', 'false')
+
+
+def ffnx_alias(stem):
+    """FFNx's name for a non-.tex texture: 'hadesdat_t00' -> 'hadesdat.t00'."""
+    m = _ALIAS.match(stem.lower())
+    return '%s.%s' % m.groups() if m else None
+
+
+def is_placeholder(payload):
+    import tex
+    t = tex.parse(payload)
+    return t is not None and t['width'] * t['height'] <= MAX_TEXELS
+
+
+def _truecolor_tex(dds):
+    """A minimal 32-bit TEX around the decoded DDS (BGRA on disk)."""
+    import dds_decode
+    import tex
+    rgba, w, h = dds_decode.decode_dds(dds)
+    hdr = bytearray(tex.HEADER_LEN)
+    struct.pack_into('<I', hdr, tex.O_VERSION, 1)
+    struct.pack_into('<I', hdr, tex.O_WIDTH, w)
+    struct.pack_into('<I', hdr, tex.O_HEIGHT, h)
+    struct.pack_into('<I', hdr, tex.O_BYTES_PER_PIXEL, 4)
+    px = bytearray(rgba)
+    px[0::4], px[2::4] = rgba[2::4], rgba[0::4]
+    return bytes(hdr) + bytes(px)
+
+
+SOLID_ENV = 'SEVENTH_NX_HADES_LID_SOLID'
+# texture entry -> (model entry, hundred index); BUILD 783
+SOLID = {'hadesdat.t00': ('hadesdat.p45', 1)}
+P_HEADER = 128
+HUNDRED = 100
+H_FEATURES, H_OPTIONS, H_BLEND = 0x08, 0x0C, 0x44
+V_ALPHABLEND = 0x400
+BLEND_AVERAGE, BLEND_NONE = 0, 4
+
+
+def solid_enabled():
+    return enabled() and os.environ.get(SOLID_ENV, '1').strip().lower() \
+        not in ('0', 'off', 'no', 'false')
+
+
+def _hundreds_at(p):
+    """(offset of hundred 0, count) in a battle .p model."""
+    h = struct.unpack_from('<16I', p, 0)
+    if h[0] != 1:
+        raise ValueError('not a .p model')
+    nv, nn, nu1, ntc, nvc, ne, npl, nu2, nu3, nh = (
+        h[3], h[4], h[5], h[6], h[7], h[8], h[9], h[10], h[11], h[12])
+    o = (P_HEADER + 12 * nv + 12 * nn + 12 * nu1 + 8 * ntc + 4 * nvc
+         + 4 * npl + 4 * ne + 24 * npl + 24 * nu2 + 3 * nu3)
+    if o + HUNDRED * nh > len(p):
+        raise ValueError('hundreds run past the file')
+    return o, nh
+
+
+def solid_lid(p, hundred):
+    """The model with that hundred's AVERAGE alpha blend made opaque.
+    Raises unless the hundred is exactly the stock alpha-blended average."""
+    o, nh = _hundreds_at(p)
+    if hundred >= nh:
+        raise ValueError('no hundred %d' % hundred)
+    at = o + HUNDRED * hundred
+    feat, opt = struct.unpack_from('<II', p, at + H_FEATURES)
+    blend, = struct.unpack_from('<I', p, at + H_BLEND)
+    if blend == BLEND_NONE:
+        return p
+    if not (feat & opt & V_ALPHABLEND) or blend != BLEND_AVERAGE:
+        raise ValueError('hundred %d is not the alpha-blended average '
+                         '(features %#x, options %#x, blend %d)'
+                         % (hundred, feat, opt, blend))
+    out = bytearray(p)
+    struct.pack_into('<I', out, at + H_BLEND, BLEND_NONE)
+    return bytes(out)
+
+
+def build(vanilla, dds):
+    """(tex bytes, note) or (None, reason)."""
+    import tex
+    if not is_placeholder(vanilla):
+        return None, 'not a placeholder'
+    data, note = tex.convert_for_battle(_truecolor_tex(dds), None, CAP)
+    if data is None:
+        return None, note
+    # keep the entry's own colour-key setting (the lid's clear corners)
+    ck = struct.unpack_from('<I', vanilla, tex.O_COLORKEY)[0]
+    out = bytearray(data)
+    struct.pack_into('<I', out, tex.O_COLORKEY, ck)
+    return bytes(out), note
+
+
+def payloads(archive, spell_dds, cache_dir, log=lambda *_: None):
+    """{toc index: tex bytes} for placeholder entries a mod supplies art for.
+
+    `spell_dds` is the build's [(rel, full)] list of magic DDS."""
+    import ff7nx_spelltex
+    if not enabled():
+        return {}
+    by_name = {}
+    for i, e in enumerate(archive.entries):
+        by_name.setdefault(e['name'].lower(), []).append(i)
+    want = {}
+    for rel, full in sorted(spell_dds, key=lambda rf: rf[0].lower()):
+        parsed = ff7nx_spelltex._parse_dds_name(
+            os.path.basename(rel.replace('\\', '/')).lower())
+        if not parsed or parsed[1] != 0:
+            continue
+        stem = parsed[0]
+        for name in (stem + '.tex', ffnx_alias(stem)):
+            for i in by_name.get(name or '', ()):
+                if is_placeholder(archive.entries[i]['payload']):
+                    want.setdefault(i, full)          # first mod in order
+    out = {}
+    os.makedirs(cache_dir, exist_ok=True)
+    for i, full in sorted(want.items()):
+        name = archive.entries[i]['name']
+        with open(full, 'rb') as f:
+            dds = f.read()
+        van = archive.entries[i]['payload']
+        key = hashlib.sha256(VERSION + van + dds).hexdigest()[:24]
+        hit = os.path.join(cache_dir, '%s.%s.tex' % (name, key))
+        if os.path.isfile(hit):
+            with open(hit, 'rb') as f:
+                out[i] = f.read()
+            log('  placeholder %s: from cache' % name)
+            continue
+        try:
+            data, note = build(van, dds)
+        except Exception as exc:                              # noqa: BLE001
+            data, note = None, '%s: %s' % (type(exc).__name__, exc)
+        if data is None:
+            log('  ! placeholder %s: %s -- stock kept' % (name, note))
+            continue
+        with open(hit + '.tmp', 'wb') as f:
+            f.write(data)
+        os.replace(hit + '.tmp', hit)
+        out[i] = data
+        log('  placeholder %s (1x1 in the Switch archive) <- %s: %s'
+            % (name, os.path.basename(full), note))
+    _solid(archive, by_name, out, log)
+    return out
+
+
+def _solid(archive, by_name, out, log):
+    """BUILD 783: the restored lid is drawn opaque (see the module note)."""
+    if not solid_enabled():
+        return
+    for i in list(out):
+        want = SOLID.get(archive.entries[i]['name'].lower())
+        if not want:
+            continue
+        model, hundred = want
+        for j in by_name.get(model, ()):
+            try:
+                new = solid_lid(archive.entries[j]['payload'], hundred)
+            except Exception as exc:                          # noqa: BLE001
+                log('  ! %s: %s -- lid blend kept' % (model, exc))
+                continue
+            if new != archive.entries[j]['payload']:
+                out[j] = new
+                log('  %s: hundred %d average -> opaque (the lid is solid; '
+                    '%s=0 keeps it)' % (model, hundred, SOLID_ENV))

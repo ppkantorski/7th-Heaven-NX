@@ -1,0 +1,17 @@
+fn 6e4b3c..6e4b9b  arm d4b630..d4b8a0  anchors(calls) 0
+6e4b4b: push 0x16c -> push 0x182
+      OK  arm d4b6c4  mov w8, #0x16c               -> mov w8, #0x182               52802d88 52803048 (=)
+6e4b5f: push 7 -> push 6
+      NEEDCAVE(def d4b68c shared by 3)  arm d4b718  str w22, [x0]  (=, new 0x6)
+6e4b66: push 0x194 -> push 0x1ad
+      NEEDCAVE(def d4b740 shared by 2)  arm d4b744  str w23, [x0]  (=, new 0x1ad)
+6e4b6b: push 0x58 -> push 0x40
+      OK  arm d4b758  mov w8, #0x58                -> mov w8, #0x40                52800b08 52800808 (=)
+6e4b7a: push 7 -> push 6
+      NEEDCAVE(def d4b68c shared by 3)  arm d4b794  str w22, [x0]  (=, new 0x6)
+6e4b81: push 0x194 -> push 0x1ad
+      NEEDCAVE(def d4b740 shared by 2)  arm d4b7c0  str w23, [x0]  (=, new 0x1ad)
+6e4b8b: add eax, 0x98 -> add eax, 0x80
+      OK  arm d4b82c  add w20, w8, #0x98           -> add w20, w8, #0x80           11026114 11020114 (=)
+UNRESOLVED def d4b68c uses ['0xd4b690', '0xd4b718', '0xd4b794'] patched ['0xd4b718', '0xd4b794'] navs {6}
+GROUP  def d4b740 for x86 6e4b66,6e4b81: mov w23, #0x194 -> mov w23, #0x1ad  52803297 528035b7

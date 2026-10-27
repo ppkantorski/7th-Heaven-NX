@@ -1,0 +1,168 @@
+#!/usr/bin/env python3
+"""tests/test_release.py -- what tools/release.py ships, and the paths a
+release build runs with.
+
+Licensed under GPLv3
+Copyright (c) 2026 ppkantorski
+"""
+
+import os as _nx_os, sys as _nx_sys  # BUILD 755: find src/ and put its modules on sys.path
+_nx_root = _nx_os.path.dirname(_nx_os.path.abspath(__file__))
+while not _nx_os.path.isfile(_nx_os.path.join(_nx_root, '7th_heaven_nx.py')) and _nx_root != _nx_os.path.dirname(_nx_root):
+    _nx_root = _nx_os.path.dirname(_nx_root)
+_nx_sys.path.insert(0, _nx_os.path.join(_nx_root, 'src'))
+import nxpaths  # noqa: E402
+nxpaths.install(tools=True)
+import importlib.util
+import os
+import subprocess
+import sys
+
+import pytest
+
+ROOT = nxpaths.ROOT
+
+
+def _release():
+    spec = importlib.util.spec_from_file_location(
+        'nx_release', os.path.join(ROOT, 'tools', 'release.py'))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_source_run_keeps_one_folder():
+    assert not nxpaths.FROZEN
+    assert nxpaths.APP == nxpaths.ROOT
+    assert nxpaths.ENTRY == os.path.join(ROOT, '7th_heaven_nx.py')
+
+
+def test_release_ships_no_local_or_game_files():
+    R = _release()
+    files = R.release_files()
+    assert '7th_heaven_nx.py' in files and 'LICENSE' in files
+    assert 'src/nxpaths.py' in files and 'src/core/build.py' in files
+    assert 'data/default_mod_settings.json' in files
+    for r in files:
+        assert not r.startswith(R.FORBIDDEN), r
+        assert '__pycache__' not in r and not r.endswith('.DS_Store'), r
+    assert not any(r.startswith('shaders/stock/') for r in files)
+    assert not any(r.endswith('_host_test.c') for r in files)
+    assert 'data/build_counters.json' not in files
+    assert 'data/ff7_en_switch' not in files
+    shaders = [r for r in files if r.startswith('shaders/')]
+    import ff7nx_shaders
+    assert shaders == ff7nx_shaders.release_files()
+
+
+def test_release_target_names():
+    R = _release()
+    system, arch = R.target()
+    assert system in ('windows', 'macos', 'linux')
+    assert arch in ('x64', 'arm64') or arch
+
+
+def test_prebuilt_lzs_name_matches_platform():
+    import lgp
+    name = lgp._prebuilt_name()
+    assert name.startswith('lzs_') and len(name.split('.')[0]) == 20
+    assert name.endswith({'win32': '.dll', 'darwin': '.dylib'}
+                         .get(sys.platform, '.so'))
+
+
+def test_frozen_paths_split_app_and_user_folder(tmp_path):
+    """nxpaths under a fake PyInstaller runtime: APP is the bundle, ROOT
+    the folder next to the executable (or SEVENTH_NX_HOME)."""
+    bundle = tmp_path / 'pkg' / '_internal'
+    bundle.mkdir(parents=True)
+    exe = tmp_path / 'pkg' / '7th Heaven NX'
+    code = (
+        'import sys, runpy\n'
+        'sys.frozen = True\n'
+        'sys._MEIPASS = %r\n'
+        'sys.executable = %r\n'
+        'ns = runpy.run_path(%r)\n'
+        'print(ns["APP"]); print(ns["ROOT"]); print(ns["install"]())\n'
+        'print(sys.dont_write_bytecode)\n'
+        % (str(bundle), str(exe), os.path.join(ROOT, 'src', 'nxpaths.py')))
+    env = dict(os.environ)
+    env.pop('SEVENTH_NX_HOME', None)
+    out = subprocess.check_output([sys.executable, '-c', code], env=env,
+                                  text=True).split('\n')
+    assert out[0] == str(bundle)
+    if sys.platform != 'darwin':
+        assert out[1] == str(tmp_path / 'pkg')
+    assert out[2] == '[]'
+    assert out[3] == 'True'
+    env['SEVENTH_NX_HOME'] = str(tmp_path / 'home')
+    out = subprocess.check_output([sys.executable, '-c', code], env=env,
+                                  text=True).split('\n')
+    assert out[1] == str(tmp_path / 'home')
+
+
+
+def test_translocated_app_uses_the_unzipped_folder(tmp_path, monkeypatch):
+    """BUILD 806: Gatekeeper runs a quarantined .app from a read-only copy
+    under AppTranslocation/. ROOT must be the folder the zip unpacked (next
+    to the original .app), not ~/7th Heaven NX."""
+    import nxpaths
+    unzipped = tmp_path / '7th Heaven NX'
+    unzipped.mkdir()
+    orig_app = unzipped / '7th Heaven NX.app'
+    copy = ('/private/var/folders/xy/T/AppTranslocation/ABCD/d/'
+            '7th Heaven NX.app')
+    monkeypatch.setattr(sys, 'platform', 'darwin')
+    monkeypatch.setattr(sys, 'executable',
+                        copy + '/Contents/MacOS/7th Heaven NX')
+    seen = []
+    monkeypatch.setattr(nxpaths, '_original_bundle',
+                        lambda b: seen.append(b) or str(orig_app))
+    assert nxpaths._frozen_root() == str(unzipped)
+    assert seen == [copy]
+    # no original found: the old fallback
+    monkeypatch.setattr(nxpaths, '_original_bundle', lambda b: None)
+    assert nxpaths._frozen_root() == os.path.join(
+        os.path.expanduser('~'), '7th Heaven NX')
+    # not translocated: next to the .app, no lookup at all
+    monkeypatch.setattr(sys, 'executable',
+                        str(orig_app / 'Contents' / 'MacOS' / 'x'))
+    monkeypatch.setattr(nxpaths, '_original_bundle',
+                        lambda b: pytest.fail('looked up'))
+    assert nxpaths._frozen_root() == str(unzipped)
+
+
+def test_no_shipped_module_imports_a_tool(tmp_path, monkeypatch):
+    """BUILD 808: ff7nx_dockres imported tools/probes/nsosyms, which a
+    release does not carry ("No module named 'nsosyms'" in the user's
+    build, docked output left at 720p). The real tree must be clean, and the
+    check must catch a planted case, including a function-level import."""
+    rel = _release()
+    assert rel.unshipped_imports(rel.release_files()) == []
+    (tmp_path / 'src' / 'core').mkdir(parents=True)
+    (tmp_path / 'tools' / 'probes').mkdir(parents=True)
+    (tmp_path / 'src' / 'core' / 'ok.py').write_text('import os\n')
+    (tmp_path / 'src' / 'core' / 'uses.py').write_text(
+        'def f():\n    import probehelper\n    return probehelper\n')
+    (tmp_path / 'tools' / 'probes' / 'probehelper.py').write_text('X = 1\n')
+    monkeypatch.setattr(rel, 'ROOT', str(tmp_path))
+    files = ['src/core/ok.py', 'src/core/uses.py']
+    assert rel.unshipped_imports(files) == [
+        ('probehelper', 'tools/probes/probehelper.py', 'src/core/uses.py')]
+
+
+def test_no_shipped_file_is_looked_up_in_the_user_folder(tmp_path,
+                                                          monkeypatch):
+    """BUILD 808c: spelltex read data/spelltex_overrides.json from
+    nxpaths.ROOT, which in a release is the user's folder, not the bundle."""
+    rel = _release()
+    assert rel.shipped_paths_under_root(rel.release_files()) == []
+    (tmp_path / 'src').mkdir()
+    (tmp_path / 'src' / 'a.py').write_text(
+        "import os, nxpaths\n_HERE = nxpaths.ROOT\n"
+        "BAD = os.path.join(_HERE, 'data', 'x.json')\n"
+        "OK = os.path.join(nxpaths.APP, 'data', 'x.json')\n"
+        "MINE = os.path.join(nxpaths.ROOT, 'data', 'build_counters.json')\n"
+        "CACHE = os.path.join(_HERE, 'cache', 'y')\n")
+    monkeypatch.setattr(rel, 'ROOT', str(tmp_path))
+    hits = rel.shipped_paths_under_root(['src/a.py'])
+    assert [(f, n) for f, n, _t in hits] == [('src/a.py', 3)]

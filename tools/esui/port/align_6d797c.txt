@@ -1,0 +1,9 @@
+fn 6d797c..6d7bbb  arm d3e340..d3eae0  anchors(calls) 13
+STRUCT-BLOCK old 6d7b29: call 0x6e1308  ->  new 6d7b29: nop ; 6d7b2a: nop ; 6d7b2b: nop ; 6d7b2c: nop ; 6d7b2d: nop 
+6d7a60: lea ecx, [edx + eax + 0xe] -> lea ecx, [edx + eax + 6]
+      OK  arm d3e704  add w22, w8, #0xe            -> add w22, w8, #0x6            11003916 11001916 (=)
+6d7ade: lea edx, [eax + ecx + 0xe] -> lea edx, [eax + ecx + 6]
+      UNMAPPED  value 0xe (1 cands)
+6d7b0c: lea ecx, [edx + eax + 0x12] -> lea ecx, [edx + eax + 0x10]
+      UNMAPPED  value 0x12 (3 cands)
+6d7bb2: or cl, byte ptr [ebx] -> or dl, byte ptr [eax]

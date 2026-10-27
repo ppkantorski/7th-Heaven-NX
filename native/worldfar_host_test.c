@@ -5,7 +5,7 @@
  * squeeze; the sink; the matrix calibration; placement, single coverage and
  * no holes; the window fill and the full-detail cache (no file access after
  * load); the horizon and the sky slices; 360-degree movement, camera follow,
- * right-stick yaw; ZL/ZR zoom, tilt, R3.
+ * right-stick yaw; ZL/ZR zoom, tilt, the ZL+ZR reset click.
  *
  *   worldfar_host_test <wm0.far>
  */
@@ -491,6 +491,7 @@ static void test_sky(void)
     int worst_i = 0;
     double worst = 0;
     int cases = 0, bad_u = 0, quads = 0;
+    double worst_perp = 0, max_slope = 0;
     for (int c = 0; c < 6; c++) {
         double yaw = c == 0 ? M_PI : 0.4 + c, pitch = 0.05 + 0.1 * c, dist = 4000 + 7000 * c;
         run(yaw, pitch, dist, 150000, 120000, 0, 0);
@@ -509,25 +510,44 @@ static void test_sky(void)
             if (a[0][7] == 0.0f && a[2][7] > 0.9f && fabsf(a[0][6] - a[1][6]) < 0.2f) {   /* cloud */
                 float du = fabsf(a[1][6] - a[0][6]) * 256.0f;
                 if (fabsf(du - 256.0f / (SKY_GRID / SKY_TILES)) > 0.01f) bad_u++;
+                /* BUILD 775: each edge stands along the horizon's normal, so
+                   its foot is 16 px below the curve PERPENDICULARLY: on a
+                   slope m that is 16 sqrt(1 + m^2) straight down, and the
+                   edge (top minus foot) is square to the tangent (1, m). */
                 for (int k = 2; k < 4; k++) {
                     if (a[k][0] < 0 || a[k][0] > 640) continue;
-                    double want = true_horizon(a[k][0]) + 16.0;
+                    double m = 0.5 * (true_horizon(a[k][0] + 1.0) - true_horizon(a[k][0] - 1.0));
+                    double want = true_horizon(a[k][0]) + 16.0 * sqrt(1.0 + m * m);
                     double e = fabs(a[k][1] - want);
                     if (e > worst) { worst = e; worst_i = c; }
+                    double ex = a[k - 2][0] - a[k][0], ey = a[k - 2][1] - a[k][1];
+                    double cosang = fabs(ex + m * ey) / (sqrt(ex * ex + ey * ey) * sqrt(1.0 + m * m));
+                    if (cosang > worst_perp) worst_perp = cosang;
+                    if (fabs(m) > max_slope) max_slope = fabs(m);
                 }
             } else if (a[0][6] == 0.0f && fabsf(a[1][6] - 0x8F / 256.0f) < 1e-5f) {   /* meteor */
-                float xm = 0.5f * (a[0][0] + a[1][0]);
-                printf("meteor: case %d centre x %.1f (width %.0f), foot %.1f vs horizon %.1f\n",
-                       c, xm, a[1][0] - a[0][0], a[2][1], true_horizon(xm) + 4.0);
+                /* BUILD 775: the meteor stands on the horizon along its
+                   normal: its foot (the bottom edge's middle) is 4 px below
+                   the curve perpendicularly, its sides square to it */
+                float xm = 0.5f * (a[2][0] + a[3][0]), ym = 0.5f * (a[2][1] + a[3][1]);
+                double m = 0.5 * (true_horizon(xm + 1.0) - true_horizon(xm - 1.0));
+                double want = true_horizon(xm) + 4.0 * sqrt(1.0 + m * m);
+                double wdt = sqrt((a[1][0] - a[0][0]) * (a[1][0] - a[0][0]) + (a[1][1] - a[0][1]) * (a[1][1] - a[0][1]));
+                double sx = a[0][0] - a[2][0], sy = a[0][1] - a[2][1];
+                double cosang = fabs(sx + m * sy) / (sqrt(sx * sx + sy * sy) * sqrt(1.0 + m * m));
+                printf("meteor: case %d foot x %.1f (width %.0f), foot %.1f vs %.1f, slope %.3f, side vs tangent cos %.4f\n",
+                       c, xm, wdt, ym, want, m, cosang);
                 if (c == 0 && fabsf(xm - (float)CXP) > 1.0f) errors++;
-                if (fabs(a[2][1] - (true_horizon(xm) + 4.0)) > 1.5) errors++;
+                if (fabs(ym - want) > 1.5 || cosang > 0.02 || fabs(wdt - 0x90 * 2) > 0.5) errors++;
             }
         }
         cases++;
     }
     printf("sky: %d views, %d quads, cloud foot within %.2f px of the true horizon (case %d), %d bad columns\n",
            cases, quads, worst, worst_i, bad_u);
-    if (worst > 1.5 || bad_u) errors++;
+    printf("sky: column edges square to the horizon within cos %.4f (steepest slope %.3f)\n",
+           worst_perp, max_slope);
+    if (worst > 1.5 || bad_u || worst_perp > 0.03) errors++;
     /* the band is fixed to the world: turn a little, the same column keeps its u */
     si(G_METEOR_ON, 0);
     /* the stock quad routine is replaced: it pops its return address only */
@@ -770,8 +790,8 @@ int main(int argc, char **argv)
         BUTTONS(BTN_ZR);
         for (int f = 0; f < 400; f++) { set_camera(0.3, 0.9, 4000, 100000, 100000); worldfar_camera(&st, g2h, callx, got); }
         z = gi(0xDE6A20 + 0x12 + 8);
-        printf("ZR: camera distance %d\n", z);
-        if (z != 4000) errors++;
+        printf("ZR: camera distance %d (BUILD 715: 35%% closer than the game's 4000)\n", z);
+        if (z != 2600) errors++;
         /* BUILD 599: a zoom-out survives a few frames in which the game's
            own distance leaves no room (the frames after leaving fship_*) */
         BUTTONS(BTN_ZL);
@@ -849,17 +869,79 @@ int main(int argc, char **argv)
         double el2 = asin(fabs(gs(G_CAM_ROT + 2 * 7) / 4096.0)) * 57.29578;
         printf("tilt: game %.1f deg, stick up %.1f, stick down %.1f\n", el0, el1, el2);
         if (fabs(el1 - 5.0) > 0.3 || fabs(el2 - 85.0) > 0.3) errors++;
-        /* BUILD 591: holding R3 no longer resets anything by itself; a new
-           R3 press (worldfar_input) resets zoom and tilt once */
-        BUTTONS(BTN_R3); RSTICK(zero, zero, zero, zero);
+        /* BUILD 591: holding the reset buttons resets nothing by itself; a
+           click (worldfar_input) resets zoom and tilt once. BUILD 803: the
+           click is ZL+ZR (it was R3); ZL and ZR held together cancel out. */
+        BUTTONS(BTN_ZL | BTN_ZR); RSTICK(zero, zero, zero, zero);
         set_camera(0.3, 0.9, 7000, 100000, 100000);
-        float t0 = st.tilt;
+        float t0 = st.tilt, z0 = st.zoom;
         worldfar_camera(&st, g2h, callx, got);
-        if (st.tilt != t0) { fprintf(stderr, "held R3 reset the camera\n"); errors++; }
-        st.r3_click = 1; st.zoom = 5000;
-        worldfar_camera(&st, g2h, callx, got);
-        if (st.tilt != 0 || st.zoom != 0 || st.r3_click) { fprintf(stderr, "R3 click did not reset\n"); errors++; }
+        if (st.tilt != t0) { fprintf(stderr, "held ZL+ZR reset the camera\n"); errors++; }
+        if (st.zoom != z0) { fprintf(stderr, "held ZL+ZR zoomed (%g -> %g)\n", z0, st.zoom); errors++; }
         BUTTONS(0);
+        st.reset_click = 1; st.zoom = 5000;
+        worldfar_camera(&st, g2h, callx, got);
+        if (st.tilt != 0 || st.zoom != 0 || st.reset_click) { fprintf(stderr, "reset click did not reset\n"); errors++; }
+
+        /* BUILD 803: what counts as the click. ZL+ZR together and nothing
+           else for the whole hold; it fires once, on the release, and puts
+           L2 (the stock view toggle) in the keys for that update. The stick
+           directions (16..23) do not spoil it; the d-pad, A, L3, R3 do, and
+           R3 alone does nothing. */
+        {
+            const unsigned long long ZZ = BTN_ZL | BTN_ZR, A_ = 1ull << 0,
+                L3_ = 1ull << 4, R3_ = (1ull << 5) | (1ull << 62),
+                UP_ = 1ull << 13, LSTK = (1ull << 16) | (1ull << 19),
+                RSTK = 1ull << 21, SL_ = 1ull << 24;
+            struct { unsigned long long seq[5]; int n, clicks; const char *what; } Z[] = {
+                { { BTN_ZL, ZZ, ZZ, 0 }, 4, 1, "ZL then ZR, let go" },
+                { { ZZ, BTN_ZR, 0 }, 3, 1, "ZL let go first: one click" },
+                { { ZZ, ZZ | A_, ZZ, 0 }, 4, 0, "A during the hold" },
+                { { ZZ | UP_, 0 }, 2, 0, "with the d-pad" },
+                { { ZZ, A_ }, 2, 0, "A on the release" },
+                { { A_, ZZ, 0 }, 3, 1, "A before, let go first" },
+                { { ZZ | L3_, ZZ, 0 }, 3, 0, "with L3" },
+                { { ZZ | R3_, 0 }, 2, 0, "with R3" },
+                { { ZZ | SL_, 0 }, 2, 0, "with SL" },
+                { { ZZ | LSTK, ZZ | RSTK, 0 }, 3, 1, "stick directions do not count" },
+                { { R3_, 0, R3_, 0 }, 4, 0, "R3 alone does nothing now" },
+                { { BTN_ZL, 0, BTN_ZR, 0 }, 4, 0, "ZL and ZR one after the other" },
+                { { ZZ, ZZ, ZZ, ZZ, ZZ }, 5, 0, "held: nothing until let go" },
+            };
+            int zok = 1;
+            si(G_MAP_TYPE, 0);
+            for (unsigned t = 0; t < sizeof Z / sizeof Z[0]; t++) {
+                st.reset_prev = 0; st.reset_click = 0;
+                int clicks = 0;
+                for (int i = 0; i < Z[t].n; i++) {
+                    BUTTONS(Z[t].seq[i]);
+                    si(G_KEYS, 0);
+                    worldfar_input(&st, g2h, callx, got, 0);
+                    u32 k = (u32)gi(G_KEYS);
+                    if (st.reset_click) {
+                        clicks++;
+                        if (!(k & K_L2) || st.keys_added != K_L2) {
+                            fprintf(stderr, "%s: no L2 for the view toggle\n", Z[t].what); zok = 0; }
+                    } else if (k & K_L2) {
+                        fprintf(stderr, "%s: L2 without a click\n", Z[t].what); zok = 0; }
+                    st.reset_click = 0;
+                    si(G_KEYS, (s32)(k & ~st.keys_added)); st.keys_added = 0;
+                }
+                if (clicks != Z[t].clicks) {
+                    fprintf(stderr, "%s: %d clicks, want %d\n", Z[t].what, clicks, Z[t].clicks); zok = 0; }
+            }
+            /* leaving the world map mid-hold: no click on the way back */
+            st.reset_prev = 0; st.reset_click = 0;
+            BUTTONS(ZZ); worldfar_input(&st, g2h, callx, got, 0);
+            si(G_MAP_TYPE, 1); worldfar_input(&st, g2h, callx, got, 0);
+            si(G_MAP_TYPE, 0); BUTTONS(0); si(G_KEYS, 0);
+            worldfar_input(&st, g2h, callx, got, 0);
+            if (st.reset_click) { fprintf(stderr, "reset click across a map change\n"); zok = 0; }
+            st.reset_click = 0; st.reset_prev = 0; st.keys_added = 0; si(G_KEYS, 0);
+            BUTTONS(0);
+            printf("ZL+ZR reset click: %u cases: %s\n", (unsigned)(sizeof Z / sizeof Z[0]), zok ? "yes" : "NO");
+            if (!zok) errors++;
+        }
 
         /* 360-degree movement: the stock UP+RIGHT move (45, -45) with the
            stick up-right becomes 60 along the camera's up-right */
@@ -895,8 +977,6 @@ int main(int argc, char **argv)
             { 0, 0, 0, 1, 0x8000,  968,  968, 0, "stick left = holding left" },
             { 0, 0, 0, .6f, 0x8000, 968, 981, 0, "stick part left turns less" },
             { 1, 0, 0, 0, 0x1000, 1000, 1000, 0, "stick up: no turn" },
-            { 1, 0, 0, 0, 0x1004,  984,  984, 0, "L1 still turns" },
-            { 1, 0, 0, 0, 0x1008, 1016, 1016, 2, "R1 still turns (Cid)" },
             { 0, .70710678f, .70710678f, 0, 0x6000, 984, 1005, 0, "down-right eases, no whip" },
             { 0, 1, 0, 0, 0x4000, 1000, 1000, 0, "stick down: no turn" },
             { 0, 0, 1, 0, 0x2000, 1005, 1005, 0, "an unexplained change is kept" },
@@ -917,6 +997,327 @@ int main(int argc, char **argv)
         }
         test_model = 0;
         printf("turns: %u stick/key cases checked\n", (unsigned)(sizeof T / sizeof T[0]));
+        /* BUILD 694: on foot, L1/R1 never reach the update (no stock spin, the
+           player keeps his facing) and turn the camera at the stock rate;
+           a new L1+R1 press puts it behind him, held it does nothing more */
+        {
+            LSTICK(zero, zero, zero, zero); RSTICK(zero, zero, zero, zero); BUTTONS(0);
+            u16 f500 = 500; memcpy(mem + ent + 0x40, &f500, 2);
+            /* BUILD 697: L1/R1 orbit the camera (st.orbit); the heading the
+               game moves by is never touched */
+            struct { u32 keys; s32 want; int model; const char *what; } L[] = {
+                { 0x0004, 4096 - 24, 0, "L1 orbits the camera left" },
+                { 0x0008, 0, 2, "R1 orbits it right (Cid)" },
+                { 0x0004, 4096 - 24, 19, "L1 on a chocobo" },
+                { 0x000C, 0, 0, "L1+R1 press: orbit back to 0" },
+                { 0x000C, 0, 0, "L1+R1 held: nothing more" },
+                { 0x0008, 0, 0, "L1 let go first: R1 alone does not nudge" },
+                { 0x0008, 0, 0, "... still R1 alone" },
+                { 0x0000, 0, 0, "both let go" },
+                { 0x0008, 24, 0, "R1 after L1+R1" },
+                { 0x0000, 24, 0, "let go: the orbit stays" },
+                { 0x0008, 48, 6, "R1 in the buggy" },
+                { 0x1008, 72, 0, "R1 walking (up held)" },
+            };
+            int ok = 1;
+            for (int view = 0; view <= 2; view += 2) {   /* BUILD 696: both views */
+            si(G_VIEW_TYPE, view);
+            memcpy(mem + ent + 0x40, &f500, 2);
+            st.lr_prev = 0; st.orbit = 0;
+            for (unsigned t = 0; t < sizeof L / sizeof L[0]; t++) {
+                test_model = L[t].model;
+                si(G_KEYS, (s32)L[t].keys);
+                BUTTONS(((L[t].keys & 4) ? BTN_L : 0) | ((L[t].keys & 8) ? BTN_R : 0));
+                si(G_CAM_FRONT, 1000); si(G_CAM_ROTY, 1000);
+                worldfar_input(&st, g2h, callx, got, 0);
+                u32 during = (u32)gi(G_KEYS);
+                worldfar_input(&st, g2h, callx, got, 1);   /* the update turned nothing */
+                u32 after = (u32)gi(G_KEYS);
+                if (during & 0x000C) { fprintf(stderr, "%s: the update saw L1/R1\n", L[t].what); ok = 0; }
+                if (after != L[t].keys) { fprintf(stderr, "%s: keys %x after\n", L[t].what, after); ok = 0; }
+                if (gi(G_CAM_FRONT) != 1000) {
+                    fprintf(stderr, "%s: heading %d, want 1000\n", L[t].what, gi(G_CAM_FRONT)); ok = 0; }
+                if (st.orbit != L[t].want) {
+                    fprintf(stderr, "%s: orbit %d, want %d\n", L[t].what, st.orbit, L[t].want); ok = 0; }
+                if (gs(ent + 0x40) != 500) {
+                    fprintf(stderr, "%s (view %d): the player turned (%d)\n", L[t].what, view, gs(ent + 0x40)); ok = 0; }
+            }
+            }
+            si(G_VIEW_TYPE, 0);
+            /* BUILD 702: the right stick's L1/R1 (the port makes them on the
+               world map) with no L/R button held: stock, the orbit is not
+               touched and the update sees them */
+            for (int view = 0; view <= 2; view += 2) {
+                si(G_VIEW_TYPE, view); BUTTONS(0);
+                u16 o0 = st.orbit;
+                for (u32 kk = 4; kk <= 8; kk += 4) {
+                    si(G_KEYS, (s32)kk); si(G_CAM_FRONT, 1000); si(G_CAM_ROTY, 1000);
+                    worldfar_input(&st, g2h, callx, got, 0);
+                    if (!(gi(G_KEYS) & kk)) { fprintf(stderr, "right stick (view %d): the update lost key %x\n", view, kk); ok = 0; }
+                    worldfar_input(&st, g2h, callx, got, 1);
+                    if (st.orbit != o0) { fprintf(stderr, "right stick (view %d): orbit moved to %d\n", view, st.orbit); ok = 0; }
+                }
+                /* L held and the stick pushed right: L orbits, R1 stays stock */
+                BUTTONS(BTN_L); si(G_KEYS, 0x000C); st.lr_prev = 0;
+                worldfar_input(&st, g2h, callx, got, 0);
+                if ((gi(G_KEYS) & 0xC) != 0x8) { fprintf(stderr, "L + stick: update keys %x\n", gi(G_KEYS)); ok = 0; }
+                worldfar_input(&st, g2h, callx, got, 1);
+                if (st.orbit != (u16)((o0 - 24) & 4095)) { fprintf(stderr, "L + stick: orbit %d\n", st.orbit); ok = 0; }
+                st.orbit = o0; BUTTONS(0);
+            }
+            printf("right stick: L1/R1 it makes stay stock: %s\n", ok ? "yes" : "NO");
+            si(G_VIEW_TYPE, 0);
+
+            /* the Highwind: L1 is the camera's too */
+            si(G_VIEW_TYPE, 3);
+            BUTTONS(BTN_L);
+            si(G_KEYS, 0x0004); si(G_CAM_FRONT, 1000);
+            worldfar_input(&st, g2h, callx, got, 0);
+            if (gi(G_KEYS) & 0x0004) { fprintf(stderr, "Highwind: the update saw L1\n"); ok = 0; }
+            worldfar_input(&st, g2h, callx, got, 1);
+            if (st.orbit != 48 || gi(G_CAM_FRONT) != 1000) { fprintf(stderr, "Highwind: orbit %d heading %d\n", st.orbit, gi(G_CAM_FRONT)); ok = 0; }
+            BUTTONS(0);
+            /* BUILD 722: the Highwind turns by how far the stick points;
+               the bank eases towards the stick's share of +-0x80 */
+            {
+                struct { float u, d, r, l; u32 keys; s32 stock, want, bank; const char *what; } H[] = {
+                    { 0, 0, 1, 0, 0x2000, 1032, 1032, -4, "full right = holding right" },
+                    { 0, 0, 0, 1, 0x8000,  968,  968,  4, "full left = holding left" },
+                    { 0, 0, .6f, 0, 0x2000, 1032, 1016, -2, "part right turns half" },
+                    { 0, 0, .3f, 0, 0x0000, 1000, 1004, 0, "a little right, no key: a little" },
+                    { .70710678f, 0, .70710678f, 0, 0x3000, 1016, 1013, -3, "up-right: about the stock half" },
+                    { 1, 0, 0, 0, 0x1000, 1000, 1000, 0, "up: no turn" },
+                    { .9f, 0, .15f, 0, 0x1000, 1000, 1000, 0, "up, leaning a little: no turn, no bank" },
+                    { 0, 0, 1, 0, 0x2080, 1032, 1032, 99, "Square (drift): stock" },
+                    { 0, 0, 1, 0, 0x2000, 1005, 1005, 99, "an unexplained change is kept" },
+                };
+                si(G_VIEW_TYPE, 3);
+                int hok = 1;
+                for (unsigned t = 0; t < sizeof H / sizeof H[0]; t++) {
+                    LSTICK(H[t].u, H[t].d, H[t].r, H[t].l);
+                    si(G_CAM_FRONT, 1000); si(G_CAM_ROTY, 1000); si(G_HW_BANK, 0);
+                    st.orbit = 0;
+                    worldfar_input(&st, g2h, callx, got, 0);
+                    si(G_KEYS, (s32)H[t].keys);
+                    si(G_CAM_FRONT, H[t].stock);
+                    si(G_HW_BANK, 77);                  /* what the stock eased to */
+                    worldfar_input(&st, g2h, callx, got, 1);
+                    s32 bank = gi(G_HW_BANK);
+                    if (gi(G_CAM_FRONT) != H[t].want
+                        || (H[t].bank != 99 && (bank != H[t].bank
+                                                || gs(G_HW_ROT + 4) != -2 * bank))
+                        || (H[t].bank == 99 && bank != 77)) {
+                        fprintf(stderr, "Highwind %s: heading %d (want %d), bank %d (want %d)\n",
+                                H[t].what, gi(G_CAM_FRONT), H[t].want, bank, H[t].bank);
+                        hok = 0;
+                    }
+                }
+                printf("Highwind analogue turn: %u cases %s\n", (unsigned)(sizeof H / sizeof H[0]), hok ? "ok" : "FAILED");
+                /* BUILD 725: level, it is drawn straight ahead of the camera
+                   (swing + 0x3C + 0x3E == 0x800 - (camera heading - orbit)),
+                   whatever the easings left; banked past 32 the swing is the
+                   game's 4 x bank, and in between the correction fades */
+                {
+                    u32 pe = 0x00250000;
+                    Env env_for_test = { g2h, callx, &st };
+                    si(G_PLAYER_ENT, (s32)pe);
+                    struct { s32 roty, orbit; s16 f3c, f3e; s32 bank; } C[] = {
+                        { 1000, 0, 2048 - 1000 + 45, 0, 0 }, { 1000, 0, 2048 - 1000, 37, 0 },
+                        { 1015, 0, 2048 - 1000, 0, 0 }, { 4200, 200, 2048 - 4050 + 4096, -5, 0 },
+                        { 30, -60, 2000, 3, 0 }, { 1000, 0, 2048 - 1060, 0, 40 },
+                        { 1000, 0, 2048 - 1060, 0, -100 }, { 1000, 0, 2048 - 1064, 0, 16 },
+                    };
+                    int cok = 1;
+                    for (unsigned c = 0; c < sizeof C / sizeof C[0]; c++) {
+                        si(G_CAM_ROTY, C[c].roty); st.orbit_added = C[c].orbit;
+                        memcpy(mem + pe + 0x3C, &C[c].f3c, 2); memcpy(mem + pe + 0x3E, &C[c].f3e, 2);
+                        si(G_HW_BANK, C[c].bank);
+                        s16 sw = 333; memcpy(mem + G_HW_ROT, &sw, 2);
+                        hw_centre(&env_for_test, &st);
+                        s32 off = wrapi(gs(G_HW_ROT) + C[c].f3c + C[c].f3e - (0x800 - (C[c].roty - C[c].orbit)), 4096);
+                        s32 ab = C[c].bank < 0 ? -C[c].bank : C[c].bank;
+                        s32 want_sw = ab >= 32 ? 4 * C[c].bank : -1000000;
+                        int bad = ab == 0 ? off != 0
+                                : ab >= 32 ? gs(G_HW_ROT) != want_sw
+                                : !(abs(off - 4 * C[c].bank) < 64 && abs(off) > 0);
+                        if (bad) { fprintf(stderr, "Highwind centre case %u: swing %d, off centre %d\n", c, gs(G_HW_ROT), off); cok = 0; }
+                    }
+                    si(G_VIEW_TYPE, 0);
+                    s16 sw = 333; memcpy(mem + G_HW_ROT, &sw, 2);
+                    hw_centre(&env_for_test, &st);
+                    if (gs(G_HW_ROT) != 333) { fprintf(stderr, "Highwind centre: touched off the Highwind\n"); cok = 0; }
+                    si(G_VIEW_TYPE, 3); st.orbit_added = 0;
+                    /* BUILD 728: level, a bank within 8 of 0 steps one a frame
+                       to 0 from its value before the update -- past the 60 fps
+                       easing's stall and without the game's jump to 0 at 4 (726
+                       zeroed it at once: a snap); a turn's or a bigger one is
+                       left to the game */
+                    {
+                        struct { u32 keys; s32 old, game, want; } B[] = {
+                            { 0, 6, 6, 5 }, { 0, -7, -7, -6 }, { 0, 8, 8, 7 }, { 0, 4, 0, 3 },
+                            { 0, 1, 0, 0 }, { 0, 12, 11, 11 }, { 0, 0, 0, 0 },
+                            { 0x2000, 6, 6, 6 }, { 0x8000, -5, -5, -5 }, { 0x1000, -6, -6, -5 },
+                        };
+                        LSTICK(zero, zero, zero, zero);
+                        for (unsigned k = 0; k < sizeof B / sizeof B[0]; k++) {
+                            si(G_CAM_FRONT, 1000); si(G_CAM_ROTY, 1000);
+                            si(G_HW_BANK, B[k].old);
+                            worldfar_input(&st, g2h, callx, got, 0);
+                            si(G_KEYS, (s32)B[k].keys);
+                            si(G_HW_BANK, B[k].game);
+                            s16 rl = (s16)(-2 * B[k].game); memcpy(mem + G_HW_ROT + 4, &rl, 2);
+                            worldfar_input(&st, g2h, callx, got, 1);
+                            if (gi(G_HW_BANK) != B[k].want || gs(G_HW_ROT + 4) != -2 * B[k].want) {
+                                fprintf(stderr, "Highwind bank case %u: bank %d roll %d, want %d\n", k, gi(G_HW_BANK), gs(G_HW_ROT + 4), B[k].want); cok = 0; }
+                        }
+                        /* a whole settle after a turn: the stock 60 fps easing
+                           ((15 b + 8) >> 4, 0 at |b| <= 4) and this, frame by frame */
+                        for (int sgn = -1; sgn <= 1; sgn += 2) {
+                            s32 bk = 112 * sgn; int fr = 0, mono = 1, tail = 0;
+                            si(G_KEYS, 0);
+                            while (bk && fr < 200) {
+                                si(G_CAM_FRONT, 1000); si(G_CAM_ROTY, 1000);
+                                si(G_HW_BANK, bk);
+                                worldfar_input(&st, g2h, callx, got, 0);
+                                s32 g = (15 * bk + 8) >> 4;
+                                if (g >= -4 && g <= 4) g = 0;
+                                si(G_HW_BANK, g);
+                                worldfar_input(&st, g2h, callx, got, 1);
+                                s32 nb = gi(G_HW_BANK);
+                                if ((sgn > 0 && (nb > bk || nb < 0)) || (sgn < 0 && (nb < bk || nb > 0))) mono = 0;
+                                if (abs(bk) <= 12 && abs(bk - nb) > tail) tail = abs(bk - nb);
+                                bk = nb; fr++;
+                            }
+                            printf("bank settle from %d: 0 after %d frames, biggest step near 0 %d\n", 112 * sgn, fr, tail);
+                            if (bk || !mono || tail > 1) cok = 0;
+                        }
+                        si(G_KEYS, 0); si(G_HW_BANK, 0);
+                    }
+                    printf("Highwind rests centred: %s\n", cok ? "yes" : "NO");
+                    if (!cok) hok = 0;
+                }
+                if (!hok) ok = 0;
+                LSTICK(zero, zero, zero, zero);
+                si(G_KEYS, 0);
+            }
+            /* BUILD 727: landing (0x74F916 simulated). From above LAND_HIGH
+               the ship comes down over ~2 s on a smooth curve instead of the
+               stock compounding drop; from the stock 4000 nothing changes. */
+            {
+                u32 pe = 0x00270000;
+                si(G_PLAYER_ENT, (s32)pe); si(G_CONTROL, 0); si(G_KEYS, 0);
+                int lok = 1;
+                struct { s32 y0, g, m; } L[] = { { 30767, 500, 1 }, { 30767, 500, 2 },
+                    { 12000, 1500, 1 }, { 4000, 300, 1 }, { 4000, 300, 2 }, { 4400, 0, 1 } };
+                for (unsigned c = 0; c < sizeof L / sizeof L[0]; c++) {
+                    for (int run = 0; run < 2; run++) {     /* 0: stock, 1: with hw_land */
+                        s32 y = L[c].y0, g = L[c].g, m = L[c].m, p = 256, vel = 0;
+                        si(G_MOVE_MULT, m); si(G_HW_LANDING, -1); si(G_HW_PROG, 256);
+                        si(G_HW_PVEL, 0); si(pe + 0x10, y); st.hw_pad2[2] = 0;
+                        int fr = 0, down = -1, maxstep = 0, mono = 1;
+                        static s32 ys[2][400];
+                        while (fr < 400) {
+                            si(pe + 0x20, gi(pe + 0x10));            /* 0x7631DF */
+                            if (run) {
+                                worldfar_input(&st, g2h, callx, got, 0);
+                                worldfar_input(&st, g2h, callx, got, 1);
+                            }
+                            vel = gi(G_HW_PVEL); p = gi(G_HW_PROG);
+                            vel += p < 128 ? m : -m;
+                            si(G_HW_PVEL, vel);
+                            fr++;
+                            if (vel == 0) { si(G_HW_LANDING, 0); break; }
+                            p += vel; if (p < 0) p = 0; if (p > 256) p = 256;
+                            si(G_HW_PROG, p);
+                            s32 ny = g + (s32)(((long long)(gi(pe + 0x20) - g) * p) >> 8);
+                            if (ny > y) mono = 0;
+                            if (y - ny > maxstep) maxstep = y - ny;
+                            y = ny; si(pe + 0x10, y);
+                            ys[run][fr] = y;
+                            if (down < 0 && y == g) down = fr;
+                        }
+                        if (run) {
+                            worldfar_input(&st, g2h, callx, got, 0);
+                            worldfar_input(&st, g2h, callx, got, 1);
+                        }
+                        int high = L[c].y0 > LAND_HIGH;
+                        int same = 1;
+                        if (run && !high)
+                            for (int i = 1; i < fr; i++) if (ys[0][i] != ys[1][i]) same = 0;
+                        int good = fr < 400 && y == g && (!run || !high || p == 0) && mono && st.hw_pad2[2] == 0
+                                   && (!run || high || same)
+                                   && (!run || !high || (maxstep <= 600 * m && down * m > 48));
+                        if (!good) fprintf(stderr, "  y %d g %d p %d mono %d pad %08x same %d\n", y, g, p, mono, st.hw_pad2[2], same);
+                        printf("landing from %d (mult %d) %s: %d frames, down at %d, biggest drop %d a frame%s\n",
+                               L[c].y0, m, run ? "now" : "stock", fr, down, maxstep, good ? "" : "  <-- BAD");
+                        if (!good) lok = 0;
+                    }
+                }
+                printf("Highwind lands smoothly: %s\n", lok ? "yes" : "NO");
+                if (!lok) ok = 0;
+                si(G_MOVE_MULT, 2); si(G_HW_LANDING, 0); si(G_PLAYER_ENT, 0); si(G_CONTROL, 1);
+            }
+            si(G_VIEW_TYPE, 0);
+            /* no control (a script): stock */
+            si(G_CONTROL, 0); si(G_KEYS, 0x0004);
+            worldfar_input(&st, g2h, callx, got, 0);
+            if (!(gi(G_KEYS) & 0x0004)) { fprintf(stderr, "script: L1 taken\n"); ok = 0; }
+            worldfar_input(&st, g2h, callx, got, 1);
+            si(G_CONTROL, 1);
+            /* BUILD 698: the orbit goes into the smoothed heading for the
+               draw (the camera builds its matrix from it) and comes back
+               out before the next update */
+            {
+                st.orbit = 512; st.reset_click = 0; st.lr_prev = 0; st.orbit_added = 0;
+                si(G_KEYS, 0); si(G_CAM_FRONT, 1000); si(G_CAM_ROTY, 1000);
+                worldfar_input(&st, g2h, callx, got, 0);
+                worldfar_input(&st, g2h, callx, got, 1);
+                int roty_draw = gi(G_CAM_ROTY);
+                worldfar_input(&st, g2h, callx, got, 0);
+                int roty_upd = gi(G_CAM_ROTY);
+                worldfar_input(&st, g2h, callx, got, 1);
+                printf("orbit: heading drawn %d, the update sees %d\n", roty_draw, roty_upd);
+                if (roty_draw != 1000 + 512 || roty_upd != 1000 || gi(G_CAM_ROTY) != 1512 || gi(G_CAM_FRONT) != 1000) ok = 0;
+                st.orbit = 3584;                         /* -512 */
+                worldfar_input(&st, g2h, callx, got, 0);
+                worldfar_input(&st, g2h, callx, got, 1);
+                if (gi(G_CAM_ROTY) != 1000 - 512) { fprintf(stderr, "orbit -512: %d\n", gi(G_CAM_ROTY)); ok = 0; }
+                worldfar_input(&st, g2h, callx, got, 0);
+                if (gi(G_CAM_ROTY) != 1000) { fprintf(stderr, "orbit -512 not taken out: %d\n", gi(G_CAM_ROTY)); ok = 0; }
+                worldfar_input(&st, g2h, callx, got, 1);
+                st.orbit = 512;
+                /* moving: the same (dx, dz) with the orbit as without */
+                LSTICK(.70710678f, zero, .70710678f, zero);
+                s32 res[2][2];
+                for (int k = 0; k < 2; k++) {
+                    st.orbit = k ? 512 : 0;
+                    set_camera(k ? 0.7 - M_PI / 4 : 0.7, 0.9, 4000, 100000, 100000);
+                    u8 cx2[0x40] = { 0 }; u32 esp2 = 0x00380000;
+                    si(esp2 + 4, 45); si(esp2 + 8, -45); st32(cx2 + 0x10, esp2);
+                    worldfar_input(&st, g2h, callx, got, 0);
+                    worldfar_move(&st, g2h, callx, cx2, 0);
+                    res[k][0] = gi(esp2 + 4); res[k][1] = gi(esp2 + 8);
+                    worldfar_input(&st, g2h, callx, got, 1);
+                }
+                printf("orbit: move (%d, %d) without, (%d, %d) with\n", res[0][0], res[0][1], res[1][0], res[1][1]);
+                if (abs(res[0][0] - res[1][0]) > 1 || abs(res[0][1] - res[1][1]) > 1) ok = 0;
+                LSTICK(zero, zero, zero, zero);
+                /* the ZL+ZR click takes it back to 0, in the same frame's heading too */
+                st.orbit = 512; st.reset_click = 1; st.orbit_added = 0;
+                si(G_CAM_FRONT, 1000); si(G_CAM_ROTY, 1000);
+                worldfar_input(&st, g2h, callx, got, 0);
+                worldfar_input(&st, g2h, callx, got, 1);
+                if (st.orbit_added) { fprintf(stderr, "reset click: orbit still drawn (%d)\n", st.orbit_added); ok = 0; }
+                worldfar_camera(&st, g2h, callx, got);
+                if (st.orbit) { fprintf(stderr, "reset click kept the orbit\n"); ok = 0; }
+                st.orbit = 0; st.reset_click = 0;
+                worldfar_input(&st, g2h, callx, got, 0);
+                worldfar_input(&st, g2h, callx, got, 1);
+            }
+            test_model = 0; si(G_KEYS, 0);
+            printf("L1/R1: camera orbit only, L1+R1 resets: %s\n", ok ? "yes" : "NO");
+            if (!ok) errors++;
+        }
         /* the buggy moves as stock */
         test_model = 6; LSTICK(zero, zero, one, zero);
         si(esp + 4, 0); si(esp + 8, 45);
@@ -947,6 +1348,27 @@ int main(int argc, char **argv)
         si(G_CAM_FRONT, 1032);
         worldfar_input(&st, g2h, callx, got, 1);
         if (gi(G_CAM_FRONT) != 1032) { fprintf(stderr, "Highwind turn undone\n"); errors++; }
+        /* BUILD 700: after a dive the drawn pitch settles at 0, not -3;
+           a dive still pitches it down */
+        {
+            int p = -10;
+            for (int f = 0; f < 40; f++) {                 /* level: target 0 */
+                p = (3 * p + 0) >> 2; si(0xE045E0, p);
+                worldfar_input(&st, g2h, callx, got, 0);
+                worldfar_input(&st, g2h, callx, got, 1);
+                p = gi(0xE045E0);
+            }
+            int q = 0, lo = 0;
+            for (int f = 0; f < 40; f++) {                 /* diving: target -10 */
+                q = (3 * q - 10) >> 2; si(0xE045E0, q);
+                worldfar_input(&st, g2h, callx, got, 0);
+                worldfar_input(&st, g2h, callx, got, 1);
+                q = gi(0xE045E0); if (q < lo) lo = q;
+            }
+            printf("Highwind pitch: settles at %d after a dive, dives to %d\n", p, lo);
+            if (p != 0 || lo > -5) errors++;
+        }
+
         si(esp + 4, 60); si(esp + 8, 0); LSTICK(one, zero, zero, zero);
         worldfar_move(&st, g2h, callx, ctx, 0);
         if (gi(esp + 4) != 60) { fprintf(stderr, "Highwind move changed\n"); errors++; }
@@ -957,46 +1379,68 @@ int main(int argc, char **argv)
         worldfar_input(&st, g2h, callx, got, 1);
         printf("yaw: right stick turns %d units per step\n", gi(G_CAM_FRONT) - 1000);
         if (gi(G_CAM_FRONT) - 1000 != 22) errors++;
-        /* R3 (bit 62 with no-cheats, bit 5 without): a new press is the
-           stock L2 (view toggle) for exactly one update, and resets the
-           camera (behind him when the view is the normal one) */
+        /* The reset click (BUILD 803: ZL+ZR, was R3) is the stock L2 (view
+           toggle) for exactly one update, and resets the camera (behind him
+           when the view is the normal one). BUILD 736: the click is the
+           RELEASE, and another button (here L3) down at any point of the
+           hold cancels it. The second pass holds the stick directions too,
+           which do not count. */
         RSTICK(zero, zero, zero, zero);
+        static const struct { unsigned long long f[6]; int click_at; const char *what; } R3T[] = {
+            { { 1, 1, 1, 1, 0, 0 }, 4, "ZL+ZR held 4 updates, then up" },
+            { { 1, 0, 0, 0, 0, 0 }, 1, "ZL+ZR tapped" },
+            { { 1, 3, 3, 1, 0, 0 }, -1, "ZL+ZR, L3 joins and leaves, ZL+ZR up" },
+            { { 3, 3, 2, 0, 0, 0 }, -1, "ZL+ZR+L3 together, ZL+ZR up first" },
+            { { 2, 3, 1, 0, 0, 0 }, -1, "L3 first, ZL+ZR join, L3 up first" },
+            { { 3, 0, 1, 0, 0, 0 }, 3, "after the combo, a plain ZL+ZR click works" },
+            { { 2, 2, 0, 0, 0, 0 }, -1, "L3 alone" },
+        };
         for (int b = 0; b < 2; b++) {
+            unsigned long long r3b = BTN_ZL | BTN_ZR | (b ? 0xFF0000ull : 0);
             BUTTONS(0);
             worldfar_input(&st, g2h, callx, got, 0);
             worldfar_input(&st, g2h, callx, got, 1);
-            st.r3_click = 0;
+            st.reset_click = 0;
             u16 f968 = 968; memcpy(mem + ent + 0x40, &f968, 2);
             int ok = 1;
-            for (int f = 0; f < 4; f++) {          /* press, then held 3 updates */
-                BUTTONS(b ? (1ull << 62) : (1ull << 5));
-                si(G_KEYS, 0x0010);
-                si(G_CAM_FRONT, 300);
-                si(G_VIEW_TYPE, 0);
-                worldfar_input(&st, g2h, callx, got, 0);
-                u32 during = (u32)gi(G_KEYS);
-                worldfar_input(&st, g2h, callx, got, 1);
-                u32 after = (u32)gi(G_KEYS);
-                int want_l2 = f == 0;
-                if (((during & 1) != 0) != want_l2 || after != 0x0010) ok = 0;
-                if (f == 0 && (gi(G_CAM_FRONT) != 1080 || !st.r3_click)) ok = 0;
-                if (f > 0 && gi(G_CAM_FRONT) != 300) ok = 0;
-                st.r3_click = 0;
+            for (unsigned t = 0; t < sizeof R3T / sizeof R3T[0]; t++) {
+                int tok = 1;
+                for (int f = 0; f < 6; f++) {
+                    unsigned long long k = R3T[t].f[f];
+                    BUTTONS(((k & 1) ? r3b : 0) | ((k & 2) ? (1ull << 4) : 0));
+                    si(G_KEYS, 0x0010);
+                    si(G_CAM_FRONT, 300);
+                    si(G_VIEW_TYPE, 0);
+                    worldfar_input(&st, g2h, callx, got, 0);
+                    u32 during = (u32)gi(G_KEYS);
+                    worldfar_input(&st, g2h, callx, got, 1);
+                    u32 after = (u32)gi(G_KEYS);
+                    int want = f == R3T[t].click_at;
+                    if (((during & 1) != 0) != want || after != 0x0010) tok = 0;
+                    if (want && (gi(G_CAM_FRONT) != 1080 || !st.reset_click)) tok = 0;
+                    if (!want && (gi(G_CAM_FRONT) != 300 || st.reset_click)) tok = 0;
+                    st.reset_click = 0;
+                }
+                if (!tok) { fprintf(stderr, "reset click%s: %s\n", b ? " (sticks pushed)" : "", R3T[t].what); ok = 0; }
             }
-            printf("R3 (bit %d): one L2 press per click, heading 1080 on the click: %s\n", b ? 62 : 5, ok ? "yes" : "NO");
+            printf("ZL+ZR%s: one L2 press per click on release, heading 1080 on the click, none with L3: %s\n", b ? " (sticks pushed)" : "", ok ? "yes" : "NO");
             if (!ok) errors++;
         }
         /* a click that enters the fixed view leaves its heading alone */
         BUTTONS(0);
         worldfar_input(&st, g2h, callx, got, 0);
         worldfar_input(&st, g2h, callx, got, 1);
-        BUTTONS(1ull << 5);
+        BUTTONS(BTN_ZL | BTN_ZR);
+        worldfar_input(&st, g2h, callx, got, 0);
+        worldfar_input(&st, g2h, callx, got, 1);
+        BUTTONS(0);
         si(G_CAM_FRONT, 300);
         worldfar_input(&st, g2h, callx, got, 0);
+        if (!st.reset_click) { fprintf(stderr, "ZL+ZR release did not click\n"); errors++; }
         si(G_VIEW_TYPE, 2);                         /* the game toggled */
         worldfar_input(&st, g2h, callx, got, 1);
-        if (gi(G_CAM_FRONT) != 300) { fprintf(stderr, "R3 turned the fixed view\n"); errors++; }
-        si(G_VIEW_TYPE, 0); st.r3_click = 0;
+        if (gi(G_CAM_FRONT) != 300) { fprintf(stderr, "the reset click turned the fixed view\n"); errors++; }
+        si(G_VIEW_TYPE, 0); st.reset_click = 0;
         BUTTONS(0); si(G_KEYS, 0);
         si(G_CONTROL, 0);
         si(G_CAM_FRONT, 1000);

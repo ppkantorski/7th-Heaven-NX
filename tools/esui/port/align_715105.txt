@@ -1,0 +1,106 @@
+fn 715105..717691  arm e11130..e19090  anchors(calls) 79
+7151e5: imul ecx, ecx, 0x25 -> imul ecx, ecx, 0x18
+      UNMAPPED  value 0x25 (8 cands)
+7151e8: add ecx, 0x6d -> add ecx, 0x6f
+      UNMAPPED  value 0x6d (3 cands)
+7151ec: push 0x12a -> push 0x14b
+      UNMAPPED  value 0x12a (6 cands)
+71523f: push 0x1a -> push 0x11
+      UNMAPPED  value 0x1a (5 cands)
+71524a: add edx, 0xd -> add edx, 0xf
+      UNMAPPED  value 0xd (15 cands)
+71526a: push 0x1a -> push 0x11
+      UNMAPPED  value 0x1a (5 cands)
+715275: add ecx, 0xd -> add ecx, 0xf
+      UNMAPPED  value 0xd (15 cands)
+71528c: imul edx, edx, 0x25 -> imul edx, edx, 0x18
+      UNMAPPED  value 0x25 (8 cands)
+71528f: add edx, 0x6d -> add edx, 0x6f
+      UNMAPPED  value 0x6d (3 cands)
+715293: push 0x12a -> push 0x14b
+      UNMAPPED  value 0x12a (6 cands)
+715308: push 0x1a -> push 0x11
+      UNMAPPED  value 0x1a (5 cands)
+715312: add eax, 0xd -> add eax, 0xf
+      UNMAPPED  value 0xd (15 cands)
+715389: push 0x1a -> push 0x11
+      UNMAPPED  value 0x1a (5 cands)
+715394: add ecx, 0xd -> add ecx, 0xf
+      UNMAPPED  value 0xd (15 cands)
+7153ab: imul edx, edx, 0x24 -> imul edx, edx, 0x18
+      UNIQ-fallback value 0x24
+      OK  arm e14568  mov w9, #0x24                -> mov w9, #0x18                52800489 52800309 (=)
+7153ae: add edx, 0x81 -> add edx, 0x80
+      UNIQ-fallback value 0x81
+      OK  arm e14570  add w20, w8, #0x81           -> add w20, w8, #0x80           11020514 11020114 (=)
+7153c0: add eax, 5 -> add eax, 8
+      UNMAPPED  value 0x5 (6 cands)
+71543a: push 0x1a -> push 0x11
+      UNMAPPED  value 0x1a (5 cands)
+715445: add edx, 0xd -> add edx, 0xf
+      UNMAPPED  value 0xd (15 cands)
+715468: lea eax, [ecx + edx + 0x11] -> lea eax, [ecx + edx + 0xe]
+      UNMAPPED  value 0x11 (7 cands)
+715477: sub edx, 0x1e -> sub edx, 0x16
+      UNMAPPED  value 0x1e (0 cands)
+7154c2: lea edx, [eax + ecx + 0xd] -> lea edx, [eax + ecx + 0xa]
+      UNMAPPED  value 0xd (15 cands)
+7154d0: add ecx, 0xd -> add ecx, 0x16
+      UNMAPPED  value 0xd (15 cands)
+715503: push 0x1a -> push 0x11
+      UNMAPPED  value 0x1a (5 cands)
+7155d7: add ecx, 0x74 -> add ecx, 0x79
+      UNMAPPED  value 0x74 (5 cands)
+71563e: push 0x11 -> push 0xd
+      UNMAPPED  value 0x11 (7 cands)
+71569d: imul edx, edx, 0x25 -> imul edx, edx, 0x18
+      UNMAPPED  value 0x25 (8 cands)
+7156ce: add eax, 0x71 -> add eax, 0x78
+      UNMAPPED  value 0x71 (2 cands)
+7156d2: push 0x123 -> push 0x12f
+      UNIQ-fallback value 0x123
+      OK  arm e15504  mov w8, #0x123               -> mov w8, #0x12f               52802468 528025e8 (=)
+7156ea: imul ecx, ecx, 0x25 -> imul ecx, ecx, 0x18
+      UNMAPPED  value 0x25 (8 cands)
+7156ed: add ecx, 0x71 -> add ecx, 0x6f
+      UNMAPPED  value 0x71 (2 cands)
+7156f1: push 0x12a -> push 0x12f
+      UNMAPPED  value 0x12a (6 cands)
+71570e: mov word ptr [0xdd17f0], 0xa -> mov word ptr [0xdd17f0], 0xf
+      UNMAPPED  value 0xa (12 cands)
+715733: mov word ptr [0xdd17f6], 0x26a -> mov word ptr [0xdd17f6], 0x26f
+      UNMAPPED  value 0x26a (4 cands)
+715745: mov word ptr [0xdd17fa], 0x11 -> mov word ptr [0xdd17fa], 0xc
+      UNMAPPED  value 0x11 (7 cands)
+71577b: add edx, 0xa -> add edx, 0xf
+      UNMAPPED  value 0xa (12 cands)
+71582a: imul ecx, ecx, 0x25 -> imul ecx, ecx, 0x18
+      UNMAPPED  value 0x25 (8 cands)
+71583c: lea ecx, [ecx + eax + 0x6d] -> lea ecx, [ecx + eax + 0x6b]
+      UNMAPPED  value 0x6d (3 cands)
+7158f4: imul eax, eax, 0x25 -> imul eax, eax, 0x18
+      UNMAPPED  value 0x25 (8 cands)
+715906: lea eax, [eax + edx + 0x69] -> lea eax, [eax + edx + 0x67]
+      UNIQ-fallback value 0x69
+      OK  arm e15db4  add w25, w8, #0x69           -> add w25, w8, #0x67           1101a519 11019d19 (=)
+71590b: push 0x157 -> push 0x357
+      UNIQ-fallback value 0x157
+      OK  arm e15de0  mov w8, #0x157               -> mov w8, #0x357               52802ae8 52806ae8 (=)
+715929: imul edx, edx, 0x25 -> imul edx, edx, 0x18
+      UNMAPPED  value 0x25 (8 cands)
+71593b: lea edx, [edx + ecx + 0x72] -> lea edx, [edx + ecx + 0x70]
+      UNIQ-fallback value 0x72
+      OK  arm e15e9c  add w25, w8, #0x72           -> add w25, w8, #0x70           1101c919 1101c119 (=)
+71595f: imul edx, edx, 0x25 -> imul edx, edx, 0x18
+      UNMAPPED  value 0x25 (8 cands)
+715971: lea edx, [edx + ecx + 0x70] -> lea edx, [edx + ecx + 0x6e]
+      UNIQ-fallback value 0x70
+      OK  arm e15fa8  add w20, w8, #0x70           -> add w20, w8, #0x6e           1101c114 1101b914 (=)
+71598d: mov word ptr [0xdd17f0], 0xa -> mov word ptr [0xdd17f0], 0xe
+      UNMAPPED  value 0xa (12 cands)
+715a6a: imul eax, eax, 0x24 -> imul eax, eax, 0x18
+      UNMAPPED  value 0x24 (0 cands)
+716574: push 0xa -> push 0xe
+      UNMAPPED  value 0xa (12 cands)
+71740f: push 0xa -> push 0xf
+      UNMAPPED  value 0xa (12 cands)

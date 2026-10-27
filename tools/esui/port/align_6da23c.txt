@@ -1,0 +1,4 @@
+fn 6da23c..6da3a8  arm d66ed0..d67280  anchors(calls) 1
+6da2cc: mov dword ptr [edx + 0xdc218c], 3 -> mov dword ptr [edx + 0xdc218c], 4
+      NEEDCAVE(def d67058 shared by 2)  arm d6705c  str w23, [x0]  (=, new 0x4)
+UNRESOLVED def d67058 uses ['0xd6705c', '0xd671f8'] patched ['0xd6705c'] navs {4}

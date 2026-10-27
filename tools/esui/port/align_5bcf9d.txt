@@ -1,0 +1,4 @@
+fn 5bcf9d..5bd050  arm 7cb990..7cbbe0  anchors(calls) 1
+STRUCT-BLOCK old 5bcfd0: mov word ptr [edx + 0xbfc3a4], 0x15  ->  new 5bcfd0: call 0x9144b3; 5bcfd5: nop ; 5bcfd6: nop ; 5bcfd7: nop ; 5bcfd8: nop 
+5bd004: imul eax, eax, 0x53 -> imul eax, eax, 0x31
+      OK  arm 7cbaf8  mov w9, #0x53                -> mov w9, #0x31                52800a69 52800629 (=)

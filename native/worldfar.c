@@ -72,7 +72,16 @@ typedef u32 (*callx_fn)(u32 x86, u32 nargs, ...);
 #define G_WORLD_BASE    0xE2D600u   /* the world map's one allocation */
 #define G_PLAYER_ENT    0xE3A7D0u   /* -> the player entity; x, y, z at +0xC */
 #define HW_VIEW         3u          /* G_VIEW_TYPE on the Highwind */
+#define G_HW_BANK       0xDE6B70u    /* BUILD 722: the Highwind's eased bank */
+#define G_CAM_ROTY      0xDFC474u    /* smoothed heading the camera uses */
+#define G_HW_ROT        0xE39BB8u    /* the Highwind's drawn yaw offset, roll (0x762F75's last two) */
+#define G_HW_LANDING    0xDE6A08u    /* BUILD 727: s32, > 0 taking off, < 0 landing */
+#define G_HW_PROG       0xDE6A40u    /* 0 landed .. 256 in the air */
+#define G_HW_PVEL       0xDFC49Cu    /* its step per frame */
+#define LAND_HIGH       4500        /* landing from above this is spread out */
 #define HW_SPOT         2048        /* same place: |dx|, |dz| within this */
+#define HW_PITCH_CLAMP  4000        /* ff7nx_worldfar.PITCH_CLAMP */
+#define HW_UNIT         (6.28318530717959 / 4096.0)  /* one angle unit, radians */
 #define G_HW_TAKEOFF    0xDF5420u   /* s32: the Highwind's take-off height (4000) */
 #define HW_FORGET       30u         /* world frames off the Highwind that forget */
 #define HW_JUMP         1000        /* saved vs now: a real difference */
@@ -192,6 +201,9 @@ typedef u32 (*callx_fn)(u32 x86, u32 nargs, ...);
 
 #define ZOOM_MAX_DIST   35000.0f    /* FFNx getMaxZoomDist */
 #define ZOOM_STEP       125.0f      /* per logic step (x movement mult) */
+#define ZOOM_IN_FRAC    0.35f       /* BUILD 694: ZR goes this share of the
+                                       game's own distance closer than it
+                                       (BUILD 715: 0.25 -> 0.35, a tad more) */
 #define STICK_DEADZONE  0.2f
 #define TILT_STEP       0.01745f    /* 1 degree per logic step, FFNx */
 #define YAW_STEP        11.4f       /* 1 degree (of 4096) per logic step */
@@ -200,10 +212,15 @@ typedef u32 (*callx_fn)(u32 x86, u32 nargs, ...);
 #define SINK_TRACK_RET  0xF65BC0u   /* 0x75692A's sink call + 4 (module VA) */
 #define SPHERE_R        250000.0f
 #define MOUNTAIN        4000.0f
+#define BTN_L           (1ull << 6)   /* BUILD 702: the L and R buttons */
+#define BTN_R           (1ull << 7)
 #define BTN_ZL          (1ull << 8)
 #define BTN_ZR          (1ull << 9)
-#define BTN_R3          ((1ull << 5) | (1ull << 62))  /* 62: where the
-                                       no-cheats cave moves StickR */
+/* BUILD 803: ZL+ZR on their own is the view toggle + camera reset (it was
+   R3). "On their own": no other button at any point of the hold -- A B X Y,
+   L3 R3, L R, + -, the d-pad, SL/SR (bits 0..15 but ZL/ZR, 24..27). The
+   stick directions (16..23) do not count. */
+#define BTN_RESET_OTHER (0xFCFFull | (0xFull << 24))
 
 typedef struct {
     u32 tris, verts, norms;         /* offsets into data */
@@ -237,6 +254,8 @@ typedef struct {                     /* BUILD 605: one texture's UV mapping */
 } TexP;
 
 #define SKY_QMAX        160         /* cloud columns + meteor per frame */
+#define SKY_NLIM        640.0f      /* BUILD 775: a longer chord is off screen (wild) */
+#define SKY_EDGES       100         /* BUILD 775: column edges a frame (2 SKY_SPAN / dphi + 4 = 93) */
 typedef struct { float xy[8], uv[8]; } SkyQ;
 
 #define BATCH_MAX       512         /* shapes per chunk: the engine's shared
@@ -260,13 +279,15 @@ typedef struct {
     u32 loads;                       /* 0x38 meshes read from wm0.map */
     u32 load_fail;                   /* 0x3C */
     u32 sky_frame;                   /* 0x40 frame the sky was last drawn */
-    u32 keys_added;                  /* 0x44 PSX keys R3 put in this update */
+    u32 keys_added;                  /* 0x44 PSX keys the ZL+ZR click put in this update */
     u32 sky_quads;                   /* 0x48 diagnostics */
     s32 rot_saved;                   /* 0x4C 0xDFC474 before the player update */
     s32 facing;                      /* 0x50 the stick's facing this update */
     u32 facing_ok;                   /* 0x54 */
-    u32 r3_prev;                     /* 0x58 R3 held at the last update */
-    u32 r3_click;                    /* 0x5C a new R3 press, for the camera */
+    u32 reset_prev;                  /* 0x58 bit 0 ZL+ZR held at the last update,
+                                        bit 1 another button was down during
+                                        that hold (BUILD 803; was R3) */
+    u32 reset_click;                 /* 0x5C a ZL+ZR click, for the camera */
     u64 got;                         /* 0x60 the input GOT slot */
     s32 nat[NAT_MAX][3];             /* 0x68 */
     Entry e[N1 + N2];
@@ -282,7 +303,11 @@ typedef struct {
     u32 ecol[N1 + N2][MAX_VERTS_TILE];
     TexP tp[512];                    /* each texture's UV mapping this frame */
     u32 own_streak;                  /* BUILD 606: frames the window's cells were all cached */
-    u32 own_frames, own_pad[2];      /* diagnostics: frames drawn with our window */
+    u32 own_frames;                  /* diagnostics: frames drawn with our window */
+    u8 lr_keys;                      /* BUILD 694: L1/R1 taken out of this update */
+    u8 lr_prev;                      /* BUILD 698: 1 L1+R1 held last update, 2 latched */
+    u16 orbit;                       /* BUILD 697: L1/R1 camera orbit, 4096 a turn */
+    s32 orbit_added;                 /* BUILD 698: what is in 0xDFC474 for the draw */
     u8 lz[LZ_BYTES];
     u32 nstage;                      /* BUILD 592: triangles staged this frame */
     u32 draws;                       /* diagnostics: chunks submitted */
@@ -322,7 +347,9 @@ typedef struct {
     u32 hw_lost;                     /* 603: control was taken away since the last record */
     u32 hw_restores;                 /* diagnostics */
     s32 hw_prev;                     /* 603c: y on the previous Highwind-view frame */
-    u32 hw_pad2[3];                  /* [0]: 606 window caves present (they set it); pad */
+    u32 hw_pad2[3];                  /* [0]: 606 window caves present (they set it);
+                                        [1]: 722 the Highwind's bank before the update
+                                        [2]: 727 landing: start y | move steps << 16 */
 } State;
 
 _Static_assert(__builtin_offsetof(State, got) == 0x60, "State.got");
@@ -469,10 +496,10 @@ static float fsqrt(float x)
     return r;
 #endif
 }
-static float fabs_(float x) { return x < 0 ? -x : x; }
-static double dabs(double x) { return x < 0 ? -x : x; }
+static float fabs_(float x) { return __builtin_fabsf(x); }
+static double dabs(double x) { return __builtin_fabs(x); }   /* BUILD 806: one fabs, not a branch */
 
-static int wrapi(int d, int period)
+__attribute__((optimize("Os"))) static int wrapi(int d, int period)   /* BUILD 806: room */
 {
     int h = period / 2;
     while (d >= h) d -= period;
@@ -612,7 +639,7 @@ void worldfar_bend(State *st, g2h_fn g2h, callx_fn call)
  * flat world's again and worldfar_sink drops the object exactly once.
  * 0x76085F(tri, s16 pos[3] in mesh space, s32 *out) -> eax 1 when it wrote
  * *out. The call has returned, so its arguments are at esp+0, +4, +8. */
-__attribute__((section(".text.worldfar_height")))
+__attribute__((section(".text.worldfar_height"), optimize("Os")))
 void worldfar_height(State *st, g2h_fn g2h, callx_fn call, u8 *ctx)
 {
     Env env = { g2h, call, st };
@@ -637,7 +664,7 @@ void worldfar_height(State *st, g2h_fn g2h, callx_fn call, u8 *ctx)
  * instead, so everything drops exactly as the terrain under it does. Called
  * in the recompiler's convention: args on the guest stack, eax out, the
  * callee pops the return address. */
-__attribute__((section(".text.worldfar_sink")))
+__attribute__((section(".text.worldfar_sink"), optimize("Os")))
 void worldfar_sink(State *st, g2h_fn g2h, callx_fn call, u8 *ctx, u64 ret)
 {
     Env env = { g2h, call, st };
@@ -829,7 +856,7 @@ typedef struct {
     float horizon;                   /* draw radius about the focus */
 } Cam;
 
-static void apply(Env *v, u32 scratch, s16 x, s16 y, s16 z, s32 out[3])
+__attribute__((optimize("Os"))) static void apply(Env *v, u32 scratch, s16 x, s16 y, s16 z, s32 out[3])
 {
     wr16(v, scratch, (u16)x); wr16(v, scratch + 2, (u16)y);
     wr16(v, scratch + 4, (u16)z); wr16(v, scratch + 6, 0);
@@ -839,7 +866,7 @@ static void apply(Env *v, u32 scratch, s16 x, s16 y, s16 z, s32 out[3])
     out[2] = (s32)rd32(v, scratch + 0x18);
 }
 
-static void camera(Env *v, u32 scratch, Cam *c)
+__attribute__((optimize("Os"))) static void camera(Env *v, u32 scratch, Cam *c)
 {
     s32 o[3], a[3];
     v->call(F_RESET_GTE, 0);
@@ -978,7 +1005,7 @@ typedef struct {
     double ex, ez, s;
 } Horizon;
 
-static int hz_point(const Horizon *h, double phi, float *sx, float *sy)
+__attribute__((optimize("Os"))) static int hz_point(const Horizon *h, double phi, float *sx, float *sy)
 {
     double sp, cp;
     dsincos(wrap_pi(phi), &sp, &cp);
@@ -988,10 +1015,36 @@ static int hz_point(const Horizon *h, double phi, float *sx, float *sy)
     return *sx > -1e5f && *sx < 1e5f && *sy > -1e5f && *sy < 1e5f;
 }
 
+/* BUILD 775. The horizon's screen normal at point i, pointing up (screen y
+   grows downward): perpendicular to the chord between its neighbours (or
+   to the one valid edge at an end). Hardware 10-21: the band was extruded
+   straight up the screen from the curved horizon, so towards the sides it
+   leaned against the curve and looked squeezed as the view turned. TL
+   pixels are square (the 0.75 widescreen scale is uniform on the 4:3
+   picture), so a normal here is a normal on screen. Straight up when the
+   chord is degenerate or wild (longer than SKY_NLIM: a point thrown off
+   screen) or steeper than 60 degrees. The caller passes only valid points. */
+__attribute__((noinline, optimize("Os"))) static void sky_normal(const float *x, const float *y, const u8 *ok, int n,
+                                                     int i, float *nx, float *ny)
+{
+    float ux = 0.0f, uy = -1.0f;
+    int a = (i > 0 && ok[i - 1]) ? i - 1 : i;
+    int b = (i + 1 < n && ok[i + 1]) ? i + 1 : i;
+    float tx = x[b] - x[a], ty = y[b] - y[a];
+    float l2 = tx * tx + ty * ty;
+    if (l2 > 1e-6f && l2 < SKY_NLIM * SKY_NLIM) {
+        float il = 1.0f / fsqrt(l2);
+        float vx = ty * il, vy = -tx * il;
+        if (vy > 0.0f) { vx = -vx; vy = -vy; }
+        if (vy < -0.5f) { ux = vx; uy = vy; }   /* steeper than 60 deg: keep up */
+    }
+    *nx = ux; *ny = uy;
+}
+
 /* quad shapes on obj in ONE engine chunk (one draw), corners as 0x754493
    lays them out: left-top, right-top, left-bottom, right-bottom */
 
-static u32 sky_submit(Env *v, State *st, u32 obj, const SkyQ *qs, u32 n, u32 col)
+__attribute__((optimize("Os"))) static u32 sky_submit(Env *v, State *st, u32 obj, const SkyQ *qs, u32 n, u32 col)
 {
     if (!obj || !n) return 0;
     if (n > SKY_QMAX) n = SKY_QMAX;
@@ -1015,7 +1068,7 @@ static u32 sky_submit(Env *v, State *st, u32 obj, const SkyQ *qs, u32 n, u32 col
     return n;
 }
 
-static void sky(Ctx *x, State *st)
+__attribute__((noinline, optimize("Os"))) static void sky(Ctx *x, State *st)
 {
     Env *v = x->v;
     const Cam *c = x->c;
@@ -1054,36 +1107,43 @@ static void sky(Ctx *x, State *st)
         const int per = SKY_GRID / SKY_TILES;
         s32 k0 = (s32)((fwd - SKY_SPAN) / dphi) - 1;
         s32 k1 = (s32)((fwd + SKY_SPAN) / dphi) + 1;
+        if (k1 - k0 >= SKY_EDGES) k1 = k0 + SKY_EDGES - 1;
         SkyQ *qs = st->skyq;
         u32 nq = 0;
-        float xa = 0, ya = 0;
-        int oka = hz_point(&h, (double)k0 * dphi, &xa, &ya);
-        for (s32 k = k0; k < k1; k++) {
-            float xb, yb;
-            int okb = hz_point(&h, (double)(k + 1) * dphi, &xb, &yb);
-            if (oka && okb) {
-                float lo = xa < xb ? xa : xb, hi = xa < xb ? xb : xa;
-                float ylo = ya < yb ? ya : yb, yhi = ya < yb ? yb : ya;
-                if (hi >= vx0 && lo <= vx1 && hi - lo < 0.5f * (vx1 - vx0)
-                    && yhi + below >= vy0 && ylo - above <= vy1) {
-                    s32 j = ((k % per) + per) % per;
-                    float ua = (float)j * (256.0f / (float)per) * su;
-                    float ub = (float)(j + 1) * (256.0f / (float)per) * su;
-                    float xl = xa, yl = ya, ul = ua, xr = xb, yr = yb, ur = ub;
-                    if (xb < xa) {
-                        xl = xb; yl = yb; ul = ub;
-                        xr = xa; yr = ya; ur = ua;
-                    }
-                    SkyQ *q = &qs[nq];
-                    float xy[8] = { xl, yl - above, xr, yr - above,
-                                    xl, yl + below, xr, yr + below };
-                    float uv[8] = { ul, (float)vt * sv, ur, (float)vt * sv,
-                                    ul, (float)vb * sv, ur, (float)vb * sv };
-                    for (int e = 0; e < 8; e++) { q->xy[e] = xy[e]; q->uv[e] = uv[e]; }
-                    if (++nq >= SKY_QMAX) break;
-                }
+        /* BUILD 775: the horizon points of every column edge first, then
+           each edge's screen normal, so the band stands out from the curve
+           (perpendicular to it) instead of straight up the screen. */
+        float hx[SKY_EDGES], hy[SKY_EDGES], nx[2], ny[2];
+        u8 hok[SKY_EDGES];
+        int np = (int)(k1 - k0) + 1;
+        for (int i = 0; i < np; i++)
+            hok[i] = (u8)hz_point(&h, (double)(k0 + i) * dphi, &hx[i], &hy[i]);
+        for (int i = 0; i + 1 < np; i++) {
+            s32 k = k0 + i;
+            if (!(hok[i] && hok[i + 1])) continue;
+            float xa = hx[i], ya = hy[i], xb = hx[i + 1], yb = hy[i + 1];
+            float lo = xa < xb ? xa : xb, hi = xa < xb ? xb : xa;
+            (void)yb;                    /* the viewport has half a screen of margin */
+            if (hi >= vx0 && lo <= vx1 && hi - lo < 0.5f * (vx1 - vx0)
+                && ya + below >= vy0 && ya - above <= vy1) {
+                s32 j = ((k % per) + per) % per;
+                float ua = (float)j * (256.0f / (float)per) * su;
+                float ub = (float)(j + 1) * (256.0f / (float)per) * su;
+                int l = i, r = i + 1;
+                float ul = ua, ur = ub;
+                if (xb < xa) { l = i + 1; r = i; ul = ub; ur = ua; }
+                sky_normal(hx, hy, hok, np, l, &nx[0], &ny[0]);
+                sky_normal(hx, hy, hok, np, r, &nx[1], &ny[1]);
+                SkyQ *q = &qs[nq];
+                float xy[8] = { hx[l] + nx[0] * above, hy[l] + ny[0] * above,
+                                hx[r] + nx[1] * above, hy[r] + ny[1] * above,
+                                hx[l] - nx[0] * below, hy[l] - ny[0] * below,
+                                hx[r] - nx[1] * below, hy[r] - ny[1] * below };
+                float uv[8] = { ul, (float)vt * sv, ur, (float)vt * sv,
+                                ul, (float)vb * sv, ur, (float)vb * sv };
+                for (int e = 0; e < 8; e++) { q->xy[e] = xy[e]; q->uv[e] = uv[e]; }
+                if (++nq >= SKY_QMAX) break;
             }
-            xa = xb; ya = yb; oka = okb;
         }
         st->sky_quads += sky_submit(v, st, obj, qs, nq, col);
     }
@@ -1103,10 +1163,16 @@ static void sky(Ctx *x, State *st)
             if (v1 <= v0) { v0 = 0; v1 = 0x3F; }
             u32 col = rd32(v, G_METEOR_DESC + 0x2C);
             float w = (float)(u1 - u0 + 1) * S, hh = (float)(v1 - v0 + 1) * S;
-            float xl = xm - 0.5f * w, xr = xm + 0.5f * w;
-            float yb = ym + 2.0f * S, yt = yb - hh;
-            if (xr >= vx0 && xl <= vx1 && yb >= vy0 && yt <= vy1) {
-                SkyQ q = { { xl, yt, xr, yt, xl, yb, xr, yb },
+            /* BUILD 775: stood on the horizon along its normal there */
+            float mx2[2] = { xm, 0.0f }, my2[2] = { ym, 0.0f }, mnx, mny;
+            u8 mok[2] = { 1, (u8)hz_point(&h, az + 3.14159265358979 / (double)SKY_GRID, &mx2[1], &my2[1]) };
+            sky_normal(mx2, my2, mok, 2, 0, &mnx, &mny);
+            float hw = 0.5f * w, rx = -mny * hw, ry = mnx * hw;    /* along the horizon */
+            float fxp = xm - mnx * 2.0f * S, fyp = ym - mny * 2.0f * S;
+            float tx = mnx * hh, ty = mny * hh, r = hw + hh;
+            if (xm + r >= vx0 && xm - r <= vx1 && ym + r >= vy0 && ym - r <= vy1) {
+                SkyQ q = { { fxp - rx + tx, fyp - ry + ty, fxp + rx + tx, fyp + ry + ty,
+                             fxp - rx, fyp - ry, fxp + rx, fyp + ry },
                            { (float)u0 * su, (float)v0 * sv, (float)u1 * su, (float)v0 * sv,
                              (float)u0 * su, (float)v1 * sv, (float)u1 * su, (float)v1 * sv } };
                 st->sky_quads += sky_submit(v, st, mobj, &q, 1, col);
@@ -1121,7 +1187,7 @@ static void sky(Ctx *x, State *st)
    [esp] is the return address, [esp+4] the quad record; the callee pops the
    return address. */
 #define F_SKY_QUAD      0x754493u
-__attribute__((section(".text.worldfar_sky")))
+__attribute__((section(".text.worldfar_sky"), optimize("Os")))
 void worldfar_sky(State *st, g2h_fn g2h, callx_fn call, u8 *ctx)
 {
     Env env = { g2h, call, st };
@@ -1779,11 +1845,11 @@ void worldfar_alloc(State *st, g2h_fn g2h, callx_fn call)
     Env env = { g2h, call, st };
     /* BUILD 595: zoom and tilt are kept across a world-map reload, so
        leaving the Highwind's cockpit (fship_*) puts the camera back where it
-       was, as the game does with the ship itself. R3 still resets both. */
+       was, as the game does with the ship itself. ZL+ZR still resets both. */
     st->nnat = 0;
     st->sky_frame = 0;
     st->keys_added = 0;
-    st->r3_click = 0;
+    st->reset_click = 0;
     st->hw_pending = st->hw_ok ? HW_WINDOW : 0;
     st->own_window = 0;              /* BUILD 606: a new world load draws its own first */
     st->own_streak = 0;
@@ -1800,6 +1866,28 @@ void worldfar_alloc(State *st, g2h_fn g2h, callx_fn call)
     }
 }
 
+/* BUILD 725: the Highwind rests pointing straight ahead of the camera.
+   Its drawn yaw (0x7635DB) is the swing 0xE39BB8 (4 x the bank) plus +0x3C,
+   which eases to the facing 0x800 - heading (0x761D61, and only while the
+   entity update runs it), plus +0x3E, eased from the ground probes in
+   0x751EFC; the camera's heading 0xDFC474 eases to the heading too. Any of
+   them could leave it a few degrees off once a turn ended (723/724 caught
+   two). So the whole difference from straight ahead goes into the swing,
+   in full when the bank is level and fading out as it banks, so a turn
+   still swings the way the game draws it. The L1/R1 orbit stays out. */
+__attribute__((noinline, optimize("Os"))) static void hw_centre(Env *v, State *st)
+{
+    if (rd32(v, G_VIEW_TYPE) != HW_VIEW || !rd32(v, G_CONTROL)) return;
+    u32 ent = rd32(v, G_PLAYER_ENT);
+    if (!ent) return;
+    s32 bank = (s32)rd32(v, G_HW_BANK), ab = bank < 0 ? -bank : bank;
+    s32 c = 0;
+    if (ab < 32)
+        c = wrapi(0x800 - ((s32)rd32(v, G_CAM_ROTY) - st->orbit_added)
+                  - rds16(v, ent + 0x3C) - rds16(v, ent + 0x3E), 4096) * (32 - ab) >> 5;
+    wr16(v, G_HW_ROT, (u16)(s16)(4 * bank + c));
+}
+
 __attribute__((section(".text.worldfar_draw")))
 void worldfar_draw(State *st, g2h_fn g2h, callx_fn call, float uvscale)
 {
@@ -1811,6 +1899,7 @@ void worldfar_draw(State *st, g2h_fn g2h, callx_fn call, float uvscale)
     u32 own = st->own_window;
     st->own_window = 0;
     draw(&env, st, uvscale, own);
+    hw_centre(&env, st);
     st->nnat = 0;                    /* the next frame's window starts empty */
     call(F_RESET_GTE, 0);
     /* BUILD 605: for leakprobe's frame timing */
@@ -1845,7 +1934,7 @@ static float stick(float v)
     return 0.0f;
 }
 
-static float mult(Env *v)
+__attribute__((optimize("Os"))) static float mult(Env *v)   /* BUILD 806: room */
 {
     s32 m = (s32)rd32(v, G_MOVE_MULT);
     if (m < 1) m = 1;
@@ -1864,7 +1953,7 @@ static float mult(Env *v)
  * Highwind view at the same x, z puts y back, once. The entity is the one
  * world_copy_player_pos (x86 0x762798) reads: [0xE3A7D0] + 0xC/0x10/0x14,
  * the y that world_add_y_pos_to_current_entity (0x761F22) moves. */
-static void highwind_keep(Env *v, State *st)
+__attribute__((optimize("Os"))) static void highwind_keep(Env *v, State *st)
 {
     u32 ent = rd32(v, G_PLAYER_ENT);
     if (!ent) return;
@@ -1917,16 +2006,23 @@ static void highwind_keep(Env *v, State *st)
     st->hw_ok = 1;
 }
 
+/* to 4.12, rounded half away from zero; out of line (BUILD 806: room) */
+__attribute__((noinline)) static s32 q12(double x)
+{
+    return (s32)(x * 4096.0 + (x >= 0 ? 0.5 : -0.5));
+}
+
 /* ------------------------------------------------------------ camera
  * FFNx's world camera (camera.cpp): pitch -95..-175 degrees, zoom up to
  * 35000 on the triggers, right stick for the view.
- *   ZL / ZR     zoom out / in (ZR in, as FFNx's right trigger)
+ *   ZL / ZR     zoom out / in (ZR in, as FFNx's right trigger); both
+ *               together cancel, so the ZL+ZR click does not zoom
  *   up/down     tilt: up looks toward the horizon, down at the ground
- *   (R3 is the stock L2/R2 view toggle now -- see worldfar_input)
+ *   ZL+ZR       alone: the stock L2/R2 view toggle + reset (worldfar_input)
  * Runs right after the game's camera update 0x74E8CE, which rebuilds the
  * camera rotation (0xDFC448) and position (0xDE6A20, t = (0,0,dist)) every
  * frame from its own state, so these are pure offsets on top of it. */
-__attribute__((section(".text.worldfar_camera")))
+__attribute__((section(".text.worldfar_camera"), optimize("Os")))  /* BUILD 697: fits the far part */
 void worldfar_camera(State *st, g2h_fn g2h, callx_fn call, u8 **got)
 {
     Env env = { g2h, call, st };
@@ -1940,12 +2036,13 @@ void worldfar_camera(State *st, g2h_fn g2h, callx_fn call, u8 **got)
     unsigned long long buttons = *(unsigned long long *)(p + 0x20);
     float mm = mult(v);
     float zoom = st->zoom, tilt = st->tilt;
-    if (!(zoom >= 0.0f && zoom < 100000.0f)) zoom = 0.0f;
+    if (!(zoom > -100000.0f && zoom < 100000.0f)) zoom = 0.0f;
     if (!(tilt > -3.2f && tilt < 3.2f)) tilt = 0.0f;
-    if (st->r3_click) {                  /* R3 (worldfar_input): reset both */
+    if (st->reset_click) {               /* ZL+ZR (worldfar_input): reset both */
         zoom = 0.0f;
         tilt = 0.0f;
-        st->r3_click = 0;
+        st->reset_click = 0;
+        st->orbit = 0;
     }
     /* BUILD 599: `zoom` is the distance the player ASKED for and is what
        st->zoom keeps; what is applied is min(zoom, room) this frame. The
@@ -1955,13 +2052,16 @@ void worldfar_camera(State *st, g2h_fn g2h, callx_fn call, u8 **got)
     s32 base = (s32)rd32(v, G_CAM_TRANS_Z);
     float room = ZOOM_MAX_DIST - (float)base;
     if (room < 0.0f) room = 0.0f;
+    /* BUILD 694: ZR goes a little closer than the game's own distance */
+    float near = base > 0 ? -ZOOM_IN_FRAC * (float)base : 0.0f;
     float applied = zoom < room ? zoom : room;
+    if (applied < near) applied = near;
     if (buttons & (BTN_ZL | BTN_ZR)) {
         zoom = applied;
         if (buttons & BTN_ZL) zoom += ZOOM_STEP * mm;
         if (buttons & BTN_ZR) zoom -= ZOOM_STEP * mm;
         if (zoom > room) zoom = room;
-        if (zoom < 0.0f) zoom = 0.0f;
+        if (zoom < near) zoom = near;
         applied = zoom;
     }
     if (zoom > ZOOM_MAX_DIST) zoom = ZOOM_MAX_DIST;
@@ -1974,10 +2074,13 @@ void worldfar_camera(State *st, g2h_fn g2h, callx_fn call, u8 **got)
 
 zoom_only:;
     /* zoom: add to the distance the game just wrote */
-    if (applied > 0.0f)
+    if (applied != 0.0f)
         wr32(v, G_CAM_TRANS_Z, (u32)(base + (s32)applied));
     st->zoom = zoom;
-    if (tilt == 0.0f)
+    /* BUILD 806: the Highwind's pitch fraction, see below */
+    s32 hgt = (s32)rd32(v, G_CAM_DELTA_Y);
+    s32 frac = (rd32(v, G_VIEW_TYPE) == HW_VIEW && hgt < HW_PITCH_CLAMP) ? (hgt & 31) : 0;
+    if (tilt == 0.0f && !frac)
         return;
 
     /* tilt: R' = Rx(delta) * R on the 3x3 the game just wrote. Row 2 is
@@ -1996,13 +2099,26 @@ zoom_only:;
         if (c < 1e-6) break;
         mag0 -= (s - fy) / c;
     }
-    double wantd = mag0 + (double)tilt;
+    /* BUILD 806: the Highwind's camera pitch is (height >> 5) + 0x6D6
+       angle units (0x74F916, height clamped at HW_PITCH_CLAMP), so a climb
+       or dive steps it 1/4096 turn every 32 of height: the horizon, clouds
+       and meteor jumped back against the smooth climb every few frames.
+       The fraction the shift drops is added back -- only when the matrix
+       holds exactly that formula's pitch, u - 1024 units below the
+       horizontal (2048 is straight down: the flip 588 clamps), else
+       nothing. Higher looks further down, so the fraction adds. */
+    double corr = 0.0;
+    if (frac && dabs(mag0 - (double)((hgt >> 5) + 0x6D6 - 1024) * HW_UNIT) < 0.4 * HW_UNIT)
+        corr = (double)frac * (HW_UNIT / 32.0);
+    if (tilt == 0.0f && corr == 0.0)
+        return;                                /* the game's camera, untouched */
+    double wantd = mag0 + (double)tilt + corr;
     if (wantd < TILT_MIN) wantd = TILT_MIN;
     if (wantd > TILT_MAX) wantd = TILT_MAX;
-    tilt = (float)(wantd - mag0);
+    tilt = (float)(wantd - mag0 - corr);
     st->zoom = zoom;
     st->tilt = tilt;
-    if (tilt == 0.0f)
+    if (wantd == mag0)
         return;
     double sw, cw;
     dsincos(wantd, &sw, &cw);
@@ -2023,10 +2139,8 @@ zoom_only:;
         }
     }
     for (int j = 0; j < 3; j++) {
-        s32 a1 = (s32)(b1[j] * 4096.0 + (b1[j] >= 0 ? 0.5 : -0.5));
-        s32 a2 = (s32)(b2[j] * 4096.0 + (b2[j] >= 0 ? 0.5 : -0.5));
-        wr16(v, G_CAM_ROT + 2 * (3 + j), (u16)(s16)a1);
-        wr16(v, G_CAM_ROT + 2 * (6 + j), (u16)(s16)a2);
+        wr16(v, G_CAM_ROT + 2 * (3 + j), (u16)(s16)q12(b1[j]));
+        wr16(v, G_CAM_ROT + 2 * (6 + j), (u16)(s16)q12(b2[j]));
     }
 }
 
@@ -2055,6 +2169,7 @@ zoom_only:;
  * the submarine keep their stock controls; only the right stick is added
  * there. Out of player control nothing moves. */
 #define SPIN_STEP       8.0f         /* the stock turn: 8 x mult x (2 - up/down) */
+#define ORBIT_STEP      12           /* BUILD 803: L/R orbit, 3/4 of 2 x SPIN_STEP */
 #define G_KEYS          0x9A85D4u    /* held PSX keys */
 #define F_PLAYER_MODEL  0x761735u    /* () -> the player's world model id */
 #define K_L2 0x0001u
@@ -2065,10 +2180,10 @@ zoom_only:;
 #define K_DOWN 0x4000u
 #define K_LEFT 0x8000u
 #define MOVE_MIN        0.35f
-#define G_CAM_ROTY      0xDFC474u    /* smoothed heading the camera uses */
+#define G_HW_PITCH      0xE045E0u    /* the Highwind's drawn climb/dive pitch */
 #define G_ENTITY        0xE39AD8u    /* -> the current entity (the player here) */
 
-static float fatan2(float y, float x)
+__attribute__((optimize("Os"))) static float fatan2(float y, float x)
 {
     float ax = fabs_(x), ay = fabs_(y);
     if (ax < 1e-20f && ay < 1e-20f) return 0.0f;
@@ -2081,7 +2196,50 @@ static float fatan2(float y, float x)
     return r;
 }
 
-static int on_foot(Env *v)
+__attribute__((noinline)) static s32 rnd(float f)
+{
+    return (s32)(f + (f < 0.0f ? -0.5f : 0.5f));
+}
+
+/* BUILD 727. Landing (0x74F916, in the camera update): the progress p
+ * goes 256 -> 0 with a step that grows by the move multiplier a frame and
+ * shrinks again past 128 (about 32 frames at 60 fps), and every frame sets
+ *     y = ground + (y at the frame's start - ground) * p / 256
+ * -- the drop compounds, so the ship is down in ~16 frames whatever the
+ * height. From the stock 4000 that is quick; from the 30767 ceiling it is
+ * 3000 units a frame, the camera (easing 1/8 a frame, 0x74DF52) is left far
+ * above and dives after it. From above LAND_HIGH: y lerps from where the
+ * landing began (the y the game reads, +0x20, is held there), and p follows
+ * an ease in / ease out over 32 + (y0 - 4000) / 256 move steps (about two
+ * seconds from the ceiling) by setting the step the game adds next; at 0 the
+ * step is set so the game's own end (step 0) runs. The first frame is the
+ * game's: it takes the heading to turn to there. */
+__attribute__((noinline, optimize("Os"))) static void hw_land(Env *v, State *st)
+{
+    u32 ent = rd32(v, G_PLAYER_ENT);
+    u32 s = st->hw_pad2[2];
+    if (!ent || (s32)rd32(v, G_HW_LANDING) >= 0) {
+        s = 0;
+    } else if (!s) {
+        s = rd32(v, ent + 0x10) & 0xFFFF;
+    } else if ((s & 0xFFFF) > LAND_HIGH) {
+        s32 y0 = (s32)(s & 0xFFFF), m = (s32)rd32(v, G_MOVE_MULT);
+        s += (u32)m << 16;
+        wr32(v, ent + 0x20, (u32)y0);
+        s32 n = 32 + ((y0 - 4000) >> 8), t = (s32)(s >> 16);
+        if (t > n) t = n;
+        int in = 2 * t < n;
+        s32 k = in ? t : n - t;
+        s32 tgt = 512 * k * k / (n * n);
+        if (in) tgt = 256 - tgt;
+        s32 p = (s32)rd32(v, G_HW_PROG);
+        if (tgt >= p) tgt = p > 0 ? p - 1 : 0;
+        wr32(v, G_HW_PVEL, (u32)(tgt - p - (p < 128 ? m : -m)));
+    }
+    st->hw_pad2[2] = s;
+}
+
+__attribute__((noinline, optimize("Os"))) static int on_foot(Env *v)
 {
     u32 vt = rd32(v, G_VIEW_TYPE);
     if (rd32(v, G_MAP_TYPE) != 0 || vt == 2 || vt == 3
@@ -2095,12 +2253,13 @@ static int on_foot(Env *v)
 
 /* The heading change 0x74EA48 makes from the keys (0x74EE.. two branches):
    L1 and the left key turn it down, R1 and the right key up, each by
-   8 x mult x (2 - up/down held); with down held the arrow keys swap.
-   *total is the whole change, *arrows the arrow keys' share of it. */
-static void stock_spin(u32 keys, s32 m, s32 *total, s32 *arrows)
+   8 x mult x (2 - up/down held); with down held the arrow keys swap
+   (not on the Highwind: hw). *total is the whole change, *arrows the
+   arrow keys' share of it. */
+__attribute__((noinline)) static void stock_spin(u32 keys, s32 m, s32 *total, s32 *arrows, int hw)
 {
     s32 unit = 8 * m * ((keys & (K_UP | K_DOWN)) ? 1 : 2);
-    int down = (keys & K_DOWN) != 0;
+    int down = !hw && (keys & K_DOWN) != 0;
     s32 a = (keys & (down ? K_RIGHT : K_LEFT)) ? 1 : 0;
     s32 b = (keys & (down ? K_LEFT : K_RIGHT)) ? 1 : 0;
     s32 l1 = (keys & K_L1) ? 1 : 0, r1 = (keys & K_R1) ? 1 : 0;
@@ -2109,7 +2268,7 @@ static void stock_spin(u32 keys, s32 m, s32 *total, s32 *arrows)
 }
 
 /* the left stick, in the world: unit (wx, wz) and its magnitude */
-static float stick_world(Env *v, u8 **got, float *wx, float *wz, float *side)
+__attribute__((noinline, optimize("Os"))) static float stick_world(Env *v, u8 **got, float *wx, float *wz, float *side)
 {
     u8 *p = input_obj(got);
     if (!p) return 0.0f;
@@ -2123,6 +2282,15 @@ static float stick_world(Env *v, u8 **got, float *wx, float *wz, float *side)
     float r2 = (float)rds16(v, G_CAM_ROT + 4) / 4096.0f;
     float f0 = (float)rds16(v, G_CAM_ROT + 12) / 4096.0f;
     float f2 = (float)rds16(v, G_CAM_ROT + 16) / 4096.0f;
+    /* BUILD 697: the matrix carries the L1/R1 orbit; the stick goes by
+       the heading, so take it back out (R = R' Ry(-orbit)) */
+    if (v->st->orbit) {
+        double so, co;
+        dsincos((double)v->st->orbit * (6.283185307179586 / 4096.0), &so, &co);
+        float s_ = (float)so, c_ = (float)co, t;
+        t = r0 * c_ + r2 * s_; r2 = r2 * c_ - r0 * s_; r0 = t;
+        t = f0 * c_ + f2 * s_; f2 = f2 * c_ - f0 * s_; f0 = t;
+    }
     float rl = fsqrt(r0 * r0 + r2 * r2), fl = fsqrt(f0 * f0 + f2 * f2);
     if (rl < 1e-3f || fl < 1e-3f) return 0.0f;
     r0 /= rl; r2 /= rl; f0 /= fl; f2 /= fl;
@@ -2135,7 +2303,7 @@ static float stick_world(Env *v, u8 **got, float *wx, float *wz, float *side)
     return mag;
 }
 
-__attribute__((section(".text.worldfar_move")))
+__attribute__((section(".text.worldfar_move"), optimize("Os")))  /* BUILD 725: fits the far part */
 void worldfar_move(State *st, g2h_fn g2h, callx_fn call, u8 *ctx, u32 phase)
 {
     Env env = { g2h, call, st };
@@ -2159,34 +2327,56 @@ void worldfar_move(State *st, g2h_fn g2h, callx_fn call, u8 *ctx, u32 phase)
     st->facing_ok = 1;
 }
 
-__attribute__((section(".text.worldfar_input")))
+__attribute__((section(".text.worldfar_input"), optimize("Os")))  /* BUILD 694: fits the far part */
 void worldfar_input(State *st, g2h_fn g2h, callx_fn call, u8 **got, u32 phase)
 {
     Env env = { g2h, call, st };
     Env *v = &env;
     st->got = (u64)(unsigned long)got;
+    /* BUILD 698: the orbit was added to the smoothed heading for the
+       draw only (end of this function); the update gets its own back */
+    if (phase == 0 && st->orbit_added) {
+        wr32(v, G_CAM_ROTY, rd32(v, G_CAM_ROTY) - (u32)st->orbit_added);
+        st->orbit_added = 0;
+    }
     if (phase != 0 && st->keys_added) {
         wr32(v, G_KEYS, rd32(v, G_KEYS) & ~st->keys_added);
         st->keys_added = 0;
     }
+    /* BUILD 694: L1/R1 were kept out of the update (see below): back in */
+    u32 lr = st->lr_keys;
+    if (phase != 0 && lr) {
+        wr32(v, G_KEYS, rd32(v, G_KEYS) | lr);
+        st->lr_keys = 0;
+    }
     if (rd32(v, G_MAP_TYPE) != 0) {
         st->saved_ok = 0;
+        st->reset_prev = 0;              /* BUILD 736: no click on re-entry */
         return;
     }
     if (phase == 0) {
-        /* BUILD 591: R3 is what ZL/ZR were in the stock game -- the PSX
-           L2/R2 view toggle (0x74EB89: a NEW press of L2 or R2 switches the
-           normal and the fixed-direction view, the next press switches
-           back). ZL/ZR zoom now, so a NEW R3 press puts L2 in the keys for
-           that one update only: one click toggles exactly once, however
-           long R3 is held. The bit is taken back out after the update. */
+        /* BUILD 591: the stock game's ZL/ZR were the PSX L2/R2 view toggle
+           (0x74EB89: a NEW press of L2 or R2 switches the normal and the
+           fixed-direction view, the next press switches back). ZL/ZR zoom
+           now, so a reset click puts L2 in the keys for that one update
+           only: one click toggles exactly once, however long it is held.
+           The bit is taken back out after the update. It also resets the
+           zoom, tilt and orbit (worldfar_camera) and the heading (below).
+           BUILD 803: the click is ZL+ZR pressed together with nothing
+           else (it was R3), and fires on the RELEASE, once, and only if no
+           other button was down at any point of the hold -- so it never
+           fires as part of a bigger combination. The stick directions do
+           not count. R3 does nothing here any more. */
         st->keys_added = 0;
         u8 *pp = input_obj(got);
-        u32 r3 = pp && (*(unsigned long long *)(pp + 0x20) & BTN_R3) ? 1u : 0u;
-        u32 click = r3 && !st->r3_prev;
-        st->r3_prev = r3;
+        unsigned long long b0 = pp ? *(unsigned long long *)(pp + 0x20) : 0;
+        u32 zz = (b0 & (BTN_ZL | BTN_ZR)) == (BTN_ZL | BTN_ZR);
+        u32 other = (b0 & BTN_RESET_OTHER) ? 1u : 0u;
+        u32 p3 = st->reset_prev;
+        st->reset_prev = zz ? (p3 | 1u | (other << 1)) : 0u;
+        u32 click = !zz && p3 == 1u && !other;
         if (click)
-            st->r3_click = 1;            /* also: zoom, tilt and heading reset */
+            st->reset_click = 1;         /* also: zoom, tilt and heading reset */
         if (click) {
             u32 k = rd32(v, G_KEYS);
             if (!(k & K_L2)) {
@@ -2194,7 +2384,26 @@ void worldfar_input(State *st, g2h_fn g2h, callx_fn call, u8 **got, u32 phase)
                 st->keys_added = K_L2;
             }
         }
+        /* BUILD 694/697: on the world map L1/R1 orbit the CAMERA only
+           (st->orbit, drawn by worldfar_camera), on foot and in every
+           vehicle, so the update never sees them: no stock spin, the
+           heading and the facing are the game's own. */
+        /* BUILD 702: only the L and R BUTTONS. On the world map the port
+           also turns the right stick into L1/R1 (0x10D3B54: module 4,
+           axis 0x16 -> DIK 0x51, 0x17 -> DIK 0x49); those stay in the
+           keys, so the right stick keeps its stock turn. */
+        st->lr_keys = 0;
+        if (rd32(v, G_CONTROL) != 0 && pp) {
+            unsigned long long b = *(unsigned long long *)(pp + 0x20);
+            u32 k = rd32(v, G_KEYS);
+            u32 m = ((b & BTN_L) ? K_L1 : 0) | ((b & BTN_R) ? K_R1 : 0);
+            if (k & m) {
+                st->lr_keys = (u8)(k & m);
+                wr32(v, G_KEYS, k & ~(u32)st->lr_keys);
+            }
+        }
         st->front_saved = (s32)rd32(v, G_CAM_FRONT);
+        st->hw_pad2[1] = rd32(v, G_HW_BANK);
         st->rot_saved = (s32)rd32(v, G_CAM_ROTY);
         st->saved_ok = 1;
         st->facing_ok = 0;
@@ -2206,6 +2415,8 @@ void worldfar_input(State *st, g2h_fn g2h, callx_fn call, u8 **got, u32 phase)
     u8 *p = input_obj(got);
     float rx = p ? stick(*(float *)(p + 0x48) - *(float *)(p + 0x4C)) : 0.0f;
     s32 front = (s32)rd32(v, G_CAM_FRONT);
+    int level = !(rd32(v, G_KEYS) & (K_LEFT | K_RIGHT));   /* BUILD 726 */
+    hw_land(v, st);                                         /* BUILD 727 */
     if (on_foot(v)) {
         float wx, wz, side;
         float mag = stick_world(v, got, &wx, &wz, &side);
@@ -2219,7 +2430,7 @@ void worldfar_input(State *st, g2h_fn g2h, callx_fn call, u8 **got, u32 phase)
                A change the keys do not explain is left alone. */
             s32 d = wrapi(front - st->front_saved, 4096);
             s32 total, arrows;
-            stock_spin(rd32(v, G_KEYS) & 0xFFFFu, (s32)mult(v), &total, &arrows);
+            stock_spin(rd32(v, G_KEYS) & 0xFFFFu & ~lr, (s32)mult(v), &total, &arrows, 0);
             if (d == total) {
                 front = st->front_saved + (total - arrows);
                 if (rx == 0.0f) {
@@ -2232,7 +2443,7 @@ void worldfar_input(State *st, g2h_fn g2h, callx_fn call, u8 **got, u32 phase)
                     }
                     float turn = 2.0f * SPIN_STEP * mult(v) * mag * side
                                * fabs_(side) * up;
-                    front += (s32)(turn + (turn < 0.0f ? -0.5f : 0.5f));
+                    front += rnd(turn);
                 }
             }
         }
@@ -2243,14 +2454,75 @@ void worldfar_input(State *st, g2h_fn g2h, callx_fn call, u8 **got, u32 phase)
                 wr16(v, ent + 0x4C, (u16)(s16)st->facing);
             }
         }
+    } else if (rd32(v, G_VIEW_TYPE) == HW_VIEW && rd32(v, G_CONTROL) != 0 && p) {
+        /* BUILD 722: the Highwind steers by how far the left stick points.
+           The stock update (0x74EDEF) turns the heading 16 x mult while
+           left or right is held (8 with up/down too), and the port gives
+           the stick only as those keys -- full turn or none, so a circle
+           traced with the stick came out as straight runs and corners.
+           The arrows' share is taken back out and the stick's sideways
+           part turns it instead, in proportion (all the way over = the
+           stock turn, a diagonal about the stock half). The bank the
+           update eased towards +-0x80 (0x74F318) is redone towards the
+           stick's share of it, and the roll drawn from it. Square (the
+           sideways drift) stays stock. */
+        float sx = *(float *)(p + 0x38) - *(float *)(p + 0x3C);
+        float sy = *(float *)(p + 0x30) - *(float *)(p + 0x34);
+        float mag = fsqrt(sx * sx + sy * sy);
+        u32 keys = rd32(v, G_KEYS) & 0xFFFFu & ~lr;
+        if (mag > STICK_DEADZONE && !(keys & 0x80u)) {
+            /* BUILD 724: the turn's own dead zone, on the sideways part
+               alone, so a stick pushed up or down to climb or dive with a
+               little lean neither turns nor banks the ship */
+            sx = stick(sx);
+            s32 m = (s32)mult(v);
+            s32 total, arrows;
+            stock_spin(keys, m, &total, &arrows, 1);
+            if (wrapi(front - st->front_saved, 4096) == total) {
+                float turn = 2.0f * SPIN_STEP * (float)m * sx
+                           * (1.0f - 0.5f * fabs_(sy));
+                front = st->front_saved + (total - arrows) + rnd(turn);
+                /* the bank: ((2^n - 1) old + target + 2^(n-1)) >> n */
+                s32 old = (s32)st->hw_pad2[1];
+                s32 target = rnd(-128.0f * sx);
+                level = !target;
+                u32 ent = rd32(v, G_ENTITY);
+                s32 aold = old < 0 ? -old : old;
+                int busy = (ent && (rd8(v, ent + 0x51) & 1) && aold >= 16)
+                         || target != 0;
+                s32 n = 3 + (busy << 1) + (m == 1);
+                s32 bank = (((1 << n) - 1) * old + target + (1 << (n - 1))) >> n;
+                if (!target && bank >= -4 && bank <= 4) bank = 0;
+                wr32(v, G_HW_BANK, (u32)bank);
+                wr16(v, G_HW_ROT, (u16)(s16)(bank * 4));
+                wr16(v, G_HW_ROT + 4, (u16)(s16)(-bank * 2));
+            }
+        }
     }
     st->facing_ok = 0;
+    /* BUILD 697: L1 / R1 orbit the camera round the player (or the
+       vehicle) on top of the heading: where he goes is not changed, so he
+       can walk or fly on while the camera circles. A new L1+R1 press (or
+       the ZL+ZR click) takes the orbit back to 0. BUILD 803: 12 x mult,
+       a quarter slower than the stock L1/R1 rate (16 x mult) it used. */
+    u32 both = lr == (K_L1 | K_R1);
+    u32 lr_reset = both && !(st->lr_prev & 1);
+    /* BUILD 698: after L1+R1 nothing turns until both are let go, so
+       releasing one a little before the other does not nudge it */
+    u32 latch = lr && ((st->lr_prev & 2) || both);
+    st->lr_prev = (u8)(both | (latch << 1));
+    s32 orb = st->orbit;
+    if (!latch && lr)
+        orb += ORBIT_STEP * (s32)mult(v) * ((lr & K_R1) ? 1 : -1);
+    if (lr_reset || st->reset_click || !(orb > -100000 && orb < 100000))
+        orb = 0;
+    st->orbit = (u16)(orb & 4095);
     if (rd32(v, G_CONTROL) != 0)
         front += (s32)(YAW_STEP * mult(v) * rx);
-    /* R3 click: back behind the player (FFNx's reset, front = 2048 -
+    /* ZL+ZR click: back behind the player (FFNx's reset, front = 2048 -
        facing) when the toggle left the normal view; the fixed view keeps
        the direction the game gives it */
-    if (st->r3_click && rd32(v, G_VIEW_TYPE) == 0 && rd32(v, G_CONTROL) != 0) {
+    if (st->reset_click && rd32(v, G_VIEW_TYPE) == 0 && rd32(v, G_CONTROL) != 0) {
         u32 ent = rd32(v, G_ENTITY);
         if (ent)
             front = 2048 - (s32)rds16(v, ent + 0x40);
@@ -2264,5 +2536,35 @@ void worldfar_input(State *st, g2h_fn g2h, callx_fn call, u8 **got, u32 phase)
     else if (r > front + 0x800) r -= 0x1000;
     if (rd32(v, G_MOVE_MULT) == 1) r = (r * 31 + front) >> 5;
     else r = (r * 15 + front) >> 4;
-    wr32(v, G_CAM_ROTY, (u32)r);
+    /* BUILD 698: the L1/R1 orbit goes into the heading everything after
+       the update draws by (the camera 0x74E8CE builds its matrix from it,
+       and the sky backdrop, the clouds, the models and the minimap use it
+       too), and is taken back out before the next update */
+    /* BUILD 700: the Highwind's climb/dive pitch eases (3p + target) >> 2
+       (0x74F3B8); the shift floors, so after a dive it sticks at -3 (4
+       degrees tail down) instead of coming back to 0. A step towards 0
+       when negative lets it settle level. Only its draw reads it. */
+    /* BUILD 726: with no turn the bank eases back by
+       ((2^n - 1) b + 2^(n-1)) >> n and is zeroed at |b| <= 4 (0x74F3F3);
+       at 60 fps (mult 1, n = 4) that floors to a standstill anywhere in
+       -7..8, so it never got there. The camera rolls by the bank
+       (0x74EA15) and the ship yaws 4x and rolls 2x it, so the Highwind
+       rested a few degrees off, the way the last turn went. BUILD 728:
+       level, from 8 in it steps one a frame to 0 from where it was before
+       the update (726 zeroed it at once: a visible snap, and the game's
+       own zero at 4 is a smaller one), so it settles without a jump. */
+    if (rd32(v, G_VIEW_TYPE) == 3) {
+        s32 hp = (s32)rd32(v, G_HW_PITCH);
+        if (hp < 0) wr32(v, G_HW_PITCH, (u32)(hp + 1));
+        s32 o = (s32)st->hw_pad2[1];
+        if (level && o >= -8 && o <= 8 && o) {
+            o -= o < 0 ? -1 : 1;
+            wr32(v, G_HW_BANK, (u32)o);
+            wr16(v, G_HW_ROT + 4, (u16)(s16)(-2 * o));
+        }
+    }
+    s32 add = (s32)st->orbit;
+    if (add >= 2048) add -= 4096;
+    st->orbit_added = add;
+    wr32(v, G_CAM_ROTY, (u32)(r + add));
 }

@@ -1,0 +1,29 @@
+fn 6df40d..6df6ca  arm d44d50..d45a20  anchors(calls) 5
+6df48e: imul eax, eax, 0x1e -> imul eax, eax, 0x18
+      UNMAPPED  value 0x1e (1 cands)
+6df491: add eax, 0x170 -> add eax, 0x18f
+      OK  arm d44f0c  add w21, w8, #0x170          -> add w21, w8, #0x18f          1105c115 11063d15 (=)
+6df497: push 0xb0 -> push 0x80
+      DEF?branch['d44fec->d44e50']  arm d44e48  mov w27, #0xb0               -> mov w27, #0x80               5280161b 5280101b (=)
+6df4b9: push 0x164 -> push 0x182
+      NEEDCAVE(def d4508c shared by 2)  arm d45090  str w25, [x0]  (=, new 0x182)
+6df4be: push 0xaa -> push 0x80
+      OK  arm d450a4  mov w8, #0xaa                -> mov w8, #0x80                52801548 52801008 (=)
+6df4e1: push 0x164 -> push 0x181
+      NEEDCAVE(def d4508c shared by 2)  arm d45190  str w25, [x0]  (=, new 0x181)
+6df4e6: push 0xe4 -> push 0x8e
+      OK  arm d451a4  mov w8, #0xe4                -> mov w8, #0x8e                52801c88 528011c8 (=)
+6df532: push 0x160 -> push 0x17d
+      OK  arm d45304  mov w8, #0x160               -> mov w8, #0x17d               52802c08 52802fa8 (=)
+6df537: push 0x118 -> push 0xc0
+      UNMAPPED  value 0x118 (0 cands)
+6df578: mov dword ptr [eax], 0x43260000 -> mov dword ptr [eax], 0x42ed0000
+      NEEDCAVE(def d45474 shared by 4)  arm d45478  str w25, [x0]  (=, new 0x42ed0000)
+6df581: mov dword ptr [ecx + 4], 0x43b10000 -> mov dword ptr [ecx + 4], 0x43bff000
+      UNMAPPED  value 0x43b10000 (0 cands)
+6df5c1: mov dword ptr [edx], 0x43260000 -> mov dword ptr [edx], 0x42ed0000
+      NEEDCAVE(def d45474 shared by 4)  arm d45584  str w25, [x0]  (=, new 0x42ed0000)
+6df628: mov dword ptr [eax], 0x43d50000 -> mov dword ptr [eax], 0x59d40000
+      UNMAPPED  value 0x43d50000 (0 cands)
+UNRESOLVED def d4508c uses ['0xd45090', '0xd45190'] patched ['0xd45090', '0xd45190'] navs {385, 386}
+UNRESOLVED def d45474 uses ['0xd45478', '0xd45498', '0xd45584', '0xd45758'] patched ['0xd45478', '0xd45584'] navs {1122828288}

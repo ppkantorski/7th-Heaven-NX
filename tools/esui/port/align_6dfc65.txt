@@ -1,0 +1,44 @@
+fn 6dfc65..6e0046  arm d75cc0..d77000  anchors(calls) 10
+6dfc74: push 1 -> push 7
+      OK  arm d75d58  mov w8, #1                   -> mov w8, #0x7                 320003e8 528000e8 (=)
+6dfc85: add ecx, 6 -> add ecx, 0xb
+      OK  arm d75df0  add w23, w8, #6              -> add w23, w8, #0xb            11001917 11002d17 (=)
+6dfd56: sub edx, 0xa -> sub edx, 2
+      OK  arm d761fc  sub w23, w8, #0xa            -> sub w23, w8, #0x2            51002917 51000917 (neg)
+6dfe6d: sub eax, 0xa -> sub eax, 2
+      OK  arm d764fc  sub w25, w8, #0xa            -> sub w25, w8, #0x2            51002919 51000919 (neg)
+6dfea5: add ecx, 0x3c -> add ecx, 0x3d
+      OK  arm d76734  add w23, w8, #0x3c           -> add w23, w8, #0x3d           1100f117 1100f517 (=)
+6dfeac: add edx, 0x26 -> add edx, 0xb
+      OK  arm d76760  add w23, w8, #0x26           -> add w23, w8, #0xb            11009917 11002d17 (=)
+6dfeef: push 7 -> push 0xd
+      OK  arm d769b4  mov w8, #6                   -> mov w8, #0xc                 321f07e8 52800188 (-1)
+6dfefc: add edx, 0x3c -> add edx, 0x3d
+      UNMAPPED  value 0x3c (2 cands)
+6dff03: add eax, 0x46 -> add eax, 0x20
+      UNMAPPED  value 0x46 (2 cands)
+6dff4f: add ecx, 0x54 -> add ecx, 0x53
+      OK  arm d76b18  add w23, w8, #0x54           -> add w23, w8, #0x53           11015117 11014d17 (=)
+6dff56: add edx, 0x26 -> add edx, 0xb
+      OK  arm d76b44  add w23, w8, #0x26           -> add w23, w8, #0xb            11009917 11002d17 (=)
+6dff7d: add eax, 0x54 -> add eax, 0x52
+      OK  arm d76c34  add w23, w8, #0x54           -> add w23, w8, #0x52           11015117 11014917 (=)
+6dff84: add ecx, 0x26 -> add ecx, 8
+      UNMAPPED  value 0x26 (2 cands)
+6dff99: push 7 -> push 0xd
+      OK  arm d76cbc  mov w8, #7                   -> mov w8, #0xd                 32000be8 528001a8 (=)
+6dffa6: add edx, 0x54 -> add edx, 0x53
+      UNIQ-fallback value 0x54
+      OK  arm d76a2c  add w23, w8, #0x54           -> add w23, w8, #0x53           11015117 11014d17 (=)
+6dffad: add eax, 0x46 -> add eax, 0x20
+      UNMAPPED  value 0x46 (2 cands)
+6e0003: add edx, 0x24 -> add edx, -0x21
+      OK  arm d76e40  add w19, w8, #0x24           -> sub w19, w8, #0x21           11009113 51008513 (=)
+6e000a: add eax, 0x32 -> add eax, 0x2a
+      OK  arm d76e6c  add w19, w8, #0x32           -> add w19, w8, #0x2a           1100c913 1100a913 (=)
+6e001f: push 1 -> push 7
+      OK  arm d76ee4  mov w8, #1                   -> mov w8, #0x7                 320003e8 528000e8 (=)
+6e002f: add ecx, 0x24 -> add ecx, -0x21
+      OK  arm d76f58  add w19, w8, #0x24           -> sub w19, w8, #0x21           11009113 51008513 (=)
+6e0036: add edx, 0x2a -> add edx, 0x22
+      OK  arm d76f84  add w19, w8, #0x2a           -> add w19, w8, #0x22           1100a913 11008913 (=)

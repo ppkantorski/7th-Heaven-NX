@@ -1,0 +1,44 @@
+#!/usr/bin/env python3
+"""
+One-time setup: stages the Avalanche Arisen native battle background files
+(from the original PC release archive, "AVALANCHE ARISEN STEAM") into
+battle_bg_native/, where build.py's BATTLE_BG_NATIVE_DIR expects them.
+
+Usage:
+    python3 stage_battle_bg_native.py "/path/to/AVALANCHE ARISEN STEAM/Battle_Add" .
+
+Run this once after unzipping your copy of the AVALANCHE ARISEN STEAM
+archive, from your 7th_heaven_nx project directory (or pass its path as
+the 2nd argument). Only needs to be re-run if that source archive changes.
+
+Licensed under GPLv3
+Copyright (c) 2026 ppkantorski
+"""
+
+import os as _nx_os, sys as _nx_sys  # BUILD 755: find src/ and put its modules on sys.path
+_nx_root = _nx_os.path.dirname(_nx_os.path.abspath(__file__))
+while not _nx_os.path.isfile(_nx_os.path.join(_nx_root, '7th_heaven_nx.py')) and _nx_root != _nx_os.path.dirname(_nx_root):
+    _nx_root = _nx_os.path.dirname(_nx_root)
+_nx_sys.path.insert(0, _nx_os.path.join(_nx_root, 'src'))
+import nxpaths  # noqa: E402
+nxpaths.install(tools=True)
+import os, shutil, sys
+
+def main():
+    if len(sys.argv) < 2:
+        print(__doc__)
+        sys.exit(1)
+    src = sys.argv[1]
+    project_dir = sys.argv[2] if len(sys.argv) > 2 else '.'
+    dest = os.path.join(project_dir, 'battle_bg_native')
+    os.makedirs(dest, exist_ok=True)
+    n = 0
+    for fn in os.listdir(src):
+        full = os.path.join(src, fn)
+        if os.path.isfile(full):
+            shutil.copy2(full, os.path.join(dest, fn.lower()))
+            n += 1
+    print(f'staged {n} files into {dest}')
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,66 @@
+fn 6cf5c5..6d0022  arm d1a7c0..d1d300  anchors(calls) 4
+STRUCT-BLOCK old 6cf6c6: mov dword ptr [edx + 4], 0x43a60000  ->  new 6cf6c6: call 0x9144d7; 6cf6cb: nop ; 6cf6cc: nop 
+STRUCT-BLOCK old 6cf756: mov al, byte ptr [ecx + 0x6d0005]  ->  new 6cf756: call 0x914529; 6cf75b: nop 
+6cf634: mov dword ptr [edx + 4], 0x43a60000 -> mov dword ptr [edx + 4], 0x43f00000
+      NEEDCAVE(def d1aa04 shared by 4)  arm d1aa08  str w22, [x0]  (=, new 0x43f00000)
+6cf79a: imul eax, eax, 0x58 -> imul eax, eax, 0x48
+      UNIQ-fallback value 0x58
+      OK  arm d1b400  mov w9, #0x58                -> mov w9, #0x48                52800b09 52800909 (=)
+6cf7ba: lea ecx, [ecx + eax - 0x24] -> lea ecx, [ecx + eax - 0x14]
+      UNMAPPED  value -0x24 (3 cands)
+6cf7e6: imul edx, edx, 0x18 -> imul edx, edx, 0x16
+      UNMAPPED  value 0x18 (1 cands)
+6cf7e9: lea eax, [eax + edx + 0xe] -> lea eax, [eax + edx + 0xc]
+      UNMAPPED  value 0xe (1 cands)
+6cf821: sub ecx, 0x24 -> sub ecx, 0x1a
+      OK  arm d1b034  sub w22, w8, #0x24           -> sub w22, w8, #0x1a           51009116 51006916 (neg)
+6cf84c: imul edx, edx, 0x1e -> imul edx, edx, 0x18
+      OK  arm d1b094  mov w9, #0x1e                -> mov w9, #0x18                321f0fe9 52800309 (=)
+6cf84f: lea eax, [eax + edx + 0x16] -> lea eax, [eax + edx + 0x19]
+      OK  arm d1b0a8  add w20, w8, #0x16           -> add w20, w8, #0x19           11005914 11006514 (=)
+6cf875: sub eax, 0x24 -> sub eax, 0x1a
+      OK  arm d1b0ec  sub w0, w21, #0x24           -> sub w0, w21, #0x1a           510092a0 51006aa0 (neg)
+6cf896: add eax, 0x10 -> add eax, 9
+      UNMAPPED  value 0x10 (3 cands)
+6cf8b6: mov word ptr [0xdc3c68], 0x28 -> mov word ptr [0xdc3c68], 0xfff8
+      UNMAPPED  value 0x28 (2 cands)
+6cf8d3: shl eax, 5 -> imul eax, eax, 0x18
+      UNMAPPED  value 0x5 (0 cands)
+6cf8d6: add eax, 0x16c -> add eax, 0x17e
+      UNIQ-fallback value 0x16c
+      OK  arm d1b754  add w20, w8, #0x16c          -> add w20, w8, #0x17e          1105b114 1105f914 (=)
+6cf90c: imul eax, eax, 0x9c -> imul eax, eax, 0x60
+      OK  arm d1b23c  mov w9, #0x9c                -> mov w9, #0x60                52801389 52800c09 (=)
+6cf92f: shl edx, 5 -> imul edx, edx, 0x18
+      OK  arm d1b4b0  add w0, w9, #4               -> add w0, w9, #0x17            11001120 11005d20 (-1)
+6cf932: add edx, 0x16c -> add edx, 0x17e
+      UNMAPPED  value 0x16c (0 cands)
+6cf955: mov word ptr [0xdc3c68], 0x3c -> mov word ptr [0xdc3c68], 0xfffa
+      OK  arm d1b51c  mov w8, #0x3c                -> mov w8, #0xfffa              321e0fe8 529fff48 (=)
+6cf972: shl edx, 5 -> imul edx, edx, 0x18
+      UNMAPPED  value 0x5 (0 cands)
+6cf975: add edx, 0x16c -> add edx, 0x17e
+      OK  arm d1b55c  add w20, w8, #0x16c          -> add w20, w8, #0x17e          1105b114 1105f914 (=)
+STRUCT  6cf9ac: neg edx -> imul edx, edx, 0x90
+STRUCT  6cf9ae: sbb edx, edx -> sub edx, 6
+STRUCT  6cf9b0: and edx, 0xf0 -> nop 
+6cf9d0: shl ecx, 5 -> imul ecx, ecx, 0x18
+      UNMAPPED  value 0x5 (0 cands)
+6cf9d3: add ecx, 0x16c -> add ecx, 0x17e
+      OK  arm d1b630  add w20, w8, #0x16c          -> add w20, w8, #0x17e          1105b114 1105f914 (=)
+6cfa03: sub ecx, 0x24 -> sub ecx, 0x1e
+      UNMAPPED  value 0x24 (0 cands)
+6cfa31: lea eax, [eax + edx + 0xe] -> lea eax, [eax + edx + 0x25]
+      UNMAPPED  value 0xe (1 cands)
+6cfa5f: sub eax, 0x24 -> sub eax, 0x19
+      OK  arm d1b680  sub w23, w8, #0x24           -> sub w23, w8, #0x19           51009117 51006517 (neg)
+6cfa7a: shl eax, 5 -> imul eax, eax, 0x18
+      UNMAPPED  value 0x5 (0 cands)
+6cfabc: imul eax, eax, 0x90 -> imul eax, eax, 0x74
+      UNMAPPED  value 0x90 (0 cands)
+6cfac2: lea ecx, [edx + eax + 0x28] -> lea ecx, [edx + eax + 5]
+      OK  arm d1b714  mov w8, #0x28                -> mov w8, #0x5                 52800508 528000a8 (=)
+6cfada: add eax, 0x3e -> add eax, 0x3c
+      UNIQ-fallback value 0x3e
+      OK  arm d1d2ec  add w20, w8, #0x3e           -> add w20, w8, #0x3c           1100f914 1100f114 (=)
+UNRESOLVED def d1aa04 uses ['0xd1aa08', '0xd1ab18', '0xd1ac04', '0xd1ac28'] patched ['0xd1aa08'] navs {1139802112}

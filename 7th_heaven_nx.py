@@ -16,15 +16,33 @@ Layout expected in this script's directory:
 
 Run with no arguments for the UI, or --cli to build with saved settings.
 
+Licensed under GPLv3
 Copyright (c) 2026 ppkantorski
 """
+
+import os as _os
+import sys as _sys
+_sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), 'src'))
+import nxpaths  # noqa: E402  BUILD 755: the code lives in src/<area>/
+nxpaths.install()
+import ff7nx_deps  # noqa: E402
+# Installs missing packages on first run (possibly re-running this script in
+# a private .venv), so this has to come before any third-party import.
+ff7nx_deps.ensure(nxpaths.ROOT, _os.path.abspath(__file__),
+                  gui='--cli' not in _sys.argv)
 import json
 import os
 import queue
+import re
 import sys
 import threading
+import weakref
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+
+# The user's folder (mods, cache, sdout, settings). The program's own files
+# (assets/, data/) are under nxpaths.APP, which is the same folder unless
+# this is a release build.
+HERE = nxpaths.ROOT
 
 # Shown in the header, nearest the title. Single source of truth --
 # anything else that needs it should import this rather than repeat it.
@@ -33,9 +51,13 @@ sys.path.insert(0, HERE)
 
 import build  # noqa: E402
 import build_guard  # noqa: E402
+import ff7nx_esui  # noqa: E402
 import iro  # noqa: E402
 import lgp    # noqa: E402
 import ff7nx_field169  # noqa: E402
+import ff7nx_modifies  # noqa: E402
+import nxsettings  # noqa: E402  BUILD 756: user vs developer settings
+import nxthemes  # noqa: E402
 
 # Resolved once, at import: $SEVENTH_NX_DUMP, then dump/, then the old
 # workingdir/, then any subfolder that contains romfs/ff7/workingdir.
@@ -45,6 +67,31 @@ MODS_DIR = os.path.join(HERE, 'mods')
 CACHE_DIR = os.path.join(HERE, 'cache')
 SDOUT_DIR = os.path.join(HERE, 'sdout')
 SETTINGS = os.path.join(HERE, 'settings.json')
+# Factory settings: Settings > Restore defaults, and the starting value of
+# any __global__ key settings.json does not have yet.
+DEFAULT_SETTINGS = os.path.join(nxpaths.APP, 'data', 'default_settings.json')
+# Factory mod settings: Install Mods > Restore defaults, and the starting
+# state of a supported mod that settings.json does not list yet.
+DEFAULT_MOD_SETTINGS = os.path.join(nxpaths.APP, 'data', 'default_mod_settings.json')
+# BUILD 756/804. Developer mode shows every setting; without it only the user
+# settings are shown. Either way the build uses what settings.json holds
+# (nxsettings.LOCKED only fills keys it does not have yet). On with
+# SEVENTH_NX_DEV=1, or with the saved Settings > GUI > Developer Settings
+# toggle. DEV_MODE is the value at startup; the dialog asks
+# nxsettings.dev_mode() because the toggle can change it while running.
+
+
+def _saved_dev_flag():
+    try:
+        with open(SETTINGS) as fh:
+            return bool(json.load(fh).get('__global__', {}).get(
+                'developer_settings', False))
+    except Exception:                                           # noqa: BLE001
+        return False
+
+
+nxsettings.set_dev_override(_saved_dev_flag())
+DEV_MODE = nxsettings.dev_mode()
 
 
 def _global_setting(key, default):
@@ -58,9 +105,19 @@ def _global_setting(key, default):
     keeps settings.json the single source of truth rather than adding a second
     one the user has to know about.
     """
+    # BUILD 806: no settings.json yet (a fresh install) still means the
+    # factory values, not `default` -- several callers pass a default that
+    # disagrees with data/default_settings.json, and the first save wrote
+    # that disagreement to disk, so Developer Settings read "Modified (3)"
+    # on a copy nobody had touched.
     try:
         with open(SETTINGS) as fh:
-            return json.load(fh).get('__global__', {}).get(key, default)
+            saved = json.load(fh).get('__global__', {})
+    except Exception:                                           # noqa: BLE001
+        saved = {}
+    try:
+        return nxsettings.effective_global(dict(
+            default_globals(), **saved)).get(key, default)
     except Exception:                                           # noqa: BLE001
         return default
 
@@ -76,10 +133,10 @@ def _global_setting(key, default):
 #   AppWrapper/VFile.cs            MapFile() returns the FIRST override
 #                                    found for a file
 #
-# First match wins. 7H can retain an explicit user-arranged profile, but NX
-# does not expose manual reordering; its old ``mod_load_order`` was therefore
-# merely the discovery sequence from an earlier run.  NX always applies the
-# same category auto-sort and procedural manifest moves that 7H shows.
+# First match wins. BUILD 753: like 7H, the list is the profile's order
+# (settings.json ``mod_load_order``) and survives mod updates; the category
+# auto-sort places mods the profile does not list yet (see
+# apply_profile_order).
 #
 # build.build_plan() applies its input later-wins, so run_build() hands it
 # this order reversed.
@@ -691,7 +748,7 @@ LIMITER_FPS_CHOICES = [
 # the console cannot decode. Frame rate is not a choice -- a movie is built at
 # whatever rate its mod ships.
 MOVIE_QUALITY_CHOICES = [
-    (name, 'Movie quality: ' + label)
+    (name, label)
     for name, _crf, label in build.movie_convert.QUALITY_LEVELS
 ]
 
@@ -763,9 +820,9 @@ MOVIE_COLOUR_CHOICES = [
 # ranges and never opens exefs/main, so the console still shows 4:3 and
 # nothing in the log said why. The label now says what each one DOES.
 WIDESCREEN_CHOICES = [
-    ('', 'Off \u2014 4:3 with black bars'),
-    ('ws', 'Data only \u2014 camera ranges; picture stays 4:3'),
-    ('ws-3d', '16:9 widescreen \u2014 recommended'),
+    ('', '4:3 \u2014 original'),
+    ('ws', 'Data only \u2014 camera ranges, picture stays 4:3 (developer)'),
+    ('ws-3d', '16:9 widescreen (recommended)'),
 ]
 WIDESCREEN_LABELS = dict(WIDESCREEN_CHOICES)
 WIDESCREEN_BY_LABEL = {v: k for k, v in WIDESCREEN_CHOICES}
@@ -793,11 +850,20 @@ WIDESCREEN_BY_LABEL = {v: k for k, v in WIDESCREEN_CHOICES}
 # sees it, so the kernel has much less to do.
 FIELD_BUF_CHOICES = [
     (0, 'Off \u2014 320\u00d7240 (has the vertical bands in 16:9)'),
-    (1, '1\u00d7 \u2014 428\u00d7240, no bands \u2014 recommended '
-        '(tested on hardware)'),
+    (1, '1\u00d7 \u2014 428\u00d7240, no bands'),
     (2, '2\u00d7 \u2014 854\u00d7480, no bands, sharper field'),
     (3, '3\u00d7 \u2014 1280\u00d7720, no bands, exactly 16:9, field at '
         'native 720p'),
+    # BUILD 757: untested on hardware. 47.6 / 60.9 MB more than stock out
+    # of the 256 MB driver pool; see ff7nx_fieldbuf.
+    (4, '4\u00d7 \u2014 1706\u00d7960, no bands (experimental)'),
+    (4.5, '4.5\u00d7 \u2014 1920\u00d71080 (tested on hardware)'),
+    # BUILD 777: every 768px-page texel on exactly 2 buffer px (4.5 gives
+    # 1.5, which shimmers on straight edges while the camera moves); the
+    # 1440-row buffer is reduced to the screen. 112.5 MB of targets.
+    # BUILD 788: the default, confirmed on hardware at 60 fps in fship_2.
+    (6, '6\u00d7 \u2014 2560\u00d71440, downscaled to the screen '
+        '(recommended)'),
 ]
 FIELD_BUF_LABELS = dict(FIELD_BUF_CHOICES)
 FIELD_BUF_BY_LABEL = {v: k for k, v in FIELD_BUF_CHOICES}
@@ -856,40 +922,95 @@ TEX_CACHE_BY_LABEL = {v: k for k, v in TEX_CACHE_CHOICES}
 # port already loads from romfs; these are drop-in replacements that used to
 # have to be copied onto the card by hand. See ff7nx_shaders.py.
 VOICE_NORM_CHOICES = [
-    ('speech:-16.2', 'Even voices — match “My hero!” (recommended)'),
-    ('speech:-15.2', 'Even voices, louder'),
-    ('speech:-17.2', 'Even voices, quieter'),
-    ('loudness:-15.3', 'Broadband loudness — the pre-349 behaviour'),
-    ('peak:-1.1', 'Equal peaks only — −1.1 dBFS'),
-    ('off', 'Off — as the mod shipped'),
+    ('speech:-16.2', 'Even (recommended)'),
+    ('speech:-15.2', 'Even, louder'),
+    ('speech:-17.2', 'Even, quieter'),
+    ('loudness:-15.3', 'Broadband loudness \u2014 pre-349 (developer)'),
+    ('peak:-1.1', 'Equal peaks only, \u22121.1 dBFS (developer)'),
+    ('off', 'Off \u2014 as the mod shipped'),
 ]
 VOICE_NORM_LABELS = dict(VOICE_NORM_CHOICES)
 VOICE_NORM_BY_LABEL = {v: k for k, v in VOICE_NORM_CHOICES}
 
 SCALER_CHOICES = [
-    ('', 'Stock \u2014 the port\u2019s own 2xSaI / HQ4x'),
-    ('hd', 'HD \u2014 Catmull-Rom + sharpen (recommended)'),
-    ('xbr', 'xBR \u2014 edge-directed, crisp flats'),
-    ('crisp', 'Crisp \u2014 nearest neighbour (no reconstruction)'),
-    ('soft', 'Soft \u2014 plain bilinear (a control, not an upgrade)'),
+    ('', 'Original'),
+    ('hd', 'HD (recommended)'),
+    ('xbr', 'xBR \u2014 edge-directed'),
+    ('crisp', 'Crisp \u2014 pixelated'),
+    ('soft', 'Soft \u2014 plain bilinear (developer control)'),
+    ('hd_lite', 'HD lite \u2014 lighter hq4x (GPU test)'),
+    ('hd_bilinear', 'HD bilinear \u2014 lightest hq4x (GPU test)'),
 ]
 SCALER_LABELS = dict(SCALER_CHOICES)
 SCALER_BY_LABEL = {v: k for k, v in SCALER_CHOICES}
 
+# BUILD 805. The background scaler's black point, in 255ths, written into the
+# sdout copy of the shader (ff7nx_shaders.BLACK_POINT_ENV). It can only lower
+# a shader's own value, so 12, the HD sets' value, is both the top and the
+# default and leaves the files untouched.
+BLACK_POINT_CHOICES = [
+    (12, 'Black level: 12/255 (current, max)'),
+    (11, 'Black level: 11/255'),
+    (10, 'Black level: 10/255'),
+    (9, 'Black level: 9/255'),
+    (8, 'Black level: 8/255'),
+    (7, 'Black level: 7/255'),
+    (6, 'Black level: 6/255'),
+    (5, 'Black level: 5/255'),
+    (4, 'Black level: 4/255'),
+    (3, 'Black level: 3/255'),
+    (2, 'Black level: 2/255'),
+    (1, 'Black level: 1/255'),
+    (0, 'Black level: 0/255 (off)'),
+]
+BLACK_POINT_LABELS = dict(BLACK_POINT_CHOICES)
+BLACK_POINT_BY_LABEL = {v: k for k, v in BLACK_POINT_CHOICES}
+
 FXAA_CHOICES = [
-    ('', 'Stock \u2014 the port\u2019s own FXAA'),
-    ('hd', 'HD FXAA \u2014 retuned'),
-    ('off', 'Off \u2014 sharper, cheaper, jaggier model edges'),
+    ('', 'Original'),
+    ('hd', 'HD (recommended)'),
+    ('off', 'Off'),
+    ('hd_fast', 'HD fast \u2014 shorter edge search (GPU test)'),
 ]
 FXAA_LABELS = dict(FXAA_CHOICES)
 FXAA_BY_LABEL = {v: k for k, v in FXAA_CHOICES}
 
 VIDEO_SHADER_CHOICES = [
-    ('', 'Stock \u2014 the port\u2019s own movie shader'),
-    ('hd', 'HD \u2014 custom_shaders/hd_video'),
+    ('', 'Original'),
+    ('hd', 'HD (recommended)'),
 ]
 VIDEO_SHADER_LABELS = dict(VIDEO_SHADER_CHOICES)
 VIDEO_SHADER_BY_LABEL = {v: k for k, v in VIDEO_SHADER_CHOICES}
+
+# BUILD 760. Enhanced Stock UI's menu sheets are rebuilt from its 4x DDS at
+# this scale (ff7nx_esui.tex_scale). Developer setting; 2 is locked for users.
+ESUI_TEXSCALE_CHOICES = [
+    (2, '2\u00d7 \u2014 512 px sheets (default, tested on hardware)'),
+    (3, '3\u00d7 \u2014 768 px sheets (experimental)'),
+    (4, '4\u00d7 \u2014 1024 px, the mod\u2019s full art (experimental)'),
+]
+ESUI_TEXSCALE_LABELS = dict(ESUI_TEXSCALE_CHOICES)
+
+# BUILD 761/762. Output resolution (ff7nx_dockres). User setting since 762.
+DOCK_RES_CHOICES = [
+    ('always', '1080p \u2014 always (recommended)'),
+    ('1080', 'Dynamic \u2014 1080p docked, 720p handheld'),
+    ('', '720p (as shipped)'),
+    ('900', '900p when docked (developer)'),
+]
+DOCK_RES_DEFAULT = 'always'     # BUILD 762: hardware-confirmed, same speed
+# BUILD 763b. Title screen background (ff7nx_titleart). User setting.
+TITLE_SCREEN_CHOICES = [
+    ('sword', 'Buster Sword \u2014 HD, original layout (recommended)'),
+    ('mods', 'As the mods set it'),
+    ('stock', 'Original (low resolution)'),
+]
+TITLE_SCREEN_DEFAULT = 'sword'
+TITLE_SCREEN_LABELS = dict(TITLE_SCREEN_CHOICES)
+TITLE_SCREEN_BY_LABEL = {v: k for k, v in TITLE_SCREEN_CHOICES}
+DOCK_RES_LABELS = dict(DOCK_RES_CHOICES)
+DOCK_RES_BY_LABEL = {v: k for k, v in DOCK_RES_CHOICES}
+ESUI_TEXSCALE_BY_LABEL = {v: k for k, v in ESUI_TEXSCALE_CHOICES}
 
 MOD_LOAD_ORDER = {
     'miscellaneous': 0,
@@ -934,6 +1055,47 @@ def profile_mod_order(saved):
         seen.add(item)
         out.append(item)
     return out
+
+
+# BUILD 751. A mod that settings.json does not mention is NEW, and new mods
+# start OFF: the distributed settings.json is what turns mods on.
+NEW_MOD_ENABLED = False
+
+
+def migrate_saved_mod_keys(saved, mods):
+    """Carry a mod's saved entry across a change of file name that keeps its
+    stem -- an .iro replaced by the same mod as an unpacked folder or the
+    reverse (Enhanced Stock UI 2.968 ships as a folder; settings.json knows
+    it as "Enhanced Stock UI-rel2.iro"). Without this the updated mod would
+    look new: OFF, and every one of its options back at the defaults.
+
+    Edits `saved` in place (and returns it). Only an entry whose own file is
+    no longer present is carried, so two installed copies never share one.
+    """
+    if not isinstance(saved, dict):
+        return saved
+    present = {m.filename for m in mods}
+
+    def stem(name):
+        return (name[:-4] if name.lower().endswith('.iro') else name).casefold()
+
+    for mod in mods:
+        if mod.filename in saved:
+            continue
+        for key in list(saved):
+            if (key == '__global__' or key in present
+                    or not isinstance(saved.get(key), dict)):
+                continue
+            if stem(key) == stem(mod.filename):
+                saved[mod.filename] = saved[key]
+                break
+    return saved
+
+
+def saved_enabled(saved, mod):
+    """Is `mod` enabled in settings.json? A mod it does not list is new."""
+    return bool((saved or {}).get(mod.filename, {}).get('enabled',
+                                                         NEW_MOD_ENABLED))
 
 
 def _mod_options_from_saved(mod, saved):
@@ -1046,12 +1208,10 @@ def _active_order_constraints(mods):
 
 
 def discover_mods(order=None):
-    """Mods in the official 7H auto-sort priority order, highest first.
-
-    NX has no manual priority-reorder control, so a stale saved list is not
-    user intent: it is only retained for backwards compatibility.  Apply the
-    same auto-sort that 7H presents in its GUI every time instead.
-    """
+    """Mods in priority order, highest first: the saved profile order
+    (`order`, settings.json's mod_load_order) for every mod it lists, as 7H
+    keeps it across updates; 7H's category auto-sort for a fresh profile and
+    for mods it does not list yet (BUILD 753)."""
     if not os.path.isdir(MODS_DIR):
         return []
     found = []
@@ -1067,12 +1227,41 @@ def discover_mods(order=None):
             # the category is known before we sort.
             mod._load_manifest()
             found.append(mod)
-    # `order` is deliberately not reapplied: older NX versions wrote their
-    # discovery sequence here, even though the UI offered no way to express a
-    # custom priority.  Reusing it would keep showing an order unlike 7H.
-    # Keep the parameter so older callers remain compatible.
-    del order
-    return _autosort_7h(found)
+    return apply_profile_order(_autosort_7h(found), order)
+
+
+def apply_profile_order(mods, order):
+    """BUILD 753. 7th Heaven's list is the PROFILE's order: it is kept as it
+    is when a mod is updated (even when the update changes the mod's category
+    or its Before/After lines), and the category auto-sort runs only when
+    asked for. A mod the profile does not list yet is added at the bottom
+    (`ProfileItem` appended, SortOrder 9999). settings.json's
+    `mod_load_order` is that profile: mods it lists keep its order, new ones
+    follow in auto-sort order. With no saved order the auto-sort is the
+    list, as a fresh 7th Heaven install shows it.
+
+    A name is matched exactly, then by stem, so an .iro replaced by the same
+    mod as a folder (or the reverse) keeps its place."""
+    if not order:
+        return list(mods)
+
+    def stem(name):
+        return (name[:-4] if name.lower().endswith('.iro') else name).casefold()
+
+    rank = {}
+    for i, name in enumerate(order):
+        rank.setdefault(name, i)
+    present = {m.filename for m in mods}
+    listed, new = [], []
+    for m in mods:
+        r = rank.get(m.filename)
+        if r is None:
+            s = stem(m.filename)
+            r = next((i for n, i in rank.items()
+                      if n not in present and stem(n) == s), None)
+        (listed if r is not None else new).append((r, m))
+    listed.sort(key=lambda t: t[0])
+    return [m for _r, m in listed] + [m for _r, m in new]
 
 
 def _option_key(settings, ident):
@@ -1089,6 +1278,43 @@ def _option_value(mod, settings, ident):
     option = next((o for o in getattr(manifest, 'options', ())
                    if o.id.casefold() == str(ident).casefold()), None)
     return option.default if option is not None else None
+
+
+# The 60/30 FPS Gameplay mod. Its FPS Mode option decides which of its
+# animation folders install, so it also decides whether our frame-rate
+# patches match them: 1 Original FPS, 2 Full 30 FPS, 3 Full 60 FPS.
+FPS_MOD_ID = 'c0d1e191-a251-465d-8a3c-a3be5366d849'
+FPS_MODE_OPTION = 'FPSMode'
+
+
+def _fps_patch_mode(fps_on, active, settings, log):
+    """The 60/30 FPS Patches setting, resolved against the mod's FPS Mode.
+
+    Returns the rate the patch set targets: 60, 30, or 0 for off.
+    Full 60 FPS (and no 60/30 mod at all) keeps the setting as it is: 60 when
+    it is on. Full 30 FPS builds the 30 FPS set -- battles at 30, field and
+    world at their stock 30 -- to match the mod's 30 FPS files. Original FPS
+    turns the set off, since the mod then ships stock-rate animations.
+    """
+    if not fps_on:
+        return 0
+    mod = next((m for m in active if _manifest_id(m) == FPS_MOD_ID), None)
+    if mod is None:
+        return 60
+    try:
+        mode = int(_option_value(mod, settings.get(mod.filename, {}),
+                                 FPS_MODE_OPTION))
+    except (TypeError, ValueError):
+        return 60
+    if mode == 1:
+        log('60/30 FPS Patches: off, %s is set to Original FPS'
+            % mod.display_name)
+        return 0
+    if mode == 2:
+        log('60/30 FPS Patches: Full 30 FPS, following %s'
+            % mod.display_name)
+        return 30
+    return 60
 
 
 def _compatibility_profile(mods, enabled, settings_by_mod, log):
@@ -1146,6 +1372,11 @@ def _compatibility_profile(mods, enabled, settings_by_mod, log):
                 except (TypeError, ValueError):
                     continue
                 if active_now != trigger:
+                    continue
+                # BUILD 641b: Nitpick is an add-on; its rules that switch
+                # another mod's feature off (Cosmos Limit Break's field art)
+                # are not applied. See ff7nx_nitpick.ignores_rule.
+                if build.ff7nx_nitpick.ignores_rule(mod, want):
                     continue
                 target_settings = effective[target.filename]
                 target_key = _option_key(target_settings, their_id)
@@ -1231,6 +1462,14 @@ def run_build(mods, enabled, settings_by_mod, log, progress,
     # animation wait scaled x4. build.py folds this into battle.lgp's key
     # only, so toggling it cannot invalidate the other four archives.
     os.environ[build.FPS_ENV] = '1' if fps_60 else '0'
+    os.environ[build.FPS_MODE_ENV] = '60'
+
+    # BUILD 754: record which cache entries this build reads (ff7nx_cachegc).
+    try:
+        import ff7nx_cachegc
+        ff7nx_cachegc.start()
+    except Exception:                                           # noqa: BLE001
+        pass
 
     audio_before = _audio_fingerprint()
 
@@ -1289,10 +1528,17 @@ def run_build(mods, enabled, settings_by_mod, log, progress,
     if not active:
         log('nothing enabled.')
         return False
+    fps_rate = _fps_patch_mode(fps_60, active, effective_settings, log)
+    fps_60 = bool(fps_rate)
+    os.environ[build.FPS_ENV] = '1' if fps_60 else '0'
+    os.environ[build.FPS_MODE_ENV] = '30' if fps_rate == 30 else '60'
 
     log('')
     for mod in active:
-        mod.ensure_extracted(log, lambda i, n: progress(i, n, 'extracting'))
+        name = mod.display_name
+        progress(0, 0, f'Checking {name}')
+        mod.ensure_extracted(
+            log, lambda i, n, name=name: progress(i, n, f'Extracting {name}'))
 
     log('')
     constraints = _active_order_constraints(active)
@@ -1330,9 +1576,22 @@ def run_build(mods, enabled, settings_by_mod, log, progress,
             pe = exe_patch.parse_pe(exe_bytes)
             runtime_read = iro.exe_var_reader(
                 exe_bytes, lambda va: exe_patch.va_to_offset(pe, va))
+
+            def _with_hext(paths, _eb=exe_bytes):
+                # BUILD 763: the same reader over the exe with this build's
+                # HEXT applied (what 7th Heaven's live memory would hold).
+                out = _eb
+                for p in paths:
+                    with open(p, encoding='utf-8', errors='replace') as f:
+                        out, _a, _s = exe_patch.apply_hext(out, f.read())
+                pe2 = exe_patch.parse_pe(out)
+                return iro.exe_var_reader(
+                    out, lambda va: exe_patch.va_to_offset(pe2, va))
+            runtime_read.with_hext = _with_hext
         except Exception as exc:                               # noqa: BLE001
             log(f'note: RuntimeVar gates not evaluated ({exc}); every '
                 'conditional folder is kept')
+    progress(0, 0, 'Planning which mod files go where')
     plan = build.build_plan(list(reversed(active)),
                             effective_settings, catalogs, log,
                             music_names=music_names,
@@ -1399,10 +1658,10 @@ def run_build(mods, enabled, settings_by_mod, log, progress,
     # The 60 FPS patches go in LAST, into this same sdout. They read the
     # battle.lgp the mods were just written into (its animation-script waits
     # need scaling to match the 4x-longer ?da animations) and the exe that
-    # HEXT may just have produced, so they cannot run any earlier.
-    if fps_60:
-        produced += build.apply_fps_patches(SDOUT_DIR, DUMP, log,
-                                            produced)
+    # HEXT may just have produced, so they cannot run any earlier. With the
+    # set off this still runs for the input and FMV tweaks, and does nothing
+    # when none of them is on.
+    produced += build.apply_fps_patches(SDOUT_DIR, DUMP, log, produced)
     # And the pillarbox fix after THAT, for the same reason: it edits
     # exefs/main, so it has to build on whatever the 60 FPS set just wrote
     # rather than on the dump's copy. Gated on its own env var, so a build
@@ -1503,7 +1762,17 @@ def run_build(mods, enabled, settings_by_mod, log, progress,
         needed=bool((plan.spell_dds
                      and build.ff7nx_spelltex.uniform_scale() > 1)
                     or (plan.minigame_dds
-                        and build.ff7nx_minigametex.cap() > 0)))
+                        and build.ff7nx_minigametex.cap() > 0)
+                    # BUILD 621: ESUI menu sheets above their native size
+                    or (build.ff7nx_esui.CURRENT is not None
+                        and build.ff7nx_esui.tex_scale() > 1)
+                    # BUILD 641: Nitpick's title / portrait / credits art
+                    or (build.ff7nx_nitpick.CURRENT is not None
+                        and build.ff7nx_nitpick.CURRENT.get('textures')
+                        and build.ff7nx_nitpick.tex_scale() > 1)
+                    # BUILD 763: a mod's title background (4x)
+                    or (build.ff7nx_titleart.CURRENT is not None
+                        and build.ff7nx_titleart.CURRENT.get('built'))))
     # The framebuffer-texture capture rect. The floor-warp summons snapshot
     # the frame and map it onto their mesh; the capture converts the rect to
     # staging-surface columns with a hardcoded identity that assumes a 640
@@ -1549,6 +1818,9 @@ def run_build(mods, enabled, settings_by_mod, log, progress,
     # still works.
     produced += build.apply_sfx_shuffle(SDOUT_DIR, DUMP, plan, log, produced)
     produced += build.apply_battle_sfx(SDOUT_DIR, DUMP, plan, log, produced)
+    # BUILD 738. Cosmo Memory's Center Battle SFX, from its <FFNxConfig>: one
+    # word in the DirectSound shim's SetPan, no cave. See ff7nx_sfxcenter.
+    produced += build.apply_sfx_center(SDOUT_DIR, DUMP, plan, log, produced)
     produced += build.apply_world_footsteps(SDOUT_DIR, DUMP, plan, log,
                                             produced)
     produced += build.apply_field_footsteps(SDOUT_DIR, DUMP, plan, log,
@@ -1595,6 +1867,24 @@ def run_build(mods, enabled, settings_by_mod, log, progress,
     # pool, and it goes after the cycle so a shortfall lands on the newest
     # thing. See ff7nx_calendar.
     produced += build.apply_calendar(SDOUT_DIR, DUMP, plan, log, produced)
+    # BUILD 621. Enhanced Stock UI screens (SEVENTH_NX_ESUI=main): in-place
+    # words in exefs/main and data patches in ff7_en. After the calendar,
+    # which owns the Time/Gil box when it is installed. See ff7nx_esui.
+    produced += build.apply_esui(SDOUT_DIR, DUMP, log, produced)
+    # BUILD 680. The camera-locked tunnel attacks (Refuse & co.) cover 16:9:
+    # six .data words in ff7_en. See ff7nx_fxtunnel.
+    produced += build.apply_fx_tunnel(SDOUT_DIR, DUMP, log, produced)
+    # BUILD 629. FFNx's title-screen music (Echo-S's main_menu.ogg): two
+    # caves in the title screen's frame function. See ff7nx_titlemusic.
+    produced += build.apply_titlemusic(SDOUT_DIR, DUMP, plan, log, produced)
+    # BUILD 640. The startup logo movie (Echo-S: _sqlogo with SYW mods,
+    # else _eidoslogo; none without Echo-S). See ff7nx_sqlogo.
+    produced += build.apply_sqlogo(SDOUT_DIR, DUMP, plan, log, produced)
+    # BUILD 641. Nitpick's title background / menu and attract-mode backdrop
+    # (module words). See ff7nx_nitpick.
+    produced += build.apply_nitpick(SDOUT_DIR, DUMP, log, produced)
+    # BUILD 763: the title quad for a non-Nitpick title background.
+    produced += build.apply_titleart(SDOUT_DIR, DUMP, log, produced)
     # Echo-S's first field script invokes a PC runtime-selected tutorial
     # movie. This preserves the real materia tutorial and redirects only
     # that field to an otherwise unused movie slot.
@@ -1618,7 +1908,11 @@ def run_build(mods, enabled, settings_by_mod, log, progress,
     # BUILD 620j. Layers 3/4 in sub-unit steps (anfrst_4's beams). Grows BSS
     # by 4 bytes, so it sits beside moviepace, after the voice runtime. See
     # ff7nx_subparallax.
+    produced += build.apply_subcam(SDOUT_DIR, DUMP, log, produced)
     produced += build.apply_subparallax(SDOUT_DIR, DUMP, log, produced)
+    # BUILD 694. Window colour sliders step once per press. Grows BSS by 8
+    # bytes, so it sits with the passes above. See ff7nx_winrepeat.
+    produced += build.apply_winrepeat(SDOUT_DIR, DUMP, log, produced)
     # BUILD 537. The sound-buffer pool: 32 MB static -> heap, so Cosmo
     # Memory's long SFX loops cannot close the game (Chocobo Race). Last of
     # the cave passes so no shipping cave moves. See ff7nx_audiopool.
@@ -1630,6 +1924,9 @@ def run_build(mods, enabled, settings_by_mod, log, progress,
     produced += build.apply_coaster(SDOUT_DIR, DUMP, log, produced)
     # BUILD 565. Fort Condor at 16:9. See ff7nx_condor.
     produced += build.apply_condor(SDOUT_DIR, DUMP, log, produced)
+    # BUILD 770. Submarine DEPTH/SPEED gauges toward the 16:9 edges
+    # (in-place words only). See ff7nx_subhud.
+    produced += build.apply_sub_hud(SDOUT_DIR, DUMP, log, produced)
     # BUILD 567. Per-field 4:3 zoom (convil_2). See ff7nx_fieldzoom.
     produced += build.apply_field_zoom(SDOUT_DIR, DUMP, log, produced)
     produced += build.apply_condorpad(SDOUT_DIR, DUMP, log, produced)
@@ -1641,18 +1938,75 @@ def run_build(mods, enabled, settings_by_mod, log, progress,
     produced += build.apply_worldfar(SDOUT_DIR, DUMP, log, produced)
     # BUILD 528. Diagnostic frame probe, off unless SEVENTH_NX_FRAME_PROBE=1.
     # Must be the last module pass. See ff7nx_frameprobe.
-    produced += build.apply_frame_probe(SDOUT_DIR, DUMP, plan, log, produced)
+    # BUILD 665. Field sounds decoded at field entry, and a frame with
+    # nothing drawn keeps the last picture. Dead-space parts of their own;
+    # the preload reads the sequential-SFX bridge's final route table.
+    # See ff7nx_sfxpreload / ff7nx_blankhold.
+    produced += build.apply_sfx_preload(SDOUT_DIR, DUMP, plan, log, produced)
+    produced += build.apply_blank_hold(SDOUT_DIR, DUMP, plan, log, produced)
+    # BUILD 675. FFNx's per-vertex model lighting. See ff7nx_lighting.
+    produced += build.apply_lighting(SDOUT_DIR, DUMP, plan, log, produced)
+    # BUILD 791. Its per-vertex loop (x86 0x68EA86) native, calling the
+    # vertex routine as built above. See ff7nx_lightloop.
+    produced += build.apply_lightloop(SDOUT_DIR, DUMP, plan, log, produced)
+    # BUILD 792. The background's quad builder (x86 0x6465FB) native. See
+    # ff7nx_bgquads.
+    produced += build.apply_bgquads(SDOUT_DIR, DUMP, log, produced)
+    # BUILD 797. The driver's paletted texture conversion with the palette
+    # translated once per texture. See ff7nx_palconv.
+    produced += build.apply_palconv(SDOUT_DIR, DUMP, log, produced)
+    # BUILD 747. FFNx's effect interpolation (decorated battle effects drawn
+    # at 60 Hz). Its own dead translated body + BSS. See ff7nx_fxinterp.
+    produced += build.apply_fxinterp(SDOUT_DIR, DUMP, log, produced)
+    produced += build.apply_uvwrap(SDOUT_DIR, DUMP, log, produced)
     # The custom PIXEL shader sets (background scaler, FXAA). These touch no
     # module at all, so they can go anywhere -- but they must go BEFORE
     # prune_stale, because that is what deletes them again when the setting
     # goes back to Stock. They also have to land after ff7nx_ws's vertex
     # shaders so both end up in the same romfs/ff7/shaders directory listing.
     produced += build.ff7nx_shaders.apply(SDOUT_DIR, log, produced)
+    # BUILD 645/646. Model shadows, battle + field ("Model shadows", default on): after
+    # every other module pass and after the shaders above, because it also
+    # adds one line to the lmain_vv.glsl they install. See ff7nx_shadows.
+    produced += build.apply_shadows(SDOUT_DIR, DUMP, log, produced)
+    # BUILD 681. Spit attacks reach the target. After shadows: it takes
+    # only padding holes no other pass is left to want. See ff7nx_spitreach.
+    produced += build.apply_spit_reach(SDOUT_DIR, DUMP, log, produced)
+    # BUILD 682. Refuse's spinning square covers 16:9. See ff7nx_fxplane.
+    produced += build.apply_fx_plane(SDOUT_DIR, DUMP, log, produced)
+    # BUILD 684. Attacks never draw over the battle UI. See ff7nx_uitop.
+    produced += build.apply_ui_top(SDOUT_DIR, DUMP, log, produced)
+    # BUILD 809. W-Item duplication / lost first item, in place (no cave).
+    produced += build.apply_witem(SDOUT_DIR, DUMP, log, produced)
+    # BUILD 761. Experimental: 1080p / 900p output when the game starts
+    # docked, 720p handheld. Nothing is written while the setting is off.
+    # After every feature pass, so each of them places its caves exactly as
+    # before; only the diagnostic probe comes later.
+    produced += build.apply_dockres(SDOUT_DIR, DUMP, log, produced)
+    # BUILD 788. Experimental GL cost cut (SEVENTH_NX_GL_STATE /
+    # SEVENTH_NX_GL_UPLOAD): after every feature pass, before the probe, so
+    # a probe build times it. See ff7nx_glstate.
+    produced += build.apply_glstate(SDOUT_DIR, DUMP, log, produced)
+    # BUILD 691. The diagnostic probe (SEVENTH_NX_FRAME_PROBE) is the LAST
+    # module pass, after every pass that edits exefs/main. Before 691 it ran
+    # ahead of the shadows, spit-reach, fx-plane and UI-on-top passes, so the
+    # UI-on-top cave found the probe's wrapper at its call site and refused:
+    # a probe build silently tested the battle UI without its fix.
+    produced += build.apply_frame_probe(SDOUT_DIR, DUMP, plan, log, produced)
 
     # Everything the build produces is known now, so anything a PREVIOUS
     # build left here that this one does not produce is stale -- a feature
     # toggled off since. Only ever removes files this packer itself wrote.
     build.prune_stale(SDOUT_DIR, produced, log)
+
+    # BUILD 754: and anything in cache/ that nothing uses any more -- mod
+    # extractions whose .iro is gone, and, after a build that rebuilt every
+    # archive, the conversion-cache entries it never read. See ff7nx_cachegc.
+    try:
+        import ff7nx_cachegc
+        ff7nx_cachegc.sweep(MODS_DIR, not build.ARCHIVES_NOT_REBUILT, log)
+    except Exception as exc:                                    # noqa: BLE001
+        log('  ! cache cleanup skipped: %s' % exc)
 
     log('')
     if produced:
@@ -1667,27 +2021,53 @@ def run_build(mods, enabled, settings_by_mod, log, progress,
                 'thing in two files -- copy data/sound as well, or the game '
                 'reads every appended sound variant at the wrong offset and '
                 'they come out as crackle.' % ', '.join(sorted(moved)))
-        # Atmosphere's fs.mitm caches the BUILT romfs layout -- every file's
-        # offset and length -- in atmosphere/contents/<title>/romfs_metadata.bin
-        # on the card. Nothing in this build writes that file and nothing here
-        # can invalidate it. Change any file under romfs/ and leave it in
-        # place, and the game is handed the old layout for the new bytes: a
-        # clip, an audio.dat record or an archive entry read at the wrong
-        # length. It is one file, deleting it costs a few seconds of boot, and
-        # skipping it costs a day of bisecting the mod instead.
-        log('then DELETE atmosphere/contents/0100A5B00BDC6000/'
-            'romfs_metadata.bin from the card. Atmosphere caches the romfs '
-            'layout there and does not notice that you changed the files; a '
-            'stale one feeds the game the wrong bytes. It rebuilds by itself '
-            'on the next boot.')
-        log('  (copying only exefs/main does not need this -- exefs is not '
-            'part of that cache, which is why a main-only test never had to.)')
     else:
         log('nothing was written.')
     return _finish(bool(produced))
 
 
 # ------------------------------------------------------------------- UI
+
+def default_globals():
+    """The `__global__` part of data/default_settings.json ({} if absent)."""
+    try:
+        with open(DEFAULT_SETTINGS, encoding='utf-8') as fh:
+            return dict(json.load(fh).get('__global__', {}))
+    except (OSError, ValueError, AttributeError):
+        return {}
+
+
+def default_mod_settings():
+    """{file name: {'enabled', 'options'}} from data/default_mod_settings.json
+    ({} if absent). Keyed like settings.json, by the name in mod_sources."""
+    try:
+        with open(DEFAULT_MOD_SETTINGS, encoding='utf-8') as fh:
+            listed = json.load(fh).get('mods', {})
+    except (OSError, ValueError, AttributeError):
+        return {}
+    if not isinstance(listed, dict):
+        return {}
+    return {name: {'enabled': bool(e.get('enabled', NEW_MOD_ENABLED)),
+                   'options': dict(e.get('options') or {})}
+            for name, e in listed.items() if isinstance(e, dict)}
+
+
+def seed_mod_defaults(saved, mods):
+    """Give every installed mod that settings.json does not list its factory
+    entry, so a supported mod installed later starts on, with the options it
+    is tested with, instead of off at the author's defaults. Runs after
+    migrate_saved_mod_keys, so a renamed mod keeps its own saved entry.
+
+    Edits `saved` in place (and returns it). A mod settings.json lists is
+    never touched, whatever its state."""
+    if not isinstance(saved, dict):
+        return saved
+    factory = default_mod_settings()
+    for mod in mods:
+        if mod.filename not in saved and mod.filename in factory:
+            saved[mod.filename] = factory[mod.filename]
+    return saved
+
 
 def _reveal(path):
     """Open a folder in the OS file browser."""
@@ -1709,7 +2089,11 @@ def launch_ui():
 
     saved = build.load_settings(SETTINGS)
     mods = discover_mods(profile_mod_order(saved))
-    global_saved = saved.get('__global__', {})
+    migrate_saved_mod_keys(saved, mods)
+    seed_mod_defaults(saved, mods)
+    # BUILD 804: saved values as they are; LOCKED fills what is missing.
+    global_saved = nxsettings.effective_global(
+        dict(default_globals(), **saved.get('__global__', {})))
     cap_label_by_value = dict(FIELD_TEX_CAP_CHOICES)
     value_by_cap_label = {v: k for k, v in FIELD_TEX_CAP_CHOICES}
     initial_cap_value = global_saved.get('field_tex_cap', 0)
@@ -1796,11 +2180,23 @@ def launch_ui():
 
     root = tk.Tk()
     root.title('7th Heaven NX')
-    root.geometry('1000x720')
-    root.minsize(880, 600)
+    # Default layout (Patrick's, Oct 2026): 1090x1128 with the Mods column
+    # at ~42.5% of the width and the log at the bottom ~26% (WIN_SPLIT_*).
+    # On a smaller screen the window shrinks to fit, either way, and the
+    # splits stay proportional because they are fractions.
+    WIN_W, WIN_H = 1090, 1128
+    WIN_SPLIT_X, WIN_SPLIT_Y = 0.425, 0.739
+    _sw, _sh = root.winfo_screenwidth(), root.winfo_screenheight()
+    _ww, _wh = min(WIN_W, _sw - 40), min(WIN_H, _sh - 100)
+    root.geometry('%dx%d+%d+%d' % (_ww, _wh, max(0, (_sw - _ww) // 2),
+                                   max(30, (_sh - _wh) // 2 - 20)))
+    root.minsize(min(880, _ww), min(600, _wh))
 
-    # ---------- dark blue theme -----------------------------------------
-    # This app always renders the same dark theme, regardless of the OS's
+    # ---------- theme ---------------------------------------------------
+    # The palette comes from nxthemes (Settings > GUI), read once
+    # here; a change applies on the next launch.
+    #
+    # This app always renders its own dark theme, regardless of the OS's
     # own light/dark setting. 'aqua' (macOS's native ttk theme) was the
     # source of the jarring white-selection-bar bug: aqua draws its own
     # native chrome per-widget and mostly ignores colors we set on it, so a
@@ -1808,21 +2204,28 @@ def launch_ui():
     # bar with no way to fix it from here. 'clam' is fully style-driven --
     # nothing native, no OS-dependent surprises -- so every color below is
     # exactly what renders, on every platform, every time.
-    BG_APP        = '#0b1220'   # window + all panel backgrounds
-    BG_ROW        = '#151d30'   # unselected mod-row background
-    BG_ROW_HOVER  = '#1a2438'   # mod-row background on mouse-over
-    BG_ROW_SEL    = '#1c3a5e'   # selected mod-row background (blue tint)
-    BORDER        = '#232e46'
-    ACCENT        = '#4f9dff'
-    ACCENT_SOFT   = '#8ec2ff'
-    TEXT_PRIMARY  = '#e8ecf4'
-    TEXT_SECONDARY = '#8b93a8'
-    TEXT_MUTED    = '#5c6579'
+    _theme = nxthemes.palette(_global_setting('gui_theme', nxthemes.DEFAULT))
+    # The names below are read when something is drawn, never copied, so
+    # apply_theme can rebind them and repaint without a restart.
+    BG_APP        = _theme['BG_APP']        # window + all panel backgrounds
+    BG_ROW        = _theme['BG_ROW']        # unselected mod-row background
+    BG_ROW_HOVER  = _theme['BG_ROW_HOVER']  # mod-row background on mouse-over
+    BG_ROW_SEL    = _theme['BG_ROW_SEL']    # selected mod-row background
+    BORDER        = _theme['BORDER']
+    ACCENT        = _theme['ACCENT']
+    ACCENT_HOVER  = _theme['ACCENT_HOVER']
+    ACCENT_SOFT   = _theme['ACCENT_SOFT']
+    ON_ACCENT     = _theme['ON_ACCENT']     # text on ACCENT / ACCENT_HOVER
+    CHECK_TICK    = _theme['CHECK_TICK']
+    TEXT_PRIMARY  = _theme['TEXT_PRIMARY']
+    TEXT_SECONDARY = _theme['TEXT_SECONDARY']
+    TEXT_MUTED    = _theme['TEXT_MUTED']
     ARCHIVE_EXACT = ACCENT_SOFT
     ARCHIVE_EST   = TEXT_MUTED
-    LOG_BG        = '#070b14'
-
-    root.configure(bg=BG_APP)
+    LOG_BG        = _theme['LOG_BG']
+    LOG_TEXT      = _theme['LOG_TEXT']
+    GOOD          = _theme['GOOD']
+    WARN          = _theme['WARN']
 
     style = ttk.Style()
     try:
@@ -1830,74 +2233,103 @@ def launch_ui():
     except tk.TclError:
         pass
 
-    style.configure('.', background=BG_APP, foreground=TEXT_PRIMARY,
-                    fieldbackground=BG_ROW, bordercolor=BORDER,
-                    darkcolor=BG_APP, lightcolor=BG_APP,
-                    troughcolor=BG_ROW, focuscolor=ACCENT,
-                    font=('Helvetica', 11))
-    style.configure('TFrame', background=BG_APP)
-    style.configure('TLabel', background=BG_APP, foreground=TEXT_PRIMARY)
-    style.configure('TLabelframe', background=BG_APP, bordercolor=BORDER,
-                    relief='solid', borderwidth=1)
-    style.configure('TLabelframe.Label', background=BG_APP,
-                    foreground=TEXT_SECONDARY, font=('Helvetica', 10, 'bold'))
-    style.configure('TPanedwindow', background=BG_APP)
-    style.configure('TSeparator', background=BORDER)
+    def _apply_styles():
+        root.configure(bg=BG_APP)
+        style.configure('.', background=BG_APP, foreground=TEXT_PRIMARY,
+                        fieldbackground=BG_ROW, bordercolor=BORDER,
+                        darkcolor=BG_APP, lightcolor=BG_APP,
+                        troughcolor=BG_ROW, focuscolor=ACCENT,
+                        font=('Helvetica', 11))
+        style.configure('TFrame', background=BG_APP)
+        style.configure('TLabel', background=BG_APP, foreground=TEXT_PRIMARY)
+        style.configure('TLabelframe', background=BG_APP, bordercolor=BORDER,
+                        relief='solid', borderwidth=1)
+        style.configure('TLabelframe.Label', background=BG_APP,
+                        foreground=TEXT_SECONDARY, font=('Helvetica', 10, 'bold'))
+        style.configure('TPanedwindow', background=BG_APP)
+        style.configure('TSeparator', background=BORDER)
 
-    style.configure('Header.TLabel', font=('Helvetica', 18, 'bold'),
-                    foreground=TEXT_PRIMARY)
-    style.configure('Sub.TLabel', foreground=TEXT_SECONDARY)
-    style.configure('ModName.TLabel', font=('Helvetica', 12),
-                    background=BG_ROW, foreground=TEXT_PRIMARY)
-    style.configure('ModNameSelected.TLabel', font=('Helvetica', 12, 'bold'),
-                    background=BG_ROW_SEL, foreground=ACCENT_SOFT)
-    style.configure('ColHeader.TLabel', font=('Helvetica', 9, 'bold'),
-                    foreground=TEXT_MUTED)
-    style.configure('Archive.TLabel', font=('Menlo', 10),
-                    foreground=ARCHIVE_EXACT)
-    style.configure('ArchiveEst.TLabel', font=('Menlo', 10),
-                    foreground=ARCHIVE_EST)
+        style.configure('Header.TLabel', font=('Helvetica', 18, 'bold'),
+                        foreground=TEXT_PRIMARY)
+        style.configure('Sub.TLabel', foreground=TEXT_SECONDARY)
+        style.configure('ModName.TLabel', font=('Helvetica', 12),
+                        background=BG_ROW, foreground=TEXT_PRIMARY)
+        style.configure('ModNameSelected.TLabel', font=('Helvetica', 12, 'bold'),
+                        background=BG_ROW_SEL, foreground=ACCENT_SOFT)
+        style.configure('Link.TLabel', foreground=ACCENT_SOFT,
+                        font=('Helvetica', 11, 'underline'))
+        style.configure('ColHeader.TLabel', font=('Helvetica', 9, 'bold'),
+                        foreground=TEXT_MUTED)
+        style.configure('Archive.TLabel', font=('Helvetica', 11),
+                        foreground=ARCHIVE_EXACT)
+        style.configure('ArchiveEst.TLabel', font=('Helvetica', 11),
+                        foreground=ARCHIVE_EST)
 
-    style.configure('TButton', background=BG_ROW, foreground=TEXT_PRIMARY,
-                    bordercolor=BORDER, padding=(10, 6))
-    style.map('TButton',
-              background=[('active', BG_ROW_HOVER), ('disabled', BG_APP)],
-              foreground=[('disabled', TEXT_MUTED)])
-    style.configure('Build.TButton', font=('Helvetica', 13, 'bold'),
-                    padding=(18, 9), background=ACCENT, foreground='#08111e',
-                    bordercolor=ACCENT)
-    style.map('Build.TButton',
-              background=[('active', ACCENT_SOFT), ('disabled', BG_ROW)],
-              foreground=[('disabled', TEXT_MUTED)])
+        # Settings' checkboxes. Without these clam paints a light grey box behind
+        # a disabled or hovered one, and a white indicator in every theme.
+        style.configure('TCheckbutton', background=BG_APP,
+                        foreground=TEXT_PRIMARY, indicatorbackground=BG_ROW,
+                        indicatorforeground=CHECK_TICK,
+                        upperbordercolor=TEXT_SECONDARY,
+                        lowerbordercolor=TEXT_SECONDARY)
+        style.map('TCheckbutton',
+                  background=[('active', BG_APP), ('disabled', BG_APP)],
+                  foreground=[('disabled', TEXT_MUTED)],
+                  indicatorbackground=[('disabled', BG_APP),
+                                       ('selected', ACCENT)],
+                  upperbordercolor=[('disabled', TEXT_MUTED),
+                                    ('selected', ACCENT)],
+                  lowerbordercolor=[('disabled', TEXT_MUTED),
+                                    ('selected', ACCENT)])
 
-    style.configure('TCombobox', fieldbackground=BG_ROW, background=BG_ROW,
-                    foreground=TEXT_PRIMARY, arrowcolor=TEXT_SECONDARY,
-                    bordercolor=BORDER, selectbackground=BG_ROW,
-                    selectforeground=TEXT_PRIMARY)
-    style.map('TCombobox',
-              fieldbackground=[('readonly', BG_ROW), ('focus', BG_ROW)],
-              foreground=[('readonly', TEXT_PRIMARY)],
-              background=[('readonly', BG_ROW)],
-              bordercolor=[('focus', ACCENT)])
-    # The Combobox's dropdown list is a separate, un-styled Tk Listbox --
-    # without this it stays white-on-black regardless of the ttk style set
-    # above, which would be its own jarring mismatch against a dark app.
-    root.option_add('*TCombobox*Listbox.background', BG_ROW)
-    root.option_add('*TCombobox*Listbox.foreground', TEXT_PRIMARY)
-    root.option_add('*TCombobox*Listbox.selectBackground', ACCENT)
-    root.option_add('*TCombobox*Listbox.selectForeground', '#08111e')
-    root.option_add('*TCombobox*Listbox.font', ('Helvetica', 11))
+        style.configure('TButton', background=BG_ROW, foreground=TEXT_PRIMARY,
+                        bordercolor=BORDER, padding=(10, 6))
+        style.map('TButton',
+                  background=[('active', BG_ROW_HOVER), ('disabled', BG_APP)],
+                  foreground=[('disabled', TEXT_MUTED)])
+        style.configure('Build.TButton', font=('Helvetica', 13, 'bold'),
+                        padding=(18, 9), background=ACCENT, foreground=ON_ACCENT,
+                        bordercolor=ACCENT)
+        style.map('Build.TButton',
+                  background=[('active', ACCENT_HOVER), ('disabled', BG_ROW)],
+                  foreground=[('disabled', TEXT_MUTED)])
+        # BUILD 804: an accent button at the normal button size (About Dev)
+        style.configure('Accent.TButton', background=ACCENT,
+                        foreground=ON_ACCENT, bordercolor=ACCENT)
+        style.map('Accent.TButton',
+                  background=[('active', ACCENT_HOVER), ('disabled', BG_ROW)],
+                  foreground=[('disabled', TEXT_MUTED)])
 
-    for pbstyle in ('TProgressbar', 'Horizontal.TProgressbar'):
-        style.configure(pbstyle, background=ACCENT, troughcolor=BG_ROW,
-                        bordercolor=BORDER, lightcolor=ACCENT,
-                        darkcolor=ACCENT)
+        style.configure('TCombobox', fieldbackground=BG_ROW, background=BG_ROW,
+                        foreground=TEXT_PRIMARY, arrowcolor=TEXT_SECONDARY,
+                        bordercolor=BORDER, selectbackground=BG_ROW,
+                        selectforeground=TEXT_PRIMARY)
+        style.map('TCombobox',
+                  fieldbackground=[('disabled', BG_APP), ('readonly', BG_ROW), ('focus', BG_ROW)],
+                  foreground=[('disabled', TEXT_MUTED), ('readonly', TEXT_PRIMARY)],
+                  background=[('readonly', BG_ROW)],
+                  bordercolor=[('focus', ACCENT)])
+        # The Combobox's dropdown list is a separate, un-styled Tk Listbox --
+        # without this it stays white-on-black regardless of the ttk style set
+        # above, which would be its own jarring mismatch against a dark app.
+        root.option_add('*TCombobox*Listbox.background', BG_ROW)
+        root.option_add('*TCombobox*Listbox.foreground', TEXT_PRIMARY)
+        root.option_add('*TCombobox*Listbox.selectBackground', ACCENT)
+        root.option_add('*TCombobox*Listbox.selectForeground', ON_ACCENT)
+        root.option_add('*TCombobox*Listbox.font', ('Helvetica', 11))
 
-    style.configure('Vertical.TScrollbar', background=BORDER,
-                    troughcolor=BG_APP, bordercolor=BG_APP,
-                    arrowcolor=TEXT_SECONDARY, relief='flat', gripcount=0)
-    style.map('Vertical.TScrollbar',
-              background=[('active', ACCENT), ('pressed', ACCENT)])
+        for pbstyle in ('TProgressbar', 'Horizontal.TProgressbar'):
+            style.configure(pbstyle, background=ACCENT, troughcolor=BG_ROW,
+                            bordercolor=BORDER, lightcolor=ACCENT,
+                            darkcolor=ACCENT)
+
+        style.configure('Vertical.TScrollbar', background=BORDER,
+                        troughcolor=BG_APP, bordercolor=BG_APP,
+                        arrowcolor=TEXT_SECONDARY, relief='flat', gripcount=0)
+        style.map('Vertical.TScrollbar',
+                  background=[('active', ACCENT), ('pressed', ACCENT)])
+
+    _apply_styles()
 
     settings_by_mod = {}
     enabled = {}
@@ -1925,18 +2357,19 @@ def launch_ui():
     # data, so a PhotoImage nothing else refers to is garbage collected and
     # the widget silently draws nothing. This is the most common way Tk icons
     # vanish and the list is what prevents it.
-    ICON_PATH = os.path.join(HERE, 'icon.png')
+    ICON_PATH = os.path.join(nxpaths.APP, 'assets', 'icon.png')
     _icon_keep = []
 
-    def _load_icon(px=None):
-        """icon.png as a Tk image, resampled to `px` square (None = native)."""
-        if not os.path.exists(ICON_PATH):
+    def _load_icon(px=None, path=ICON_PATH):
+        """`path` (icon.png) as a Tk image, resampled to `px` square (None =
+        native)."""
+        if not os.path.exists(path):
             return None
         img = None
         try:
             # preferred: a real resample
             from PIL import Image, ImageTk
-            im = Image.open(ICON_PATH).convert('RGBA')
+            im = Image.open(path).convert('RGBA')
             if px and im.size != (px, px):
                 im = im.resize((px, px), getattr(Image, 'LANCZOS',
                                                  Image.BICUBIC))
@@ -1946,7 +2379,7 @@ def launch_ui():
             # Linux), so fall back to Tk's own PNG reader. It can only
             # downscale by an integer factor, which is fine on a square source.
             try:
-                raw = tk.PhotoImage(file=ICON_PATH)
+                raw = tk.PhotoImage(file=path)
                 if px:
                     k = max(1, min(raw.width(), raw.height()) // px)
                     raw = raw.subsample(k, k) if k > 1 else raw
@@ -1958,7 +2391,14 @@ def launch_ui():
 
     # window / taskbar / Dock. `True` makes it the default for every toplevel,
     # so the Settings dialog inherits it too.
-    _win_icon = _load_icon(256)
+    #
+    # On macOS Tk's iconphoto IS the Dock icon, so it gets the rounded-square
+    # icon_macos.png too. Given the round icon.png, the release's Dock icon
+    # flashed round for a moment at launch, between the .app's own icon and
+    # the AppKit call below.
+    _dock_icon = os.path.join(nxpaths.APP, 'assets', 'icon_macos.png')
+    _win_icon = _load_icon(256, _dock_icon if sys.platform == 'darwin'
+                           and os.path.exists(_dock_icon) else ICON_PATH)
     if _win_icon is not None:
         try:
             root.iconphoto(True, _win_icon)
@@ -1971,12 +2411,18 @@ def launch_ui():
     # pyobjc happens to be installed; when it is not, this does nothing and
     # the Dock keeps showing Python. Making that reliable needs a real .app
     # bundle with an .icns, which is a packaging job, not a code one.
+    #
+    # The Dock gets icon_macos.png, the rounded-square cut of the same art
+    # that the release's .app carries: macOS 26 shows any other shape on a
+    # grey plate, and a Dock icon that changed shape at launch looks wrong.
     if sys.platform == 'darwin':
         try:
             from AppKit import NSApplication, NSImage
             from Foundation import NSURL
             ns = NSImage.alloc().initWithContentsOfURL_(
-                NSURL.fileURLWithPath_(ICON_PATH))
+                NSURL.fileURLWithPath_(_dock_icon
+                                       if os.path.exists(_dock_icon)
+                                       else ICON_PATH))
             if ns is not None:
                 NSApplication.sharedApplication().setApplicationIconImage_(ns)
         except Exception:
@@ -1988,10 +2434,59 @@ def launch_ui():
 
     ttk.Label(header, text='7th Heaven NX', style='Header.TLabel'
               ).pack(side='left')
-    status = DUMP.describe() if DUMP else \
-        'game dump MISSING — put your Switch dump in dump/'
-    ttk.Label(header, text=f'v{VERSION}  ·  {len(mods)} mods  ·  {status}',
-              style='Sub.TLabel').pack(side='left', padx=12)
+    def _count_text():
+        return f'v{VERSION}  ·  {len(mods)} mods  ·'
+
+    count_label = ttk.Label(header, text=_count_text(), style='Sub.TLabel')
+    count_label.pack(side='left', padx=(12, 0))
+    # Dump status, checked once here (build.check_game_dump reads headers
+    # and one small hash, ~0.1 s). Not found: click to open the folder the
+    # dump goes in. Invalid: click to put the reasons in the log.
+    dump_problems = build.check_game_dump(DUMP)
+    if DUMP is None:
+        dump_text, dump_fg = 'game dump not found', WARN
+    elif dump_problems:
+        dump_text, dump_fg = 'game dump found - INVALID', WARN
+    else:
+        dump_text, dump_fg = 'game dump found - VALID', GOOD
+    dump_lbl = ttk.Label(header, text=dump_text, foreground=dump_fg)
+    dump_lbl.pack(side='left', padx=(4, 0))
+
+    def _dump_click(_evt=None):
+        """Opens the dump folder, whatever its state; says why when it is
+        missing or not right."""
+        if DUMP is None:
+            target = os.path.join(HERE, 'dump')
+            os.makedirs(target, exist_ok=True)
+            log_write('Put your Switch game dump in %s (romfs/ and exefs/ '
+                      'inside it), then restart.' % target)
+        else:
+            target = DUMP.root
+            if dump_problems:
+                log_write('Game dump at %s:' % DUMP.root)
+                for why in dump_problems:
+                    log_write('  ! ' + why)
+        try:
+            _reveal(target)
+        except OSError:             # no file browser to hand it to
+            pass
+
+    dump_lbl.configure(cursor='hand2')
+    dump_lbl.bind('<Button-1>', _dump_click)
+    dump_lbl.bind('<Enter>', lambda _e: dump_lbl.configure(
+        font=('Helvetica', 11, 'underline')))
+    dump_lbl.bind('<Leave>', lambda _e: dump_lbl.configure(
+        font=('Helvetica', 11)))
+    # short: the header buttons are packed after this and get only the
+    # width that is left, so a long label clips "Install Mods"
+    dev_tag = ttk.Label(header, text='·  DEV', style='Sub.TLabel')
+
+    def _show_dev_tag():
+        if nxsettings.dev_mode():
+            dev_tag.pack(side='left', padx=(4, 0), after=dump_lbl)
+        else:
+            dev_tag.pack_forget()
+    _show_dev_tag()
 
     # ---------- settings (one button; the dialog is built on demand) -----
     # Everything below used to live loose in the header: four wide combo
@@ -2034,6 +2529,38 @@ def launch_ui():
 
     def current_spell_tex_cap():
         return spell_value_by_cap_label.get(spell_cap_var.get(), 512)
+
+    _dr = global_saved.get('dock_resolution', DOCK_RES_DEFAULT)
+    dockres_var = tk.StringVar(value=DOCK_RES_LABELS.get(
+        DOCK_RES_DEFAULT if _dr is None else str(_dr),
+        DOCK_RES_LABELS[DOCK_RES_DEFAULT]))
+
+    title_var = tk.StringVar(value=TITLE_SCREEN_LABELS.get(
+        str(global_saved.get('title_screen', TITLE_SCREEN_DEFAULT)),
+        TITLE_SCREEN_LABELS[TITLE_SCREEN_DEFAULT]))
+
+    def current_title_screen():
+        return TITLE_SCREEN_BY_LABEL.get(title_var.get(), TITLE_SCREEN_DEFAULT)
+
+    theme_var = tk.StringVar(value=nxthemes.LABELS.get(
+        str(global_saved.get('gui_theme', nxthemes.DEFAULT)),
+        nxthemes.LABELS[nxthemes.DEFAULT]))
+
+    def current_theme():
+        return nxthemes.BY_LABEL.get(theme_var.get(), nxthemes.DEFAULT)
+
+    # Settings > GUI > Developer Settings. SEVENTH_NX_DEV=1 forces it on.
+    devset_var = tk.BooleanVar(value=nxsettings.dev_mode())
+
+    def current_dock_resolution():
+        return DOCK_RES_BY_LABEL.get(dockres_var.get(), DOCK_RES_DEFAULT)
+
+    _esc = global_saved.get('esui_texscale', 2)
+    esuisc_var = tk.StringVar(value=ESUI_TEXSCALE_LABELS.get(
+        _esc, ESUI_TEXSCALE_LABELS[2]))
+
+    def current_esui_texscale():
+        return ESUI_TEXSCALE_BY_LABEL.get(esuisc_var.get(), 2)
 
     mini_cap_var = tk.StringVar(
         value=mini_cap_label_by_value[initial_mini_cap_value])
@@ -2210,6 +2737,8 @@ def launch_ui():
     # write a word -- ff7nx_letterbox.enabled() and ff7nx_modelcull.enabled()
     # both fall through to ff7nx_ws.enabled().
     frame_var = tk.BooleanVar(value=bool(global_saved.get('field_frame', True)))
+    # BUILD 645/646. Model shadows (battle + field); on by default, off writes nothing.
+    shadows_var = tk.BooleanVar(value=bool(global_saved.get('model_shadows', True)))
     nocheat_var = tk.BooleanVar(value=bool(global_saved.get('no_cheats', False)))
 
     lim_label_by_value = {v: l for v, l in LIMITER_FPS_CHOICES}
@@ -2261,9 +2790,9 @@ def launch_ui():
     # default that reproduces a known artefact is not a default.
     fbuf_saved = global_saved.get('field_buffer',
                                   build.ff7nx_fieldbuf.DEFAULT_SCALE)
-    try:
-        fbuf_saved = int(fbuf_saved)
-    except (TypeError, ValueError):
+    # BUILD 757: 4.5 is a valid step, so not int().
+    fbuf_saved = build.ff7nx_fieldbuf._norm(fbuf_saved)
+    if fbuf_saved is None:
         fbuf_saved = build.ff7nx_fieldbuf.DEFAULT_SCALE
     if fbuf_saved not in FIELD_BUF_LABELS:
         # Same rule as the widescreen dropdown: an unknown value must not
@@ -2313,6 +2842,16 @@ def launch_ui():
     def current_scaler():
         return SCALER_BY_LABEL.get(scaler_var.get(), '')
 
+    _bp = global_saved.get('hd_black_point',
+                           build.ff7nx_shaders.BLACK_POINT_DEFAULT)
+    if _bp not in BLACK_POINT_LABELS:
+        _bp = build.ff7nx_shaders.BLACK_POINT_DEFAULT
+    bp_var = tk.StringVar(value=BLACK_POINT_LABELS[_bp])
+
+    def current_black_point():
+        return BLACK_POINT_BY_LABEL.get(
+            bp_var.get(), build.ff7nx_shaders.BLACK_POINT_DEFAULT)
+
     fxaa_saved = global_saved.get('fxaa', '')
     if fxaa_saved not in FXAA_LABELS:
         fxaa_saved = ''
@@ -2329,628 +2868,322 @@ def launch_ui():
     def current_video_shader():
         return VIDEO_SHADER_BY_LABEL.get(vshader_var.get(), '')
 
-    if not have_nso:
-        # These need exefs/main, which a bare workingdir/ does not have.
-        #
-        # 16:9 is NOT in this list any more, and that is the point of the
-        # content stage: it edits flevel.lgp and nothing else, so it works
-        # on a workingdir-only setup where every module patch is
-        # unavailable.
-        fps_var.set(False)
-        m30_var.set(False)
-        a360_var.set(False)
-        norun_var.set(False)
-        nocheat_var.set(False)
-        lim_var.set(lim_label_by_value[0])
+    # fps_60, movie_30fps, analog_360, no_autorun, no_cheats and the limiter
+    # need exefs/main, which a bare workingdir/ (or no dump yet) does not
+    # have. They stay editable and saved as chosen -- a fresh release folder
+    # has no dump until the user adds one, and forcing them off here used to
+    # save that over their choice -- and only the BUILD treats them as off
+    # (`_needs_nso`). 16:9 is not one of them: the content stage edits
+    # flevel.lgp only, so it works on a workingdir-only setup.
+    def _needs_nso(value, off=False):
+        return value if have_nso else off
 
     # ---- the dialog -----------------------------------------------------
-    # Grouped by what the setting is ABOUT, not by which module implements
-    # it, because that is how someone looks for one.
-    SETTINGS_SECTIONS = [
+    # BUILD 756. Two lists. USER_SECTIONS is all a player sees: settings that
+    # are a matter of taste and cannot break the build. DEV_SECTIONS appears
+    # only in developer mode, but builds as saved either way (BUILD 804). Help text is kept to a line or two; the
+    # full measurements and history that used to live here are in
+    # docs/notes/SETTINGS-HELP-ARCHIVE-755.md.
+    #
+    # Row: (kind, label, var, values, help, needs_full_dump)
+    class _Choices(list):
+        """Every label; `.user` is the list without the developer-only
+        ones, which is what the dialog offers outside developer mode."""
+
+    def _choices(pairs, user_hide=()):
+        out = _Choices(l for _v, l in pairs)
+        out.user = [l for v, l in pairs if v not in user_hide]
+        return out
+
+    USER_SECTIONS = [
+        ('GUI', [
+            ('combo', 'Theme', theme_var,
+             [label for _k, label in nxthemes.CHOICES],
+             'Colours of this window. Has no effect on the build.', False),
+            ('check', 'Developer Settings', devset_var, None,
+             'Shows every setting. Turning it off only hides them: the '
+             'build keeps using them as set. The note on the right says '
+             'whether they are at their tested defaults.', False),
+        ]),
         ('Display', [
-            ('combo', '16:9 widescreen', ws_var,
-             [l for _, l in WIDESCREEN_CHOICES],
-             '“16:9 widescreen” is the whole thing: it bakes the widescreen '
-             'mod’s per-field camera ranges into flevel.lgp (Cosmos Limit '
-             'Break ships a config — on it, that takes 341 of 711 fields to '
-             '647), widens the render target to 16:9, opens the field '
-             'background’s tile window on all four sides, and ships the two '
-             'vertex shaders that carry the scale. Needs a widescreen mod '
-             'enabled AND exefs/main from a full game dump.\n\n'
-             '“Data only” bakes the camera ranges and stops there. It never '
-             'opens exefs/main, so THE PICTURE STAYS 4:3 — it exists to test '
-             'the data half on its own, or to prepare flevel on a machine '
-             'with no dump. If you pick it and wonder why nothing changed on '
-             'the console, that is why; the build log says so too.\n\n'
-             'FIXED since this text was written: the battle scene now draws '
-             'to the bottom of the frame instead of stopping at the UI band; '
-             'the battle-entry swirl fills the frame instead of squeezing '
-             'the 16:9 picture into 4:3; and the battle fade and the summon '
-             'and limit-break flashes cover the whole frame; and menu and '
-             'dialogue boxes keep the border on the side that faces screen '
-             'centre; and the intro/prelude no longer SMEARS credit text '
-             'into the side margins -- its fade covers the whole frame and '
-             'its colour buffer is cleared every frame. Those follow this '
-             'setting automatically and have no switch of their own.\n\n'
-             'KNOWN GAPS with full widescreen: the battle fade-in animation '
-             'sweeps only the top ~70% before snapping, because its strip '
-             'stride still scales to the old 332-unit height; the victory '
-             'fade-to-black and some battle flashes are still 4:3; and the '
-             'fields with no camera range in the mod’s config can show a '
-             'black bar at the left edge when the camera pans; and in the '
-             'intro/prelude, credit lines are visible sitting in the side '
-             'margins while they wait to slide in. The smear is gone, but '
-             'the margins are not painted black yet -- the gate that would '
-             'do it needs a flag the game does not keep. See HANDOFF-104.'
-             '\n\n'
-             'CORRECTED: this text used to say the clipped window borders '
-             'were “NOT a widescreen bug”, on the grounds that the window '
-             'geometry is a stock data table this build never touches. The '
-             'geometry was innocent; the CLIP was not. The scale lives in '
-             'the vertex shader, so 2D geometry is scaled but a window’s own '
-             'viewport rect — computed on the CPU — is not, and the two only '
-             'agree at the centre of the screen. A box left of centre lost '
-             'its right border, a box right of centre lost its left one. '
-             'Fixed, and it follows this setting. See FINDINGS-103.\n\n'
-             'AND CORRECTED AGAIN: the first fix for that pointed the window '
-             'clip at the whole screen. Borders came back, but dialogue text '
-             'started outliving its box — the text kept drawing over the '
-             'field while the box shrank away — because that same clip is '
-             'what hides a window’s contents as it opens and closes. It is '
-             'now SCALED rather than removed, so the clip still does its job '
-             'and does it in the right place. If you saw text linger after '
-             'its box, that build is what did it, and this one does not.',
-             True),
-            ('combo', 'Field render resolution', fbuf_var,
-             [l for _, l in FIELD_BUF_CHOICES],
-             'THE FIX FOR THE VERTICAL BANDS. The port draws the field into '
-             'a hidden 320×240 buffer, because at 320 pixels the '
-             'pre-rendered background lands exactly 1:1 — one source texel '
-             'on one pixel — and the background scaler reconstructs it from '
-             'there. Widescreen squeezed 853 game units through those same '
-             '320 pixels, so a 16-texel tile was drawn into 12, and that '
-             'resample beats every 3 buffer pixels: the 12-pixel bands glued '
-             'to the screen. Widening the buffer puts the 1:1 back.\n\n'
-             '1× is the one confirmed on hardware, and it also hands the '
-             'field back the 25% of horizontal resolution widescreen had '
-             'been costing it. 2× and 3× supersample the whole field pass on '
-             'top of that; 3× is exactly 16:9 and renders the field at '
-             'native 720p in handheld, but it magnifies the background with '
-             'the hardware sampler before the scaler sees it, so it is a '
-             'different look rather than simply a better one — try Crisp '
-             'with it.\n\n'
-             'MEMORY: there are eight of these buffers, so 1× costs +0.8 MB '
-             'over stock, 2× costs +10 MB and 3× costs +26 MB — out of the '
-             'same pool the field background PAGES allocate from. The page '
-             'budget below was measured at the stock size, so at 2× or 3× a '
-             'heavy field (7–8 pages: the Sector 7 slums, nmkin_*) can run '
-             'out, and when it does the loader gives up on the first page it '
-             'cannot fit and every page after it draws nothing at all — a '
-             'flat coloured block where the art should be. Lower the page '
-             'budget or come back to 1× if you see that.\n\n'
-             'Only does anything with “16:9 widescreen” selected above. '
-             'See HANDOFF-51.', True),
-            ('combo', 'Graphics memory', gfx_var,
-             [l for _, l in GFX_POOL_CHOICES],
-             'LEAVE THIS AT 256 MB. It is here because it was tried, and '
-             'because the result is worth being able to reproduce — not '
-             'because it is a setting anyone should change.\n\n'
-             'WHAT IT IS. The port asks the NVN/GL driver for one 256 MB '
-             'block at module +0x113BD7C and keeps textures, render targets, '
-             'vertex and command memory in it. It is NOT the guest heap — '
-             'that one is FF7\'s own pixel arena and this build already '
-             'raises it from 64 to 256 MB.\n\n'
-             'WHY IT LOOKED LIKE A GOOD IDEA. This build spends far more of '
-             'that pool than the game it was sized for: +25.78 MB of '
-             'permanent field render target at 3×, 768px truecolor field '
-             'pages at 3.38 MB apiece against a vanilla paletted page\'s '
-             '0.31 MB, plus 768px world and battle caps. On paper it is '
-             'overspent.\n\n'
-             'WHAT ACTUALLY HAPPENS. Raising it CORRUPTS TEXTURES. Builds '
-             '187, 188 and 189 shipped 384 MB and every one of them showed '
-             'permanent corruption of field models, world map and battle '
-             'textures — and 512 MB was worse, not better. Setting it back '
-             'to 256 stopped all of it, in Wutai, in lower Junon, in battle '
-             'and on the world map, with nothing else changed. Measured on '
-             'hardware, 2026-08-27.\n\n'
-             'THE SIZES BELOW 256 ARE A DIAGNOSTIC, NOT A SETTING. 384 MB '
-             'corrupted textures constantly; 256 MB still corrupts them, '
-             'rarely, after enough field and battle churn. That is a '
-             'dose-response — more pool, sooner — so the axis is probably '
-             'how far into the block the allocator has climbed, not how '
-             'much room is left. If that is right, 192 MB should make the '
-             'corruption STOP, because the high-water mark can never reach '
-             'whatever address stops being correct. If instead the pool is '
-             'simply running out, 192 MB will be far WORSE, fast. Those are '
-             'opposite outcomes from one playtest, which is why the rung is '
-             'here. Expect a game that will not boot at the low end.\n\n'
-             'So this is not a headroom knob. 256 MB is a number the port '
-             'and the driver agree about, and a bigger block does not mean '
-             'more room — whatever the driver does with it stops being '
-             'correct. The exact mechanism is not established and this text '
-             'is not going to pretend otherwise.\n\n'
-             'It also does not fix the end-of-frame crash. That was the GL '
-             'error reporter, and it is fixed separately and permanently. '
-             'See FINDINGS-303.', True),
+            ('combo', 'Aspect ratio', ws_var,
+             _choices(WIDESCREEN_CHOICES, user_hide=('ws',)),
+             'Widens the picture to 16:9. Needs a widescreen mod such as '
+             'Cosmos Limit Break.', True),
+            ('combo', 'Output resolution', dockres_var,
+             _choices(DOCK_RES_CHOICES, user_hide=('900',)),
+             'Always: 1080p on the TV; the console scales it to the handheld '
+             'screen, so docking and undocking work at any time. Dynamic: '
+             'chosen when the game starts. The game renders at the same '
+             'internal size in every option.', True),
+            ('combo', 'Title screen', title_var,
+             _choices(TITLE_SCREEN_CHOICES),
+             'Buster Sword: a hand-refined HD painting of the sword, where '
+             'the original title has it. As the mods set it: what 7th Heaven '
+             'would show.', True),
         ]),
-        ('Display extras', [
-            ('check', 'Full-height 16:9 field', frame_var, None,
-             'The field is drawn 448 of 480 game units tall and the driver '
-             'PAINTS the missing 32 as two black quads over the finished '
-             'frame — set_driver_mode’s field branch is the only one of '
-             'fifteen that stores a non-zero letterbox height, which is why '
-             'battle and the menus reach the top of the screen and the field '
-             'does not, and why characters vanish under the bars instead of '
-             'being drawn over them.\n\n'
-             'This stops painting them, opens the field viewport to the full '
-             '480, and moves the background and its sprites down 8 tile '
-             'units so the window sits exactly on FF7’s own camera clamp '
-             'rather than 8 units past the edge of the art. That last part '
-             'is what stops a black band appearing at the bottom of a map '
-             'when you walk down to it: measured over the built archive, 561 '
-             'of 699 fields run out by exactly 8 units without it and 3 with '
-             'it.\n\n'
-             'It also shifts the FMV quad by the same amount, so a video '
-             'that hands straight over to gameplay does it seamlessly — '
-             'the bars drop and the view expands instead of the picture '
-             'jumping 24 px. Those two are one change and cannot be split: '
-             'move the field without the movie and the cut looks worse than '
-             'it did before. FFNx’s numbers (enable_uncrop, '
-             'ff7_field_center).\n\n'
-             'It also paints the FMV’s own 4:3 margins. FF7 keeps videos at '
-             '4:3, so in a 16:9 frame there is black to the left and right of '
-             'the picture and a thin band above and below it — and a field '
-             'model standing near the edge used to be drawn straight over it, '
-             'sword and legs hanging outside the video. Four opaque black '
-             'quads go down last, over the finished frame, so the overhang '
-             'passes UNDER them the way a real letterbox works. Nothing is '
-             'clipped and no model disappears. Only while a video is actually '
-             'playing. See FINDINGS-92.\n\n'
-             'NOT on this switch: the model cull box. It is 4:3-sized and '
-             'gets widened to the 16:9 frame whenever 16:9 is on, with or '
-             'without this box ticked. That one is a plain bug — NPCs '
-             'switched off while still inside the picture — and there is '
-             'no setting in which you would want it back.\n\n'
-             'Seven words, an eighteen-word cave for the movie quad and a '
-             'seventy-six-word one for the margin bars, all in dead alignment '
-             'padding and byte-exactly reversible. Only does anything with '
-             '“16:9 widescreen” selected above — at 4:3 the letterbox is '
-             'the framing the game was authored in, and there are no margins '
-             'to paint. See FINDINGS-88 and FINDINGS-92.', True),
-            # REMOVED, both retired on hardware results -- FINDINGS-92 §6.
-            #
-            # "Clip models to the movie" narrowed the GL scissor to the central
-            # 4:3 while a movie played. It could not work: the scissor it
-            # narrowed also caught the PRESENTATION BLIT, so the back buffer's
-            # margins were never written and froze the last field frame drawn
-            # before the FMV. That job is now done by ff7nx_moviebars, which
-            # paints the four margins as opaque black quads in the flip path --
-            # last, over the finished frame -- so overhang goes UNDER the black
-            # instead of being clipped, and no frame state changes at all.
-            #
-            # "Black 16:9 margins" made gfx_drv_setbg store black instead of
-            # the colour it was handed. Measured on hardware and it changed
-            # nothing, because the flat margin colour is not the clear colour.
-            # ff7nx_marginart / ff7nx_marginpal fixed that at the source.
-        ]),
-        ('Shaders', [
-            ('combo', 'Background scaler', scaler_var,
-             [l for _, l in SCALER_CHOICES],
-             'Replaces the 2xSaI / HQ4x pair the port uses to turn the '
-             'low-resolution field buffer into screen pixels — the thing '
-             'that makes the pre-rendered maps look soft. HD was tuned '
-             'against this game’s own art by reconstructing downsampled '
-             'flevel crops, which is why it is the recommendation over the '
-             'generic pixel-art kernels. These used to have to be copied '
-             'onto the card by hand; now the build ships them, and removes '
-             'them again when you switch back to Stock.\n\n'
-             'How much this matters depends on the setting above: at 1× the '
-             'scaler is doing all the magnification and the choice is very '
-             'visible; at 3× most of it has already happened and every '
-             'kernel converges towards smooth.', False),
-            ('combo', 'Full-screen anti-aliasing', fxaa_var,
-             [l for _, l in FXAA_CHOICES],
-             'The port runs FXAA over the whole frame. HD is a retuned '
-             'version; Off is sharper and cheaper and leaves 3D model edges '
-             'jaggier. Independent of the scaler above — it is a different '
-             'shader on a different pass.', False),
+        ('Graphics', [
+            ('combo', 'Background upscaling', scaler_var,
+             _choices(SCALER_CHOICES, user_hide=('soft',)),
+             'How the pre-rendered backgrounds are scaled up to the screen. '
+             'HD is tuned for this game.', False),
+            ('combo', 'Anti-aliasing', fxaa_var,
+             _choices(FXAA_CHOICES),
+             'Smooths the edges of 3D models. Off is sharper but more '
+             'jagged.', False),
             ('combo', 'Movie shader', vshader_var,
-             [l for _, l in VIDEO_SHADER_CHOICES],
-             'The shader the port draws FMVs through. HD is '
-             'custom_shaders/hd_video. One file, independent of everything '
-             'else here, and it does not re-encode anything — the movies '
-             'themselves are built by the settings further down.', False),
-        ]),
-        ('Frame rate', [
-            ('check', '60 FPS patches', fps_var, None,
-             'The whole 60 FPS set. Menus, battles, field and world.', True),
-            ('check', '30 FPS FMVs', m30_var, None,
-             'Builds every movie at 30 fps and halves the game\u2019s movie '
-             'frame counter to match. Independent of the switch above.', True),
-            ('combo', 'Frame pacing headroom', lim_var,
-             [l for _, l in LIMITER_FPS_CHOICES],
-             'Each limiter waits a frame\u2019s worth of time measured from '
-             'the START of the frame, but the frame is not finished when it '
-             'releases \u2014 the tail after it is added on top, so the real '
-             'period is longer than 1/60 and the game produces slightly under '
-             '60 frames a second. Presents are capped at 60, so the shortfall '
-             'shows up as 57\u201359. Aiming a little higher cancels the '
-             'tail. USE THE LOWEST VALUE THAT HOLDS A SOLID 60: above that '
-             'the game produces more than 60 a second and runs FAST, which '
-             'the display will hide from you.', True),
+             _choices(VIDEO_SHADER_CHOICES),
+             'How FMVs are drawn. HD is sharper.', False),
+            ('combo', 'Movie quality', movie_var,
+             _choices(MOVIE_QUALITY_CHOICES),
+             'Higher quality makes the build slower and the SD card output '
+             'larger.', False),
+            ('check', 'Model shadows', shadows_var, None,
+             'Characters, enemies and vehicles cast shadows shaped like '
+             'themselves instead of round blobs.', True),
         ]),
         ('Controls', [
-            ('check', '360\u00b0 field movement', a360_var, None,
-             'Walk in the exact stick direction instead of snapping to '
-             'eight. Needs cave space the full 60 FPS preset does not leave '
-             'spare \u2014 if the build stops with \u201ccave overflows '
-             '.rodata\u201d, this is why.', True),
-            ('check', 'Disable Auto-Run', norun_var, None,
-             'The port holds the run button for you once the stick is pushed '
-             'past 90%. This removes that, so walk and run are the button '
-             'again. Direction is unaffected — that uses a separate, '
-             'lower threshold.', True),
-            ('check', 'No Cheats', nocheat_var, None,
-             'Makes clicking the RIGHT STICK do nothing. On this port that '
-             'click fills HP, MP and the limit gauge, and one accidental '
-             'press can spoil a playthrough. Left stick click (3× speed) '
-             'is left alone.', True),
-            ('combo', 'Texture cache', texcache_var,
-             [l for _, l in TEX_CACHE_CHOICES],
-             'THIS IS THE FIX FOR THE FRAMERATE SAG AND THE TEXTURE '
-             'CORRUPTION. Confirmed on hardware.\n\n'
-             'WHAT IS WRONG. Freeing a texture on this port does not destroy '
-             'it. It parks the surface in a table keyed on its WIDTH AND '
-             'HEIGHT ONLY, ten per size, and only a later texture of exactly '
-             'those dimensions ever takes it back out. Nothing else empties '
-             'it — not leaving the field, not ending the battle, not the '
-             'world map. Visit an area whose sizes you never revisit and its '
-             'surfaces stay resident until you close the game.\n\n'
-             'WHY IT MATTERS HERE. The bound is per size, and this mod '
-             'pushes both axes: bigger textures AND more distinct sizes '
-             '(battle alone goes 17 → 32). Worst case counted off the built '
-             'archives is 137.6 MB, against 16.5 MB in vanilla — out of a '
-             '256 MB pool that also holds everything on screen. That is the '
-             'framerate decaying as you play, and then textures corrupting.'
-             '\n\n'
-             'BOUNDED SMALL (recommended). Recycling is a real '
-             'optimisation for short-lived textures that churn — water, '
-             'spell effects, animation frames — and that is where turning '
-             'the cache fully off costs you frames. This keeps recycling for '
-             'every surface up through 256×256, including the Wutai/FX '
-             'class, while retaining the stock limit of ten freed surfaces per exact '
-             'size and 64 globally. Larger and excess surfaces are destroyed '
-             'on free. The archive-backed ceiling is about 8.1 MiB and the '
-             'absolute runtime bound is 16 MiB. This matters because '
-             'the first “small” implementation removed the count cap and '
-             'could still grow without bound; it reproduced corruption and '
-             'has been replaced. Build 195 proved the four-per-size bounded '
-             'revision corruption-free; ten restores the port\'s original '
-             'same-size reuse without raising the 64-surface/16 MiB hard '
-             'limit.\n\n'
-             'OFF. No recycling at all. One word. This is the version that '
-             'was confirmed on hardware to stop the corruption, so it is the '
-             'known-good fallback if “small” ever misbehaves — but it is '
-             'also the one that cost framerate in Wutai.\n\n'
-             'STOCK. The port as shipped. Leaks.\n\n'
-             'Every mode branches to the same destroy path the stock game '
-             'already takes whenever a size fills up — well-travelled code, '
-             'not new code. FINDINGS-306.', True),
-        ]),
-        ('Textures', [
-            ('combo', 'Field backgrounds', fpre_var,
-             [l for _, l in FIELD_BG_PRESET_CHOICES],
-             'THE ONLY ONE OF THESE YOU NEED. It sets the five controls in '
-             '“Field backgrounds (advanced)” below.\n\n'
-             'Each preset pins the four safety controls to the same values '
-             '— replace-only on, ceiling 12 pages, all or nothing, '
-             'budget unlimited — because that is the combination which '
-             'cannot ask the loader for more textures than the stock game '
-             'does. The preset chooses only the PAGE SIZE, which is the one '
-             'axis that is a genuine trade rather than a guess.\n\n'
-             'Conservative (256px) is truecolor at vanilla resolution: it '
-             'removes palette banding but gives NO sharpness gain, because '
-             'the mod’s art is downscaled back to the size it was '
-             'upscaled from. Balanced (384px) and Maximum (512px) are real '
-             'detail gains.\n\n'
-             'Picking anything in the advanced section moves this to '
-             'Custom.', True),
-        ]),
-        ('Field backgrounds (advanced)', [
-            ('combo', 'Field background page size', fbg_var,
-             [l for _, l in FIELD_BG_PAGE_PX_CHOICES],
-             'Sets the size AND the colour depth of the field background '
-             'pages, so an upscale mod\u2019s art can actually be shown.\n\n'
-             'Cost per page is 6\u00d7px\u00b2 \u2014 the pixels plus the '
-             '32bpp surface the engine builds from them \u2014 and the '
-             'heaviest field in the game has 12 pages. That is the whole '
-             'trade: 128px costs 0.09 MB a page, 512px costs 1.50 MB, and '
-             '12 \u00d7 1.50 = 18 MB is exactly where black bars were '
-             'measured on hardware.\n\n'
-             '256px is the one to try first. It keeps vanilla resolution but '
-             'makes every page TRUECOLOR, which removes palette banding, the '
-             'colour-key restriction and neighbouring-palette substitution, '
-             'and it is cheap enough that every page on every field fits \u2014 '
-             'so no field is ever left half-upgraded. 128px is the setting '
-             'for when memory is the problem: it is cheaper than the paletted '
-             'pages the game already ships, at the cost of half the '
-             'background resolution.\n\n'
-             'Sizes other than 256 patch exefs/main AND rewrite flevel.lgp, '
-             'and both halves are needed. 256px needs no module patch at all, '
-             'so it is the only one testable without a full game dump.', True),
-            ('combo', 'Field background PALETTED (fx) page size', fd1_var,
-             [l for _, l in FIELD_BG_D1_PX_CHOICES],
-             'The size of every 8-bit PALETTED page, which is where the fx '
-             'textures live — the blinking lights in cosin3, the '
-             'animated blend layers, and every page the truecolor promotion '
-             'refuses.\n\n'
-             'THIS IS THE ONLY FX SIZE CONTROL THERE CAN BE, and the reason '
-             'is worth knowing before you reach for it. An fx page is an '
-             'ordinary page a tile binds at record offset 34. Section 9 '
-             'stores no per-page dimension — the engine infers it from a '
-             'constant patched into exefs/main — so every paletted page '
-             'in a build must be the same size. "Cap the fx pages only" is '
-             'not something the format can express; one page disagreeing '
-             'with the constant desynchronises the whole TEXTURE walk from '
-             'that slot on, which is a scrambled field, not a smaller one.\n\n'
-             'MEASURED on the 512px build, all 711 fields: 1,609 paletted '
-             'pages holding 421.8 MB, of which 813 are fx pages holding '
-             '213.1 MB. At 256 the paletted term drops to 105 MB; uutai1 '
-             'goes from 4,096 KB of texture to 2,048 KB and cosin3 from '
-             '2,816 KB to 2,048 KB.\n\n'
-             '256 IS NOT A DOWNGRADE FROM 512 UNTIL THE ART LANDS. Build 108 '
-             'lifted these pages by 2x REPLICATION — same 256px of '
-             'detail, four texels where there was one — so at the moment '
-             '512 costs four times the memory and bandwidth for a picture '
-             'that is bit-for-bit identical. Choose 256 if you are chasing a '
-             'crash or a frame-rate dip; the two settings should look the '
-             'same on screen, and if they do not, that is worth reporting.\n\n'
-             '512 rewrites flevel.lgp AND patches ten words of exefs/main, '
-             'and both halves are needed — they are emitted together and '
-             'the build asserts if they disagree.', True),
-            ('combo', 'Field background TRUECOLOR pages', ftc_var,
-             [l for _, l in FIELD_BG_TRUECOLOR_CHOICES],
-             'How many pages of a field may be promoted from 8-bit paletted '
-             'to 16-bit truecolor.\n\n'
-             'A truecolor page costs 0.38 MB against a paletted page\u2019s '
-             '0.31 MB \u2014 seven hundredths of a megabyte \u2014 so this '
-             'is cheap in memory. What it is NOT cheap in is PAGES: a '
-             'promotion ADDS a page, because the original paletted one must '
-             'stay alive for every cell that could not move (colour-key '
-             'cells, fx-page tiles).\n\n'
-             'RAISE THIS WITH PAGE GROWTH ON "NO GROWTH", NOT "OFF". '
-             'Compaction rides with no-growth and nothing else \u2014 it is '
-             'the pass that pays for the promoted pages out of the originals, '
-             'which are mostly empty afterwards. MEASURED: with it on, 1,165 '
-             'pages freed and 5.6 pages per field; with growth "Off" it does '
-             'not run, the count goes to 7.5 per field, and '
-             'field_load_textures starts abandoning the load \u2014 which is '
-             'what black squares are.\n\n'
-             '3 is what shipped, and it was never measured as a ceiling \u2014 '
-             'the numbers behind it came from 512px experiments whose model '
-             'has since been retracted. What it was really guarding against '
-             'was the 256-tiles-per-page overrun (FINDINGS-110), and that is '
-             'now prevented outright by field_bg_pagecap.\n\n'
-             'This control previously said "Field background promotion" and '
-             'did nothing at all: it fed field_bg_repack.all_or_nothing(), '
-             'and the pass that reads it stopped being called. Both settings '
-             'produced byte-identical builds.',
-             True),
-            ('combo', 'Field background page growth', frepl_var,
-             [l for _, l in FIELD_BG_REPLACE_ONLY_CHOICES],
-             'Turn this on if you want a BIG page size without black '
-             'squares. It is the one setting that attacks the cause rather '
-             'than rationing the symptom.\n\n'
-             'Promoting a page normally ADDS one. The promoted cells go to a '
-             'new truecolor page, but the original paletted page has to stay '
-             'alive for every tile that could not move — cells with a '
-             'colour key, tiles that animate from an fx page, cells the '
-             'mod draws transparent. Two textures where there was one, and '
-             'every texture is an allocation the loader can fail on.\n\n'
-             'A page whose tiles ALL move is different: nothing references it '
-             'afterwards, so it is freed and the count does not grow. '
-             'Promoting only those holds the texture count at vanilla’s, '
-             'which is what lets the page SIZE go up safely.\n\n'
-             'The trade is that less art gets promoted. Turn it on when the '
-             'page ceiling is what is holding you back.', True),
-            ('combo', 'Cosmos widescreen margin art', fmart_var,
-             [l for _, l in FIELD_BG_MARGIN_ART_CHOICES],
-             'Fills the 16:9 side bands with the mod\u2019s own widescreen '
-             'art instead of a flat colour. Needs Cosmos Limit Break (or any '
-             'mod that ships field .dds) enabled \u2014 with nothing to read '
-             'it does nothing.\n\n'
-             'Those bands are MISSING TEXTURES, not authored letterbox. '
-             'Cosmos points margin tiles at cells that are blank in the '
-             'vanilla page and painted in its upscale. FFNx loads the .dds '
-             'and draws scenery there; this port has no loader for it, so the '
-             'tile samples the blank placeholder and the band comes out one '
-             'flat colour \u2014 tan, green or plum depending on the field. '
-             'Measured over 45 fields: 81% of those tiles have real art in '
-             'the .dds.\n\n'
-             'This writes that art into the paletted page as INDICES, so it '
-             'costs no new page and no new texture, and cannot bring the '
-             'black squares back.\n\n'
-             'MARGIN + INTERIOR does the same thing inside the 4:3 picture. '
-             'That matters because the repack can only reach an interior cell '
-             'by PROMOTING its page to truecolor, and three things forbid '
-             'that — a colour key on the cell, an fx page sharing one '
-             'u,v, or the mod’s own art being transparent there. On a '
-             'real build that is ~138,000 tiles left drawing vanilla INSIDE '
-             'fields the log already counts as covered, which is why the '
-             'centre still looks stock and why it looks patchy rather than '
-             'uniformly old. Writing indices into the page that is already '
-             'there sidesteps all three: index 0 stays index 0, so the colour '
-             'key survives and the fx pairing stays valid.\n\n'
-             'It is bounded by what the mod ships. Only layer 1 (the static '
-             'scenery) is touched, so no animation can be left half-Cosmos '
-             'and flicker; a cell drawn with two palettes is skipped, because '
-             'a paletted page is one index array and there is no single right '
-             'answer for it; and a cell the mod does not cover keeps its '
-             'vanilla content rather than being painted black. Expect a large '
-             'but partial lift, not a clean sweep.\n\n'
-             'Runs BEFORE the background repack, because the mod names its '
-             'art against the ORIGINAL page numbering and the repack '
-             'renumbers and compacts.', False),
-            ('combo', 'Field background max pages per field', fmaxp_var,
-             [l for _, l in FIELD_BG_MAX_PAGES_CHOICES],
-             'The ceiling that actually decides whether you get black '
-             'squares. Read this one before the memory budget.\n\n'
-             'Every page present in a field becomes a TEXTURE, and '
-             'field_load_textures gives up on the whole loop at the first '
-             'one it cannot allocate — every page after that draws '
-             'nothing. So what breaks is the NUMBER of pages, not the number '
-             'of megabytes.\n\n'
-             'The repack ADDS pages rather than replacing them: a page can '
-             'only be freed once nothing points at it, and enormous numbers '
-             'of tiles keep their paletted page because their cell has a '
-             'colour key or they animate from an fx page. Measured on a real '
-             'build: 1,697 new pages against 184 freed, about +2.3 per '
-             'field, with one field going from 10 pages to 17 — more '
-             'than any field the stock game ships.\n\n'
-             'Vanilla’s heaviest field is 12 pages and only 5 fields '
-             'reach it, so 12 is the order the port was provisioned for. '
-             'Raise it to hunt for the true ceiling; the build log names '
-             'every field that goes over.', True),
-            ('combo', 'Field background memory budget', fbud_var,
-             [l for _, l in FIELD_BG_BUDGET_CHOICES],
-             'A hard ceiling on the TRUECOLOR texture memory one field may '
-             'use, in megabytes of RUNTIME cost \u2014 6\u00d7px\u00b2 per '
-             'page, i.e. the pixels plus the 32bpp surface the engine builds '
-             'from them.\n\n'
-             'IT WAS DEAD UNTIL NOW, and that is worth knowing because the '
-             'log has been quoting it for months. It was read only by '
-             'field_bg_repack.upgrade(), and upgrade() stopped being called '
-             'when field_bg_dense replaced it \u2014 zero references to the '
-             'budget in that module. Any value you picked produced the same '
-             'build. It is now enforced where the promotion actually '
-             'happens.\n\n'
-             'THIS IS THE RIGHT UNIT ONCE THE PAGE SIZE MOVES. A ceiling in '
-             'PAGES means something four times bigger the moment you go from '
-             '256px to 512px \u2014 the same 12 pages cost 4.56 MB at 256 '
-             'and 18.00 MB at 512. Bytes do not do that:\n\n'
-             '    budget      at 256px        at 512px\n'
-             '    3.0 MB      8 pages         2 pages\n'
-             '    4.5 MB     12 pages         3 pages\n'
-             '    6.0 MB     16 pages         4 pages\n\n'
-             'For reference, the last build with no black squares measured '
-             'mean 1.87 MB per field and a heaviest field of 4.75 MB. The '
-             '512px build that DID show black squares measured mean 4.72 MB '
-             'and a heaviest of 12.31 MB. Somewhere between those is the '
-             'ceiling field_load_textures actually has, and this is the '
-             'control that bisects it.\n\n'
-             'Unlimited is right at 256px, where a truecolor page is only '
-             '0.07 MB more than the paletted one it replaces. At 512px it is '
-             'not.',
-             True),
-            ('combo', 'Field model texture cap', cap_var,
-             [l for _, l in FIELD_TEX_CAP_CHOICES],
-             'Downscales oversized char.lgp model textures. World-map '
-             'textures use the separate control below.',
-             False),
-            ('combo', 'World map texture cap', world_cap_var,
-             [l for _, l in WORLD_TEX_CAP_CHOICES],
-             'Downscales oversized world_us.lgp textures, separately from '
-             'the field cap above.\n\n'
-             'Cosmos Gaia support: the build maps its active frame-zero DDS '
-             'files to exact native .tex names, creates fresh 256-colour '
-             'indexed palettes, and rebuilds world_us.lgp. It also patches '
-             'the native world mesh\u2019s pixel-space UV normalisation to match '
-             'the selected uniform scale; without that paired correction an '
-             'enlarged TEX displays only its upper-left crop. This native '
-             'indexed format is required by the Switch world renderer. Gaia '
-             'UI/effect assets (including the soft shadow, snow overlays, '
-             'cloud, and meteor) remain native because they use independent '
-             'sprite UV, blend, palette, or FFNx external-mesh state. Mesh '
-             'files remain separate and can never collide '
-             'with similarly named event scripts.\n\n'
-             'MEASURED: vanilla world_us.lgp has 415 textures. Gaia provides '
-             'one exact frame-zero source for all 415. Two sky-only sources '
-             'and two multi-palette runtime effects are held back. The '
-             'remaining textures and all six terrain U/V calculations use '
-             'one matching scale (512 = 2x, 768 = 3x, 1024/off = 4x).'
-             '\n\n'
-             'ff7nx_heap raises the guest heap to 256 MB. The recommended '
-             '512px cap keeps the indexed set compact while retaining more '
-             'spatial detail than the 32\u2013256px native sources.\n\n'
-             'For fast world-map iteration after one normal build, launch '
-             'the GUI with SEVENTH_NX_REUSE_FLEVEL=1. The builder verifies '
-             'and preserves the existing sdout flevel.lgp while rebuilding '
-             'everything else.', False),
-            ('combo', 'Battle background cap (Avalanche Arisen)', bg_cap_var,
-             [l for _, l in BATTLE_BG_TEX_CAP_CHOICES],
-             'Scoped to Arisen\u2019s own tiles. Everything else in '
-             'battle.lgp stays at the proven 256px.', False),
-            ('combo', 'Spell texture cap (SYW Unified Spells)',
-             spell_cap_var, [l for _, l in SPELL_TEX_CAP_CHOICES],
-             'Applies to every deterministically mapped SYW spell, summon, '
-             'attack and effect texture, including packed frame sheets. Each '
-             'resized TEX records its own physical-to-logical scale, and the '
-             'native loader corrects u_offset/v_offset once when it constructs '
-             'the graphics object. Atlas cells stay in their original logical '
-             'texel space without changing their on-screen size.\n\n'
-             'The cap is a maximum. A source with less real detail stops at '
-             'its available integer scale. Animation .s files remain '
-             'byte-identical.',
-             False),
-            ('combo', 'Minigame texture cap (SYW Unified Minigames)',
-             mini_cap_var, [l for _, l in MINIGAME_TEX_CAP_CHOICES],
-             'Applies only to native minigame TEX rebuilt from the enabled '
-             'SYW Unified Minigames DDS set. The cap chooses the largest '
-             'whole-number upscale within that dimension and the source '
-             'resolution. Native size still applies the art without '
-             'enlarging it. Larger sizes use more decoded texture memory; '
-             'resized TEX reuses the existing logical-UV patch.', False),
-        ]),
-        ('Movies', [
-            ('combo', 'Video quality', movie_var,
-             [l for _, l in MOVIE_QUALITY_CHOICES],
-             'Applies to converted FMVs. Higher costs build time and card '
-             'space; frame rate is set by the mod, not here.', False),
-            ('combo', 'Video size', mfit_var,
-             [l for _, l in MOVIE_FIT_CHOICES],
-             'MEASURED on hardware: the panel shows the game in a 960x672 '
-             'box, so a 1280x896 FMV can only ever land 56% of its pixels '
-             'on screen \u2014 the rest are discarded by one bilinear tap in '
-             'video_p.glsl. \u201cDisplayed area\u201d resamples here with '
-             'Lanczos so the console draws 1:1 and throws nothing away.',
-             True),
-            ('combo', 'Video colour', mcol_var,
-             [l for _, l in MOVIE_COLOUR_CHOICES],
-             'The port\u2019s movie shader hardcodes BT.709. FMV packs made '
-             'from FF7\u2019s standard-definition originals are BT.601, so '
-             'without this their colour is slightly desaturated.', False),
+            ('check', '360° movement', a360_var, None,
+             'Walk in the exact direction of the stick instead of eight '
+             'fixed directions.', True),
+            ('check', 'Disable auto-run', norun_var, None,
+             'Pushing the stick all the way no longer makes you run. Hold '
+             'the run button instead.', True),
+            ('check', 'Disable the right-stick cheat', nocheat_var, None,
+             'Clicking the right stick no longer refills HP, MP and Limit. '
+             'Stops one accidental press spoiling a playthrough.', True),
         ]),
         ('Voice', [
             ('combo', 'Dialogue loudness', voice_norm_var,
-             [l for _, l in VOICE_NORM_CHOICES],
-             'Echo-S’s lines come from many people, many microphones and '
-             'many years, and they arrive at very different levels. Measured '
-             'over 160 random clips of the set you have installed:\n\n'
-             '    peak       −12.0 … −0.0 dBFS     spread 12 dB\n'
-             '    loudness   −28.4 … −9.2 LUFS     spread 19 dB\n\n'
-             'and the second row is the one you hear. This measures every '
-             'clip and applies ONE gain to it — not compression, not a '
-             'per-frame filter, so nothing pumps and no timbre changes. On '
-             'the same sample it takes the loudness spread from 19 dB to '
-             '3.6 dB with nothing clipping.\n\n'
-             'THE DEFAULT IS NOT INVENTED. −15.3 LUFS is the measured '
-             'loudness of Jessie’s “My hero!” in the first reactor '
-             '(nmkin_3, line 6). Pick a neighbouring level if you want it '
-             'louder or quieter against the music.\n\n'
-             '“Equal peaks only” does what it says — every clip’s '
-             'loudest sample becomes identical. It is here because it is the '
-             'obvious reading of the request, but on your own files it still '
-             'leaves a 16.4 dB loudness spread, because a line with one '
-             'sharp consonant peaks high while sounding quiet.\n\n'
-             'COST: changing this re-encodes all 15,505 clips once, which is '
-             'the long part of a build. Changing it back is free — the '
-             'cache is keyed by the setting, so every level you have already '
-             'built is still there.', False),
+             _choices(VOICE_NORM_CHOICES, user_hide=('loudness:-15.3', 'peak:-1.1')),
+             'Evens out Echo-S voice lines so quiet and loud ones sound '
+             'alike. Changing it re-encodes the voice clips once.', False),
         ]),
     ]
 
+    DEV_SECTIONS = [
+        ('Developer — frame rate', [
+            ('check', '60/30 FPS Patches', fps_var, None,
+             'The frame-rate set for menus, battles, field and world. '
+             'Follows the 60/30 FPS Gameplay mod: Full 60 FPS runs '
+             'everything at 60, Full 30 FPS runs battles at 30 and leaves '
+             'the field and world at 30, Original FPS turns it off.', True),
+            ('check', '30 FPS FMVs', m30_var, None,
+             'Builds every movie at 30 fps and halves the movie frame '
+             'counter to match.', True),
+            ('combo', '60 FPS frame pacing headroom', lim_var,
+             _choices(LIMITER_FPS_CHOICES),
+             'The limiters run slightly under 60. Use the lowest target that '
+             'holds a solid 60; higher runs the game fast. Full 30 FPS '
+             'ignores it and aims for 30.', True),
+        ]),
+        ('Developer — rendering and memory', [
+            ('combo', 'Field render resolution', fbuf_var,
+             _choices(FIELD_BUF_CHOICES),
+             'Size of the field render target. Off shows vertical bands in '
+             '16:9; 2× and 3× cost graphics memory. HANDOFF-51.',
+             True),
+            ('combo', 'Graphics memory', gfx_var,
+             _choices(GFX_POOL_CHOICES),
+             'The driver pool. Keep 256 MB: larger corrupts textures, smaller '
+             'is a diagnostic. FINDINGS-303.', True),
+            ('check', 'Full-height 16:9 field', frame_var, None,
+             'Removes the field’s 32-unit letterbox, shifts the FMV quad '
+             'to match and paints the FMV margins. 16:9 only. FINDINGS-88/92.',
+             True),
+            ('combo', 'Texture cache', texcache_var,
+             _choices(TEX_CACHE_CHOICES),
+             'Recycling of freed textures. Stock leaks and corrupts textures; '
+             'Bounded small is the fix. FINDINGS-306.', True),
+            ('combo', 'Background black level', bp_var,
+             _choices(BLACK_POINT_CHOICES),
+             'How much the background upscaling shader pulls down to pure '
+             'black, in 255ths. Written into the shader copied to sdout; '
+             'only the HD upscaling options use it. 12 is the tested value '
+             'and the most it can be.', False),
+        ]),
+        ('Developer — field backgrounds', [
+            ('combo', 'Preset', fpre_var,
+             _choices(FIELD_BG_PRESET_CHOICES),
+             'Sets the controls below in one go. Changing any of them moves '
+             'this to Custom.', True),
+            ('combo', 'Page size', fbg_var,
+             _choices(FIELD_BG_PAGE_PX_CHOICES),
+             'Size and colour depth of the background pages. Cost per page '
+             'is 6×px².', True),
+            ('combo', 'Paletted (fx) page size', fd1_var,
+             _choices(FIELD_BG_D1_PX_CHOICES),
+             'Every 8-bit page shares one size, patched into exefs/main. '
+             'FINDINGS-223/225.', True),
+            ('combo', 'Truecolor pages per field', ftc_var,
+             _choices(FIELD_BG_TRUECOLOR_CHOICES),
+             'How many pages may be promoted to truecolor. Pair with '
+             '“No growth”.', True),
+            ('combo', 'Page growth', frepl_var,
+             _choices(FIELD_BG_REPLACE_ONLY_CHOICES),
+             'Whether promotion may add pages. No growth compacts to pay for '
+             'them.', True),
+            ('combo', 'Widescreen margin art', fmart_var,
+             _choices(FIELD_BG_MARGIN_ART_CHOICES),
+             'Writes the mod’s art into the 16:9 bands (and the 4:3 '
+             'interior) as palette indices.', False),
+            ('combo', 'Max pages per field', fmaxp_var,
+             _choices(FIELD_BG_MAX_PAGES_CHOICES),
+             'Too many pages and the loader stops: black squares. The log '
+             'names every field over the limit.', True),
+            ('combo', 'Memory budget', fbud_var,
+             _choices(FIELD_BG_BUDGET_CHOICES),
+             'Ceiling on truecolor texture memory per field, in runtime '
+             'megabytes.', True),
+        ]),
+        ('Developer — texture caps', [
+            ('combo', 'Field models', cap_var,
+             _choices(FIELD_TEX_CAP_CHOICES),
+             'Downscales oversized char.lgp model textures.', False),
+            ('combo', 'World map', world_cap_var,
+             _choices(WORLD_TEX_CAP_CHOICES),
+             'Downscales world_us.lgp textures and scales the world-mesh UVs '
+             'to match.', False),
+            ('combo', 'Battle backgrounds (Avalanche Arisen)', bg_cap_var,
+             _choices(BATTLE_BG_TEX_CAP_CHOICES),
+             'Arisen’s own tiles only. The rest of battle.lgp stays at '
+             '256px.', False),
+            ('combo', 'Spells (SYW Unified Spells)', spell_cap_var,
+             _choices(SPELL_TEX_CAP_CHOICES),
+             'Maximum upscale for mapped SYW spell, summon and effect '
+             'textures.', False),
+            ('combo', 'Minigames (SYW Unified Minigames)', mini_cap_var,
+             _choices(MINIGAME_TEX_CAP_CHOICES),
+             'Maximum upscale for the rebuilt minigame textures.', False),
+            ('combo', 'Menu art (Enhanced Stock UI)', esuisc_var,
+             _choices(ESUI_TEXSCALE_CHOICES),
+             'Size the menu, font and battle-window sheets are rebuilt at '
+             'from the mod\u2019s 4\u00d7 art. Bigger costs graphics memory '
+             '(about 2.3\u00d7 at 3\u00d7, 4\u00d7 at 4\u00d7) and rebuilds '
+             'menu_us.lgp.', False),
+        ]),
+        ('Developer — movies', [
+            ('combo', 'Video size', mfit_var,
+             _choices(MOVIE_FIT_CHOICES),
+             '“Displayed area” resamples to the 960×672 box '
+             'the console actually shows.', True),
+            ('combo', 'Video colour', mcol_var,
+             _choices(MOVIE_COLOUR_CHOICES),
+             'The movie shader assumes BT.709. Choose BT.601 for packs made '
+             'from the SD originals.', False),
+        ]),
+    ]
+
+    def settings_sections():
+        """The rows the dialog shows right now."""
+        return USER_SECTIONS + (DEV_SECTIONS if nxsettings.dev_mode()
+                                else [])
+
+    # Every row, for code that sets vars from values (Restore defaults, the
+    # Developer Settings toggle).
+    SETTINGS_SECTIONS = USER_SECTIONS + DEV_SECTIONS
+
+    _settings_win = [None]
+    _settings_refill = [None]   # the open dialog's redraw, while it is open
+    _theme_now = [current_theme()]
+
+    def apply_globals(want):
+        """
+        Set the dialog's vars so snapshot_settings() saves `want` (a
+        __global__ dict), then save once. Returns the keys it could not
+        reach. The theme and the Developer Settings toggle are left alone.
+
+        The vars hold display labels, and each one maps to its key in its
+        own way, so rather than a second copy of every mapping this tries
+        each row's choices and keeps the one whose snapshot matches `want`
+        best. Saving is held off while it searches.
+        """
+        def score():
+            g = snapshot_settings(raw=True)['__global__']
+            return sum(1 for k, v in want.items() if g.get(k) == v)
+
+        _ui_ready[0] = False
+        try:
+            if score() < len(want):
+                # Twice: a few rows only take effect once another is set.
+                for _pass in range(2):
+                    for _section, rows in SETTINGS_SECTIONS:
+                        for kind, _label, var, values, _b, _n in rows:
+                            if var is theme_var or var is devset_var:
+                                continue
+                            choices = ((True, False) if kind == 'check'
+                                       else tuple(values))
+                            best, best_score = var.get(), -1
+                            for c in choices:
+                                var.set(c)
+                                n = score()
+                                if n > best_score:
+                                    best, best_score = c, n
+                            var.set(best)
+        finally:
+            _ui_ready[0] = True
+        save_settings_now()
+        g = snapshot_settings(raw=True)['__global__']
+        return sorted(k for k, v in want.items() if g.get(k) != v)
+
+    # BUILD 804: the Default/Modified note beside the Developer Settings
+    # toggle, while the dialog is open. Refreshed on every save.
+    _dev_note = [None]
+
+    def refresh_dev_note():
+        lbl = _dev_note[0]
+        if lbl is None:
+            return
+        try:
+            off = nxsettings.modified_keys(
+                snapshot_settings(raw=True)['__global__'])
+            if off:
+                lbl.configure(text='Modified (%d)' % len(off),
+                              foreground=WARN)
+            else:
+                lbl.configure(text='Default', foreground=GOOD)
+        except tk.TclError:                        # dialog closed
+            _dev_note[0] = None
+
+    def _dev_changed():
+        """
+        Developer Settings was toggled. It only shows or hides the developer
+        rows (BUILD 804): the build uses them as saved either way, so the
+        dialog just redraws.
+        """
+        on = bool(devset_var.get())
+        if nxsettings.env_dev_mode() and not on:
+            devset_var.set(True)        # SEVENTH_NX_DEV wins; nothing to do
+            return
+        nxsettings.set_dev_override(on)
+        save_settings_now()
+        _show_dev_tag()
+        try:
+            n = len(nxsettings.modified_keys(
+                snapshot_settings(raw=True)['__global__']))
+        except Exception:                                   # noqa: BLE001
+            n = 0
+        log_write('Developer Settings %s. %s' % (
+            'shown' if on else 'hidden',
+            '%d differ from the tested defaults and are still used.' % n
+            if n else 'All are at the tested defaults.'))
+        if _settings_refill[0] is not None:
+            _settings_refill[0]()
+
+    devset_var.trace_add('write', lambda *_a: root.after_idle(_dev_changed)
+                         if _ui_ready[0] else None)
+
+    def on_theme_change():
+        if current_theme() != _theme_now[0]:
+            apply_theme(current_theme())
+
     def open_settings():
         win = tk.Toplevel(root)
+        _settings_win[0] = win
+        # Hidden until it is sized and placed: mapped straight away, Tk
+        # shows it at the window manager's default spot and it visibly
+        # jumps when the geometry below lands.
+        win.withdraw()
         win.title('Settings')
         win.configure(bg=BG_APP)
         win.transient(root)
@@ -2966,6 +3199,40 @@ def launch_ui():
         footer = ttk.Frame(win, padding=(16, 12))
         footer.pack(side='bottom', fill='x')
         ttk.Button(footer, text='Done', command=win.destroy).pack(side='right')
+        # BUILD 804: About Dev sits alone in the bottom-left corner, on the
+        # same left edge as the settings above it.
+        ttk.Button(footer, text='About Dev',
+                   command=lambda: open_about(win)).pack(side='left')
+
+        def restore_defaults():
+            """Every setting, developer ones included, back to
+            data/default_settings.json -- except the theme and the
+            Developer Settings toggle."""
+            want = default_globals()
+            for k in ('gui_theme', 'developer_settings'):
+                want.pop(k, None)
+            if not want:
+                messagebox.showerror('Restore defaults', 'data/default_'
+                                     'settings.json is missing or empty.',
+                                     parent=win)
+                return
+            if not messagebox.askyesno(
+                    'Restore defaults',
+                    'Put every setting back to its default?\n\n'
+                    'This resets every setting in this window, developer '
+                    'settings included, to the tested values in '
+                    'data/default_settings.json. Your theme, the Developer '
+                    'Settings toggle, your mods and their options are not '
+                    'changed.\n\nAny setting you changed here will be lost.',
+                    icon='warning', default='no', parent=win):
+                return
+            off = apply_globals(want)
+            log_write('Settings restored to defaults.' + (
+                ' Not offered here, left as they were: ' + ', '.join(off)
+                if off else ''))
+
+        ttk.Button(footer, text='Restore defaults',
+                   command=restore_defaults).pack(side='right', padx=(0, 8))
 
         # `make_scrollable` is defined further down this same function, so it
         # is not bound yet at definition time -- but open_settings only runs
@@ -2989,33 +3256,93 @@ def launch_ui():
         # width instead of leaving it hugging its label.
         body.columnconfigure(1, weight=1)
 
-        r = 0
-        for si, (section, rows) in enumerate(SETTINGS_SECTIONS):
-            ttk.Label(body, text=section.upper(), style='Sub.TLabel'
-                      ).grid(row=r, column=0, columnspan=2,
-                             sticky='w', pady=(0 if si == 0 else 16, 6))
-            r += 1
-            for kind, label, var, values, blurb, needs in rows:
-                dim = needs and not have_nso
-                if kind == 'check':
-                    w = ttk.Checkbutton(body, text=label, variable=var)
-                    w.grid(row=r, column=0, columnspan=2, sticky='w')
-                else:
-                    ttk.Label(body, text=label).grid(row=r, column=0,
-                                                    sticky='w', padx=(0, 12))
-                    w = ttk.Combobox(body, textvariable=var, values=values,
-                                     state='readonly', width=44)
-                    w.grid(row=r, column=1, sticky='e')
-                if dim:
-                    w.state(['disabled'])
+        def fill():
+            for child in body.winfo_children():
+                child.destroy()
+            dev = nxsettings.dev_mode()
+            env = nxsettings.env_dev_mode()
+            r = 0
+            if env:
+                ttk.Label(body, text='Developer mode is forced on by '
+                          'SEVENTH_NX_DEV=1. The developer settings below '
+                          'build exactly as set here.',
+                          style='Sub.TLabel', wraplength=560,
+                          justify='left'
+                          ).grid(row=r, column=0, columnspan=2, sticky='w',
+                                 pady=(0, 12))
                 r += 1
-                note = blurb + ('   (needs exefs/main from a full game dump)'
-                                if dim else '')
-                ttk.Label(body, text=note, style='Sub.TLabel',
-                          wraplength=560, justify='left'
+            _fill_rows(r, dev, env)
+
+        # BUILD 806. A settings checkbox drawn like the mod rows: the same
+        # _Check box, and the label placed so the CAP BAND of its "A" is
+        # centred on the box (see "optical vertical centring" further down),
+        # not the label's line box, which ttk.Checkbutton centres and which
+        # reads low. `text_y` is exposed so a note in the same row (Default /
+        # Modified) sits on the same band.
+        CHK_FONT = ('Helvetica', 11)        # the ttk default ('.') it replaces
+
+        def _settings_check(parent, text, var, disabled=False):
+            f = tkfont.Font(font=CHK_FONT)
+            a, d = f.metrics('ascent'), f.metrics('descent')
+            cap = _cap_height(CHK_FONT, a, d)
+            h = (max(_CHK_SIZE, a + d) + 6) | 1    # odd -> a centre pixel
+            mid = h // 2
+            row = tk.Frame(parent, bg=BG_APP, height=h, bd=0,
+                           highlightthickness=0)
+            row.pack_propagate(False)
+            row.grid_propagate(False)
+            chk = _Check(row, var, BG_APP)
+            chk.place(x=0, y=mid - (_CHK_SIZE - 1) // 2 + _CHK_NUDGE)
+            row.text_y = mid - ((a - cap) + (cap - 1) // 2) + TEXT_RASTER_TWEAK
+            lbl = tk.Label(row, text=text, bg=BG_APP,
+                           fg=TEXT_MUTED if disabled else TEXT_PRIMARY,
+                           font=CHK_FONT, bd=0, padx=0, pady=0,
+                           highlightthickness=0)
+            lbl.place(x=_CHK_SIZE + 6, y=row.text_y)
+            if disabled:
+                chk.unbind('<Button-1>')
+                chk.configure(cursor='')
+            else:
+                lbl.configure(cursor='hand2')
+                lbl.bind('<Button-1>', chk._toggle)
+            return row
+
+        def _fill_rows(r, dev, env):
+            for si, (section, rows) in enumerate(settings_sections()):
+                ttk.Label(body, text=section.upper(), style='Sub.TLabel'
                           ).grid(row=r, column=0, columnspan=2,
-                                 sticky='w', pady=(1, 0))
+                                 sticky='w', pady=(0 if si == 0 else 16, 6))
                 r += 1
+                for kind, label, var, values, blurb, needs in rows:
+                    dim = needs and not have_nso
+                    if kind == 'check':
+                        w = _settings_check(body, label, var,
+                                            disabled=var is devset_var and env)
+                        w.grid(row=r, column=0, columnspan=2, sticky='we')
+                    else:
+                        ttk.Label(body, text=label).grid(
+                            row=r, column=0, sticky='w', padx=(0, 12))
+                        w = ttk.Combobox(
+                            body, textvariable=var, state='readonly',
+                            values=values if dev else getattr(values, 'user',
+                                                              values),
+                            width=44 if dev else 32)
+                        w.grid(row=r, column=1, sticky='e')
+                    if var is devset_var:
+                        # in the toggle's own row, on its cap band
+                        _dev_note[0] = tk.Label(
+                            w, bg=BG_APP, fg=TEXT_SECONDARY, font=CHK_FONT,
+                            bd=0, padx=0, pady=0, highlightthickness=0)
+                        _dev_note[0].place(relx=1.0, y=w.text_y, anchor='ne')
+                        refresh_dev_note()
+                    r += 1
+                    note = blurb + (' Needs a full game dump: saved now, '
+                                    'used once dump/ has one.' if dim else '')
+                    ttk.Label(body, text=note, style='Sub.TLabel',
+                              wraplength=560, justify='left'
+                              ).grid(row=r, column=0, columnspan=2,
+                                     sticky='w', pady=(1, 0))
+                    r += 1
 
         win.bind('<Escape>', lambda _e: win.destroy())
 
@@ -3065,25 +3392,49 @@ def launch_ui():
                         ('<End>', _scroll(to=1.0))):
             win.bind(seq, fn)
 
-        # Size to the content, then cap the height so the window always fits
-        # on the screen it is opening on. Without the cap a long settings
-        # list simply grew off the bottom, which is the bug this replaces.
-        win.update_idletasks()
-        # `body` is a ttk.Frame with padding=16, and a padded frame's
-        # requested size ALREADY includes its padding -- adding it again here
-        # is how a dialog ends up with 32px of dead space down one side.
-        want_w = body.winfo_reqwidth()
-        want_h = body.winfo_reqheight() + footer.winfo_reqheight()
-        max_h = int(win.winfo_screenheight() * 0.86)
-        height = min(want_h, max_h)
-        if height < want_h:
-            # The scrollbar is about to appear inside the canvas width, so
-            # widen by its thickness rather than letting it eat 16px of the
-            # blurbs.
-            want_w += 18
-        win.geometry('%dx%d' % (want_w, height))
-        win.minsize(want_w, min(420, height))
-        win.maxsize(want_w, want_h)
+        def fit():
+            """Size to the content, then cap the height so the window
+            always fits on the screen it is opening on. Without the cap a
+            long settings list simply grew off the bottom."""
+            win.update_idletasks()
+            # `body` is a ttk.Frame with padding=16, and a padded frame's
+            # requested size ALREADY includes its padding -- adding it again
+            # here is how a dialog ends up with 32px of dead space.
+            want_w = body.winfo_reqwidth()
+            want_h = body.winfo_reqheight() + footer.winfo_reqheight()
+            max_h = int(win.winfo_screenheight() * 0.86)
+            height = min(want_h, max_h)
+            if height < want_h:
+                # The scrollbar is about to appear inside the canvas width,
+                # so widen by its thickness rather than letting it eat 16px
+                # of the blurbs.
+                want_w += 18
+            win.minsize(1, 1)
+            win.maxsize(want_w, want_h)
+            win.geometry('%dx%d' % (want_w, height))
+            win.minsize(want_w, min(420, height))
+            return want_w, height
+
+        fill()
+        want_w, height = fit()
+
+        def refill():
+            if not win.winfo_exists():
+                return
+            top = canvas.yview()[0]
+            fill()
+            w, _h = fit()
+            canvas.yview_moveto(top)
+            # keep it centred on the main window now that its width changed
+            x = root.winfo_rootx() + (root.winfo_width() - w) // 2
+            win.geometry('+%d+%d' % (max(x, 0), win.winfo_y()))
+        _settings_refill[0] = refill
+
+        def _forget_refill(evt):
+            if evt.widget is win:
+                _settings_refill[0] = None
+                _dev_note[0] = None
+        win.bind('<Destroy>', _forget_refill, add='+')
 
         # centre on the main window, then pull back on-screen if the cap
         # still leaves it hanging off the bottom
@@ -3093,11 +3444,708 @@ def launch_ui():
         if y + height > win.winfo_screenheight() - 40:
             y = max(20, win.winfo_screenheight() - height - 40)
         win.geometry('+%d+%d' % (max(x, 0), max(y, 0)))
+        win.deiconify()
+        try:
+            win.wait_visibility()       # a grab needs a viewable window
+        except tk.TclError:                            # pragma: no cover
+            pass
         win.grab_set()
         win.focus_set()
 
-    ttk.Button(header, text='\u2699  Settings', command=open_settings
-               ).pack(side='right')
+    # Defined here, ahead of the header, because the header buttons below
+    # are the first thing that centres text on it; the mod rows reuse it.
+    def _cap_height(font_tuple, ascent, descent):
+        """
+        Ink height of a capital "A", measured at the size Tk is ACTUALLY using.
+
+        The subtle part is units. Tk's font size 12 means 12 POINTS; Pillow's
+        truetype(size=12) means 12 PIXELS. Asking Pillow for "12" therefore
+        measures a different-sized glyph than Tk draws, and mixing that cap
+        with Tk's ascent puts the text a pixel out -- MEASURED: cap band
+        landed at y=17..25 against a row centre of 20, exactly 1px low.
+
+        So do not trust the nominal size. Search Pillow sizes for the one
+        whose ascent+descent matches Tk's linespace, and measure the cap
+        there. Both numbers then describe the same rendering.
+        """
+        family, size = font_tuple[0], font_tuple[1]
+        target = ascent + descent
+        try:
+            from PIL import ImageFont
+            path = None
+            for cand in (family, family + '.ttc', family + '.ttf',
+                         '/System/Library/Fonts/Helvetica.ttc',
+                         '/System/Library/Fonts/Supplemental/Arial.ttf',
+                         'DejaVuSans.ttf'):
+                try:
+                    ImageFont.truetype(cand, 12)
+                    path = cand
+                    break
+                except Exception:
+                    continue
+            if path is not None:
+                best, best_err = None, None
+                for px in range(max(6, size - 4), size + 10):
+                    try:
+                        f = ImageFont.truetype(path, px)
+                    except Exception:
+                        continue
+                    a, d = f.getmetrics()
+                    err = abs((a + d) - target)
+                    if best_err is None or err < best_err:
+                        best, best_err = f, err
+                if best is not None:
+                    box = best.getbbox('A')
+                    cap = box[3] - box[1]
+                    if 0.4 * target <= cap <= 1.0 * target:
+                        return cap
+        except Exception:
+            pass
+        # no Pillow, or nothing plausible: the usual cap ratio for a humanist
+        # sans, applied to the size Tk reports
+        return int(round(0.72 * target))
+
+    # ---------- Install Mods: download / update the supported mods -------
+    # The mods in data/mod_sources.json, from 7th Heaven's own catalogs (see
+    # ff7nx_download). One row per mod: what is installed, what the catalog
+    # has, and an Install or Update button; Install all does every row that
+    # needs it, and turns into Cancel while it runs. Work runs on a thread, one mod
+    # at a time, and reports through a queue this window drains with
+    # after() -- Tk must only be touched from the main thread.
+    #
+    # Each mod that lands here goes straight into the main window's list
+    # (reload_mods), no restart. settings.json keys mods by file name and every download lands
+    # on the name it lists, so their on/off state and options carry over.
+    _getmods = {'win': None}
+
+    def restore_mod_defaults(parent):
+        """Every supported mod's on/off state and options back to
+        data/default_mod_settings.json. A mod it does not list is left
+        alone, and so is everything outside the mod list."""
+        want = default_mod_settings()
+        if not want:
+            messagebox.showerror('Restore defaults', 'data/default_mod_'
+                                 'settings.json is missing or empty.',
+                                 parent=parent)
+            return
+        if build_btn.instate(['disabled']):
+            messagebox.showinfo(
+                'Restore defaults', 'A build is running. Restore the mod '
+                'defaults once it has finished.', parent=parent)
+            return
+        if not messagebox.askyesno(
+                'Restore defaults',
+                'Put every supported mod back to its tested settings?\n\n'
+                'This turns each of the %d supported mods on and resets all '
+                'of their options to the configuration 7th Heaven NX is '
+                'tested with. Use it if a build stopped working after you '
+                'changed mod options.\n\nYour app settings, theme and '
+                'downloaded mods are not changed. Any mod option you '
+                'changed will be lost.' % len(want),
+                icon='warning', default='no', parent=parent):
+            return
+        done = 0
+        for mod in mods:
+            entry = want.get(mod.filename)
+            if entry is None:
+                continue
+            settings_by_mod[mod.filename] = _mod_options_from_saved(
+                mod, {mod.filename: entry})
+            var = enabled.get(mod.filename)
+            if var is not None:
+                var.set(entry['enabled'])
+            done += 1
+        current = next((m for m in mods if m.filename == selected.get()),
+                       None)
+        if current is not None:
+            show_options(current)
+        save_settings_now()
+        later = len(want) - done
+        log_write('Mod settings restored to defaults for %d mod%s.%s' % (
+            done, '' if done == 1 else 's',
+            ' %d not installed yet; they start with their defaults when '
+            'installed.' % later if later else ''))
+
+    def open_get_mods():
+        import ff7nx_download as dl
+        if _getmods['win'] is not None and _getmods['win'].winfo_exists():
+            _getmods['win'].lift()
+            _getmods['win'].focus_set()
+            return
+        try:
+            sources = dl.load_sources()
+        except (OSError, ValueError) as exc:
+            messagebox.showerror('Install Mods', 'data/mod_sources.json could '
+                                 'not be read:\n\n%s' % exc)
+            return
+        dl.cleanup(MODS_DIR)
+
+        win = tk.Toplevel(root)
+        _getmods['win'] = win
+        # Hidden until it is sized and placed: mapped straight away, Tk
+        # shows it at the window manager's default spot and it visibly
+        # jumps when the geometry below lands.
+        win.withdraw()
+        win.title('Install Mods')
+        win.configure(bg=BG_APP)
+        win.transient(root)
+        win.minsize(760, 420)
+
+        top = ttk.Frame(win, padding=(16, 14, 16, 6))
+        top.pack(side='top', fill='x')
+        ttk.Label(top, text='Supported mods', font=('Helvetica', 13, 'bold')
+                  ).pack(side='left')
+        catalog_lbl = ttk.Label(top, text='', style='Sub.TLabel')
+        catalog_lbl.pack(side='left', padx=12)
+        check_btn = ttk.Button(top, text='Check for updates')
+        check_btn.pack(side='right')
+        ttk.Button(top, text='Restore defaults',
+                   command=lambda: restore_mod_defaults(win)
+                   ).pack(side='right', padx=(0, 8))
+
+        # Right to left: Close, Install all (Cancel while running). The
+        # status text sits
+        # left of the buttons and the bar takes whatever width is left, so
+        # there is no dead gap between them.
+        footer = ttk.Frame(win, padding=(16, 10, 16, 14))
+        footer.pack(side='bottom', fill='x')
+        close_btn = ttk.Button(footer, text='Close')
+        close_btn.pack(side='right')
+        all_btn = ttk.Button(footer, text='Install all', width=16)
+        all_btn.pack(side='right', padx=(0, 8))
+        gm_status = ttk.Label(footer, text='', style='Sub.TLabel')
+        gm_status.pack(side='right', padx=(10, 12))
+        gm_bar = ttk.Progressbar(footer, mode='determinate')
+        gm_bar.pack(side='left', fill='x', expand=True)
+
+        area = ttk.Frame(win, padding=(16, 0))
+        area.pack(side='top', fill='both', expand=True)
+        _c, table = make_scrollable(area, inner_width_tracks_canvas=True)
+        table.columnconfigure(0, weight=1)
+        for col, (text, w) in enumerate((('MOD', 0), ('INSTALLED', 90),
+                                         ('LATEST', 90), ('SIZE', 80),
+                                         ('STATUS', 150))):
+            table.columnconfigure(col, minsize=w)
+            ttk.Label(table, text=text, style='ColHeader.TLabel').grid(
+                row=0, column=col, sticky='w', padx=(0, 10), pady=(4, 2))
+        ttk.Separator(table, orient='horizontal').grid(
+            row=1, column=0, columnspan=5, sticky='ew', pady=(0, 4))
+
+        state = {'catalog': {}, 'busy': False, 'cancel': False,
+                 'installed': 0, 'jobs': []}
+        msgs = queue.Queue()
+        rows = {}
+
+        versions = {}       # path -> installed version, until it changes
+
+        def installed_version(src):
+            path = os.path.join(MODS_DIR, src['file'])
+            if not os.path.exists(path):
+                return None
+            if path not in versions:
+                # the startup list's manifest, unless this window replaced
+                # the file since (then the list still holds the old one)
+                m = next((x for x in mods if x.path == path), None)
+                if m is None or m.manifest is None or path in fresh:
+                    m = build.Mod(path, CACHE_DIR)
+                    m._load_manifest()
+                versions[path] = (m.manifest.version
+                                  if m.manifest else '') or '?'
+            return versions[path]
+
+        fresh = set()       # paths this window installed
+
+        def size_text(n):
+            if not n:
+                return ''
+            return ('%.1f GB' % (n / 2 ** 30) if n >= 2 ** 30
+                    else '%d MB' % max(1, round(n / 2 ** 20)))
+
+        def need(src):
+            """'download', 'update' or None for this row."""
+            cat = state['catalog'].get(src['id'])
+            have = installed_version(src)
+            if have is None:
+                return 'download' if cat else None
+            if cat and have != '?' and dl.is_newer(cat.version, have):
+                return 'update'
+            return None
+
+        for i, src in enumerate(sources):
+            r = i + 2
+            name = ttk.Label(table, text=src['name'])
+            name.grid(row=r, column=0, sticky='w', padx=(0, 10), pady=3)
+            have = ttk.Label(table, style='Sub.TLabel')
+            have.grid(row=r, column=1, sticky='w', padx=(0, 10))
+            latest = ttk.Label(table, style='Sub.TLabel')
+            latest.grid(row=r, column=2, sticky='w', padx=(0, 10))
+            size = ttk.Label(table, style='Sub.TLabel')
+            size.grid(row=r, column=3, sticky='w', padx=(0, 10))
+            cell = ttk.Frame(table)
+            cell.grid(row=r, column=4, sticky='w')
+            # Install / Update is a link, not a button, so the column reads
+            # as text like "Up to date" beside it.
+            btn = ttk.Label(cell, style='Link.TLabel', cursor='hand2')
+            btn.bind('<Button-1>', lambda e, b=btn: b.command())
+            note = ttk.Label(cell, style='Sub.TLabel')
+            rows[src['id']] = dict(name=name, have=have, latest=latest,
+                                   size=size, btn=btn, note=note)
+
+        def show_row(src, note=None):
+            w = rows[src['id']]
+            cat = state['catalog'].get(src['id'])
+            have = installed_version(src)
+            if cat:
+                w['name'].configure(text=cat.name)
+            w['have'].configure(text=have or '—')
+            w['latest'].configure(text=cat.version if cat else '—')
+            w['size'].configure(text=size_text(cat.size) if cat else '')
+            what = need(src)
+            w['btn'].pack_forget()
+            w['note'].pack_forget()
+            if note is None and what and not state['busy']:
+                w['btn'].configure(
+                    text='Install' if what == 'download' else 'Update')
+                w['btn'].command = lambda s=src: start([s])
+                w['btn'].pack(side='left')
+                return
+            if note is None:
+                # "Up to date" only when the catalog said so: with no
+                # catalog loaded there is nothing to compare against.
+                note = ('Queued' if src in state['jobs'] else
+                        'Not in the catalog' if state['catalog'] and not cat
+                        else 'Up to date' if have and cat else
+                        'Installed' if have else '')
+            w['note'].configure(text=note)
+            w['note'].pack(side='left')
+
+        def refresh():
+            for src in sources:
+                show_row(src)
+            todo = [s for s in sources if need(s)]
+            idle = not state['busy']
+            check_btn.state(['!disabled' if idle else 'disabled'])
+            if state['jobs']:
+                # installing: the same button cancels
+                all_btn.configure(text='Cancel', command=cancel)
+                all_btn.state(['disabled' if state['cancel']
+                               else '!disabled'])
+                return
+            all_btn.configure(
+                text='Install all (%d)' % len(todo) if todo
+                else 'Install all',
+                command=lambda: start([s for s in sources if need(s)]))
+            all_btn.state(['!disabled' if idle and todo else 'disabled'])
+
+        def worker_catalog():
+            try:
+                cat = dl.load_catalogs(
+                    log=lambda s: msgs.put(('log', s)))
+                msgs.put(('catalog', cat))
+            except Exception as exc:                           # noqa: BLE001
+                msgs.put(('catalog_error', str(exc)))
+
+        def check():
+            state['busy'] = True
+            catalog_lbl.configure(text='Checking the 7th Heaven catalogs…')
+            gm_bar.configure(mode='indeterminate')
+            gm_bar.start(15)
+            refresh()
+            threading.Thread(target=worker_catalog, daemon=True).start()
+
+        def worker_install(jobs):
+            for n, src in enumerate(jobs):
+                if state['cancel']:
+                    break
+                cat = state['catalog'][src['id']]
+                msgs.put(('job', (n, len(jobs), src)))
+
+                def prog(done, total, src=src):
+                    msgs.put(('bytes', (src, done, total)))
+                try:
+                    path = dl.download_and_install(
+                        cat, MODS_DIR, src['file'], prog,
+                        cancel=lambda: state['cancel'],
+                        log=lambda s: msgs.put(('log', s)))
+                    msgs.put(('installed', (src, path)))
+                except dl.Cancelled:
+                    msgs.put(('failed', (src, 'cancelled')))
+                    break
+                except Exception as exc:                       # noqa: BLE001
+                    msgs.put(('failed', (src, str(exc))))
+            msgs.put(('finished', None))
+
+        def start(jobs):
+            if state['busy'] or not jobs:
+                return
+            state.update(busy=True, cancel=False, jobs=list(jobs))
+            gm_bar.stop()
+            gm_bar.configure(mode='determinate', maximum=1, value=0)
+            refresh()
+            threading.Thread(target=worker_install, args=(list(jobs),),
+                             daemon=True).start()
+
+        def cancel():
+            state['cancel'] = True
+            all_btn.state(['disabled'])
+            gm_status.configure(text='Cancelling…')
+
+        def pump_getmods():
+            if not win.winfo_exists():
+                return
+            try:
+                while True:
+                    kind, p = msgs.get_nowait()
+                    if kind == 'log':
+                        log_write('Install Mods: ' + p)
+                    elif kind == 'catalog':
+                        state['catalog'] = p
+                        state['busy'] = False
+                        gm_bar.stop()
+                        gm_bar.configure(mode='determinate', value=0)
+                        found = sum(1 for s in sources if s['id'] in p)
+                        catalog_lbl.configure(
+                            text='%d of %d found in the catalogs'
+                            % (found, len(sources)) if p else
+                            'Catalogs unavailable -- check your connection')
+                        refresh()
+                    elif kind == 'catalog_error':
+                        state['busy'] = False
+                        gm_bar.stop()
+                        catalog_lbl.configure(text='Catalog check failed: '
+                                              + p)
+                        refresh()
+                    elif kind == 'job':
+                        n, total, src = p
+                        gm_status.configure(text='%d of %d: %s' % (
+                            n + 1, total, src['name']))
+                        show_row(src, 'Starting…')
+                    elif kind == 'bytes':
+                        src, done, total = p
+                        if total:
+                            gm_bar.configure(maximum=total, value=done)
+                            text = 'Downloading %d%%' % (100 * done // total)
+                        else:
+                            text = 'Downloading %s' % size_text(done)
+                        if done and total and done >= total:
+                            text = 'Installing…'
+                        show_row(src, text)
+                    elif kind == 'installed':
+                        src, path = p
+                        state['installed'] += 1
+                        fresh.add(os.path.join(MODS_DIR, src['file']))
+                        for k in [k for k in versions
+                                  if k.startswith(os.path.join(MODS_DIR, ''))
+                                  and os.path.basename(k) in (
+                                      src['file'], os.path.basename(path))]:
+                            del versions[k]
+                        if src in state['jobs']:
+                            state['jobs'].remove(src)
+                        log_write('Install Mods: installed %s -> %s'
+                                  % (src['name'], os.path.relpath(path, HERE)))
+                        show_row(src, 'Installed')
+                        # straight into the main list, no restart
+                        reload_mods()
+                    elif kind == 'failed':
+                        src, why = p
+                        if src in state['jobs']:
+                            state['jobs'].remove(src)
+                        log_write('Install Mods: %s failed -- %s'
+                                  % (src['name'], why))
+                        show_row(src, 'Cancelled' if why == 'cancelled'
+                                 else 'Failed (see log)')
+                    elif kind == 'finished':
+                        state.update(busy=False, jobs=[], cancel=False)
+                        gm_bar.configure(value=0)
+                        n = state['installed']
+                        if n and build_btn.instate(['disabled']):
+                            text = ('%d mod(s) installed, listed once the '
+                                    'build ends' % n)
+                        elif n:
+                            text = '%d mod(s) installed and listed' % n
+                        else:
+                            text = ''
+                        gm_status.configure(text=text)
+                        refresh()
+            except queue.Empty:
+                pass
+            win.after(100, pump_getmods)
+
+        def close():
+            if state['busy'] and state['jobs']:
+                if not messagebox.askyesno(
+                        'Install Mods', 'A download is still running. Cancel '
+                        'it and close?', parent=win):
+                    return
+                state['cancel'] = True
+            win.destroy()
+
+        check_btn.configure(command=check)
+        close_btn.configure(command=close)
+        win.protocol('WM_DELETE_WINDOW', close)
+
+        win.update_idletasks()
+        w, h = 820, 620
+        x = root.winfo_rootx() + (root.winfo_width() - w) // 2
+        y = root.winfo_rooty() + 40
+        win.geometry('%dx%d+%d+%d' % (w, h, max(x, 0), max(y, 0)))
+        win.deiconify()
+        refresh()
+        check()
+        pump_getmods()
+
+    # ---------- header buttons: Settings, Support (Ko-fi), Install Mods ----------------
+    # Both are drawn the same way: a 16px icon from assets/, a gap, the
+    # label. gear.png and kofi.png are drawn in TEXT_PRIMARY (the stock Ko-fi
+    # cup's black outline vanishes on this dark header).
+    #
+    # Drawn on a Canvas, not as ttk.Buttons, for the same reason the mod rows
+    # are: a ttk.Button centres the label's LINE BOX, so descent space sits
+    # under the capitals and the word reads low. Here the cap band of "A" in
+    # the button font is centred on the button's centre pixel, as for the
+    # rows (see "optical vertical centring" below), and the icon is centred
+    # on the same pixel. Without an icon, or without Pillow, a button is its
+    # label alone.
+    BTN_FONT = ('Helvetica', 11)        # the ttk default ('.') it replaces
+    BTN_ICON = 16
+    BTN_PAD_X, BTN_GAP = 10, 6
+    BTN_H = (BTN_ICON + 2 * 7) | 1      # odd -> a centre pixel exists
+    _btn_mid = BTN_H // 2
+    _btnf = tkfont.Font(font=BTN_FONT)
+    _btn_a, _btn_d = _btnf.metrics('ascent'), _btnf.metrics('descent')
+    _btn_cap = _cap_height(BTN_FONT, _btn_a, _btn_d)
+    # -1 is TEXT_RASTER_TWEAK, the calibration measured for the mod rows
+    # (Tk's glyph rasterisation lands the ink a pixel low on this platform).
+    _btn_text_y = _btn_mid - ((_btn_a - _btn_cap) + (_btn_cap - 1) // 2) - 1
+
+    _tinted_icons = []      # (PhotoImage, name): repainted by apply_theme
+
+    def _button_icon(name):
+        try:
+            from PIL import ImageTk as _KImgTk
+            img = _KImgTk.PhotoImage(_button_icon_art(name))
+        except Exception:
+            return None
+        _icon_keep.append(img)          # Tk's weak image reference
+        _tinted_icons.append((img, name))
+        return img
+
+    def _button_icon_art(name):
+        # aliased: a bare `Image` here would become a local of the whole
+        # GUI function and shadow the name for its nested helpers.
+        from PIL import Image as _KImg
+        im = _KImg.open(os.path.join(nxpaths.APP, 'assets', name)
+                        ).convert('RGBA')
+        # The icons are drawn in Abyss Blue's text colour; repaint those
+        # pixels (alpha kept) in this theme's. Ko-fi's orange and white
+        # are left alone.
+        src = (0xe8, 0xec, 0xf4)
+        dst = tuple(int(TEXT_PRIMARY[i:i + 2], 16) for i in (1, 3, 5))
+        if dst != src:
+            px = im.load()
+            for y in range(im.size[1]):
+                for x in range(im.size[0]):
+                    r, g, b, a = px[x, y]
+                    if a and all(abs(c - s0) <= 12 for c, s0
+                                 in zip((r, g, b), src)):
+                        px[x, y] = dst + (a,)
+        return im.resize((BTN_ICON, BTN_ICON),
+                         getattr(_KImg, 'LANCZOS', _KImg.BICUBIC))
+
+    def header_button(text, icon, command):
+        icon = _button_icon(icon)
+        x = BTN_PAD_X
+        w = x + (BTN_ICON + BTN_GAP if icon else 0) + \
+            _btnf.measure(text) + BTN_PAD_X
+        c = tk.Canvas(header, width=w, height=BTN_H, bg=BG_APP, bd=0,
+                      highlightthickness=0)
+        # What clam drew for TButton: a 1px BORDER edge, a 1px ring in
+        # BG_APP (its light/dark colours), then the fill.
+        c.create_rectangle(0, 0, w - 1, BTN_H - 1, outline=BORDER)
+        # (an outline-less rectangle fills x1..x2-1, hence w - 2)
+        fill = c.create_rectangle(2, 2, w - 2, BTN_H - 2, outline='',
+                                  fill=BG_ROW)
+        if icon:
+            # a run of n pixels centres on top + (n-1)//2
+            c.create_image(x, _btn_mid - (BTN_ICON - 1) // 2, image=icon,
+                           anchor='nw')
+            x += BTN_ICON + BTN_GAP
+        c.create_text(x, _btn_text_y, text=text, font=BTN_FONT,
+                      fill=TEXT_PRIMARY, anchor='nw')
+        pressed = [False]
+
+        def paint(bg):
+            c.itemconfigure(fill, fill=bg)
+
+        def release(e):
+            inside = 0 <= e.x < w and 0 <= e.y < BTN_H
+            paint(BG_ROW_HOVER if inside else BG_ROW)
+            if pressed[0] and inside:
+                command()
+            pressed[0] = False
+
+        def press(_e):
+            pressed[0] = True
+            paint(BG_ROW_SEL)
+
+        c.bind('<Enter>', lambda e: paint(BG_ROW_SEL if pressed[0]
+                                          else BG_ROW_HOVER))
+        c.bind('<Leave>', lambda e: paint(BG_ROW))
+        c.bind('<ButtonPress-1>', press)
+        c.bind('<ButtonRelease-1>', release)
+        return c
+
+    KOFI_URL = 'https://ko-fi.com/ppkantorski'
+
+    def open_support():
+        import webbrowser
+        webbrowser.open(KOFI_URL)
+
+    # ---------- Settings > About Dev (BUILD 804) ----------
+    # The avatar ships as assets/dev_avatar.png, already cut to a circle, and
+    # the bio is the GitHub profile's, copied here. Nothing is fetched: the
+    # page has to open offline and must not stall the GUI on a network call.
+    DEV_NAME = 'ppkantorski'
+    DEV_URL = 'https://github.com/ppkantorski'
+    DEV_BIO = ('Software developer with background in embedded systems, '
+               'signal processing, machine learning / AI, electrical '
+               'engineering, and astrophysics research.')
+    DEV_CREDITS = ('Special thanks to FFNX, 7th Heaven, Tsunamods, Ad0ky, '
+                   'and many others. \u2665\ufe0f')
+    DEV_AVATAR = os.path.join(nxpaths.APP, 'assets', 'dev_avatar.png')
+    DEV_AVATAR_PX = 112
+    _about_win = [None]
+
+    def open_about(parent=None):
+        import webbrowser
+        if _about_win[0] is not None and _about_win[0].winfo_exists():
+            _about_win[0].lift()
+            _about_win[0].focus_set()
+            return
+        owner = parent or root
+        win = tk.Toplevel(owner)
+        _about_win[0] = win
+        # Hidden until it is sized and placed: mapped straight away, Tk
+        # shows it at the window manager's default spot and it visibly
+        # jumps when the geometry below lands.
+        win.withdraw()
+        win.title('About the Developer')
+        win.configure(bg=BG_APP)
+        win.transient(owner)
+        win.resizable(False, False)
+
+        # A card: avatar, name and role on the left; a divider; the bio and
+        # the profile link on the right. tk widgets rather than ttk inside
+        # the card, so they can take its BG_ROW fill (apply_theme recolours
+        # them like every other tk widget).
+        body = ttk.Frame(win, padding=(20, 20, 20, 14))
+        body.pack(fill='both', expand=True)
+        card = tk.Frame(body, bg=BG_ROW, highlightthickness=1,
+                        highlightbackground=BORDER, highlightcolor=BORDER)
+        card.pack(fill='both', expand=True)
+
+        left = tk.Frame(card, bg=BG_ROW)
+        left.grid(row=0, column=0, padx=(28, 24), pady=24)
+        # The avatar inside a 2px accent ring, on a Canvas so the ring is
+        # drawn in this theme's colour rather than baked into the PNG.
+        ring, gap = 2, 3
+        side = DEV_AVATAR_PX + 2 * (ring + gap)
+        c = tk.Canvas(left, width=side, height=side, bg=BG_ROW, bd=0,
+                      highlightthickness=0)
+        c.pack()
+        c.create_oval(1, 1, side - 2, side - 2, outline=ACCENT, width=ring)
+        av = _load_icon(DEV_AVATAR_PX, DEV_AVATAR)
+        if av is not None:
+            c.create_image(side // 2, side // 2, image=av)
+        else:
+            c.create_text(side // 2, side // 2, text=DEV_NAME[:1].upper(),
+                          font=('Helvetica', 40, 'bold'), fill=TEXT_PRIMARY)
+        tk.Label(left, text=DEV_NAME, bg=BG_ROW, fg=TEXT_PRIMARY,
+                 font=('Helvetica', 17, 'bold')).pack(pady=(12, 0))
+        tk.Label(left, text='7HNX Developer', bg=BG_ROW, fg=TEXT_SECONDARY,
+                 font=('Helvetica', 11)).pack(pady=(2, 0))
+
+        tk.Frame(card, bg=BORDER, width=1).grid(row=0, column=1, sticky='ns',
+                                                 pady=24)
+
+        right = tk.Frame(card, bg=BG_ROW)
+        right.grid(row=0, column=2, sticky='w', padx=(24, 28), pady=24)
+
+        def heading(text, top, parent=None, **grid):
+            lbl = tk.Label(parent or right, text=text, bg=BG_ROW,
+                           fg=TEXT_MUTED, font=('Helvetica', 9, 'bold'))
+            if grid:
+                lbl.grid(sticky='w', pady=(top, 4), **grid)
+            else:
+                lbl.pack(anchor='w', pady=(top, 4))
+
+        def url_label(parent, url, **grid):
+            lbl = tk.Label(parent, text=url.split('://', 1)[1], bg=BG_ROW,
+                           fg=ACCENT_SOFT, cursor='hand2',
+                           font=('Helvetica', 12, 'underline'))
+            lbl.grid(sticky='w', **grid)
+            lbl.bind('<Button-1>', lambda _e: webbrowser.open(url))
+
+        heading('ABOUT', 0)
+        tk.Label(right, text=DEV_BIO, bg=BG_ROW, fg=TEXT_PRIMARY,
+                 font=('Helvetica', 12), wraplength=300, justify='left'
+                 ).pack(anchor='w')
+        # GitHub and Ko-fi side by side, each heading over its link.
+        links = tk.Frame(right, bg=BG_ROW)
+        links.pack(anchor='w')
+        heading('GITHUB', 16, links, row=0, column=0)
+        url_label(links, DEV_URL, row=1, column=0, padx=(0, 28))
+        heading('KO-FI', 16, links, row=0, column=1)
+        url_label(links, KOFI_URL, row=1, column=1)
+        heading('CREDITS', 16)
+        tk.Label(right, text=DEV_CREDITS, bg=BG_ROW, fg=TEXT_SECONDARY,
+                 font=('Helvetica', 11), wraplength=300, justify='left'
+                 ).pack(anchor='w')
+
+        foot = ttk.Frame(win, padding=(20, 0, 20, 20))
+        foot.pack(fill='x')
+        ttk.Label(foot, text='© 2026 %s' % DEV_NAME, style='Sub.TLabel'
+                  ).pack(side='left')
+        ttk.Button(foot, text='Close', command=win.destroy
+                   ).pack(side='right')
+        ttk.Button(foot, text='View on GitHub', style='Accent.TButton',
+                   command=lambda: webbrowser.open(DEV_URL)
+                   ).pack(side='right', padx=(0, 8))
+        win.bind('<Escape>', lambda _e: win.destroy())
+
+        # centre on whatever opened it
+        win.update_idletasks()
+        w, h = win.winfo_reqwidth(), win.winfo_reqheight()
+        x = owner.winfo_rootx() + (owner.winfo_width() - w) // 2
+        y = owner.winfo_rooty() + (owner.winfo_height() - h) // 2
+        win.geometry('+%d+%d' % (max(x, 0), max(y, 0)))
+        win.deiconify()
+        # Settings holds the input grab (it is modal), so a second window
+        # gets no clicks until the grab moves to it. Take it while open and
+        # hand it back to whichever window had it when this one closes.
+        prev = win.grab_current()
+
+        def _give_back(evt):
+            if evt.widget is win and prev is not None:
+                try:
+                    if prev.winfo_exists():
+                        prev.grab_set()
+                except tk.TclError:                    # pragma: no cover
+                    pass
+        win.bind('<Destroy>', _give_back, add='+')
+        try:
+            win.wait_visibility()
+            win.grab_set()
+        except tk.TclError:                            # pragma: no cover
+            pass
+        win.focus_set()
+
+    # Packed side='right' in this order: Install Mods, Support, Settings.
+    header_button('Settings', 'gear.png', open_settings).pack(side='right')
+    header_button('Support', 'kofi.png', open_support
+                  ).pack(side='right', padx=(0, 8))
+    header_button('Install Mods', 'download.png', open_get_mods
+                  ).pack(side='right', padx=(0, 8))
 
     # ---------- settings persistence -------------------------------------
     # Everything the user can touch is written back to settings.json as soon
@@ -3112,12 +4160,13 @@ def launch_ui():
     # good settings file.
     _ui_ready = [False]
 
-    def snapshot_settings():
+    def snapshot_settings(raw=False):
         persist = {}
         for mod in mods:
             var = enabled.get(mod.filename)
             persist[mod.filename] = {
-                'enabled': bool(var.get()) if var is not None else True,
+                'enabled': (bool(var.get()) if var is not None
+                            else NEW_MOD_ENABLED),
                 'options': settings_by_mod.get(mod.filename, {}),
             }
         persist['__global__'] = {'mod_load_order': [m.filename for m in mods],
@@ -3222,11 +4271,13 @@ def launch_ui():
                                  'movie_quality': current_movie_quality(),
                                  'movie_fit': current_movie_fit(),
                                  'movie_colour': current_movie_colour(),
+                                 'hd_black_point': current_black_point(),
                                  'movie_30fps': bool(m30_var.get()),
                                  'analog_360': bool(a360_var.get()),
                                  'no_autorun': bool(norun_var.get()),
                                  'texture_cache': current_texture_cache(),
                                  'field_frame': bool(frame_var.get()),
+                                 'model_shadows': bool(shadows_var.get()),
                                  'no_cheats': bool(nocheat_var.get()),
                                  'limiter_fps': current_limiter_fps(),
                                  'widescreen': current_widescreen(),
@@ -3236,7 +4287,15 @@ def launch_ui():
                                  'fxaa': current_fxaa(),
                                  'video_shader': current_video_shader(),
                                  'voice_normalize':
-                                     current_voice_normalize()}
+                                     current_voice_normalize(),
+                                 'esui_texscale': current_esui_texscale(),
+                                 'dock_resolution':
+                                     current_dock_resolution(),
+                                 'title_screen': current_title_screen(),
+                                 'gui_theme': current_theme(),
+                                 'developer_settings':
+                                     bool(devset_var.get())}
+        # BUILD 804: saved as the vars hold them, developer mode or not.
         return persist
 
     def save_settings_now(*_args):
@@ -3249,6 +4308,7 @@ def launch_ui():
             build.save_settings(SETTINGS, snapshot_settings())
         except Exception as exc:                      # noqa: BLE001
             print('could not save settings: %s' % exc, file=sys.stderr)
+        refresh_dev_note()
 
     fps_var.trace_add('write', save_settings_now)
     ws_var.trace_add('write', save_settings_now)
@@ -3256,6 +4316,12 @@ def launch_ui():
     world_cap_var.trace_add('write', save_settings_now)
     bg_cap_var.trace_add('write', save_settings_now)
     mini_cap_var.trace_add('write', save_settings_now)
+    esuisc_var.trace_add('write', save_settings_now)
+    dockres_var.trace_add('write', save_settings_now)
+    title_var.trace_add('write', save_settings_now)
+    theme_var.trace_add('write', save_settings_now)
+    theme_var.trace_add('write',
+                        lambda *_a: root.after_idle(on_theme_change))
     fbg_var.trace_add('write', save_settings_now)
     fbud_var.trace_add('write', save_settings_now)
     ftc_var.trace_add('write', save_settings_now)
@@ -3275,6 +4341,7 @@ def launch_ui():
     norun_var.trace_add('write', save_settings_now)
     texcache_var.trace_add('write', save_settings_now)
     frame_var.trace_add('write', save_settings_now)
+    shadows_var.trace_add('write', save_settings_now)
     nocheat_var.trace_add('write', save_settings_now)
     lim_var.trace_add('write', save_settings_now)
     # The four added with the field-buffer work. Without these they are
@@ -3284,6 +4351,7 @@ def launch_ui():
     fbuf_var.trace_add('write', save_settings_now)
     gfx_var.trace_add('write', save_settings_now)
     scaler_var.trace_add('write', save_settings_now)
+    bp_var.trace_add('write', save_settings_now)
     fxaa_var.trace_add('write', save_settings_now)
     vshader_var.trace_add('write', save_settings_now)
 
@@ -3318,26 +4386,217 @@ def launch_ui():
     logframe = ttk.Labelframe(vsplit, text='Log', padding=(2, 2))
     vsplit.add(logframe, weight=1)
 
-    logbox = tk.Text(logframe, height=8, wrap='none', font=('Menlo', 11),
-                     relief='flat', background=LOG_BG, foreground='#c9d2e3',
-                     insertbackground=ACCENT, selectbackground=BG_ROW_SEL,
-                     highlightthickness=0, state='disabled')
+    # ---------- log: drawn on a Canvas, banner behind the text -----------
+    # A Tk Text cannot put an image BEHIND its text, so the log is a Canvas:
+    # assets/banner.png sits at the bottom of the stack in the bottom-right
+    # corner, and the visible lines are drawn over it. Only the lines on
+    # screen exist as canvas items, so a 50,000-line build log redraws as
+    # fast as a 10-line one. It keeps what the Text did: follows the end
+    # while you are at the bottom, wheel and scrollbar, drag to select whole
+    # lines, Cmd/Ctrl+C to copy them, Cmd/Ctrl+A for everything, and a
+    # right-click Copy / Copy all.
+    LOG_FONT = tkfont.Font(family='Menlo', size=11)
+    LOG_LH = LOG_FONT.metrics('linespace')
+    LOG_PAD = 4
+    logbox = tk.Canvas(logframe, background=LOG_BG, highlightthickness=0,
+                       bd=0, height=8 * LOG_LH + 2 * LOG_PAD,
+                       takefocus=1)
+    _log = {'lines': [], 'top': 0, 'follow': True, 'sel': None,
+            'anchor': None, 'job': None}
+
+    def _log_rows():
+        return max(1, (logbox.winfo_height() - 2 * LOG_PAD) // LOG_LH)
+
+    def _log_max_top():
+        return max(0, len(_log['lines']) - _log_rows())
+
+    def _log_render():
+        _log['job'] = None
+        lines, rows = _log['lines'], _log_rows()
+        top = _log_max_top() if _log['follow'] else \
+            min(max(0, _log['top']), _log_max_top())
+        _log['top'] = top
+        logbox.delete('logtxt', 'logsel')
+        W = logbox.winfo_width()
+        if _log['sel']:
+            a, b = _log['sel']
+            a, b = max(a, top), min(b, top + rows)
+            if a <= b:
+                logbox.create_rectangle(
+                    0, LOG_PAD + (a - top) * LOG_LH, W,
+                    LOG_PAD + (b - top + 1) * LOG_LH,
+                    fill=BG_ROW_SEL, outline='', tags='logsel')
+        for i in range(top, min(len(lines), top + rows + 1)):
+            y = LOG_PAD + (i - top) * LOG_LH
+            # a 1px dark copy first, so the text stays readable where it
+            # crosses the bright banner
+            logbox.create_text(LOG_PAD + 1, y + 1, text=lines[i],
+                               anchor='nw', font=LOG_FONT, fill='#000000',
+                               tags='logtxt')
+            logbox.create_text(LOG_PAD, y, text=lines[i], anchor='nw',
+                               font=LOG_FONT, fill=LOG_TEXT, tags='logtxt')
+        logbox.tag_lower('banner')
+        n = len(lines)
+        logscroll.set(*((top / n, min(1.0, (top + rows) / n)) if n
+                        else (0.0, 1.0)))
+
+    def _log_soon(*_a):
+        if _log['job'] is None:
+            _log['job'] = logbox.after_idle(_log_render)
+
+    def _log_scroll_to(top):
+        _log['top'] = min(max(0, int(top)), _log_max_top())
+        _log['follow'] = _log['top'] >= _log_max_top()
+        _log_soon()
+
+    def _log_yview(*args):
+        if not args:
+            return
+        if args[0] == 'moveto':
+            _log_scroll_to(float(args[1]) * len(_log['lines']))
+        elif args[0] == 'scroll':
+            k = int(args[1]) * (_log_rows() if args[2] == 'pages' else 1)
+            _log_scroll_to(_log['top'] + k)
+
     logscroll = ttk.Scrollbar(logframe, orient='vertical',
-                              command=logbox.yview)
-    logbox.configure(yscrollcommand=logscroll.set)
+                              command=_log_yview)
     logscroll.pack(side='right', fill='y')
     logbox.pack(side='left', fill='both', expand=True)
 
+    def _log_wheel(event):
+        if getattr(event, 'num', None) in (4, 5):
+            step = -3 if event.num == 4 else 3
+        else:
+            d = event.delta
+            # Windows reports 120 a notch, macOS a few units
+            step = -max(1, abs(d) // 40) if d > 0 else max(1, abs(d) // 40)
+            if sys.platform == 'darwin':
+                step = -1 if d > 0 else 1
+        _log_scroll_to(_log['top'] + step)
+        return 'break'
+
+    logbox.bind('<MouseWheel>', _log_wheel)
+    logbox.bind('<Button-4>', _log_wheel)
+    logbox.bind('<Button-5>', _log_wheel)
+
+    def _log_line_at(y):
+        i = _log['top'] + (y - LOG_PAD) // LOG_LH
+        return min(max(0, i), max(0, len(_log['lines']) - 1))
+
+    def _log_press(event):
+        logbox.focus_set()
+        if not _log['lines']:
+            return
+        # a plain click only clears; dragging is what selects
+        _log.update(anchor=_log_line_at(event.y), sel=None)
+        _log_soon()
+
+    def _log_drag(event):
+        if _log['anchor'] is None or not _log['lines']:
+            return
+        if event.y < 0:
+            _log_scroll_to(_log['top'] - 1)
+        elif event.y > logbox.winfo_height():
+            _log_scroll_to(_log['top'] + 1)
+        i, a = _log_line_at(event.y), _log['anchor']
+        _log['sel'] = (min(a, i), max(a, i))
+        _log_soon()
+
+    def _log_copy(_evt=None, every=False):
+        lines = _log['lines']
+        if every:
+            chosen = lines
+        elif _log['sel']:
+            a, b = _log['sel']
+            chosen = lines[a:b + 1]
+        else:
+            return 'break'
+        root.clipboard_clear()
+        root.clipboard_append('\n'.join(chosen))
+        return 'break'
+
+    def _log_select_all(_evt=None):
+        if _log['lines']:
+            _log['sel'] = (0, len(_log['lines']) - 1)
+            _log_soon()
+        return 'break'
+
+    def _log_clear_sel(_evt=None):
+        _log.update(sel=None, anchor=None)
+        _log_soon()
+
+    logbox.bind('<Button-1>', _log_press)
+    logbox.bind('<B1-Motion>', _log_drag)
+    logbox.bind('<Escape>', _log_clear_sel)
+    _mod = 'Command' if sys.platform == 'darwin' else 'Control'
+    logbox.bind('<%s-c>' % _mod, _log_copy)
+    logbox.bind('<%s-a>' % _mod, _log_select_all)
+
+    log_menu = tk.Menu(logbox, tearoff=0)
+    log_menu.add_command(label='Copy', command=_log_copy)
+    log_menu.add_command(label='Copy all',
+                         command=lambda: _log_copy(every=True))
+
+    def _log_menu(event):
+        log_menu.tk_popup(event.x_root, event.y_root)
+    logbox.bind('<Button-3>', _log_menu)
+    if sys.platform == 'darwin':
+        logbox.bind('<Button-2>', _log_menu)
+        logbox.bind('<Control-Button-1>', _log_menu)
+
     def log_write(text):
-        logbox.configure(state='normal')
-        logbox.insert('end', text + '\n')
-        logbox.see('end')
-        logbox.configure(state='disabled')
+        _log['lines'].extend(str(text).split('\n'))
+        _log_soon()
 
     def log_clear():
-        logbox.configure(state='normal')
-        logbox.delete('1.0', 'end')
-        logbox.configure(state='disabled')
+        _log.update(lines=[], top=0, follow=True, sel=None, anchor=None)
+        _log_soon()
+
+    # ---------- banner in the log's bottom-right corner -------------------
+    # assets/banner.png with a soft drop shadow, sized to the log's height
+    # (at most BANNER_MAX_H). The lowest item on the log canvas, so the
+    # text always draws over it.
+    BANNER_PATH = os.path.join(nxpaths.APP, 'assets', 'banner.png')
+    BANNER_MAX_H, BANNER_MARGIN = 150, 8
+    _banner = {'src': None, 'img': None, 'size': None}
+
+    def _banner_image(h):
+        """The banner at height `h`, shadow included, keeping its alpha."""
+        try:
+            from PIL import Image as _BImg, ImageFilter as _BFlt, \
+                ImageTk as _BImgTk
+            if _banner['src'] is None:
+                _banner['src'] = _BImg.open(BANNER_PATH).convert('RGBA')
+            src = _banner['src']
+            pad, off = 6, (2, 3)    # room for the blur; shadow offset
+            ih = h - 2 * pad
+            iw = max(1, round(src.width * ih / src.height))
+            art = src.resize((iw, ih), getattr(_BImg, 'LANCZOS',
+                                               _BImg.BICUBIC))
+            out = _BImg.new('RGBA', (iw + 2 * pad, h), (0, 0, 0, 0))
+            alpha = art.getchannel('A').point(lambda a: a * 0.55)
+            out.paste((0, 0, 0, 255), (pad + off[0], pad + off[1]), alpha)
+            out = out.filter(_BFlt.GaussianBlur(3))
+            out.alpha_composite(art, (pad, pad))
+            return _BImgTk.PhotoImage(out)
+        except Exception:                                   # noqa: BLE001
+            return None
+
+    def _log_configure(_evt=None):
+        W, H = logbox.winfo_width(), logbox.winfo_height()
+        h = min(BANNER_MAX_H, H - 2 * BANNER_MARGIN)
+        logbox.delete('banner')
+        if h >= 40 and os.path.exists(BANNER_PATH):
+            if _banner['size'] != h:
+                img = _banner_image(h)
+                _banner.update(img=img, size=h if img else None)
+            if _banner['img'] is not None:
+                logbox.create_image(W - BANNER_MARGIN, H - BANNER_MARGIN,
+                                    image=_banner['img'], anchor='se',
+                                    tags='banner')
+        _log_render()
+
+    logbox.bind('<Configure>', _log_configure)
 
     # ---------- centre: mods | options (fills remaining space) ----------
     panes = ttk.PanedWindow(content, orient='horizontal')
@@ -3410,17 +4669,133 @@ def launch_ui():
     _opt_canvas, options_body = make_scrollable(
         right, inner_width_tracks_canvas=True)
 
+    # Shown, centred in both panes, while there are no mods; reload_mods
+    # hides it once one arrives.
+    _empty_notes = [ttk.Label(pane, text='Install mods to start.',
+                              style='Sub.TLabel')
+                    for pane in (left, right)]
+
+    def show_empty_notes():
+        for note in _empty_notes:
+            if mods:
+                note.place_forget()
+            else:
+                note.place(relx=0.5, rely=0.5, anchor='center')
+
     selected = tk.StringVar(value=mods[0].filename if mods else '')
 
-    def archive_label(parent, archives, exact, wraplength=220, **grid_kw):
-        text = build.archives_text(archives, exact)
-        if not text:
-            text = '—'
-        lbl = ttk.Label(parent, text=text, wraplength=wraplength,
-                        justify='left',
-                        style='Archive.TLabel' if exact else 'ArchiveEst.TLabel')
+    # "Modifies": what a mod or option changes in the game, from
+    # ff7nx_modifies (the mod's file list routed as the build routes it).
+    # Exact categories in the accent colour, guessed ones (no dump) muted.
+    def _field_bg_on():
+        return current_field_bg_page_px() != build.ff7nx_fieldbg.OFF_PAGE_PX
+
+    def modifies_label(parent, result, wraplength=220, **grid_kw):
+        cats, _unused, guessed = result
+        lbl = ttk.Label(parent, text=ff7nx_modifies.text(*result) or '—',
+                        wraplength=wraplength, justify='left',
+                        style='ArchiveEst.TLabel' if guessed or not cats
+                        else 'Archive.TLabel')
         lbl.grid(**grid_kw)
         return lbl
+
+    # ---------- mod details (what 7th Heaven's preview panel shows) ------
+    # Description, release notes and the mod's own links from mod.xml
+    # (iro.Manifest reads and cleans them). Prose goes in a read-only Text
+    # rather than a Label because a Text can carry clickable spans: every
+    # http(s):// or www. address inside the prose becomes a link. The Text
+    # is sized to its own wrapped line count, so it scrolls with the panel
+    # and never on its own.
+    _URL = re.compile(r'(?:https?://|www\.)[^\s<>"\']+')
+    DETAIL_FONT = ('Helvetica', 11)
+
+    def open_url(url):
+        import webbrowser
+        webbrowser.open(url if '://' in url else 'http://' + url)
+
+    def _fit_text(t):
+        r = t.count('1.0', 'end-1c', 'displaylines')
+        n = r[0] if isinstance(r, tuple) else (r or 0)
+        if int(t.cget('height')) != n + 1:
+            t.configure(height=n + 1)
+
+    def detail_text(parent, text, fg=TEXT_PRIMARY):
+        # padx=2 is the inset every ttk.Label around it has (clam's TLabel
+        # layout: a 1px Label.border around a 1px Label.padding); without
+        # it this text starts 2px left of "Modifies" and the headings.
+        t = tk.Text(parent, wrap='word', height=1, width=1, font=DETAIL_FONT,
+                    bg=BG_APP, fg=fg, bd=0, highlightthickness=0, padx=2,
+                    pady=0, relief='flat', cursor='arrow', insertwidth=0,
+                    selectbackground=BG_ROW_SEL, selectforeground=fg,
+                    inactiveselectbackground=BG_ROW_SEL, takefocus=0)
+        t.tag_configure('link', foreground=ACCENT_SOFT, underline=True)
+        t.tag_bind('link', '<Enter>', lambda e: t.configure(cursor='hand2'))
+        t.tag_bind('link', '<Leave>', lambda e: t.configure(cursor='arrow'))
+        pos = 0
+        for i, m in enumerate(_URL.finditer(text)):
+            url = m.group(0).rstrip('.,;:!?)]}')
+            t.insert('end', text[pos:m.start()])
+            tag = 'link%d' % i
+            t.insert('end', url, ('link', tag))
+            t.tag_bind(tag, '<Button-1>', lambda e, u=url: open_url(u))
+            pos = m.start() + len(url)
+        t.insert('end', text[pos:])
+        # disabled still lets the text be selected and copied
+        t.configure(state='disabled')
+        t.bind('<Configure>', lambda e: _fit_text(t))
+        return t
+
+    def _readme(folder):
+        """7th Heaven's Readme button: readme.md, .html or .txt at the mod's
+        root, in that order, whatever the case."""
+        try:
+            names = {n.lower(): n for n in os.listdir(folder)}
+        except OSError:
+            return None
+        for want in ('readme.md', 'readme.html', 'readme.txt'):
+            if want in names:
+                return os.path.join(folder, names[want])
+        return None
+
+    def show_details(m):
+        links = []
+        if m.link and _URL.match(m.link):
+            links.append(('Mod page', m.link))
+        readme = _readme(m.folder)
+        if readme:
+            import pathlib
+            links.append(('Readme', pathlib.Path(readme).as_uri()))
+        if m.donation_link and _URL.match(m.donation_link):
+            links.append(('Donate', m.donation_link))
+        if links:
+            row = ttk.Frame(options_body)
+            row.pack(anchor='w', pady=(2, 6))
+            for i, (label, url) in enumerate(links):
+                lbl = ttk.Label(row, text=label, style='Link.TLabel',
+                                cursor='hand2')
+                lbl.pack(side='left', padx=(0 if i == 0 else 14, 0))
+                lbl.bind('<Button-1>', lambda e, u=url: open_url(u))
+        if m.description:
+            detail_text(options_body, m.description).pack(
+                fill='x', pady=(2, 8))
+        if m.release_notes:
+            ttk.Label(options_body, text='RELEASE NOTES',
+                      style='ColHeader.TLabel').pack(anchor='w')
+            detail_text(options_body, m.release_notes,
+                        fg=TEXT_SECONDARY).pack(fill='x', pady=(2, 8))
+        if links or m.description or m.release_notes:
+            # One pixel, half the ttk.Separator under the OPTION / VALUE
+            # header (clam draws that one 2px), so the two lines do not
+            # read as the same kind of break.
+            tk.Frame(options_body, height=1, bg=BORDER, bd=0,
+                     highlightthickness=0).pack(fill='x', pady=(2, 8))
+
+    def _opt_label(label):
+        """An option label as shown: ON / OFF (any case) read On / Off, as
+        Bool options already do. Display only -- values are matched back
+        through this same function, and settings keep the numbers."""
+        word = label.strip()
+        return {'on': 'On', 'off': 'Off'}.get(word.lower(), label)
 
     def show_options(mod):
         for w in options_body.winfo_children():
@@ -3436,26 +4811,47 @@ def launch_ui():
         m = mod.manifest
         ttk.Label(options_body, text=m.name or mod.stem,
                   font=('Helvetica', 13, 'bold')).pack(anchor='w')
-        meta = ' · '.join(x for x in (m.author, m.version, m.category) if x)
+        meta = ' · '.join(x for x in (
+            m.author, m.version, m.category,
+            m.release_date and 'released ' + m.release_date) if x)
         if meta:
             ttk.Label(options_body, text=meta, style='Sub.TLabel'
                       ).pack(anchor='w', pady=(0, 2))
+        show_details(m)
         store = settings_by_mod.setdefault(mod.filename, {})
-        mod_arch, mod_exact = build.mod_archives(mod, store, catalogs)
         summary = ttk.Frame(options_body)
-        summary.pack(anchor='w', pady=(2, 10))
+        summary.pack(anchor='w', fill='x', pady=(2, 10))
+        summary.columnconfigure(1, weight=1)
         ttk.Label(summary, text='Modifies (as configured): ',
-                  style='Sub.TLabel').pack(side='left')
-        summary_text = build.archives_text(mod_arch, mod_exact) or '—'
-        ttk.Label(summary, text=summary_text, wraplength=460, justify='left',
-                  style='Archive.TLabel' if mod_exact else 'ArchiveEst.TLabel'
-                  ).pack(side='left')
-        if not mod_exact and mod_arch:
-            ttk.Label(options_body,
-                      text='(estimated from folder names — point this app '
-                      'at your game dump for exact matches)',
-                      style='Sub.TLabel', font=('Helvetica', 9)
-                      ).pack(anchor='w', pady=(0, 8))
+                  style='Sub.TLabel').grid(row=0, column=0, sticky='nw')
+        summary_lbl = ttk.Label(summary, wraplength=460, justify='left')
+        summary_lbl.grid(row=0, column=1, sticky='w')
+        summary_note = ttk.Label(summary, style='Sub.TLabel',
+                                 font=('Helvetica', 9), wraplength=600,
+                                 justify='left')
+
+        def refresh_summary():
+            cats, unused, guessed = result = ff7nx_modifies.for_mod(
+                mod, store, catalogs, _field_bg_on())
+            summary_lbl.configure(
+                text=ff7nx_modifies.text(*result) or '—',
+                style='ArchiveEst.TLabel' if guessed or not cats
+                else 'Archive.TLabel')
+            notes = []
+            if unused and cats:
+                notes.append('%d file(s) in this selection are PC-only and '
+                             'not used on the Switch.' % unused)
+            if guessed:
+                notes.append('(est.) is guessed from folder names; point '
+                             'this app at your game dump for exact matches.')
+            summary_note.configure(text='  '.join(notes))
+            if notes:
+                summary_note.grid(row=1, column=0, columnspan=2, sticky='w',
+                                  pady=(2, 0))
+            else:
+                summary_note.grid_remove()
+
+        refresh_summary()
         if not m.options:
             ttk.Label(options_body, text='No configurable options.',
                       style='Sub.TLabel').pack(anchor='w')
@@ -3500,7 +4896,7 @@ def launch_ui():
             ttk.Label(grid, text=opt.name, wraplength=OPTION_COL - 16,
                      justify='left').grid(
                 row=row, column=0, sticky='w', pady=3, padx=(0, 12))
-            labels = [label for _, label in opt.values]
+            labels = [_opt_label(label) for _, label in opt.values]
             current = store.get(opt.id, opt.default)
 
             # A List with no <Option> at all -- Enhanced Stock UI's
@@ -3513,22 +4909,40 @@ def launch_ui():
                 store.setdefault(opt.id, current)
                 continue
 
-            var = tk.StringVar(value=opt.label_for(current))
+            var = tk.StringVar(value=_opt_label(opt.label_for(current)))
+            _clb = any(v.get() for f, v in enabled.items()
+                       if 'limitbreak' in f.lower().replace(' ', '').replace('_', ''))
+            locked = (ff7nx_esui.locked_option(mod, opt.id)
+                      or build.ff7nx_nitpick.locked_option(mod, opt.id, clb=_clb))
+            if locked and build.ff7nx_nitpick.locked_value(mod, opt.id, clb=_clb) is not None:
+                # BUILD 641: shown at the value the build applies
+                current = build.ff7nx_nitpick.locked_value(mod, opt.id, clb=_clb)
+                var.set(_opt_label(opt.label_for(current)))
             combo = ttk.Combobox(grid, textvariable=var, values=labels,
-                                 state='readonly', width=16)
+                                 state='disabled' if locked else 'readonly',
+                                 width=16)
             combo.grid(row=row, column=1, sticky='ew', pady=3, padx=(0, 14))
+            if locked:
+                # BUILD 629: shown, greyed out -- the Switch build has its
+                # own version of what this option changes on PC
+                ttk.Label(grid, text=locked, style='Sub.TLabel',
+                          wraplength=MODIFIES_COL - 10).grid(
+                    row=row, column=2, sticky='w', padx=(14, 0))
+                store.setdefault(opt.id, current)
+                continue
 
-            opt_arch, opt_exact = build.option_archives(mod, opt, catalogs)
-            archive_label(grid, opt_arch, opt_exact,
-                         wraplength=MODIFIES_COL - 10,
-                         row=row, column=2, sticky='w', padx=(14, 0))
+            modifies_label(grid, ff7nx_modifies.for_option(
+                mod, opt, store, catalogs, _field_bg_on()),
+                wraplength=MODIFIES_COL - 10,
+                row=row, column=2, sticky='w', padx=(14, 0))
 
             def on_pick(_evt, o=opt, v=var, mf=mod.filename):
                 for value, label in o.values:
-                    if label == v.get():
+                    if _opt_label(label) == v.get():
                         settings_by_mod.setdefault(mf, {})[o.id] = value
                         break
                 save_settings_now()
+                refresh_summary()
 
             combo.bind('<<ComboboxSelected>>', on_pick)
             store.setdefault(opt.id, current)
@@ -3576,6 +4990,7 @@ def launch_ui():
     _CHK_NUDGE = 0
     _CHK_TICK = ((3.2, 6.8), (5.4, 9.2), (9.8, 3.6))
     _chk_cache = {}
+    _all_checks = weakref.WeakSet()     # every _Check, for apply_theme
 
     def _check_image(on, bg):
         key = (bool(on), bg)
@@ -3594,7 +5009,7 @@ def launch_ui():
             d.rounded_rectangle([0, 0, S - 1, S - 1], radius=r * ss,
                                 fill=ACCENT)
             d.line([(x * ss, y * ss) for x, y in _CHK_TICK],
-                   fill='#ffffff', width=2 * ss, joint='curve')
+                   fill=CHECK_TICK, width=2 * ss, joint='curve')
         else:
             d.rounded_rectangle([0, 0, S - 1, S - 1], radius=r * ss,
                                 fill=bg, outline=TEXT_SECONDARY,
@@ -3614,6 +5029,7 @@ def launch_ui():
             self._var = variable
             self._bg = bg
             self._command = command
+            _all_checks.add(self)
             self._canvas = None
             self.bind('<Button-1>', self._toggle)
             variable.trace_add('write', lambda *_: self._draw())
@@ -3649,9 +5065,9 @@ def launch_ui():
             if self._var.get():
                 c.create_rectangle(0, 0, n, n, fill=ACCENT, outline=ACCENT)
                 (ax, ay), (bx, by), (cx, cy) = _CHK_TICK
-                c.create_line(ax, ay, bx, by, fill='#ffffff', width=2,
+                c.create_line(ax, ay, bx, by, fill=CHECK_TICK, width=2,
                               capstyle='round')
-                c.create_line(bx, by, cx, cy, fill='#ffffff', width=2,
+                c.create_line(bx, by, cx, cy, fill=CHECK_TICK, width=2,
                               capstyle='round')
             else:
                 c.create_rectangle(0, 0, n, n, fill=self._bg,
@@ -3717,57 +5133,6 @@ def launch_ui():
     _rowf = tkfont.Font(font=ROW_FONT)
     _asc = _rowf.metrics('ascent')
     _desc = _rowf.metrics('descent')
-
-    def _cap_height(font_tuple, ascent, descent):
-        """
-        Ink height of a capital "A", measured at the size Tk is ACTUALLY using.
-
-        The subtle part is units. Tk's font size 12 means 12 POINTS; Pillow's
-        truetype(size=12) means 12 PIXELS. Asking Pillow for "12" therefore
-        measures a different-sized glyph than Tk draws, and mixing that cap
-        with Tk's ascent puts the text a pixel out -- MEASURED: cap band
-        landed at y=17..25 against a row centre of 20, exactly 1px low.
-
-        So do not trust the nominal size. Search Pillow sizes for the one
-        whose ascent+descent matches Tk's linespace, and measure the cap
-        there. Both numbers then describe the same rendering.
-        """
-        family, size = font_tuple[0], font_tuple[1]
-        target = ascent + descent
-        try:
-            from PIL import ImageFont
-            path = None
-            for cand in (family, family + '.ttc', family + '.ttf',
-                         '/System/Library/Fonts/Helvetica.ttc',
-                         '/System/Library/Fonts/Supplemental/Arial.ttf',
-                         'DejaVuSans.ttf'):
-                try:
-                    ImageFont.truetype(cand, 12)
-                    path = cand
-                    break
-                except Exception:
-                    continue
-            if path is not None:
-                best, best_err = None, None
-                for px in range(max(6, size - 4), size + 10):
-                    try:
-                        f = ImageFont.truetype(path, px)
-                    except Exception:
-                        continue
-                    a, d = f.getmetrics()
-                    err = abs((a + d) - target)
-                    if best_err is None or err < best_err:
-                        best, best_err = f, err
-                if best is not None:
-                    box = best.getbbox('A')
-                    cap = box[3] - box[1]
-                    if 0.4 * target <= cap <= 1.0 * target:
-                        return cap
-        except Exception:
-            pass
-        # no Pillow, or nothing plausible: the usual cap ratio for a humanist
-        # sans, applied to the size Tk reports
-        return int(round(0.72 * target))
 
     _cap = _cap_height(ROW_FONT, _asc, _desc)
 
@@ -3853,7 +5218,7 @@ def launch_ui():
     _chk_x = 4 + 10
     _label_x = _chk_x + _CHK_SIZE + 6
 
-    for i, mod in enumerate(mods):
+    def add_mod_row(mod):
         # The row height is EXPLICIT, and that is what makes the title sit
         # centred. It used to be implicit: no child had a fixed height, so
         # whichever was tallest -- the label -- set the row height and then
@@ -3875,10 +5240,12 @@ def launch_ui():
         indicator.pack_propagate(False)
 
         mod._load_manifest()
-        var = tk.BooleanVar(
-            value=saved.get(mod.filename, {}).get('enabled', True))
-        enabled[mod.filename] = var
-        var.trace_add('write', save_settings_now)
+        # A row rebuilt by reload_mods keeps its tick.
+        var = enabled.get(mod.filename)
+        if var is None:
+            var = tk.BooleanVar(value=saved_enabled(saved, mod))
+            enabled[mod.filename] = var
+            var.trace_add('write', save_settings_now)
         chk = _Check(row, var, BG_ROW)
         chk.place(x=_chk_x, y=_chk_y + _CHK_NUDGE)
 
@@ -3909,10 +5276,238 @@ def launch_ui():
             widget.bind('<Enter>', lambda e, f=mod.filename: on_row_enter(f))
             widget.bind('<Leave>', lambda e, f=mod.filename: on_row_leave(f))
 
-        settings_by_mod[mod.filename] = _mod_options_from_saved(mod, saved)
+        if mod.filename not in settings_by_mod:
+            settings_by_mod[mod.filename] = _mod_options_from_saved(mod, saved)
+
+    for mod in mods:
+        add_mod_row(mod)
 
     if mods:
         select(mods[0])
+    show_empty_notes()
+
+    # ---------- picking up new mods ----------
+    # The list used to be read once, at startup, so a mod added by Install
+    # Mods (or dropped into mods/ by hand) only showed after a restart.
+    # reload_mods re-reads the folder and rebuilds the rows when what is
+    # there changed. Ticks, options and order of the mods already listed
+    # are kept; a new mod joins at the bottom with its factory entry, as at
+    # startup. Not during a build, which reads `mods`: `done` calls it.
+    def _mods_signature():
+        try:
+            names = sorted(os.listdir(MODS_DIR))
+        except OSError:
+            return ()
+        sig = []
+        for fn in names:
+            if fn.startswith('.'):
+                continue
+            try:
+                sig.append((fn, os.stat(os.path.join(MODS_DIR, fn)).st_mtime))
+            except OSError:
+                pass
+        return tuple(sig)
+
+    _mods_sig = [_mods_signature()]
+
+    def reload_mods(force=False):
+        nonlocal _ver_w
+        if build_btn.instate(['disabled']):
+            return False
+        sig = _mods_signature()
+        if not force and sig == _mods_sig[0]:
+            return False
+        _mods_sig[0] = sig
+        had = {m.filename for m in mods}
+        found = discover_mods([m.filename for m in mods]
+                              or profile_mod_order(saved))
+        migrate_saved_mod_keys(saved, found)
+        seed_mod_defaults(saved, found)
+        for row_widgets in rows.values():
+            row_widgets[0].destroy()
+        rows.clear()
+        mods[:] = found
+        _ver_w = max([_verf.measure(_ver_text(m)) for m in mods] or [0])
+        for mod in mods:
+            add_mod_row(mod)
+        cur = next((m for m in mods if m.filename == selected.get()), None)
+        if cur is None and mods:
+            cur = mods[0]
+        if cur is not None:
+            selected.set('')
+            select(cur)
+        else:
+            selected.set('')
+            show_options(None)
+        show_empty_notes()
+        count_label.configure(text=_count_text())
+        added = [m.display_name for m in mods if m.filename not in had]
+        if added:
+            log_write('Added to the mod list: ' + ', '.join(added))
+        if _ui_ready[0]:
+            save_settings_now()
+        return True
+
+    # Picks up a mod copied in by hand once the user comes back to the window.
+    root.bind('<FocusIn>', lambda e: reload_mods(), add='+')
+
+    # ---------- theme, live ----------
+    # Switching used to need a restart because the colours were read once.
+    # Now: rebind the palette names (everything draws from them at draw
+    # time), re-run the ttk styles, then walk every Tk widget -- through Tcl,
+    # so the Combobox dropdowns and open dialogs are included -- and swap
+    # each old palette colour for the new one, in widget options, Canvas
+    # items and Text tags. What keeps a colour of its own (the checkbox
+    # images, the tinted header icons, the mod rows) is redrawn after.
+    _THEME_KEYS = ('BG_APP', 'BG_ROW', 'BG_ROW_HOVER', 'BG_ROW_SEL',
+                   'BORDER', 'ACCENT', 'ACCENT_SOFT', 'ACCENT_HOVER',
+                   'ON_ACCENT', 'CHECK_TICK', 'TEXT_PRIMARY',
+                   'TEXT_SECONDARY', 'TEXT_MUTED', 'LOG_BG', 'LOG_TEXT',
+                   'GOOD', 'WARN')
+    _WIDGET_COLOURS = ('-background', '-foreground', '-activebackground',
+                       '-activeforeground', '-highlightbackground',
+                       '-highlightcolor', '-selectbackground',
+                       '-selectforeground', '-insertbackground',
+                       '-disabledforeground', '-troughcolor',
+                       '-selectcolor', '-readonlybackground',
+                       '-disabledbackground')
+
+    def apply_theme(key):
+        nonlocal BG_APP, BG_ROW, BG_ROW_HOVER, BG_ROW_SEL, BORDER, ACCENT, \
+            ACCENT_HOVER, ACCENT_SOFT, ON_ACCENT, CHECK_TICK, TEXT_PRIMARY, \
+            TEXT_SECONDARY, TEXT_MUTED, ARCHIVE_EXACT, ARCHIVE_EST, LOG_BG, \
+            LOG_TEXT, GOOD, WARN
+        old = {'BG_APP': BG_APP, 'BG_ROW': BG_ROW,
+               'BG_ROW_HOVER': BG_ROW_HOVER, 'BG_ROW_SEL': BG_ROW_SEL,
+               'BORDER': BORDER, 'ACCENT': ACCENT,
+               'ACCENT_HOVER': ACCENT_HOVER, 'ACCENT_SOFT': ACCENT_SOFT,
+               'ON_ACCENT': ON_ACCENT, 'CHECK_TICK': CHECK_TICK,
+               'TEXT_PRIMARY': TEXT_PRIMARY,
+               'TEXT_SECONDARY': TEXT_SECONDARY, 'TEXT_MUTED': TEXT_MUTED,
+               'LOG_BG': LOG_BG, 'LOG_TEXT': LOG_TEXT, 'GOOD': GOOD,
+               'WARN': WARN}
+        new = nxthemes.palette(key)
+        _theme_now[0] = key
+        # Two names can share a colour in one theme and not in the next;
+        # the first name in _THEME_KEYS wins, which favours the colours a
+        # widget rests in over the ones it only flashes.
+        swap = {}
+        for k in _THEME_KEYS:
+            swap.setdefault(old[k].lower(), new[k])
+        BG_APP, BG_ROW = new['BG_APP'], new['BG_ROW']
+        BG_ROW_HOVER, BG_ROW_SEL = new['BG_ROW_HOVER'], new['BG_ROW_SEL']
+        BORDER, ACCENT = new['BORDER'], new['ACCENT']
+        ACCENT_HOVER, ACCENT_SOFT = new['ACCENT_HOVER'], new['ACCENT_SOFT']
+        ON_ACCENT, CHECK_TICK = new['ON_ACCENT'], new['CHECK_TICK']
+        TEXT_PRIMARY = new['TEXT_PRIMARY']
+        TEXT_SECONDARY, TEXT_MUTED = new['TEXT_SECONDARY'], new['TEXT_MUTED']
+        ARCHIVE_EXACT, ARCHIVE_EST = ACCENT_SOFT, TEXT_MUTED
+        LOG_BG, LOG_TEXT = new['LOG_BG'], new['LOG_TEXT']
+        GOOD, WARN = new['GOOD'], new['WARN']
+        _apply_styles()
+
+        call = root.tk.call
+
+        def remap(value):
+            return swap.get(str(value).lower()) if value else None
+
+        def walk(path):
+            try:
+                cls = str(call('winfo', 'class', path))
+            except tk.TclError:
+                return
+            for opt in _WIDGET_COLOURS:
+                try:
+                    to = remap(call(path, 'cget', opt))
+                    if to:
+                        call(path, 'configure', opt, to)
+                except tk.TclError:
+                    pass        # ttk widgets, or not an option of this one
+            if cls == 'Canvas':
+                for item in root.tk.splitlist(call(path, 'find', 'all')):
+                    for opt in ('-fill', '-outline'):
+                        try:
+                            to = remap(call(path, 'itemcget', item, opt))
+                            if to:
+                                call(path, 'itemconfigure', item, opt, to)
+                        except tk.TclError:
+                            pass
+            elif cls == 'Text':
+                for tag in root.tk.splitlist(call(path, 'tag', 'names')):
+                    for opt in ('-foreground', '-background'):
+                        to = remap(call(path, 'tag', 'cget', tag, opt))
+                        if to:
+                            call(path, 'tag', 'configure', tag, opt, to)
+            for child in root.tk.splitlist(call('winfo', 'children', path)):
+                walk(str(child))
+
+        walk('.')
+        _chk_cache.clear()
+        for chk in list(_all_checks):
+            try:
+                chk._bg = remap(chk._bg) or chk._bg
+                chk.configure(bg=chk._bg)
+                chk._draw()
+            except tk.TclError:
+                pass
+        try:
+            for img, name in _tinted_icons:
+                img.paste(_button_icon_art(name))
+        except Exception:                                   # noqa: BLE001
+            pass
+        for fn in rows:
+            _restyle(fn)
+        _log_render()
+
+    # ---------- build status ----------
+    # The line beside the progress bar says what the build is doing NOW.
+    # It used to show the label of the last determinate progress call and
+    # nothing else, so after Echo-S's voice clips it read "Echo-S voice"
+    # through every exe and module pass that followed. Two things move it:
+    #
+    #   progress(i, n, label), n > 0   a counted step: label and percentage,
+    #                                  the bar determinate
+    #   progress(0, 0, label)          a stage with no count (run_build and
+    #                                  apply_plan call these between steps)
+    #
+    # and a log line that opens a pass -- unindented and ending in "..."
+    # ("applying 60 FPS patches ...", "building flevel.lgp ..."). Every
+    # pass already logs one, so a new pass is covered without touching this.
+    _STAGE_TAG = re.compile(r'\s*\((?:BUILD|HANDOFF)[^)]*\)')
+
+    def _status_text(label):
+        label = label[:1].upper() + label[1:]
+        return label if len(label) <= 60 else label[:59].rstrip() + '…'
+
+    def set_stage(label):
+        label = _STAGE_TAG.sub('', label).strip()
+        if not label:
+            return
+        statuslabel.configure(text=_status_text(label))
+        if str(bar['mode']) != 'indeterminate':
+            bar.configure(mode='indeterminate', maximum=100)
+            bar['value'] = 0
+            bar.start(15)
+
+    def set_count(i, n, label):
+        if str(bar['mode']) != 'determinate':
+            bar.stop()
+            bar.configure(mode='determinate')
+        bar['maximum'] = n
+        bar['value'] = i
+        label = _STAGE_TAG.sub('', label or '').strip()
+        pct = int(100 * min(i, n) / n)
+        statuslabel.configure(
+            text='%s  %d%%' % (_status_text(label), pct)
+            if label else '%d%%' % pct)
+
+    def _stage_from_log(line):
+        if not line or line[0].isspace() or line[0] in '!(':
+            return None
+        line = line.rstrip()
+        if not line.endswith('...'):
+            return None
+        return line[:-3]
 
     # ---------- queue pump ----------
     def pump():
@@ -3921,15 +5516,23 @@ def launch_ui():
                 kind, payload = messages.get_nowait()
                 if kind == 'log':
                     log_write(payload)
+                    stage = _stage_from_log(payload)
+                    if stage:
+                        set_stage(stage)
                 elif kind == 'progress':
                     i, n, label = payload
-                    bar['maximum'] = max(n, 1)
-                    bar['value'] = i
-                    statuslabel.configure(text=label or '')
+                    if n > 0:
+                        set_count(i, n, label)
+                    else:
+                        set_stage(label or '')
                 elif kind == 'done':
+                    bar.stop()
+                    bar.configure(mode='determinate')
                     build_btn.state(['!disabled'])
                     bar['value'] = bar['maximum'] if payload else 0
                     statuslabel.configure(text='done' if payload else 'failed')
+                    # anything installed while the build ran
+                    reload_mods()
                     if payload:
                         open_btn.state(['!disabled'])
                         # refresh options: manifests now exist post-extract
@@ -3951,7 +5554,7 @@ def launch_ui():
         log_clear()
         build_btn.state(['disabled'])
         open_btn.state(['disabled'])
-        statuslabel.configure(text='working…')
+        set_stage('Starting…')
         cap_value = current_field_tex_cap()
         world_cap_value = current_world_tex_cap()
         bg_cap_value = current_battle_bg_tex_cap()
@@ -3987,8 +5590,7 @@ def launch_ui():
         # above needs eight module words to agree with it.
         if build.field_bg_shadow.ENV not in os.environ:
             os.environ[build.field_bg_shadow.ENV] = (
-                '1' if build.load_settings(SETTINGS).get(
-                    '__global__', {}).get('field_bg_d1_art', True) else '0')
+                '1' if _global_setting('field_bg_d1_art', True) else '0')
         os.environ[build.field_bg_repack.BUDGET_ENV] = str(
             current_field_bg_budget_mb())
         # The value IS the constant. build.py reads
@@ -4055,12 +5657,17 @@ def launch_ui():
         os.environ[build.movie_convert.QUALITY_ENV] = current_movie_quality()
         os.environ[build.movie_convert.FIT_ENV] = current_movie_fit()
         os.environ[build.movie_convert.COLOUR_ENV] = current_movie_colour()
-        os.environ[build.MOVIE_30FPS_ENV] = '1' if m30_var.get() else '0'
-        os.environ[build.ANALOG_360_ENV] = '1' if a360_var.get() else '0'
-        os.environ[build.NO_AUTORUN_ENV] = '1' if norun_var.get() else '0'
+        os.environ[build.MOVIE_30FPS_ENV] = (
+            '1' if _needs_nso(m30_var.get()) else '0')
+        os.environ[build.ANALOG_360_ENV] = (
+            '1' if _needs_nso(a360_var.get()) else '0')
+        os.environ[build.NO_AUTORUN_ENV] = (
+            '1' if _needs_nso(norun_var.get()) else '0')
         os.environ[_HEADLESS_TEXCACHE_ENV] = current_texture_cache()
-        os.environ[build.NO_CHEATS_ENV] = '1' if nocheat_var.get() else '0'
-        os.environ[build.LIMITER_FPS_ENV] = str(current_limiter_fps())
+        os.environ[build.NO_CHEATS_ENV] = (
+            '1' if _needs_nso(nocheat_var.get()) else '0')
+        os.environ[build.LIMITER_FPS_ENV] = str(
+            _needs_nso(current_limiter_fps(), 0))
         os.environ[build.ff7nx_ws.WIDESCREEN_ENV] = current_widescreen()
         # The FRAME HEIGHT and the MOVIE that has to meet it ride the
         # checkbox. They are one visual change and cannot be split --
@@ -4070,6 +5677,7 @@ def launch_ui():
         _ff = '1' if frame_var.get() else '0'
         os.environ[build.FIELD_FRAME_ENV] = _ff
         os.environ[build.MOVIE_ALIGN_ENV] = _ff
+        os.environ['SEVENTH_NX_SHADOWS'] = '1' if shadows_var.get() else '0'
         # The MODEL CULL is NOT on it and has no switch of its own. Its box
         # is 4:3-sized; against a 16:9 frame that is simply a bug, and there
         # is no configuration in which you would want an NPC switched off
@@ -4114,9 +5722,23 @@ def launch_ui():
         os.environ[_HEADLESS_GFX_ENV] = str(current_gfx_pool())
         os.environ[build.voice_ogg.NORMALIZE_ENV] = current_voice_normalize()
         os.environ[build.ff7nx_shaders.SCALER_ENV] = current_scaler()
+        os.environ[build.ff7nx_shaders.BLACK_POINT_ENV] = str(
+            current_black_point())
         os.environ[build.ff7nx_shaders.FXAA_ENV] = current_fxaa()
         os.environ[build.ff7nx_shaders.VIDEO_ENV] = \
             current_video_shader()
+        # Only written when it is not the default, so a 2x build keeps the
+        # archive fingerprints every earlier build recorded.
+        # BUILD 761: unset when off, so nothing about the build changes.
+        os.environ['SEVENTH_NX_TITLE_SCREEN'] = current_title_screen()
+        if current_dock_resolution():
+            os.environ['SEVENTH_NX_DOCK_RES'] = current_dock_resolution()
+        else:
+            os.environ.pop('SEVENTH_NX_DOCK_RES', None)
+        if current_esui_texscale() != 2:
+            os.environ[ff7nx_esui.SCALE_ENV] = str(current_esui_texscale())
+        else:
+            os.environ.pop(ff7nx_esui.SCALE_ENV, None)
         build.save_settings(SETTINGS, snapshot_settings())
         os.environ[build.FIELD_TEX_CAP_ENV] = str(cap_value)
         if cap_value:
@@ -4190,7 +5812,7 @@ def launch_ui():
                     lambda s: messages.put(('log', s)),
                     lambda i, n, label='': messages.put(
                         ('progress', (i, n, label))),
-                    fps_60=bool(fps_var.get()))
+                    fps_60=bool(_needs_nso(fps_var.get())))
             except Exception as exc:
                 import traceback
                 messages.put(('log', 'ERROR: ' + str(exc)))
@@ -4212,24 +5834,133 @@ def launch_ui():
 
     root.protocol('WM_DELETE_WINDOW', on_close)
 
+    def _initial_splits():
+        root.update_idletasks()
+        try:
+            panes.sashpos(0, int(panes.winfo_width() * WIN_SPLIT_X))
+            vsplit.sashpos(0, int(vsplit.winfo_height() * WIN_SPLIT_Y))
+        except tk.TclError:
+            pass
+    root.after(50, _initial_splits)
+
+    if DUMP is not None and dump_problems:
+        log_write('The game dump does not look right -- builds may fail:')
+        for why in dump_problems:
+            log_write('  ! ' + why)
     if not mods:
         log_write(f'No .iro files found in {MODS_DIR}')
-        log_write('Drop your 7th Heaven mods there and restart.')
+        log_write('Drop your 7th Heaven mods there, or use Install Mods; '
+                  'the list picks them up on its own.')
     else:
         log_write('Ready. Tick the mods you want, choose options, '
                   'then Build SD Output.')
-        log_write('If a heavily-modded scene crashes on load, try the '
-                  '"Field texture cap" dropdown (top right) before '
-                  'disabling mods -- it downscales oversized character/'
-                  'world model textures without changing anything else.')
+        if DEV_MODE:
+            log_write('Developer mode: every setting is shown.')
 
     root.mainloop()
 
 
+def selftest():
+    """
+    `--selftest`: check that this copy has everything it runs on, without
+    opening the window or building -- every module findable, the packages
+    and PyFF7 importable, the program's own files present and the user's
+    folder writable. tools/release.py runs it on each finished release.
+    Returns the exit status.
+    """
+    import importlib
+    import importlib.util
+    import ff7nx_shaders
+    bad = []
+    names = sorted({f[:-3] for f in nxpaths.code_files()
+                    if f.endswith('.py') and f != '7th_heaven_nx.py'})
+    for name in names:
+        try:
+            if importlib.util.find_spec(name) is None:
+                bad.append('module %s: not found' % name)
+        except Exception as exc:                                # noqa: BLE001
+            bad.append('module %s: %s' % (name, exc))
+    for name in ('numpy', 'scipy', 'PIL.Image', 'lz4.block', 'capstone',
+                 'PyFF7.lgp', 'tkinter', 'lgp', 'build'):
+        try:
+            importlib.import_module(name)
+        except Exception as exc:                                # noqa: BLE001
+            bad.append('import %s: %s' % (name, exc))
+    # BUILD 808: the modules that add folders to sys.path must not let one
+    # outside the program replace a bundled module (release.py plants a
+    # decoy arm64emu.py in this folder and its parent to prove it).
+    for name in ('diag_common', 'ff7nx_letterbox', 'ff7nx_camclamp',
+                 'cave_space', 'ws_emu', 'arm64emu'):
+        try:
+            importlib.import_module(name)
+        except Exception as exc:                                # noqa: BLE001
+            bad.append('import %s: %s' % (name, exc))
+    for name in ('arm64emu', 'ws_emu', 'nxpaths'):
+        mod = sys.modules.get(name)
+        where = getattr(mod, '__file__', '') or ''
+        if mod is None or not where or not nxpaths._inside_app(where):
+            bad.append('module %s loaded from outside the program: %s'
+                       % (name, where or '?'))
+    if not hasattr(getattr(sys.modules.get('arm64emu'), 'Cpu', None),
+                   'guest_to_host'):
+        bad.append('arm64emu.Cpu has no guest_to_host (wrong arm64emu)')
+    if nxpaths.FROZEN:
+        stray = [p for p in sys.path if not nxpaths._inside_app(p)]
+        if stray:
+            bad.append('sys.path reaches outside the program: %s'
+                       % ', '.join(stray[:3]))
+    files = (['assets/icon.png', 'assets/banner.png',
+              'data/default_settings.json', 'data/default_mod_settings.json',
+              'data/mod_sources.json', 'data/battle_bg_dds_map.json']
+             + ff7nx_shaders.release_files())
+    for rel in files:
+        if not os.path.isfile(os.path.join(nxpaths.APP, rel)):
+            bad.append('missing %s' % rel)
+    try:
+        os.makedirs(HERE, exist_ok=True)
+        probe = os.path.join(HERE, '.selftest')
+        with open(probe, 'w') as f:
+            f.write('ok')
+        os.remove(probe)
+    except OSError as exc:
+        bad.append('folder %s is not writable: %s' % (HERE, exc))
+    print('7th Heaven NX %s selftest' % VERSION)
+    print('  program files: %s' % nxpaths.APP)
+    print('  your folder:   %s' % HERE)
+    print('  modules:       %d' % len(names))
+    print('  LZS native:    %s' % ('yes' if lgp._native_lib() else
+                                   'no (Python fallback, same output)'))
+    for line in bad:
+        print('  FAIL ' + line)
+    print('  result:        %s' % ('ok' if not bad else 'FAILED'))
+    return 1 if bad else 0
+
+
 def main():
+    if '--selftest' in sys.argv:
+        return selftest()
+    # The folders the user fills. Neither is in git or in a release zip, so
+    # a fresh copy has to make them (a download into a missing mods/ fails).
+    for d in (MODS_DIR, os.path.join(HERE, 'dump')):
+        try:
+            os.makedirs(d, exist_ok=True)
+        except OSError as exc:
+            print('could not create %s: %s' % (d, exc), file=sys.stderr)
+    # BUILD 756: drop the extractions of mods that are no longer installed
+    # as soon as the program starts, not only at the end of a build.
+    try:
+        import ff7nx_cachegc
+        ff7nx_cachegc.sweep_orphans(MODS_DIR, print)
+    except Exception as exc:                                    # noqa: BLE001
+        print('cache cleanup skipped: %s' % exc, file=sys.stderr)
     if '--cli' in sys.argv:
         saved = build.load_settings(SETTINGS)
+        # BUILD 804: the same values as the GUI.
+        saved['__global__'] = nxsettings.effective_global(
+            dict(default_globals(), **saved.get('__global__', {})))
         mods = discover_mods(profile_mod_order(saved))
+        migrate_saved_mod_keys(saved, mods)
+        seed_mod_defaults(saved, mods)
         if build.FIELD_TEX_CAP_ENV not in os.environ:
             cap_value = saved.get('__global__', {}).get('field_tex_cap', 0)
             os.environ[build.FIELD_TEX_CAP_ENV] = str(cap_value)
@@ -4328,6 +6059,8 @@ def main():
                            .get('field_frame', 1))))
         os.environ.setdefault(build.FIELD_FRAME_ENV, _ff)
         os.environ.setdefault(build.MOVIE_ALIGN_ENV, _ff)
+        os.environ.setdefault('SEVENTH_NX_SHADOWS', str(int(bool(
+            saved.get('__global__', {}).get('model_shadows', 1)))))
         # SEVENTH_NX_MODEL_CULL and SEVENTH_NX_MOVIE_BARS are deliberately left
         # unset: the cull follows 16:9 rather than this checkbox, and the FMV
         # margin bars follow MOVIE_ALIGN_ENV, which is set just above.
@@ -4358,9 +6091,8 @@ def main():
         if build.ff7nx_fieldbuf.SCALE_ENV not in os.environ:
             _fb = saved.get('__global__', {}).get(
                 'field_buffer', build.ff7nx_fieldbuf.DEFAULT_SCALE)
-            try:
-                _fb = int(_fb)
-            except (TypeError, ValueError):
+            _fb = build.ff7nx_fieldbuf._norm(_fb)      # BUILD 757: 4.5
+            if _fb is None:
                 _fb = build.ff7nx_fieldbuf.DEFAULT_SCALE
             os.environ[build.ff7nx_fieldbuf.SCALE_ENV] = str(_fb)
         if build.voice_ogg.NORMALIZE_ENV not in os.environ:
@@ -4370,12 +6102,29 @@ def main():
         if build.ff7nx_shaders.SCALER_ENV not in os.environ:
             os.environ[build.ff7nx_shaders.SCALER_ENV] = str(
                 saved.get('__global__', {}).get('scaler', '') or '')
+        if build.ff7nx_shaders.BLACK_POINT_ENV not in os.environ:
+            os.environ[build.ff7nx_shaders.BLACK_POINT_ENV] = str(
+                saved.get('__global__', {}).get(
+                    'hd_black_point',
+                    build.ff7nx_shaders.BLACK_POINT_DEFAULT))
         if build.ff7nx_shaders.FXAA_ENV not in os.environ:
             os.environ[build.ff7nx_shaders.FXAA_ENV] = str(
                 saved.get('__global__', {}).get('fxaa', '') or '')
         if build.ff7nx_shaders.VIDEO_ENV not in os.environ:
             os.environ[build.ff7nx_shaders.VIDEO_ENV] = str(
                 saved.get('__global__', {}).get('video_shader', '') or '')
+        _dr = saved.get('__global__', {}).get(           # BUILD 761/762
+            'dock_resolution', DOCK_RES_DEFAULT)
+        _dr = DOCK_RES_DEFAULT if _dr is None else str(_dr)
+        if 'SEVENTH_NX_TITLE_SCREEN' not in os.environ:           # BUILD 763b
+            os.environ['SEVENTH_NX_TITLE_SCREEN'] = str(
+                saved.get('__global__', {}).get('title_screen',
+                                                TITLE_SCREEN_DEFAULT))
+        if _dr and 'SEVENTH_NX_DOCK_RES' not in os.environ:
+            os.environ['SEVENTH_NX_DOCK_RES'] = _dr
+        _esc = saved.get('__global__', {}).get('esui_texscale', 2)  # BUILD 760
+        if _esc != 2 and ff7nx_esui.SCALE_ENV not in os.environ:
+            os.environ[ff7nx_esui.SCALE_ENV] = str(_esc)
         if build.MOVIE_30FPS_ENV not in os.environ:
             os.environ[build.MOVIE_30FPS_ENV] = \
                 '1' if saved.get('__global__', {}).get('movie_30fps') else '0'
@@ -4407,8 +6156,7 @@ def main():
             os.environ[build.movie_convert.QUALITY_ENV] = \
                 saved.get('__global__', {}).get(
                     'movie_quality', build.movie_convert.QUALITY_DEFAULT)
-        enabled = {m.filename: saved.get(m.filename, {}).get('enabled', True)
-                   for m in mods}
+        enabled = {m.filename: saved_enabled(saved, m) for m in mods}
         settings = {}
         for m in mods:
             m.ensure_extracted(print)

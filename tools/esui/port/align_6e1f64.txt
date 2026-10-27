@@ -1,0 +1,5 @@
+fn 6e1f64..6e2033  arm d48360..d48750  anchors(calls) 1
+6e200e: shl ecx, 5 -> imul ecx, ecx, 0x18
+      UNMAPPED  value 0x5 (0 cands)
+6e2011: lea edx, [eax + ecx + 0x160] -> lea edx, [eax + ecx + 0x186]
+      OK  arm d48610  add w26, w9, #0x160          -> add w26, w9, #0x186          1105813a 1106193a (=)

@@ -1,0 +1,13 @@
+fn 6d84c4..6d8550  arm d5e240..d5e4e0  anchors(calls) 2
+6d84f1: push 0xb2 -> push 0xa7
+      OK  arm d5e324  mov w8, #0xb2                -> mov w8, #0xa7                52801648 528014e8 (=)
+6d8505: add ecx, 8 -> add ecx, -1
+      UNMAPPED  value 0x8 (0 cands)
+6d8511: push 0x30 -> push 0x2c
+      OK  arm d5e394  mov w8, #0x30                -> mov w8, #0x2c                321c07e8 52800588 (=)
+6d8516: add edx, 0x14 -> add edx, 0x18
+      OK  arm d5e3ac  add w20, w8, #0x14           -> add w20, w8, #0x18           11005114 11006114 (=)
+6d851a: push 0xa6 -> push 0x9e
+      OK  arm d5e3d8  mov w8, #0xa6                -> mov w8, #0x9e                528014c8 528013c8 (=)
+6d852e: sub ecx, 4 -> sub ecx, 0xd
+      UNMAPPED  value 0x4 (0 cands)

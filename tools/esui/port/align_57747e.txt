@@ -1,0 +1,5 @@
+fn 57747e..5775ff  arm 685000..6856f0  anchors(calls) 3
+57748c: mov dword ptr [ebp - 0x18], 0x1e -> mov dword ptr [ebp - 0x18], 0x28
+      OK  arm 685068  mov w8, #0x1e                -> mov w8, #0x28                321f0fe8 52800508 (=)
+57749a: mov dword ptr [ebp - 0x10], 0x13f -> mov dword ptr [ebp - 0x10], 0x140
+      OK  arm 68508c  mov w8, #0x13f               -> mov w8, #0x140               528027e8 52802808 (=)

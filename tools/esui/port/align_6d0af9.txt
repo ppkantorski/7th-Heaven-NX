@@ -1,0 +1,3 @@
+fn 6d0af9..6d0be1  arm d20370..d206d0  anchors(calls) 0
+STRUCT-BLOCK old 6d0b2d: mov word ptr [ecx + eax], dx  ->  new 6d0b2d: nop ; 6d0b2e: nop ; 6d0b2f: nop ; 6d0b30: nop 
+STRUCT-BLOCK old 6d0b45: mov word ptr [ecx + eax + 2], dx  ->  new 6d0b45: nop ; 6d0b46: nop ; 6d0b47: nop ; 6d0b48: nop ; 6d0b49: nop 

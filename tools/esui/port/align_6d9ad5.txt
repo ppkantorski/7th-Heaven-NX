@@ -1,0 +1,4 @@
+fn 6d9ad5..6d9b98  arm d64d40..d65040  anchors(calls) 1
+6d9b2b: mov dword ptr [eax + 0xc], 3 -> mov dword ptr [eax + 0xc], 4
+      NEEDCAVE(def d64e7c shared by 3)  arm d64ea0  str w21, [x0]  (=, new 0x4)
+UNRESOLVED def d64e7c uses ['0xd64e80', '0xd64ea0', '0xd64ec0'] patched ['0xd64ea0'] navs {4}
