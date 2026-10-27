@@ -35,7 +35,7 @@
     "texture_cache": "small",
     "field_frame": true,
     "model_shadows": true,
-    "no_cheats": false,
+    "no_cheats": true,
     "limiter_fps": 66,
     "widescreen": "ws-3d",
     "field_buffer": 6,

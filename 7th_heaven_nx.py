@@ -2750,7 +2750,7 @@ def launch_ui():
     frame_var = tk.BooleanVar(value=bool(global_saved.get('field_frame', True)))
     # BUILD 645/646. Model shadows (battle + field); on by default, off writes nothing.
     shadows_var = tk.BooleanVar(value=bool(global_saved.get('model_shadows', True)))
-    nocheat_var = tk.BooleanVar(value=bool(global_saved.get('no_cheats', False)))
+    nocheat_var = tk.BooleanVar(value=bool(global_saved.get('no_cheats', True)))   # BUILD 819: on by default
 
     lim_label_by_value = {v: l for v, l in LIMITER_FPS_CHOICES}
     lim_value_by_label = {l: v for v, l in LIMITER_FPS_CHOICES}

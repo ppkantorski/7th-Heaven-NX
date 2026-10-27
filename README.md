@@ -48,27 +48,27 @@ On PC, mods like Cosmo Memory, Echo-S and Enhanced Stock UI depend on FFNx, a re
 
 The **Install Mods** window lists every mod below and fetches it from the 7th Heaven catalog.
 
-| Mod | Category |
-|---|---|
-| [Tsunamods] Cosmo Memory | Field backgrounds, widescreen |
-| [Tsunamods] Wizard Staff | Modern spell names |
-| Nitpick | Title, attract mode, art fixes |
-| [Tsunamods] Enhanced Stock UI | Menus, fonts, battle UI |
-| [Tsunamods] Echo-S | Voice acting |
-| Cosmos FMV (30 fps) | Movies |
-| Double Input Bugfix (and menu input QoL) | Gameplay |
-| [Tsunamods] Idle Animations - 60fps | Animations |
-| 60/30 FPS Gameplay | Frame rate |
-| Ninostyle Chibi Fixes and Additions | Field models |
-| NinoStyle Battle Models | Battle models |
-| [Tsunamods] Avalanche Arisen Battle Scenes | Battle backgrounds |
-| AxlRose's Blender v1 | Textures |
-| NinoStyle Chibi Field Models | Field models |
-| Cosmos Limit Break | Field backgrounds, widescreen |
-| [Tsunamods] Arranged Soundtrack | Music |
-| [Tsunamods] SYW Unified Minigame Textures | Minigames |
-| [Tsunamods] SYW Unified Spells Textures | Spells and summons |
-| Cosmos Gaia | World map |
+| Mod | Category | Developer |
+|---|---|---|
+| [Tsunamods] Cosmo Memory | Field backgrounds, widescreen | Bonez |
+| [Tsunamods] Wizard Staff | Modern spell names | Bonez |
+| Nitpick | Title, attract mode, art fixes | Kuraudo |
+| [Tsunamods] Enhanced Stock UI | Menus, fonts, battle UI | Chrysalis |
+| [Tsunamods] Echo-S | Voice acting | Tsunamods Team |
+| Cosmos FMV (30 fps) | Movies | Cosmos, Satsuki Yatoshi, NiNoStyle, Kaldarasha |
+| Double Input Bugfix (and menu input QoL) | Gameplay | Dig (aka potus-barret) |
+| [Tsunamods] Idle Animations - 60fps | Animations | Orichalcon |
+| 60/30 FPS Gameplay | Frame rate | Vertex2995, Obesebear, Kaldarasha |
+| Ninostyle Chibi Fixes and Additions | Field models | htp314 |
+| NinoStyle Battle Models | Battle models | Ninostyle, Tsunamix, Shiniboy |
+| [Tsunamods] Avalanche Arisen Battle Scenes | Battle backgrounds | UpRisen |
+| AxlRose's Blender v1 | Textures | AxlRose |
+| NinoStyle Chibi Field Models | Field models | Ninostyle, L@zar0, Tsunamix, Shiniboy |
+| Cosmos Limit Break | Field backgrounds, widescreen | Cosmos, Satsuki_Yatoshi, Manakaiser, Aavock, L@ZaR0 |
+| [Tsunamods] Arranged Soundtrack | Music | Dracula9AntiChapel, Bonez, Tsunamix |
+| [Tsunamods] SYW Unified Minigame Textures | Minigames | Satsuki_Yatoshi, Aavock, jtd |
+| [Tsunamods] SYW Unified Spells Textures | Spells and summons | Kela51, Satsuki_Yatoshi |
+| Cosmos Gaia | World map | Cosmos, L@ZaRO, Satsuki_Yatoshi |
 
 Other `.iro` mods can be dropped into `mods/` and will be built, but only the ones above have been played through on hardware.
 
