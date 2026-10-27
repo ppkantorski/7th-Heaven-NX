@@ -922,32 +922,53 @@ def build_native(dest_dir, compilers=None, log=print):
         src = os.path.join(tmp, 'lzs_native.c')
         with open(src, 'w') as f:
             f.write(src_text)
-        for cc in compilers or (os.environ.get('CC') or 'cc', 'clang', 'gcc'):
-            cmd = [cc, '-O2', '-shared', '-o', out, src]
-            if sys.platform != 'win32':
-                cmd.insert(2, '-fPIC')
+        default = (os.environ.get('CC') or 'cc', 'clang', 'gcc')
+        if sys.platform == 'win32':
+            # MSVC first: a gcc on PATH may build for another CPU (the
+            # Windows arm64 runner has an x64 one), and Python can only load
+            # a DLL of its own architecture
+            default = ('cl',) + default
+        global _native, _native_tried
+        for cc in compilers or default:
+            if cc == 'cl':
+                cmd = ['cl', '/nologo', '/O2', '/LD', src,
+                       '/Fo' + tmp + os.sep, '/Fe' + out]
+            else:
+                cmd = [cc, '-O2', '-shared', '-o', out, src]
+                if sys.platform != 'win32':
+                    cmd.insert(2, '-fPIC')
             try:
-                r = subprocess.run(cmd, capture_output=True, timeout=300)
+                r = subprocess.run(cmd, capture_output=True, timeout=300,
+                                   cwd=tmp)
             except (OSError, subprocess.SubprocessError):
                 continue
-            if r.returncode == 0 and os.path.isfile(out):
+            if r.returncode != 0 or not os.path.isfile(out):
+                log('LZS library: %s failed: %s'
+                    % (cc, ((r.stderr or b'') + (r.stdout or b''))
+                       .decode(errors='replace')[-400:]))
+                continue
+            # it must load into this Python and give the right bytes, or
+            # the next compiler gets a turn
+            saved = _native, _native_tried
+            try:
+                _native, _native_tried = _load_native(out), True
+                ok = _native_selftest()
+            except OSError as e:
+                ok = False
+                log('LZS library: %s built one this Python cannot load (%s)'
+                    % (cc, e))
+            finally:
+                _native, _native_tried = saved
+            if ok:
                 log('LZS library: built with %s' % cc)
                 break
-            log('LZS library: %s failed: %s'
-                % (cc, (r.stderr or b'').decode(errors='replace')[-400:]))
+            log('LZS library: %s build failed the self-test' % cc)
+            try:
+                os.remove(out)
+            except OSError:
+                pass
         else:
             return None
-    global _native, _native_tried
-    saved = _native, _native_tried
-    try:
-        _native, _native_tried = _load_native(out), True
-        ok = _native_selftest()
-    finally:
-        _native, _native_tried = saved
-    if not ok:
-        log('LZS library: self-test FAILED, not shipping it')
-        os.remove(out)
-        return None
     return out
 
 
