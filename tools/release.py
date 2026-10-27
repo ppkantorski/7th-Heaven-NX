@@ -132,8 +132,16 @@ def check_packages(install=False, strict=False):
                                                if not req]
         for batch in batches:
             _say('installing: %s' % ', '.join(batch))
-            subprocess.call([sys.executable, '-m', 'pip', 'install']
-                            + batch)
+            rc = subprocess.call([sys.executable, '-m', 'pip', 'install']
+                                 + batch)
+            if rc and len(batch) > 1:
+                # pip installs nothing when one package of a batch fails to
+                # build: retry each alone so the rest still go in and the
+                # error names only the one that broke
+                for p in batch:
+                    _say('installing: %s' % p)
+                    subprocess.call([sys.executable, '-m', 'pip', 'install',
+                                     p])
         importlib.invalidate_caches()
         missing = [(i, p, req) for i, p, req in missing if not _have(i)]
     hard = [p for _, p, req in missing if req or strict]
