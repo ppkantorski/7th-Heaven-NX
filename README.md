@@ -342,7 +342,9 @@ A release ships only the program's own files: no game files, no stock shaders, a
 
 ## Contributing
 
-Contributions are welcome. Please open an [issue](https://github.com/ppkantorski/7th-Heaven-NX/issues/new/choose) or submit a [pull request](https://github.com/ppkantorski/7th-Heaven-NX/compare). If a mod you use isn't supported yet, an issue with the mod's name and what goes wrong is the best place to start. For questions, bug reports or just to talk about the project, join the [7th Heaven NX Discord](https://discord.gg/r6zJPPfqtr).
+Contributions are welcome. Please open an [issue](https://github.com/ppkantorski/7th-Heaven-NX/issues/new/choose) or submit a [pull request](https://github.com/ppkantorski/7th-Heaven-NX/compare). If a mod you use isn't supported yet, an issue with the mod's name and what goes wrong is the best place to start.
+
+For questions, bug reports or just to talk about the project, join the [7th Heaven NX Discord](https://discord.gg/r6zJPPfqtr).
 
 [![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/X8X3VR194) [![sponsor](https://github.com/ppkantorski/ppkantorski/raw/refs/heads/main/.pics/sponsor-icon.png)](https://github.com/sponsors/ppkantorski)
 
