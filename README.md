@@ -3,11 +3,11 @@
 [![platform](https://img.shields.io/badge/platform-Switch-898c8c?logo=C++.svg)](https://gbatemp.net/forums/nintendo-switch.283/)
 [![language](https://img.shields.io/badge/language-Python-3572A5.svg)](https://github.com/topics/python)
 [![GPLv3 License](https://img.shields.io/badge/license-GPLv3-189c11.svg)](https://www.gnu.org/licenses/gpl-3.0.en.html)
+[![Discord](https://img.shields.io/badge/discord-7HNX-5865F2?logo=discord&logoColor=white)](https://discord.gg/r6zJPPfqtr)
 [![Latest Version](https://img.shields.io/github/v/release/ppkantorski/7th-Heaven-NX?label=latest&color=blue)](https://github.com/ppkantorski/7th-Heaven-NX/releases/latest)
 [![GitHub Downloads](https://img.shields.io/github/downloads/ppkantorski/7th-Heaven-NX/total?color=6f42c1)](https://somsubhra.github.io/github-release-stats/?username=ppkantorski&repository=7th-Heaven-NX&page=1&per_page=300)
 [![GitHub issues](https://img.shields.io/github/issues/ppkantorski/7th-Heaven-NX?color=222222)](https://github.com/ppkantorski/7th-Heaven-NX/issues)
 [![GitHub stars](https://img.shields.io/github/stars/ppkantorski/7th-Heaven-NX)](https://github.com/ppkantorski/7th-Heaven-NX/stargazers)
-[![Discord](https://img.shields.io/badge/discord-7HNX-5865F2?logo=discord&logoColor=white)](https://discord.gg/r6zJPPfqtr)
 
 **7th Heaven NX** brings PC 7th Heaven mods to **Final Fantasy VII on Nintendo Switch**. You point it at your own game dump, pick your mods, and it builds an Atmosphère LayeredFS folder you copy straight onto your SD card.
 
