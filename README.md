@@ -33,7 +33,7 @@ On PC, mods like Cosmo Memory, Echo-S and Enhanced Stock UI depend on FFNx, a re
 - Per-mod options, the same ones 7th Heaven shows, with a *Modifies* column so you can see which parts of the game each choice touches
 - Load order resolved exactly like 7th Heaven (category auto-sort, first match wins), so conflicts come out the same as on PC
 - **16:9 widescreen** across fields, battles, the world map and movies, using each mod's own widescreen config
-- **60 FPS** in menus, battles, fields and the world map, following the 60/30 FPS Gameplay mod's choice
+- **60 FPS** in menus, battles, fields and the world map, following the 60/30 FPS Gameplay mod's choice (a stable 60 needs an overclock, see [Requirements](#requirements))
     - Camera interpolation at 60 FPS: the walking camera and scripted cutscene pans move in fractions of a unit instead of stepping, movie-synced cameras are interpolated, and battle effects are drawn smoothly between their 15 Hz steps
 - **1080p output**, docked or handheld, with no reboot needed to switch
 - HD background upscaling, HD anti-aliasing and an HD movie shader, all tuned for this game
@@ -112,6 +112,13 @@ Where FFNx already solves a problem (field camera ranges, shadow rules, effect i
 - Your own dump of Final Fantasy VII (`0100A5B00BDC6000`) with update **1.0.3_5** applied, as an `exefs/` and `romfs/` folder
   > The patches are written for this exact version of the game. Before a build starts, 7th Heaven NX checks the build ID of `exefs/main` and the checksum of the game's internal exe. If either one is from another version, the build stops with an "unsupported game version" error.
 - A PC running Windows, macOS or Linux to do the build
+- **For a stable 60 FPS**, the Switch needs to be overclocked to at least:
+
+  | CPU | GPU | RAM |
+  |---|---|---|
+  | 1428 MHz | 844 MHz | 1600 MHz |
+
+  Use an overclocking tool such as [sys-clk](https://github.com/retronx-team/sys-clk). Below these clocks the game still runs, but 60 FPS may not hold in busier scenes.
 
 ---
 
