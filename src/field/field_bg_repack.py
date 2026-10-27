@@ -2183,6 +2183,16 @@ class ArtProvider:
         self._cache = {}
         return self._art_for
 
+    def view(self):
+        """BUILD 838: this provider for one worker thread. The lookup tables
+        (`slots`, `by_page`, ...) are filled in __init__ and only read after,
+        so they are shared; the current field, its page cache and the open
+        .iro readers are per-caller state, so the view gets its own of each."""
+        import copy
+        v = copy.copy(self)
+        v._field, v._cache, v.readers = None, {}, {}
+        return v
+
     def palettes(self, page):
         """Palette indices the mod actually holds for this page."""
         return self.by_page.get((self._field, page), ())

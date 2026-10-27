@@ -776,6 +776,47 @@ def quantise(cell_rgb, pal_rgb, dither=False, _dedup=None):
     return (d2.argmin(1) + 1).astype(np.uint8).reshape(cell_rgb.shape[:2])
 
 
+# BUILD 839. SEVENTH_NX_NO_BATCH_QUANTISE=1 goes back to one call per cell.
+BATCH_QUANTISE = os.environ.get('SEVENTH_NX_NO_BATCH_QUANTISE', '').strip() != '1'
+_BATCH_ROWS = 16384          # distinct colours per distance matrix
+
+
+def quantise_many(cells, pal_rgb):
+    """`quantise(cell, pal_rgb)` for many cells against ONE palette, in a
+    handful of numpy calls instead of several per cell (BUILD 839).
+
+    IDENTICAL, NOT APPROXIMATE. `quantise` gives each pixel the argmin of
+    its colour's row of `_sqdist(colours, pal)`. A row depends only on that
+    colour and the palette -- every term is an exact integer in float64 (see
+    `_sqdist`), so the same colour gives the same row whatever else is in the
+    matrix -- and argmin breaks ties the same way on the same row. Pooling
+    every cell's colours, solving each distinct one once and mapping back
+    therefore gives every pixel the index it gets alone. The no-dither path
+    only; that is the only one the margin pass uses. Rows are solved in
+    chunks so a big slot does not need one huge matrix."""
+    if not cells:
+        return []
+    pal = pal_rgb[1:].astype(np.int32)              # skip index 0
+    flats = [c.reshape(-1, 3).astype(np.int32) for c in cells]
+    allc = np.concatenate(flats)
+    # One int per colour, r<<16|g<<8|b: a 1-D unique is many times faster
+    # than np.unique(axis=0), and these keys sort exactly as the rows do.
+    key = (allc[:, 0] << 16) | (allc[:, 1] << 8) | allc[:, 2]
+    ukey, inv = np.unique(key, return_inverse=True)
+    inv = inv.reshape(-1)
+    uniq = np.stack([(ukey >> 16) & 255, (ukey >> 8) & 255, ukey & 255],
+                    axis=1).astype(np.int32)
+    best = np.empty(len(uniq), dtype=np.int64)
+    for a in range(0, len(uniq), _BATCH_ROWS):
+        best[a:a + _BATCH_ROWS] = _sqdist(uniq[a:a + _BATCH_ROWS], pal).argmin(1)
+    idx = (best[inv] + 1).astype(np.uint8)
+    out, at = [], 0
+    for c, f in zip(cells, flats):
+        out.append(idx[at:at + len(f)].reshape(c.shape[:2]))
+        at += len(f)
+    return out
+
+
 BLEND_BAND_FIRST_SLOT = 0x0F
 
 
@@ -1581,6 +1622,36 @@ def fill_field(name, raw, lgp_mod, art, log=None, scope='margin'):
         # shape-agnostic (verified on a 32x32 block), and `k` is the DDS
         # oversample factor, which is per-page and unaffected.
         _edge = 32 if (BIG_CELL and pages[slot].size_flag) else TILE
+        # BUILD 839: every cell's quantise input is worked out first and the
+        # cells are quantised TOGETHER, one batch per palette, instead of one
+        # call per cell. A colour's nearest palette entry does not depend on
+        # which cell it is in (see quantise_many), and the input is a pure
+        # function of the cell's own art and the fixed palette choice, so
+        # each cell gets the same indices. The loop below still checks that
+        # its input matches and quantises alone if it ever does not.
+        _pre, _qres = {}, {}
+        if BATCH_QUANTISE:
+            _groups = {}
+            for sx, sy in sorted(cs):
+                src = img[sy * k:(sy + _edge) * k, sx * k:(sx + _edge) * k]
+                if src.shape[:2] != (_edge * k, _edge * k):
+                    continue
+                _sm = (np.ascontiguousarray(src[..., :3])
+                       .reshape(_edge, k, _edge, k, 3).mean(axis=(1, 3)))
+                _cv = (np.ascontiguousarray(src[..., 3])
+                       .reshape(_edge, k, _edge, k).mean(axis=(1, 3)))
+                _pre[(sx, sy)] = (_sm, _cv)
+                _q = _sm
+                if HONOUR_MOD_ALPHA:
+                    _c = _cv >= 128
+                    if EXTEND_INTO_GAP and not _c.all() and _c.any():
+                        _q = _extend_into_gap(_sm.copy(), _c)
+                _groups.setdefault(_pal_for(slot, sx, sy, pal), []).append(
+                    ((sx, sy), _q.astype(np.uint8)))
+            for _ep, _items in _groups.items():
+                _outs = quantise_many([q for _k, q in _items], prgbs[_ep])
+                for (_k, _qin), _o in zip(_items, _outs):
+                    _qres[_k] = (_qin, _o)
         for sx, sy in sorted(cs):
             # A repointed placeholder is quantised against the palette it will
             # ACTUALLY be drawn through, not the one the mod left behind.
@@ -1590,13 +1661,17 @@ def fill_field(name, raw, lgp_mod, art, log=None, scope='margin'):
             if src.shape[:2] != (_edge * k, _edge * k):
                 st['no_dds'] += 1
                 continue
-            # box filter (edge*k)^2 -> edge^2
-            small = (np.ascontiguousarray(src[..., :3])
-                     .reshape(_edge, k, _edge, k, 3).mean(axis=(1, 3)))
-            # HOW MUCH OF EACH DESTINATION PIXEL THE MOD ACTUALLY COVERS.
-            # 0 = the mod paints nothing here; 255 = fully painted.
-            cover = (np.ascontiguousarray(src[..., 3])
-                     .reshape(_edge, k, _edge, k).mean(axis=(1, 3)))
+            _p = _pre.get((sx, sy))
+            if _p is not None:              # BUILD 839: worked out above
+                small, cover = _p[0].copy(), _p[1]
+            else:
+                # box filter (edge*k)^2 -> edge^2
+                small = (np.ascontiguousarray(src[..., :3])
+                         .reshape(_edge, k, _edge, k, 3).mean(axis=(1, 3)))
+                # HOW MUCH OF EACH DESTINATION PIXEL THE MOD ACTUALLY COVERS.
+                # 0 = the mod paints nothing here; 255 = fully painted.
+                cover = (np.ascontiguousarray(src[..., 3])
+                         .reshape(_edge, k, _edge, k).mean(axis=(1, 3)))
             # A CELL THE ORIGINAL DREW AS PURE BLACK IS A SILHOUETTE, NOT A
             # GAP, AND IT IS NOT OURS TO FILL.
             #
@@ -1692,7 +1767,12 @@ def fill_field(name, raw, lgp_mod, art, log=None, scope='margin'):
                 dark = True
             else:
                 dark = False
-            idx = quantise(small.astype(np.uint8), prgb)
+            _qin = small.astype(np.uint8)
+            _r = _qres.get((sx, sy))
+            if _r is not None and np.array_equal(_r[0], _qin):
+                idx = _r[1]
+            else:
+                idx = quantise(_qin, prgb)
             # THE PRISTINE QUANTISER OUTPUT, KEPT FOR THE 512px SHADOW.
             #
             # BUILD 109. Every guard below overrides individual texels of
@@ -2235,6 +2315,19 @@ def fill_field(name, raw, lgp_mod, art, log=None, scope='margin'):
 
 
 # ------------------------------------------------------------------ the pass
+def field_workers(jobs=0):
+    """Threads for a per-field flevel pass (BUILD 838): every CPU thread, up
+    to 16. SEVENTH_NX_FIELD_WORKERS=1 runs the passes one field at a time,
+    which is also how to check the two give the same archive."""
+    try:
+        want = int(os.environ.get('SEVENTH_NX_FIELD_WORKERS') or 0)
+    except ValueError:
+        want = 0
+    if want <= 0:
+        want = max(1, min(16, nxpaths.cpu_threads()))
+    return max(1, min(want, jobs or want))
+
+
 def apply_to_flevel(archive, payloads, art, encode=None, log=print,
                     fields=None, scope='margin'):
     """
@@ -2275,6 +2368,21 @@ def apply_to_flevel(archive, payloads, art, encode=None, log=print,
                   'err_after': [], 'idx_before': [], 'idx_after': []}}
     encode = encode or (lambda raw: archive.encode_field(raw))
 
+    # BUILD 838: the fields are worked out on several threads, then applied
+    # in archive order. Identical to the one-at-a-time loop by construction:
+    #
+    #  * compute() reads only this field's own bytes (snapshotted below, so
+    #    no thread ever reads `payloads` while it is being written), the
+    #    provider's read-only lookup tables, and a provider VIEW of its own:
+    #    `ArtProvider` keeps a current-field cursor, a decoded-page cache and
+    #    open .iro handles, all of which two fields at once would trample
+    #    (thread A would get thread B's art). Each worker gets its own.
+    #  * apply() is the old loop's bookkeeping, run in archive.names() order
+    #    on this thread: the same counters merged in the same order, the
+    #    same encode() calls, the same refusals, the same log lines.
+    #  * field_bg_shadow (the 512px recorder) keeps ONE global per-field
+    #    table; when it is armed this stays serial.
+    jobs = []
     for name in archive.names():
         entry = archive.index.get(name)
         if entry is None or not archive.is_field(entry):
@@ -2284,10 +2392,56 @@ def apply_to_flevel(archive, payloads, art, encode=None, log=print,
         payload = payloads.get(name, entry.get('payload'))
         if not payload:
             continue
+        jobs.append((name, entry, payload, name in payloads))
+
+    prov0 = getattr(art, 'provider', None)
+
+    def compute(job, art_fn, prov):
+        name, entry, payload, mine = job
+        lines = []
         try:
-            raw = (lgp.lzs_decompress(payload[4:]) if name in payloads
+            raw = (lgp.lzs_decompress(payload[4:]) if mine
                    else archive.decompressed(entry))
-            new, s = fill_field(name, raw, lgp, art, scope=scope)
+            new, s = fill_field(name, raw, lgp, art_fn, scope=scope)
+        except Exception as exc:                                # noqa: BLE001
+            return name, ('fail', exc), lines
+        # SQUARE'S CHROMA-KEY ENTRY, RE-INDEXED TO THE MOD'S ART.
+        # FINDINGS-261, `ff7nx_greenkey`. It runs HERE, inside this
+        # loop, for two reasons: `art` is already open at the vanilla
+        # page numbering (see this function's docstring on why that
+        # matters and what running after the repack shipped), and the
+        # field's bytes are already in hand, so the pass costs one
+        # section split rather than a second pass over the archive.
+        #
+        # It is deliberately AFTER `fill_field`: marginart may itself
+        # have rewritten the cell, and there is no point re-indexing a
+        # marker that no longer exists.
+        gs, gerr = {}, None
+        try:
+            import ff7nx_greenkey as _GK
+            if _GK.enabled() and prov is not None:
+                _base = new if new is not None else raw
+                _pn = lgp.split_sections(_base)
+                _s9, gs = _GK.fix_section9(_pn[8], _pn[3], prov.open(name),
+                                           log=lines.append)
+                if gs.get('pages'):
+                    _pn[8] = _s9
+                    new = lgp.join_sections(_pn)
+        except Exception as _exc:                              # noqa: BLE001
+            gerr = _exc
+        return name, ('ok', new, s, gs, gerr), lines
+
+    def apply(result):
+        name, out, lines = result
+        for line in lines:
+            log(line)
+        if out[0] == 'fail':
+            exc = out[1]
+            st['refused'].append((name, '%s: %s'
+                                  % (type(exc).__name__, str(exc)[:60])))
+            return
+        _, new, s, gs, gerr = out
+        try:
             st['read'] += 1
             # MERGE EVERY INTEGER COUNTER, NOT A HARDCODED LIST.
             #
@@ -2303,41 +2457,39 @@ def apply_to_flevel(archive, payloads, art, encode=None, log=print,
             ps = s.get('pal')
             if ps:
                 merge_pal(st['pal'], ps, s)
-            # SQUARE'S CHROMA-KEY ENTRY, RE-INDEXED TO THE MOD'S ART.
-            # FINDINGS-261, `ff7nx_greenkey`. It runs HERE, inside this
-            # loop, for two reasons: `art` is already open at the vanilla
-            # page numbering (see this function's docstring on why that
-            # matters and what running after the repack shipped), and the
-            # field's bytes are already in hand, so the pass costs one
-            # section split rather than a second pass over the archive.
-            #
-            # It is deliberately AFTER `fill_field`: marginart may itself
-            # have rewritten the cell, and there is no point re-indexing a
-            # marker that no longer exists.
-            try:
-                import ff7nx_greenkey as _GK
-                _prov = getattr(art, 'provider', None)
-                if _GK.enabled() and _prov is not None:
-                    _base = new if new is not None else raw
-                    _pn = lgp.split_sections(_base)
-                    _s9, _gs = _GK.fix_section9(_pn[8], _pn[3],
-                                                _prov.open(name), log=log)
-                    if _gs.get('pages'):
-                        _pn[8] = _s9
-                        new = lgp.join_sections(_pn)
-                    for _k, _v in _gs.items():
-                        if isinstance(_v, int):
-                            st['green_' + _k] = st.get('green_' + _k, 0) + _v
-            except Exception as _exc:                          # noqa: BLE001
+            if gerr is not None:
                 st['refused'].append((name, 'greenkey %s: %s'
-                                      % (type(_exc).__name__, str(_exc)[:50])))
+                                      % (type(gerr).__name__, str(gerr)[:50])))
+            else:
+                for _k, _v in gs.items():
+                    if isinstance(_v, int):
+                        st['green_' + _k] = st.get('green_' + _k, 0) + _v
             if new is None:
-                continue
+                return
             payloads[name] = encode(new)
             st['changed'] += 1
         except Exception as exc:                                # noqa: BLE001
             st['refused'].append((name, '%s: %s'
                                   % (type(exc).__name__, str(exc)[:60])))
+
+    workers = field_workers(len(jobs))
+    view = getattr(prov0, 'view', None)
+    if workers > 1 and view is not None and not SH.active():
+        import threading
+        from concurrent.futures import ThreadPoolExecutor
+        local = threading.local()
+
+        def run(job):
+            if not hasattr(local, 'art'):
+                p = view()
+                local.prov, local.art = p, provider_source(p)
+            return compute(job, local.art, local.prov)
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            for result in pool.map(run, jobs):      # results in job order
+                apply(result)
+    else:
+        for job in jobs:
+            apply(compute(job, art, prov0))
     if st['refused'] and log:
         log('  ! margin art: %d field(s) not changed (%s)'
             % (len(st['refused']),

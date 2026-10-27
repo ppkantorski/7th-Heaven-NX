@@ -616,6 +616,7 @@ ECHO_S_MOD_ID = '09e81530-3f09-46b9-831b-df431b8f319c'
 _MOD_CACHE_ROOT = os.path.realpath(os.path.join(HERE, 'cache'))
 _TWIN_INDEX = {}        # mod dir -> {(name.lower(), size, mtime): [paths]}
 _TWIN_SUFFIX = {}       # realpath -> '' or '-c<sha1>'
+_TWIN_BY_PATH = {}      # path as given -> the same answer (BUILD 840)
 
 
 def _file_sha1(path):
@@ -630,18 +631,27 @@ def _twin_suffix(path, st=None):
     """'' unless `path` is a mod file with a same-name, same-size, same-mtime
     sibling in its own mod whose bytes differ; then '-c' + its content hash.
     """
+    # BUILD 840: answered by the path as given before any filesystem call.
+    # realpath() stats every component, and this runs for every _sig() of
+    # every mod file, several passes over. The answer cannot change within a
+    # build: it is already cached by realpath, and the per-mod index it
+    # rests on is cached for the build too (both cleared together below).
+    hit = _TWIN_BY_PATH.get(path)
+    if hit is not None:
+        return hit
     try:
         real = os.path.realpath(path)
     except OSError:
         return ''
     hit = _TWIN_SUFFIX.get(real)
     if hit is not None:
+        _TWIN_BY_PATH[path] = hit
         return hit
     rel = os.path.relpath(real, _MOD_CACHE_ROOT)
     mod = rel.split(os.sep, 1)[0]
     if (rel.startswith('..') or os.sep not in rel or mod.startswith('_')
             or not mod):
-        _TWIN_SUFFIX[real] = ''
+        _TWIN_SUFFIX[real] = _TWIN_BY_PATH[path] = ''
         return ''
     root = os.path.join(_MOD_CACHE_ROOT, mod)
     index = _TWIN_INDEX.get(root)
@@ -661,7 +671,7 @@ def _twin_suffix(path, st=None):
     group = index.get((os.path.basename(real).lower(), st.st_size,
                        int(st.st_mtime)), ())
     if len(group) < 2:
-        _TWIN_SUFFIX[real] = ''
+        _TWIN_SUFFIX[real] = _TWIN_BY_PATH[path] = ''
         return ''
     hashes = {}
     for q in group:
@@ -674,6 +684,7 @@ def _twin_suffix(path, st=None):
         _TWIN_SUFFIX[q] = ('-c' + h[:16]) if distinct else ''
     if real not in _TWIN_SUFFIX:
         _TWIN_SUFFIX[real] = ('-c' + _file_sha1(real)[:16]) if distinct else ''
+    _TWIN_BY_PATH[path] = _TWIN_SUFFIX[real]
     return _TWIN_SUFFIX[real]
 
 
@@ -7623,12 +7634,14 @@ def _debleed_textures(name, mod_files, van, log):
         # strict enough to be the test: it checks the version word AND that
         # the file length matches the header's own dimensions exactly, which
         # is what stops a .p model (also version 1) being mistaken for one.
+        # BUILD 840: the header decides, the BODY is read only on a cache
+        # miss. A hit never looks at it, and this pass opens every texture
+        # of every model archive -- vanilla too -- on every build.
         try:
             with open(src, 'rb') as f:
                 head = f.read(4)
                 if len(head) < 4 or head != b'\x01\x00\x00\x00':
                     continue
-                data = head + f.read()
         except OSError:
             continue
         key = 'DEBLEED-V1-' + ('van-' if mod is None else 'mod-') + _sig(src)
@@ -7639,6 +7652,13 @@ def _debleed_textures(name, mod_files, van, log):
         if os.path.exists(cached):
             out[low] = (cached, mod)
             done += 1
+            continue
+        try:
+            with open(src, 'rb') as f:
+                data = f.read()
+        except OSError:
+            continue
+        if data[:4] != head:            # changed between the two opens
             continue
         try:
             new, _note = tex.debleed(data)
@@ -7973,19 +7993,28 @@ def _cap_field_textures(name, mod_files, log, max_dim):
     capped = 0
     saved_bytes = 0
     for low, (src, mod) in mod_files.items():
+        # BUILD 840: read the file only on a cache miss -- a hit never uses
+        # its bytes. It is still OPENED first, so an unreadable file takes
+        # the same "use the original" path it always did.
         try:
-            with open(src, 'rb') as f:
-                data = f.read()
+            with open(src, 'rb'):
+                pass
+            cache_key = f'TEXCAP-V1-{max_dim}-' + _sig(src)
         except OSError:
             out[low] = (src, mod)
             continue
-        cache_key = f'TEXCAP-V1-{max_dim}-' + _sig(src)
         cached = os.path.join(
             TEXCAP_CACHE,
             f'{name}.{low}.{hashlib.sha1(cache_key.encode()).hexdigest()[:16]}')
         if os.path.exists(cached):
             out[low] = (cached, mod)
             capped += 1
+            continue
+        try:
+            with open(src, 'rb') as f:
+                data = f.read()
+        except OSError:
+            out[low] = (src, mod)
             continue
         try:
             new, note = tex.cap_dimensions(data, max_dim)
@@ -11332,6 +11361,18 @@ def _link_or_copy(src, dest):
         shutil.copyfile(src, dest)
 
 
+def movie_workers(jobs=0):
+    """Movies encoded at once (BUILD 837): one per ~4 CPU threads, 1 to 4,
+    never more than there are movies. SEVENTH_NX_MOVIE_WORKERS overrides."""
+    try:
+        want = int(os.environ.get('SEVENTH_NX_MOVIE_WORKERS') or 0)
+    except ValueError:
+        want = 0
+    if want <= 0:
+        want = max(1, min(4, nxpaths.cpu_threads() // 4))
+    return max(1, min(want, jobs or want))
+
+
 def _emplace_movies(plan, romfs, sdout, dump, log, progress, produced):
     """
     Re-encode every movie a mod supplied into the port's mp4 shape.
@@ -11476,173 +11517,209 @@ def _emplace_movies(plan, romfs, sdout, dump, log, progress, produced):
     # are a genuine A/B: 15 fps with no caves, or 30 fps with them.
     target_fps = (movie_convert.NORMALISED_FPS if normalise
                   else movie_convert.VANILLA_MOVIE_FPS)
-    for i, (reldir, stem) in enumerate(sorted(work)):
-        src, _mod = work[(reldir, stem)]
-        progress(i, len(work), f'Encoding movie {stem}')
-        dest = os.path.join(romfs, *reldir.split('/'), stem + '.mp4')
-        vanilla = vanilla_at.get((reldir, stem))
-        music = (plan.movie_audio.get((stem, 'music')) or (None,))[0]
-        voice = (plan.movie_audio.get((stem, 'voice')) or (None,))[0]
-        # BUILD 759: the startup logo (ff7nx_sqlogo) follows the Movie fit
-        # setting like every other movie, so it ships at Echo-S's own
-        # resolution. BUILD 640d had forced it down to the 960x672 picture
-        # area; with the 1080p field that is no longer wanted.
-        fit_this = fit
+    # BUILD 837: several movies at once on a machine with the cores for it.
+    # One ffmpeg x264 encode keeps about four cores busy (measured: 3.6 of 4)
+    # and gains little past that, so a 16-thread PC sat mostly idle through
+    # a hundred-odd movies. Each movie writes only its own cache file and
+    # its own destination, so they are independent. Everything else in the
+    # body -- the counters, the log, plan.opening_* -- still runs under one
+    # lock, released only around the encode itself.
+    import threading as _threading
+    from concurrent.futures import ThreadPoolExecutor as _Pool
+    _mv_lock = _threading.RLock()
+    _mv_stop = [False]
 
-        try:
-            # Everything that changes the OUTPUT goes in the key, and nothing
-            # that does not. Content hash rather than mtime, so re-extracting
-            # the .iro does not invalidate a pack that has not changed.
-            # `vanilla is not None` is in there because a silent mod file
-            # borrows the original's soundtrack, so whether one was available
-            # changes what comes out.
-            # CONVERTER_VERSION is in here, not just the settings. A
-            # 768px texture fix once silently did nothing because its key
-            # carried the cap but not the code that applied it, so an
-            # unchanged input with unchanged settings kept serving the old
-            # output. Any change to what convert() emits bumps that string.
-            # The two audio layers go in the key by CONTENT, for the same
-            # reason the video does: re-extracting an .iro must not re-encode
-            # a soundtrack that has not changed, and swapping which mod
-            # supplies one must. `audio_key_part` is EMPTY when a movie has
-            # no layer, so introducing the feature did not invalidate the
-            # hundred-odd cached movies that have nothing to gain from it.
-            key = movie_convert.source_key(
-                src, '%s|%s|%d|%s|%s|%d|%d|%s|%s|%s%s'
-                % (movie_convert.CONVERTER_VERSION,
-                   quality,
-                   movie_convert.crf_for(quality),
-                   movie_convert.TARGET_PROFILE,
-                   movie_convert.TARGET_PRESET,
-                   movie_convert.TARGET_ARATE,
-                   vanilla is not None,
-                   target_fps,
-                   fit_this,
-                   colour,
-                   movie_convert.audio_key_part(music, voice))
-                + ('|' + movie_convert.LOOP_CLOSE_TAG
-                   if movie_convert.loop_close_wanted(stem) else ''))
-            tag = stem if reldir == movie_convert.MOVIE_DIR else \
-                '%s.%s' % (reldir.replace('/', '_'), stem)
-            cached_file = os.path.join(cache, f'{tag}.{key}.mp4')
-
-            if os.path.exists(cached_file):
-                _link_or_copy(cached_file, dest)
-                cached += 1
-                produced.append(dest)
-                if (reldir, stem) == (movie_convert.MOVIE_DIR,
-                                     'opening'):
-                    oi = movie_convert.probe(cached_file)
-                    plan.opening_fps = oi['fps'] if oi else None
-                    if oi:
-                        plan.opening_dims = (oi['width'], oi['height'])
-                continue
-
-            info = movie_convert.probe(src)
-            if info is None:
-                log(f'  ! {stem}: not a video file, skipped')
-                failed += 1
-                continue
-
-            # A mod that already ships the exact target format gets copied
-            # rather than re-encoded: a second lossy pass buys nothing.
-            # A mod already shipping the target format is copied only when
-            # its audio is present -- otherwise it still needs the original's
-            # soundtrack muxed in, which means a real encode.
-            # Copying is only right when the file is ALREADY what we want,
-            # which under normalisation means already at the target rate.
-            # ... and never when there is a soundtrack or a voice layer to
-            # mux in, because then the file is exactly NOT what we want: its
-            # audio is the one we are replacing.
-            at_rate = (not target_fps
-                       or abs(info['fps'] - target_fps) < 0.01)
-            if movie_convert.already_target(info, fit=fit_this, colour=colour) \
-                    and info['has_audio'] and at_rate \
-                    and not music and not voice:
-                shutil.copyfile(src, cached_file)
-                _link_or_copy(cached_file, dest)
-                copied += 1
-                produced.append(dest)
-                if (reldir, stem) == (movie_convert.MOVIE_DIR,
-                                     'opening'):
-                    plan.opening_fps = info['fps']
-                    plan.opening_dims = (info['width'], info['height'])
-                log(f'  ok {stem}: already H.264/mp4, copied as-is')
-                continue
-
-            # Encode into the CACHE, then link into place. Writing the cache
-            # copy first means an interrupted build leaves the cache correct
-            # and sdout missing a file, rather than the other way round.
-            t0 = time.time()
-            # BUILD 618z7: last4_2 / last4_3 are re-timed so their 39-frame
-            # loop has no double step at the wrap (movies.loop_close); the
-            # key above carries the tag.
-            if movie_convert.loop_close_wanted(stem):
-                closed = movie_convert.loop_close(src, cache, log=log,
-                                                  stem=stem)
-                if closed:
-                    src = closed
-            r = movie_convert.convert(src, cached_file, vanilla=vanilla,
-                                      quality=quality, target_fps=target_fps,
-                                      fit=fit_this, colour=colour,
-                                      music=music, voice=voice, log=log)
-            took = time.time() - t0
-            spent += took
-            _link_or_copy(cached_file, dest)
-            done += 1
-            produced.append(dest)
-            if (reldir, stem) == (movie_convert.MOVIE_DIR,
-                                 'opening'):
-                plan.opening_fps = r['out']['fps']
-                plan.opening_dims = (r['out']['width'],
-                                     r['out']['height'])
-            extra = ' + original audio' if r['borrowed_audio'] else ''
-            if r.get('music'):
-                extra += ' + mod soundtrack'
-                muxed_music += 1
-            if r.get('voice_is_programme'):
-                extra += (' + voice %+.1f dB (silent cutscene, so the voice '
-                          'IS the soundtrack)' % r['voice_gain'])
-                muxed_voice += 1
-            elif r.get('voice') is not None and r.get('voice_gain') is not None:
-                extra += (' + voice %+.1f dB (bed %.1f, voice %.1f LUFS)'
-                          % (r['voice_gain'], r['bed_lufs'], r['voice_lufs']))
-                muxed_voice += 1
-            elif r.get('voice'):
-                extra += ' + voice (unmeasured, level unchanged)'
-                muxed_voice += 1
-            if r.get('doubled'):
-                extra += ' (frame-doubled)'
-            shown = stem if reldir == movie_convert.MOVIE_DIR else \
-                '%s/%s' % (reldir.rsplit('/', 2)[-2], stem)
-            if r['fit_reason'] == 'fit':
-                resized += 1
-                extra += ' (%dx%d -> %dx%d, lanczos)' % (
-                    r['src']['width'], r['src']['height'],
-                    r['out']['width'], r['out']['height'])
-            elif r['src']['width'] < r['drawn'][0] * 0.98:
-                undersize.append((stem, r['src']['width'],
-                                  r['src']['height']))
-            if r['colour_converted']:
-                recoloured += 1
-            if fit_this != 'fit' and r['src']['width'] > r['drawn'][0] * 1.02:
-                oversize_left.append((stem, r['src']['width'],
-                                      r['src']['height']))
-            log('  ok %-12s %s -> h264 %s fps, crf %d%s  [%.1fs]'
-                % (shown, movie_convert.describe_source(r['src']),
-                   r['fps'], r['crf'], extra, took))
-        except movie_convert.MissingFFmpeg as exc:
-            log(f'! movies skipped: {exc}')
+    def _movie_one(i, reldir, stem):
+        nonlocal done, failed, cached, copied, resized, recoloured
+        nonlocal muxed_music, muxed_voice, spent
+        if _mv_stop[0]:
             return
-        except Exception as exc:                       # noqa: BLE001
-            log(f'  ! {stem}: {exc}')
-            failed += 1
-            # A cache entry only ever appears after a successful, verified
-            # encode, so a failed one must not leave a stub behind for the
-            # next build to trust.
-            stale = locals().get('cached_file')
-            if stale and os.path.exists(stale):
-                os.remove(stale)
+        with _mv_lock:
+            src, _mod = work[(reldir, stem)]
+            progress(i, len(work), f'Encoding movie {stem}')
+            dest = os.path.join(romfs, *reldir.split('/'), stem + '.mp4')
+            vanilla = vanilla_at.get((reldir, stem))
+            music = (plan.movie_audio.get((stem, 'music')) or (None,))[0]
+            voice = (plan.movie_audio.get((stem, 'voice')) or (None,))[0]
+            # BUILD 759: the startup logo (ff7nx_sqlogo) follows the Movie fit
+            # setting like every other movie, so it ships at Echo-S's own
+            # resolution. BUILD 640d had forced it down to the 960x672 picture
+            # area; with the 1080p field that is no longer wanted.
+            fit_this = fit
+
+            try:
+                # Everything that changes the OUTPUT goes in the key, and nothing
+                # that does not. Content hash rather than mtime, so re-extracting
+                # the .iro does not invalidate a pack that has not changed.
+                # `vanilla is not None` is in there because a silent mod file
+                # borrows the original's soundtrack, so whether one was available
+                # changes what comes out.
+                # CONVERTER_VERSION is in here, not just the settings. A
+                # 768px texture fix once silently did nothing because its key
+                # carried the cap but not the code that applied it, so an
+                # unchanged input with unchanged settings kept serving the old
+                # output. Any change to what convert() emits bumps that string.
+                # The two audio layers go in the key by CONTENT, for the same
+                # reason the video does: re-extracting an .iro must not re-encode
+                # a soundtrack that has not changed, and swapping which mod
+                # supplies one must. `audio_key_part` is EMPTY when a movie has
+                # no layer, so introducing the feature did not invalidate the
+                # hundred-odd cached movies that have nothing to gain from it.
+                key = movie_convert.source_key(
+                    src, '%s|%s|%d|%s|%s|%d|%d|%s|%s|%s%s'
+                    % (movie_convert.CONVERTER_VERSION,
+                       quality,
+                       movie_convert.crf_for(quality),
+                       movie_convert.TARGET_PROFILE,
+                       movie_convert.TARGET_PRESET,
+                       movie_convert.TARGET_ARATE,
+                       vanilla is not None,
+                       target_fps,
+                       fit_this,
+                       colour,
+                       movie_convert.audio_key_part(music, voice))
+                    + ('|' + movie_convert.LOOP_CLOSE_TAG
+                       if movie_convert.loop_close_wanted(stem) else ''))
+                tag = stem if reldir == movie_convert.MOVIE_DIR else \
+                    '%s.%s' % (reldir.replace('/', '_'), stem)
+                cached_file = os.path.join(cache, f'{tag}.{key}.mp4')
+
+                if os.path.exists(cached_file):
+                    _link_or_copy(cached_file, dest)
+                    cached += 1
+                    produced.append(dest)
+                    if (reldir, stem) == (movie_convert.MOVIE_DIR,
+                                         'opening'):
+                        oi = movie_convert.probe(cached_file)
+                        plan.opening_fps = oi['fps'] if oi else None
+                        if oi:
+                            plan.opening_dims = (oi['width'], oi['height'])
+                    return
+
+                info = movie_convert.probe(src)
+                if info is None:
+                    log(f'  ! {stem}: not a video file, skipped')
+                    failed += 1
+                    return
+
+                # A mod that already ships the exact target format gets copied
+                # rather than re-encoded: a second lossy pass buys nothing.
+                # A mod already shipping the target format is copied only when
+                # its audio is present -- otherwise it still needs the original's
+                # soundtrack muxed in, which means a real encode.
+                # Copying is only right when the file is ALREADY what we want,
+                # which under normalisation means already at the target rate.
+                # ... and never when there is a soundtrack or a voice layer to
+                # mux in, because then the file is exactly NOT what we want: its
+                # audio is the one we are replacing.
+                at_rate = (not target_fps
+                           or abs(info['fps'] - target_fps) < 0.01)
+                if movie_convert.already_target(info, fit=fit_this, colour=colour) \
+                        and info['has_audio'] and at_rate \
+                        and not music and not voice:
+                    shutil.copyfile(src, cached_file)
+                    _link_or_copy(cached_file, dest)
+                    copied += 1
+                    produced.append(dest)
+                    if (reldir, stem) == (movie_convert.MOVIE_DIR,
+                                         'opening'):
+                        plan.opening_fps = info['fps']
+                        plan.opening_dims = (info['width'], info['height'])
+                    log(f'  ok {stem}: already H.264/mp4, copied as-is')
+                    return
+
+                # Encode into the CACHE, then link into place. Writing the cache
+                # copy first means an interrupted build leaves the cache correct
+                # and sdout missing a file, rather than the other way round.
+                t0 = time.time()
+                # BUILD 618z7: last4_2 / last4_3 are re-timed so their 39-frame
+                # loop has no double step at the wrap (movies.loop_close); the
+                # key above carries the tag.
+                if movie_convert.loop_close_wanted(stem):
+                    closed = movie_convert.loop_close(src, cache, log=log,
+                                                      stem=stem)
+                    if closed:
+                        src = closed
+                # only the encode runs outside the lock (BUILD 837)
+                _mv_lock.release()
+                try:
+                    r = movie_convert.convert(src, cached_file, vanilla=vanilla,
+                                              quality=quality, target_fps=target_fps,
+                                              fit=fit_this, colour=colour,
+                                              music=music, voice=voice, log=log)
+                finally:
+                    _mv_lock.acquire()
+                took = time.time() - t0
+                spent += took
+                _link_or_copy(cached_file, dest)
+                done += 1
+                produced.append(dest)
+                if (reldir, stem) == (movie_convert.MOVIE_DIR,
+                                     'opening'):
+                    plan.opening_fps = r['out']['fps']
+                    plan.opening_dims = (r['out']['width'],
+                                         r['out']['height'])
+                extra = ' + original audio' if r['borrowed_audio'] else ''
+                if r.get('music'):
+                    extra += ' + mod soundtrack'
+                    muxed_music += 1
+                if r.get('voice_is_programme'):
+                    extra += (' + voice %+.1f dB (silent cutscene, so the voice '
+                              'IS the soundtrack)' % r['voice_gain'])
+                    muxed_voice += 1
+                elif r.get('voice') is not None and r.get('voice_gain') is not None:
+                    extra += (' + voice %+.1f dB (bed %.1f, voice %.1f LUFS)'
+                              % (r['voice_gain'], r['bed_lufs'], r['voice_lufs']))
+                    muxed_voice += 1
+                elif r.get('voice'):
+                    extra += ' + voice (unmeasured, level unchanged)'
+                    muxed_voice += 1
+                if r.get('doubled'):
+                    extra += ' (frame-doubled)'
+                shown = stem if reldir == movie_convert.MOVIE_DIR else \
+                    '%s/%s' % (reldir.rsplit('/', 2)[-2], stem)
+                if r['fit_reason'] == 'fit':
+                    resized += 1
+                    extra += ' (%dx%d -> %dx%d, lanczos)' % (
+                        r['src']['width'], r['src']['height'],
+                        r['out']['width'], r['out']['height'])
+                elif r['src']['width'] < r['drawn'][0] * 0.98:
+                    undersize.append((stem, r['src']['width'],
+                                      r['src']['height']))
+                if r['colour_converted']:
+                    recoloured += 1
+                if fit_this != 'fit' and r['src']['width'] > r['drawn'][0] * 1.02:
+                    oversize_left.append((stem, r['src']['width'],
+                                          r['src']['height']))
+                log('  ok %-12s %s -> h264 %s fps, crf %d%s  [%.1fs]'
+                    % (shown, movie_convert.describe_source(r['src']),
+                       r['fps'], r['crf'], extra, took))
+            except movie_convert.MissingFFmpeg as exc:
+                log(f'! movies skipped: {exc}')
+                _mv_stop[0] = True
+                return
+            except Exception as exc:                       # noqa: BLE001
+                log(f'  ! {stem}: {exc}')
+                failed += 1
+                # A cache entry only ever appears after a successful, verified
+                # encode, so a failed one must not leave a stub behind for the
+                # next build to trust.
+                stale = locals().get('cached_file')
+                if stale and os.path.exists(stale):
+                    os.remove(stale)
+
+    _mv_jobs = [(i, r, st) for i, (r, st) in enumerate(sorted(work))]
+    _mv_workers = movie_workers(len(_mv_jobs))
+    if _mv_workers > 1:
+        log('  encoding %d movies at a time' % _mv_workers)
+        with _Pool(max_workers=_mv_workers) as _pool:
+            for _f in [_pool.submit(_movie_one, *a) for a in _mv_jobs]:
+                _f.result()
+    else:
+        for a in _mv_jobs:
+            _movie_one(*a)
+    if _mv_stop[0]:
+        return
 
     # Resolution, reported every build so "is it being downscaled?" is
     # answerable from the log rather than from ffprobe -- and so is the
@@ -13374,6 +13451,10 @@ MAIN_ONLY_ENV = frozenset((
     'SEVENTH_NX_FX_SCALE',       # ff7nx_fxscale     ditto, by whole bits
     'SEVENTH_NX_FX_RIM',         # ff7nx_fxrim       the rim UV cap
     'SEVENTH_NX_FX_SNAP',        # ff7nx_fxsnap      the snapshot origin
+    # BUILD 837: how fast, not what. Parallel movie encodes and the
+    # sampling profiler change no output byte.
+    'SEVENTH_NX_MOVIE_WORKERS', 'SEVENTH_NX_PROFILE',
+    'SEVENTH_NX_FIELD_WORKERS',
     'SEVENTH_NX_FX_WINDOW',      # ff7nx_fxwindow    the snapshot SIZE
     'SEVENTH_NX_FX_SUMMONHOLD',  # ff7nx_summonhold  the 60fps pause guard
     'SEVENTH_NX_FX_MODELINTERP', # ff7nx_60fps       summon model hold

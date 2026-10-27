@@ -186,6 +186,56 @@ def candidate_slots(sec9, surv, pages, placeholder):
     return {s: (ts, other.get(s, [])) for s, ts in ph.items()}
 
 
+def _score_slot_batched(img, cells, prgbs, npg, k):
+    """BUILD 839: score_slot's sweep with every cell quantised in one batch
+    per palette (ff7nx_marginart.quantise_many) instead of one call per cell
+    per palette. The same result, exactly:
+
+      * the same cells, chosen by the same test, in the same order;
+      * the same indices per cell (quantise_many is identical to quantise);
+      * each cell's error is mean(|pal[ix] - art|) over integers 0..255, a
+        sum that is exact in float64, divided by the same count -- the same
+        float as the per-cell .mean();
+      * those floats are added to err[p] ONE AT A TIME IN CELL ORDER, as the
+        loop does, because float addition is not associative.
+
+    None when the batch cannot run (the loop then does it as before)."""
+    try:
+        from ff7nx_marginart import quantise_many, BATCH_QUANTISE
+    except Exception:                                          # noqa: BLE001
+        return None
+    if not BATCH_QUANTISE:
+        return None
+    smalls = []
+    for sx, sy in cells:
+        blk = img[sy * k:(sy + TILE) * k, sx * k:(sx + TILE) * k]
+        if blk.shape[:2] != (TILE * k, TILE * k):
+            continue
+        small = (np.ascontiguousarray(blk[..., :3])
+                 .reshape(TILE, k, TILE, k, 3).mean(axis=(1, 3)))
+        if small.max() <= 24:                     # EMPTY SOURCE, see fill_field
+            continue
+        smalls.append(small.astype(np.uint8))
+    if not smalls:
+        return None, None
+    S = np.stack(smalls).astype(np.int16)              # (n, T, T, 3)
+    n = len(smalls)
+    per = S[0].size                                    # T*T*3 values per cell
+    err = np.zeros(npg)
+    nid = np.zeros(npg)
+    for p in range(npg):
+        ix = np.stack(quantise_many(smalls, prgbs[p]))  # (n, T, T)
+        got = prgbs[p][ix].astype(np.int16)             # (n, T, T, 3)
+        tot = np.abs(got - S).reshape(n, -1).sum(axis=1, dtype=np.int64)
+        for v in tot.tolist():
+            err[p] += float(v / per)
+        srt = np.sort(ix.reshape(n, -1), axis=1)
+        distinct = 1 + (srt[:, 1:] != srt[:, :-1]).sum(axis=1)
+        for v in distinct.tolist():
+            nid[p] += int(v)
+    return err / n, nid / n
+
+
 def score_slot(img, cells, prgbs, quantise, npg):
     """
     (err_per_palette, idx_per_palette) summed over `cells`, or (None, None).
@@ -198,6 +248,9 @@ def score_slot(img, cells, prgbs, quantise, npg):
     k = img.shape[1] // 256
     if k < 1:
         return None, None
+    batched = _score_slot_batched(img, cells, prgbs, npg, k)
+    if batched is not None:
+        return batched
     err = np.zeros(npg)
     nid = np.zeros(npg)
     seen = 0

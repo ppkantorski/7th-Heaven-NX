@@ -1306,7 +1306,13 @@ def stage(entries, output_dir, filename=voicemod.folder_voice_key_to_filename,
             workers = int(os.environ.get('SEVENTH_NX_VOICE_WORKERS') or 0)
         except ValueError:
             workers = 0
-    workers = workers or min(8, (os.cpu_count() or 2))
+    # At most 8, as it always was. BUILD 835 raised this to every CPU thread
+    # and a full Echo-S stage on an Apple-silicon Mac went from 12m49s to
+    # 17m09s (BUILD 841, measured): every worker starts an ffmpeg that sizes
+    # its own decode/filter threads to the whole machine, so more workers
+    # oversubscribe the cores instead of adding throughput. The output is the
+    # same at any count; SEVENTH_NX_VOICE_WORKERS still overrides.
+    workers = workers or max(2, min(8, nxpaths.cpu_threads()))
 
     # ONE SOURCE IS ENCODED ONCE, HOWEVER MANY NAMES IT ANSWERS TO.
     # =============================================================

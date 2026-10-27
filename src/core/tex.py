@@ -178,6 +178,85 @@ def _median_cut(pixels, max_colors):
                             max_colors)
 
 
+# Histograms this big take the numpy path; it gives the same palette.
+_NP_MEDIAN_CUT_MIN = 2000
+
+
+def _median_cut_hist_np(hist, max_colors):
+    """BUILD 837: _median_cut_hist with each box's per-colour work in numpy:
+    the spread per channel, the stable sort on the split channel, the
+    running total that finds the cut, the weighted mean. Same decisions in
+    the same order -- the stable argsort is list.sort's order, sums are
+    exact integers, and scores and means are computed by the same Python
+    float expressions -- so the result is identical. None without numpy."""
+    try:
+        import numpy as np
+    except ImportError:
+        return None
+    keys = list(hist)
+    K = np.array([k[:3] for k in keys], dtype=np.int64)
+    V = np.array([hist[k] for k in keys], dtype=np.int64)
+    palette, boxes = _median_cut_core_np(K, V, max_colors)
+    mapping = {}
+    for idx, box in enumerate(boxes):
+        for j in box.tolist():
+            mapping[keys[j]] = idx
+    return palette, mapping
+
+
+def _median_cut_core_np(K, V, max_colors):
+    """The numpy median cut over colour rows K (n, 3) in histogram order
+    with counts V: (palette, boxes), boxes as index arrays into K. Split out
+    of _median_cut_hist_np (BUILD 840) so shared_palette can run it without
+    building a Counter or the colour->index mapping it does not use."""
+    import numpy as np
+
+    def rate(box):
+        n = len(box)
+        if n < 2:
+            return None
+        root = n ** 0.5
+        sub = K[box]
+        spread = (sub.max(axis=0) - sub.min(axis=0)).tolist()
+        top, top_ch = -1, 0
+        for ch in range(3):
+            score = spread[ch] * root
+            if score > top:
+                top, top_ch = score, ch
+        return top, top_ch
+
+    boxes = [np.arange(len(K), dtype=np.int64)]
+    rates = [rate(boxes[0])]
+    while len(boxes) < max_colors:
+        best, best_score, best_ch = None, -1, 0
+        for bi, rt in enumerate(rates):
+            if rt is not None and rt[0] > best_score:
+                best, best_score, best_ch = bi, rt[0], rt[1]
+        if best is None:
+            break
+        box = boxes.pop(best)
+        rates.pop(best)
+        box = box[np.argsort(K[box, best_ch], kind='stable')]
+        cs = np.cumsum(V[box])
+        half = int(cs[-1]) / 2
+        hit = np.nonzero(cs[:-1] >= half)[0]
+        cut = int(hit[0]) + 1 if len(hit) else len(box) // 2
+        boxes.append(box[:cut])
+        boxes.append(box[cut:])
+        rates.append(rate(boxes[-2]))
+        rates.append(rate(boxes[-1]))
+    palette = []
+    for box in boxes:
+        w = V[box]
+        tot = int(w.sum())
+        sub = K[box]
+        r = round(int((sub[:, 0] * w).sum()) / tot)
+        g = round(int((sub[:, 1] * w).sum()) / tot)
+        b = round(int((sub[:, 2] * w).sum()) / tot)
+        palette.append((r, g, b, 255))
+    return palette, boxes
+
+
 def _median_cut_hist(hist, max_colors):
     """The body of _median_cut, over a prebuilt {colour: count} histogram.
 
@@ -186,21 +265,41 @@ def _median_cut_hist(hist, max_colors):
     histogram is exactly how one palette comes to describe a whole stage."""
     if not hist:
         return [], {}
+    if len(hist) >= _NP_MEDIAN_CUT_MIN:
+        out = _median_cut_hist_np(hist, max_colors)
+        if out is not None:
+            return out
+
+    # BUILD 837: a box's score depends only on its contents, so it is
+    # worked out ONCE, when the box is made, instead of for every box on
+    # every one of up to 255 splits (that rescan was 86% of a battle.lgp
+    # build). The choice is the same one: boxes in list order, channels
+    # 0..2, the first strictly greater score wins -- so the same box splits
+    # on the same channel and the palette is identical.
+    def rate(box):
+        if len(box) < 2:
+            return None
+        root = len(box) ** 0.5
+        top, top_ch = -1, 0
+        for ch in range(3):
+            vals = [c[ch] for c, _ in box]
+            score = (max(vals) - min(vals)) * root
+            if score > top:
+                top, top_ch = score, ch
+        return top, top_ch
+
     boxes = [list(hist.items())]
+    rates = [rate(boxes[0])]
     while len(boxes) < max_colors:
         # split the box with the largest spread * population
         best, best_score, best_ch = None, -1, 0
-        for bi, box in enumerate(boxes):
-            if len(box) < 2:
-                continue
-            for ch in range(3):
-                vals = [c[ch] for c, _ in box]
-                score = (max(vals) - min(vals)) * (len(box) ** 0.5)
-                if score > best_score:
-                    best, best_score, best_ch = bi, score, ch
+        for bi, rt in enumerate(rates):
+            if rt is not None and rt[0] > best_score:
+                best, best_score, best_ch = bi, rt[0], rt[1]
         if best is None:
             break
         box = boxes.pop(best)
+        rates.pop(best)
         box.sort(key=lambda cv: cv[0][best_ch])
         half = sum(v for _, v in box) / 2
         acc, cut = 0, 1
@@ -213,6 +312,8 @@ def _median_cut_hist(hist, max_colors):
             cut = len(box) // 2
         boxes.append(box[:cut])
         boxes.append(box[cut:])
+        rates.append(rate(boxes[-2]))
+        rates.append(rate(boxes[-1]))
     palette, mapping = [], {}
     for box in boxes:
         tot = sum(v for _, v in box)
@@ -406,6 +507,37 @@ def cap_dimensions(data, max_dim):
     return out, note
 
 
+def _sample_hist_np(px, bypp, n, stride):
+    """BUILD 840: _sample_hist in numpy. The same Counter, key for key and
+    count for count, AND in the same insertion order -- colours enter in the
+    order their first sampled pixel appears, which is the order the median
+    cut sees them in (shared_palette's union histogram depends on it). None
+    when numpy is missing or the buffer is short (the loop then raises or
+    copes exactly as before)."""
+    try:
+        import numpy as np
+    except ImportError:
+        return None
+    from collections import Counter
+    if bypp not in (3, 4) or len(px) < n * bypp:
+        return None
+    a = np.frombuffer(bytes(px[:n * bypp]), dtype=np.uint8).reshape(n, bypp)
+    a = a[::stride]
+    if bypp == 4:
+        a = a[a[:, 3] >= 128]
+    out = Counter()
+    if not len(a):
+        return out
+    # stored BGR(A): the key is (R, G, B) = (px[o+2], px[o+1], px[o])
+    key = ((a[:, 2].astype(np.int64) << 16) | (a[:, 1].astype(np.int64) << 8)
+           | a[:, 0].astype(np.int64))
+    uk, first, cnt = np.unique(key, return_index=True, return_counts=True)
+    for j in np.argsort(first, kind='stable').tolist():
+        k = int(uk[j])
+        out[((k >> 16) & 255, (k >> 8) & 255, k & 255, 255)] = int(cnt[j])
+    return out
+
+
 def _sample_hist(t, stride):
     """{(r,g,b,255): count} sampled from a truecolor TEX, every `stride`th
     pixel. Sampling rather than counting every pixel keeps the union
@@ -414,8 +546,11 @@ def _sample_hist(t, stride):
     voted."""
     from collections import Counter
     px, bypp = t['pixels'], t['bytes_per_pixel']
-    out = Counter()
     n = t['width'] * t['height']
+    fast = _sample_hist_np(px, bypp, n, stride)
+    if fast is not None:
+        return fast
+    out = Counter()
     for i in range(0, n, stride):
         o = i * bypp
         if bypp == 4 and px[o + 3] < 128:
@@ -443,6 +578,9 @@ def shared_palette(sources, max_colors=255, stride=7):
     `sources` is a list of TEX byte strings. Anything that is not truecolor
     is ignored -- it has a palette already and is not ours to unify.
     """
+    fast = _shared_palette_np(sources, max_colors, stride)
+    if fast is not None:
+        return fast
     from collections import Counter
     hist = Counter()
     for data in sources:
@@ -456,7 +594,82 @@ def shared_palette(sources, max_colors=255, stride=7):
     return pal
 
 
+def _shared_palette_np(sources, max_colors, stride):
+    """BUILD 840: shared_palette without a Counter. The union histogram is
+    built in arrays by the Counter's own rules -- a colour's position is
+    where it is FIRST seen (source by source, pixel by pixel), its count is
+    the sum over every source -- and goes straight into the median cut. The
+    palette is the one the Counter path gives: same rows, same order, same
+    counts, and _median_cut_core_np is _median_cut_hist's algorithm exactly.
+    None (the Counter path then runs) without numpy or on a short buffer."""
+    try:
+        import numpy as np
+    except ImportError:
+        return None
+    keys, firsts, counts = [], [], []
+    for si, data in enumerate(sources):
+        t = parse(data)
+        if t is None or t['palette_flag'] or t['bytes_per_pixel'] < 3:
+            continue
+        px, bypp = t['pixels'], t['bytes_per_pixel']
+        n = t['width'] * t['height']
+        if bypp not in (3, 4) or len(px) < n * bypp:
+            return None
+        a = np.frombuffer(px, dtype=np.uint8, count=n * bypp).reshape(n, bypp)
+        a = a[::stride]
+        if bypp == 4:
+            a = a[a[:, 3] >= 128]
+        if not len(a):
+            continue
+        key = ((a[:, 2].astype(np.int64) << 16)
+               | (a[:, 1].astype(np.int64) << 8) | a[:, 0].astype(np.int64))
+        uk, first, cnt = np.unique(key, return_index=True, return_counts=True)
+        keys.append(uk)
+        firsts.append(first.astype(np.int64) + (np.int64(si) << 40))
+        counts.append(cnt.astype(np.int64))
+    if not keys:
+        return []
+    allk = np.concatenate(keys)
+    allf = np.concatenate(firsts)
+    allc = np.concatenate(counts)
+    uk, inv = np.unique(allk, return_inverse=True)
+    inv = inv.reshape(-1)
+    first = np.full(len(uk), np.iinfo(np.int64).max, dtype=np.int64)
+    np.minimum.at(first, inv, allf)
+    tot = np.zeros(len(uk), dtype=np.int64)
+    np.add.at(tot, inv, allc)
+    order = np.argsort(first, kind='stable')
+    uk, tot = uk[order], tot[order]
+    K = np.stack([(uk >> 16) & 255, (uk >> 8) & 255, uk & 255], axis=1)
+    pal, _ = _median_cut_core_np(K.astype(np.int64), tot, max_colors)
+    return pal
+
+
 _LUT_CACHE = {}
+
+
+def _palette_lut_np(pal, n, shift, half):
+    """BUILD 840: the grid search below, in numpy. Identical: the distances
+    are exact integers either way, and the loop's strict `d < bd` keeps the
+    FIRST nearest entry, which is what argmin returns. The grid is walked
+    r, g, b in the same order, so index i is the same cell. About 8 million
+    distances, ~3.6 s in Python per battle stage. None without numpy."""
+    try:
+        import numpy as np
+    except ImportError:
+        return None
+    if not pal or len(pal) > 256:       # the loop would raise; let it
+        return None
+    c = (np.arange(n, dtype=np.int64) << shift) + half
+    grid = np.stack(np.meshgrid(c, c, c, indexing='ij'), axis=-1).reshape(-1, 3)
+    P = np.asarray(pal, dtype=np.int64)                    # (K, 3)
+    out = np.empty(len(grid), dtype=np.int64)
+    step = 4096
+    for a in range(0, len(grid), step):
+        g = grid[a:a + step]
+        d = ((g[:, None, :] - P[None, :, :]) ** 2).sum(-1)  # exact ints
+        out[a:a + step] = d.argmin(1)
+    return bytearray(out.astype(np.uint8).tobytes())
 
 
 def _palette_lut(palette, bits=5):
@@ -481,6 +694,12 @@ def _palette_lut(palette, bits=5):
     shift = 8 - bits
     half = 1 << (shift - 1)
     pal = [(p[0], p[1], p[2]) for p in palette]
+    lut = _palette_lut_np(pal, n, shift, half)
+    if lut is not None:
+        if len(_LUT_CACHE) > 2:
+            _LUT_CACHE.clear()
+        _LUT_CACHE[key] = lut
+        return lut
     lut = bytearray(n * n * n)
     for ri in range(n):
         r = (ri << shift) + half

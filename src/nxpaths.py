@@ -223,6 +223,62 @@ def tool_dirs():
     return _code_dirs(TOOLS) if os.path.isdir(TOOLS) else []
 
 
+def _no_console_windows():
+    """BUILD 835. On Windows, start every child program without a console
+    window.
+
+    The Windows release is a windowed app, so it has no console of its own,
+    and Windows gives every console program it starts -- ffmpeg, ffprobe,
+    oggenc -- a NEW console window unless asked not to. A first build starts
+    ffmpeg tens of thousands of times (Echo-S alone is three runs per voice
+    line), so that was a window created and torn down for each, the
+    screen flickering, and the build crawling with the CPU nearly idle.
+    CREATE_NO_WINDOW is the documented way to ask; it changes nothing about
+    what the program does or prints. Set once, here, because every module
+    imports this one before it starts anything, so no call site can miss
+    it. A caller that sets its own creationflags keeps them."""
+    if sys.platform != 'win32':
+        return
+    import subprocess
+    flag = getattr(subprocess, 'CREATE_NO_WINDOW', 0x08000000)
+    if getattr(subprocess.Popen, '_nx_no_window', False):
+        return
+    original = subprocess.Popen.__init__
+
+    def __init__(self, *args, **kwargs):
+        if not kwargs.get('creationflags'):
+            kwargs['creationflags'] = flag
+        original(self, *args, **kwargs)
+    subprocess.Popen.__init__ = __init__
+    subprocess.Popen._nx_no_window = True
+
+
+_no_console_windows()
+
+
+def cpu_threads():
+    """CPU threads this process may actually use (BUILD 839).
+
+    os.cpu_count() is every CPU in the machine. A process limited to fewer
+    -- CPU affinity, a container, a cgroup quota, Windows processor groups --
+    would oversubscribe on that number. Python 3.13's os.process_cpu_count()
+    and Linux's sched_getaffinity() answer the real question; cpu_count()
+    is the fallback. Never less than 1."""
+    n = None
+    f = getattr(os, 'process_cpu_count', None)
+    if f is not None:
+        try:
+            n = f()
+        except Exception:                                      # noqa: BLE001
+            n = None
+    if not n and hasattr(os, 'sched_getaffinity'):
+        try:
+            n = len(os.sched_getaffinity(0))
+        except Exception:                                      # noqa: BLE001
+            n = None
+    return max(1, n or os.cpu_count() or 1)
+
+
 def install(tools=False):
     """Put the module directories on sys.path (after the running script's
     own directory). Idempotent.

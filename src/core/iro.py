@@ -192,7 +192,44 @@ def extract(src, dest, progress=None, skip=None):
     filesize = os.path.getsize(src)
     written = skipped = excluded = 0
     failures = []
-    with open(src, 'rb') as f:
+    # BUILD 837: entries are decompressed and written on a pool of threads.
+    # zlib and lzma release the GIL, so an LZMA mod (Cosmos Limit Break is
+    # 3.1 GB of it, ~26 MB/s on one core) unpacks on every core instead of
+    # one. The file is still READ in order by this thread alone, and the
+    # work in flight is capped by bytes, so memory stays bounded. Each entry
+    # has its own output path, so the result is the same files.
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+    import nxpaths
+    workers = max(1, min(16, nxpaths.cpu_threads()))
+    cap = 512 << 20                 # compressed bytes in flight, at most
+    flight = [0]
+    room = threading.Condition()
+    lock = threading.Lock()
+    made_dirs = set()
+
+    def finish(name, eflags, size, out, data, held):
+        try:
+            if eflags == 1:
+                data = zlib.decompress(data)
+            elif eflags == 2:
+                data = _decompress_lzma(data)
+            else:
+                data = data[:size]
+            with open(out, 'wb') as o:
+                o.write(data)
+            return True
+        except Exception as exc:                               # noqa: BLE001
+            with lock:
+                failures.append((name, str(exc)))
+            return False
+        finally:
+            with room:
+                flight[0] -= held
+                room.notify_all()
+
+    futures = []
+    with open(src, 'rb') as f, ThreadPoolExecutor(max_workers=workers) as pool:
         _, _, entries = read_entries(f)
         check_complete(src, entries, filesize)
         for i, (name, eflags, offset, size) in enumerate(entries):
@@ -206,22 +243,21 @@ def extract(src, dest, progress=None, skip=None):
                     and os.path.getsize(out) == size:
                 skipped += 1
                 continue
-            os.makedirs(os.path.dirname(out), exist_ok=True)
+            d = os.path.dirname(out)
+            if d not in made_dirs:
+                os.makedirs(d, exist_ok=True)
+                made_dirs.add(d)
             f.seek(offset)
             data = f.read(min(size + 16, filesize - offset))
-            try:
-                if eflags == 1:
-                    data = zlib.decompress(data)
-                elif eflags == 2:
-                    data = _decompress_lzma(data)
-                else:
-                    data = data[:size]
-            except Exception as exc:
-                failures.append((name, str(exc)))
-                continue
-            with open(out, 'wb') as o:
-                o.write(data)
-            written += 1
+            held = len(data)
+            with room:
+                # one entry bigger than the cap still goes, alone
+                room.wait_for(lambda: flight[0] == 0
+                              or flight[0] + held <= cap)
+                flight[0] += held
+            futures.append(pool.submit(finish, name, eflags, size, out,
+                                       data, held))
+        written = sum(1 for fu in futures if fu.result())
     return written, skipped, failures, excluded
 
 

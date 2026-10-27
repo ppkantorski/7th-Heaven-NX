@@ -1213,6 +1213,17 @@ BACKDROP = {
     'menus': {
         0x6CB56A: [(0xD05048, 0x294226E8, ((-160, -160, 800, 640),), 0.9999, 0xFF000000)],
     },
+    # BUILD 836: the shop. It is not one of the menu loop's screens (its
+    # draw, 71AAA3, is called by its own loop 71FF95, not through the menu
+    # table at 0x91AB98), so it never got the 669b backdrop. With nothing
+    # clearing colour, a window that slides in from the side -- the Sell
+    # "How many" box -- left every position it passed through in the 16:9
+    # margins. Same quad, same depth, queued just before the shop's draw
+    # call (x86 72000F..720019: arg pushed, return slot next; ARM E3D61C is
+    # the `ldr w8, [x23, #0x10]` that starts the return-slot push).
+    'shop': {
+        0x71FF95: [(0xE3D61C, 0xB94012E8, ((-160, -160, 800, 640),), 0.9999, 0xFF000000)],
+    },
 }
 ITEM_LIST_DX = -19
 

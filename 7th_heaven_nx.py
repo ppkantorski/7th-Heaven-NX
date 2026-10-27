@@ -46,7 +46,7 @@ HERE = nxpaths.ROOT
 
 # Shown in the header, nearest the title. Single source of truth --
 # anything else that needs it should import this rather than repeat it.
-VERSION = '1.0.1'
+VERSION = '1.0.2'
 sys.path.insert(0, HERE)
 
 import build  # noqa: E402
@@ -1519,8 +1519,155 @@ def _audio_fingerprint():
     return out
 
 
+import time  # noqa: E402  (BUILD 835: _BuildClock)
+
+
+class _Sampler:
+    """BUILD 837, SEVENTH_NX_PROFILE=1: a sampling profiler for one build.
+
+    A background thread looks at the build thread's stack four times a
+    second and counts every function on it, so the report says where the
+    build's WALL time went -- including time spent waiting on ffmpeg or a
+    thread pool, which a CPU profiler would miss -- for a cost that does not
+    show next to a build. Only this program's own functions are listed."""
+
+    PERIOD = 0.25
+
+    def __init__(self, ident):
+        self.ident, self.n = ident, 0
+        self.incl, self.self_ = {}, {}
+        self._stop = threading.Event()
+        self._t = threading.Thread(target=self._run, daemon=True)
+        self._t.start()
+
+    @staticmethod
+    def _ours(code):
+        f = code.co_filename.replace('\\', '/')
+        return ('/src/' in f or f.endswith('7th_heaven_nx.py')
+                or '/' not in f)
+
+    def _run(self):
+        while not self._stop.wait(self.PERIOD):
+            frame = sys._current_frames().get(self.ident)
+            seen = set()
+            inner = None
+            while frame is not None:
+                code = frame.f_code
+                if self._ours(code):
+                    key = '%s:%s' % (os.path.basename(code.co_filename)
+                                     .rsplit('.', 1)[0], code.co_name)
+                    if inner is None:
+                        # the innermost of ours, at the line it is on
+                        inner = '%s:%d' % (key, frame.f_lineno)
+                    if key not in seen:
+                        seen.add(key)
+                        self.incl[key] = self.incl.get(key, 0) + 1
+                frame = frame.f_back
+            if inner is not None:
+                self.self_[inner] = self.self_.get(inner, 0) + 1
+            self.n += 1
+
+    def report(self, top=25):
+        self._stop.set()
+        self._t.join(1.0)
+        if not self.n:
+            return []
+        out = ['profile (%d samples, share of build time spent inside each '
+               'function, callees included):' % self.n]
+        for key, c in sorted(self.incl.items(), key=lambda kv: -kv[1])[:top]:
+            out.append('  %5.1f%%  %8.0fs  %s' % (100.0 * c / self.n,
+                                                  c * self.PERIOD, key))
+        out.append('hot lines (where the time is actually spent):')
+        for key, c in sorted(self.self_.items(),
+                             key=lambda kv: -kv[1])[:top]:
+            out.append('  %5.1f%%  %8.0fs  %s' % (100.0 * c / self.n,
+                                                  c * self.PERIOD, key))
+        return out
+
+
+class _BuildClock:
+    """BUILD 835. Where a build's time went, at no cost to the build.
+
+    Every log line is stamped as it is written, and the time until the next
+    line is charged to the step that line announced ("building flevel.lgp
+    ...", "encoding Echo-S voice ..."). At the end the slowest steps are
+    listed, with the machine facts that decide speed, so a report of a slow
+    build says what was slow instead of leaving it to guesswork."""
+
+    TOP = 12
+
+    def __init__(self, log):
+        self._log = log
+        self.t0 = self._last_t = time.monotonic()
+        self._last = None
+        self.steps = []
+        self._prof = None
+        if os.environ.get('SEVENTH_NX_PROFILE', '').strip() == '1':
+            self._prof = _Sampler(threading.get_ident())
+
+    def __call__(self, text):
+        now = time.monotonic()
+        if self._last is not None:
+            self.steps.append((now - self._last_t, self._last))
+        line = str(text).strip()
+        if line:
+            self._last, self._last_t = line, now
+        self._log(text)
+
+    def header(self):
+        try:
+            import lgp
+            lzs = ('native C library' if lgp._native_lib() is not None
+                   else 'Python routines (slower)')
+        except Exception:                                      # noqa: BLE001
+            lzs = 'unknown'
+        import platform
+        self._log('machine: %s %s, %d CPU threads, LZS: %s'
+                  % (platform.system(), platform.machine(),
+                     nxpaths.cpu_threads(), lzs))
+
+    def summary(self):
+        now = time.monotonic()
+        if self._last is not None:
+            self.steps.append((now - self._last_t, self._last))
+            self._last = None
+        total = now - self.t0
+
+        def hms(sec):
+            sec = int(round(sec))
+            return ('%dh %02dm %02ds' % (sec // 3600, sec // 60 % 60, sec % 60)
+                    if sec >= 3600 else '%dm %02ds' % (sec // 60, sec % 60)
+                    if sec >= 60 else '%ds' % sec)
+        slow = sorted(self.steps, reverse=True)[:self.TOP]
+        slow = [(t, line) for t, line in slow if t >= 5]
+        self._log('')
+        self._log('build time: %s' % hms(total))
+        if self._prof is not None:
+            for line in self._prof.report():
+                self._log(line)
+        if slow:
+            self._log('slowest steps (time until the next log line):')
+            for t, line in slow:
+                self._log('  %9s  %s' % (hms(t), line[:110]))
+
+
 def run_build(mods, enabled, settings_by_mod, log, progress,
               fps_60=False):
+    """The build, timed (BUILD 835): see _BuildClock."""
+    clock = _BuildClock(log)
+    clock.header()
+    try:
+        return _run_build_steps(mods, enabled, settings_by_mod, clock,
+                                progress, fps_60=fps_60)
+    finally:
+        try:
+            clock.summary()
+        except Exception:                                      # noqa: BLE001
+            pass
+
+
+def _run_build_steps(mods, enabled, settings_by_mod, log, progress,
+                     fps_60=False):
     # BUILD 326. Publish the 60 FPS setting so the ARCHIVE CACHE can see it.
     # It arrives here as a GUI checkbox / --60fps flag, which means
     # `_archive_fingerprint` was blind to it -- and it is the one setting

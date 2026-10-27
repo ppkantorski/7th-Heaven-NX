@@ -65,6 +65,18 @@ def test_menu_backdrop():
     assert out[0xD05048] == A.b(0xD05048, 0x100000)
 
 
+def test_shop_backdrop():
+    """BUILD 836: the shop runs its own loop (71FF95), so it gets its own
+    backdrop just before its draw call -- the Sell "How many" box left a
+    trail in the 16:9 margins without it."""
+    p = E._with_deltas('shop', 0x71FF95, dict(EMPTY))
+    assert p['backdrop'] == [(0xE3D61C, 0xB94012E8, ((-160, -160, 800, 640),), 0.9999, 0xFF000000)]
+    w = EC.backdrop_cave(0x100000, 0xE3D61C, 0xB94012E8, 0x200000, *p['backdrop'][0][2:])
+    assert w[-2] == 0xB94012E8 and w[-1] == A.b(0x100000 + 4 * (len(w) - 1), 0xE3D620)
+    out, _ = EC.build(p, lambda va: 0xB94012E8, {0x66E272: 0x200000}, 0x100000)
+    assert out[0xE3D61C] == A.b(0xE3D61C, 0x100000)
+
+
 def test_call_hook_refuses_other_word():
     port = dict(EMPTY, calls=[(0x1000, 0x6FA12F, (0,), 0x294252E0)])
     try:
