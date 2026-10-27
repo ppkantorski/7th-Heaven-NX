@@ -47,7 +47,7 @@ On PC, mods like Cosmo Memory, Echo-S and Enhanced Stock UI depend on FFNx, a re
 
 The **Install Mods** window lists every mod below and fetches it from the 7th Heaven catalog.
 
-| Mod | Category | Developer |
+| Mod | Category | Developer(s) |
 |---|---|---|
 | [Tsunamods] Cosmo Memory | Field backgrounds, widescreen | Bonez |
 | [Tsunamods] Wizard Staff | Modern spell names | Bonez |
