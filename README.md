@@ -135,7 +135,7 @@ FFmpeg is downloaded once on the first run, into `ffmpeg/`.
 python3 7th_heaven_nx.py
 ```
 
-Python 3.9+ with tkinter is all you need up front. On the first run it installs whatever else is missing (Pillow, numpy, scipy, lz4, capstone and a few extras) into a private `.venv/`, downloads PyFF7, and fetches FFmpeg if it isn't on your PATH. Your system Python is left alone. Delete `.venv/` to start over.
+Python 3.9+ with tkinter is all you need up front. On the first run it installs whatever else is missing (Pillow, numpy, scipy, lz4, capstone and a few extras) into a private `.venv/`, downloads PyFF7 into `common/`, and fetches FFmpeg if it isn't on your PATH. Your system Python is left alone. Delete `.venv/` to start over.
 
 To build with your saved settings and no window:
 

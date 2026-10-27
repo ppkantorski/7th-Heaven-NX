@@ -8,7 +8,8 @@ same idea as a C project's include directories.
 ``ROOT`` is the project folder: cache/, mods/, dump/, sdout/,
 settings.json and everything else the program writes are found from it,
 never from a module's own location. ``APP`` is where the program's own
-read-only files are: assets/, data/, native/, shaders/ and PyFF7/.
+read-only files are: assets/, data/, native/, shaders/ and common/PyFF7/
+(BUILD 817: PyFF7 moved from the root into common/; see ``pyff7_root``).
 
 Run from source they are the same folder. In a release build (PyInstaller,
 ``sys.frozen``) ``APP`` is the bundle's own folder and ``ROOT`` is the folder
@@ -24,6 +25,26 @@ import os
 import sys
 
 FROZEN = bool(getattr(sys, 'frozen', False))
+
+#: BUILD 817. Third-party code the program vendors, out of the project root.
+COMMON_DIR = 'common'
+
+
+def pyff7_root(base=None):
+    """The PyFF7 clone root (the folder holding the ``PyFF7`` package).
+
+    ``<base>/common/PyFF7`` (BUILD 817), unless only the pre-817 ``<base>/PyFF7``
+    exists -- then that, so a folder the first-run setup has not migrated yet
+    still works. ``base`` defaults to ``APP``.
+    """
+    if base is None:
+        base = APP
+    new = os.path.join(base, COMMON_DIR, 'PyFF7')
+    old = os.path.join(base, 'PyFF7')
+    if (not os.path.isdir(os.path.join(new, 'PyFF7'))
+            and os.path.isdir(os.path.join(old, 'PyFF7'))):
+        return old
+    return new
 
 
 def _original_bundle(bundle):

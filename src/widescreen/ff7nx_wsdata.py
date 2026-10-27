@@ -162,7 +162,7 @@ def _pyff7():
     if nxpaths.FROZEN:
         return True                     # compiled in (see pyff7_path)
     here = nxpaths.APP
-    for cand in (os.path.join(here, 'PyFF7'), here):
+    for cand in (nxpaths.pyff7_root(here), here):       # BUILD 817
         if os.path.isdir(os.path.join(cand, 'PyFF7')):
             if cand not in sys.path:
                 sys.path.insert(0, cand)

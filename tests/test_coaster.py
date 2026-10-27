@@ -192,7 +192,7 @@ def test_stock_anchors_and_install():
     lo, hi = DS.part(MAIN, 'coaster', MAIN)
     # 1 KB from BUILD 687 (the stale 0x800 here predates it); 512 B since
     # BUILD 742 gave the upper half to ff7nx_sfxbattle's tables
-    assert hi - lo == 0x200 and lo == DS.part(MAIN, 'sub')[1]
+    assert hi - lo == 0x200 and lo == DS.part(MAIN, 'fmt')[1]   # BUILD 813: 'fmt' sits between 'sub' and 'coaster'
     assert hi == DS.part(MAIN, 'sfxtab')[0]
     d = tempfile.mkdtemp()
     try:

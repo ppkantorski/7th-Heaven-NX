@@ -69,7 +69,7 @@ def ensure(project_dir=None):
     """
     if project_dir is None:
         project_dir = nxpaths.APP
-    clone_root = os.path.join(project_dir, PACKAGE)
+    clone_root = nxpaths.pyff7_root(project_dir)      # BUILD 817: common/PyFF7
     if not os.path.isfile(os.path.join(clone_root, PACKAGE, '__init__.py')):
         return None
     if nxpaths.FROZEN:

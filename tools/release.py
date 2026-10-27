@@ -181,8 +181,9 @@ def release_files():
         and not r.startswith('native/lzs/'))
     import ff7nx_shaders
     out += ff7nx_shaders.release_files()
-    out += ['PyFF7/LICENSE']
-    out += _walk('PyFF7/PyFF7', lambda r: r.endswith('.py'))
+    # BUILD 817: vendored under common/
+    out += ['common/PyFF7/LICENSE']
+    out += _walk('common/PyFF7/PyFF7', lambda r: r.endswith('.py'))
     return sorted(set(out))
 
 
@@ -256,7 +257,7 @@ def unshipped_imports(files):
 
 #: Under the user's folder ON PURPOSE: written per user, or supplied by them.
 USER_DATA = ('build_counters.json', 'ff7_en_switch')
-_SHIPPED_DIRS = ('data', 'native', 'shaders', 'assets', 'PyFF7', 'tools',
+_SHIPPED_DIRS = ('data', 'native', 'shaders', 'assets', 'common', 'tools',
                  'tests')
 
 
@@ -348,7 +349,7 @@ def _pyinstaller(app, work, dist, system):
               'requests_toolbelt', 'cryptography'):
         args += ['--exclude-module', m]
     # src/ first: PyFF7's clone has top-level names of its own
-    for d in src_dirs + [os.path.join(app, 'PyFF7')]:
+    for d in src_dirs + [os.path.join(app, 'common', 'PyFF7')]:
         args += ['--paths', d]
     for n in names:
         args += ['--hidden-import', n]
@@ -501,7 +502,7 @@ def main():
     if not opts.no_venv and not _in_build_venv():
         return build_venv(out, system, arch)
     check_packages(opts.install, opts.strict)
-    # PyFF7 is a clone next to the program; fetch it like a first run does
+    # PyFF7 is a clone in common/ (BUILD 817); fetch it like a first run does
     ff7nx_deps._ensure_pyff7(ROOT)
     files = release_files()
     if opts.list:

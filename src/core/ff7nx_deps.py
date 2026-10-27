@@ -28,7 +28,7 @@ name one, `static-ffmpeg` fetches a build for this platform once and the
 build is pointed at it through SEVENTH_NX_FFMPEG / SEVENTH_NX_FFPROBE.
 
 PyFF7 (the LGP packer and field reader) is vendored as a clone at
-`<project>/PyFF7` and is imported at startup, so a fresh copy of the project
+`<project>/common/PyFF7` (BUILD 817; it was `<project>/PyFF7`) and is imported at startup, so a fresh copy of the project
 fetches it here too: GitHub's zip of it, which needs no git.
 
 A release build (tools/release.py) has all of this inside it already, so
@@ -333,9 +333,25 @@ def _fetch_pyff7_zip(dest):
 
 
 def _ensure_pyff7(root):
-    dest = os.path.join(root, 'PyFF7')
+    # BUILD 817: common/PyFF7. A pre-817 clone at the root is MOVED there, not
+    # fetched again (nxpaths.pyff7_root reads either until this has run).
+    dest = os.path.join(root, 'common', 'PyFF7')
+    legacy = os.path.join(root, 'PyFF7')
+    if (not os.path.isfile(os.path.join(dest, 'PyFF7', '__init__.py'))
+            and os.path.isfile(os.path.join(legacy, 'PyFF7', '__init__.py'))):
+        try:
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            if os.path.isdir(dest):
+                shutil.rmtree(dest, ignore_errors=True)
+            shutil.move(legacy, dest)
+            _say('Moved PyFF7 into common/PyFF7.')
+        except Exception as exc:                                # noqa: BLE001
+            _say('Could not move PyFF7 into common/ (%s); using %s.'
+                 % (exc, legacy))
+            return
     if os.path.isfile(os.path.join(dest, 'PyFF7', '__init__.py')):
         return
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
     _say('Fetching PyFF7 (first run only) ...')
     if os.path.isdir(dest):
         shutil.rmtree(dest, ignore_errors=True)

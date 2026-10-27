@@ -282,7 +282,7 @@ import dds_decode
 from PIL import Image
 
 HERE = nxpaths.ROOT
-PYFF7_DIR = os.path.join(nxpaths.APP, 'PyFF7')
+PYFF7_DIR = nxpaths.pyff7_root()          # BUILD 817: common/PyFF7
 VANILLA_CACHE = os.path.join(HERE, 'cache', '_vanilla')
 
 
@@ -296,6 +296,7 @@ def ensure_pyff7(log=lambda *_: None):
     if not os.path.isdir(os.path.join(PYFF7_DIR, 'PyFF7')):
         log('fetching PyFF7 (one-time)...')
         try:
+            os.makedirs(os.path.dirname(PYFF7_DIR), exist_ok=True)
             subprocess.run(
                 ['git', 'clone', '--depth', '1',
                  'https://github.com/niemasd/PyFF7.git', PYFF7_DIR],

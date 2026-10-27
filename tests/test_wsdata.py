@@ -112,7 +112,7 @@ def test_lzss_against_pyff7():
         print('  skip  no flevel.lgp (set SEVENTH_NX_FLEVEL)')
         return
     try:
-        pyff7 = os.path.join(os.path.dirname(_HERE), 'PyFF7')
+        pyff7 = nxpaths.pyff7_root(os.path.dirname(_HERE))   # BUILD 817
         if os.path.isdir(pyff7) and pyff7 not in sys.path:
             sys.path.insert(0, pyff7)
         from PyFF7.lgp import LGP
