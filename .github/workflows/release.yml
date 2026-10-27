@@ -2,7 +2,7 @@
 # target -- PyInstaller cannot cross-compile -- and attaches them to a DRAFT
 # GitHub release for the pushed tag. Review the draft, then publish it.
 #
-#   git tag v1.0.0 && git push origin v1.0.0
+#   git tag v1.0.2 && git push origin v1.0.2
 #
 # The tag must match VERSION in 7th_heaven_nx.py. Run it by hand from the
 # Actions tab (workflow_dispatch) to get the zips as artifacts without a
@@ -100,7 +100,7 @@ jobs:
     if: ${{ !cancelled() && startsWith(github.ref, 'refs/tags/') }}
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/download-artifact@v6
+      - uses: actions/download-artifact@v7
         with:
           path: dist
           merge-multiple: true
