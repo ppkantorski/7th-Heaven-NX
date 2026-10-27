@@ -1,4 +1,4 @@
-# 7th Heaven NX
+# <sub><img src="assets/icon.png" height="40" alt="icon"></sub> 7th Heaven NX
 
 [![platform](https://img.shields.io/badge/platform-Switch-898c8c?logo=C++.svg)](https://gbatemp.net/forums/nintendo-switch.283/)
 [![language](https://img.shields.io/badge/language-Python-3572A5.svg)](https://github.com/topics/python)
