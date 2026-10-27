@@ -335,7 +335,7 @@ A release ships only the program's own files: no game files, no stock shaders, a
 
 - [FFNx](https://github.com/julianxhokaxhiu/FFNx) and the [7th Heaven](https://github.com/tsunamods-codes/7th-Heaven) team, whose work this follows closely
 - [PyFF7](https://github.com/niemasd/PyFF7) for FF7's file formats
-- [Ad0ky](https://github.com/Ad0ky) for help with Echo-S and Cosmo Memory
+- [Ad0ky](https://github.com/Ad0ky) for help with Echo-S and Cosmo Memory integrations
 - Tsunamods and every mod author listed above, whose mods this exists to run
 
 ---
