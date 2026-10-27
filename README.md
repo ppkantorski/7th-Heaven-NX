@@ -45,7 +45,7 @@ On PC, mods like Cosmo Memory, Echo-S and Enhanced Stock UI depend on FFNx, a re
 
 ### Supported Mods
 
-The **Install Mods** window lists every mod below and fetches it from the 7th Heaven catalog.
+The **Install Mods** window lists every mod below and fetches it from the 7th Heaven catalog (using all is highly recommended).
 
 | Mod | Category | Developer(s) |
 |---|---|---|
