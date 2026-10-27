@@ -40,6 +40,7 @@ USER_KEYS = frozenset((
     'dock_resolution',              # BUILD 762: output resolution
     'title_screen',                 # BUILD 763b: title background
     'gui_theme',                    # window colours (nxthemes); not a build input
+    'install_selection',            # BUILD 814: Install Mods' check boxes; not a build input
     'developer_settings',           # Settings > GUI toggle: same as SEVENTH_NX_DEV
 ))
 

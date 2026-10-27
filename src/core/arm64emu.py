@@ -504,6 +504,28 @@ class Cpu:
             if imm9 & 0x100:
                 imm9 -= 0x200
             return s(rd, self.mem.u(self._rd64(rn) + imm9, 8))
+        if (w & 0x7F800000) == 0x12800000:                    # movn Wd/Xd,#i,lsl #hw
+            # BUILD 813: `mov x0, #-1`
+            hw = (w >> 21) & 3
+            v = ~(((w >> 5) & 0xFFFF) << (16 * hw))
+            if (w >> 31) & 1:
+                return s(rd, v & M64)
+            return s(rd, v & M32, True)
+        if (w & 0xFFA00C00) == 0x38200800:                    # ldrb/strb Wt,[Xn,Rm,ext]
+            # BUILD 813 (fmtcache's path scan and copy): the byte forms, LSL #0
+            opt = (w >> 13) & 7
+            off = self.x[rm]
+            if opt == 2:
+                off &= M32
+            elif opt == 6:
+                off = s32(off)
+            elif opt not in (3, 7):
+                raise Unsupported('ldrb/strb extend %d at 0x%X' % (opt, pc))
+            a = (self._rd64(rn) + off) & M64
+            if (w >> 22) & 1:
+                return s(rd, self.mem.u(a, 1), True)
+            self.mem.setu(a, g(rd, True) & 0xFF, 1)
+            return None
         if (w & 0xFFE00C00) == 0xF8600800:                    # ldr Xt,[Xn,Rm,ext]
             opt, sh = (w >> 13) & 7, 3 if (w >> 12) & 1 else 0
             off = self.x[rm]

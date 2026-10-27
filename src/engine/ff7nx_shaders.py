@@ -123,16 +123,17 @@ SCALER_SETS = {
     # grading kept verbatim.
     'sharp': ('sharp', SCALER_FILES, 'Sharp — point sample + HD grading'),
     'soft': ('soft', SCALER_FILES, 'Soft — plain bilinear'),
-    # GPU tests: the HD 2xSaI files with a cheaper hq4x pass.
-    'hd_lite': ('hq4x_lite', SCALER_FILES_NATIVE_DEPTH, 'HD lite — 10-read hq4x (test)'),
-    'hd_bilinear': ('hq4x_bilinear', SCALER_FILES_NATIVE_DEPTH, 'HD bilinear — 1-read hq4x (test)'),
+    # The HD 2xSaI files with a cheaper hq4x pass. hd_lite is the shipped
+    # default since the GPU tests (BUILD 815: no longer labelled a test).
+    'hd_lite': ('hq4x_lite', SCALER_FILES_NATIVE_DEPTH, 'HD lite — 10-read hq4x'),
+    'hd_bilinear': ('hq4x_bilinear', SCALER_FILES_NATIVE_DEPTH, 'HD bilinear — 1-read hq4x'),
 }
 
 FXAA_SETS = {
     '': (None, (), 'stock FXAA'),
     'hd': ('hd_fxaa', FXAA_FILES, 'HD FXAA'),
     'off': ('fxaa_off', FXAA_FILES, 'FXAA off'),
-    'hd_fast': ('hd_fxaa_fast', FXAA_FILES, 'HD FXAA fast — 12-step search (test)'),
+    'hd_fast': ('hd_fxaa_fast', FXAA_FILES, 'HD FXAA fast — 12-step search'),
 }
 
 VIDEO_SETS = {

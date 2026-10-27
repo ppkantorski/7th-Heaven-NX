@@ -27,7 +27,9 @@ It is split so a shipping pass and the diagnostic probe can never collide:
     [lo + 0xC00,   lo + SHIP)   'speak': ff7nx_facial (BUILD 708) -- the lip
                                 flap's speaker lookup (592 bytes), which the
                                 spent padding pool no longer has room for
-    [lo + SHIP,    lo + 0x1800) 'sub':  ff7nx_sublines (BUILD 557) -- the
+    [lo + 0x1400,  lo + 0x1800) 'fmt':  ff7nx_fmtcache (BUILD 813) -- audio.fmt
+                                served from memory
+    [lo + SHIP,    lo + 0x1400) 'sub':  ff7nx_sublines (BUILD 557) -- the
                                 submarine limiter, line pen and depth pull;
                                 the padding pool has no multi-word hole
                                 left by the time that pass runs
@@ -81,10 +83,10 @@ It is split so a shipping pass and the diagnostic probe can never collide:
                                 'sfxpre' (ff7nx_sfxpreload, BUILD 665: opt-in,
                                 and it never fitted -- it now gets an empty
                                 part, logs and skips as before)
-    [lo + 0xA840,  lo + 0xAF00) 'subcam': ff7nx_subcam (BUILD 670) -- the
+    [lo + 0xA840,  lo + 0xAEA0) 'subcam': ff7nx_subcam (BUILD 670) -- the
                                 field camera's scripted moves in sub-unit
                                 steps
-    [lo + 0xAF00,  lo + 0xB000) 'blank': ff7nx_blankhold (BUILD 665) -- a
+    [lo + 0xAEA0,  lo + 0xB000) 'blank': ff7nx_blankhold (BUILD 665) -- a
                                 frame with nothing drawn shows the last one
     [lo + 0xA000,  hi - FAR)    ff7nx_drawprobe, diagnostic builds only --
                                 the SAME space as 'light' + 'subcam' +
@@ -118,6 +120,8 @@ PACE_AT = 0x800
 SFXBAT_AT = 0x8C0                     # BUILD 741: was 0x900 (740); 'pace' needs 84 B
 SPEAK_AT = 0xC00                      # BUILD 708: the upper KB of 'pace'
 SUB_AT = 0x1000
+FMT_AT = 0x1400                       # BUILD 813: the upper KB of 'sub' (sublines
+                                      # uses 748 of 2,048) -- ff7nx_fmtcache
 COASTER_AT = 0x1800
 SFXTAB_AT = 0x1A00                    # BUILD 742: the upper half of 'coaster'
 DNTABLES_AT = 0x1C00                  # BUILD 687: the upper half of 'coaster'
@@ -142,7 +146,9 @@ SUBCAM_AT = 0xA840                    # BUILD 783: was 0xA800. lighting's battle
                                       # BUILD 670: the tail of 'sfxpre' (whose
                                       # opt-in preload did not fit 3,840 bytes
                                       # either -- it logs and skips)
-BLANK_AT = 0xAF00                     # BUILD 665
+BLANK_AT = 0xAEA0                     # BUILD 812: was 0xAF00 (665); blankhold's
+                                      # handoff hold needs 312 B, subcam uses 1,616
+                                      # of the 1,632 left below it
 PROBE_AT = 0xB000                     # BUILD 665: end of 'blank' (the probe now
                                       # reuses SFXPRE_AT..far, see part())
 FAR_BYTES = 0x6A00                     # BUILD 665: was 0x6C00 (662), 0x7400 (661), 0x7800 (655);
@@ -179,7 +185,9 @@ def part(src, which, stock=None):
     elif which == 'speak':
         p = (lo + SPEAK_AT, lo + SHIP_BYTES)
     elif which == 'sub':
-        p = (lo + SUB_AT, lo + COASTER_AT)
+        p = (lo + SUB_AT, lo + FMT_AT)
+    elif which == 'fmt':
+        p = (lo + FMT_AT, lo + COASTER_AT)
     elif which == 'coaster':
         p = (lo + COASTER_AT, lo + SFXTAB_AT)
     elif which == 'sfxtab':

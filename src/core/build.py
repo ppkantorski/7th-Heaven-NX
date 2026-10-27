@@ -13456,6 +13456,7 @@ MAIN_ONLY_ENV = frozenset((
     'SEVENTH_NX_SFX_PRELOAD', 'SEVENTH_NX_SFX_PRELOAD_KB',  # BUILD 665
     'SEVENTH_NX_SFX_PRELOAD_BUDGET_KB',  # BUILD 665, ff7nx_sfxpreload
     'SEVENTH_NX_BLANK_HOLD',     # BUILD 665, ff7nx_blankhold.ENV
+    'SEVENTH_NX_FMT_CACHE',      # BUILD 813, ff7nx_fmtcache.ENV
     'SEVENTH_NX_FIELD_ZOOM',     # BUILD 567, ff7nx_fieldzoom.ENV
     'SEVENTH_NX_CONDOR_PAD',     # BUILD 569, ff7nx_condorpad.ENV
     'SEVENTH_NX_CONDOR_SPEED',   # BUILD 569, ff7nx_condorpad.SPEED_ENV
@@ -13561,6 +13562,8 @@ MAIN_ONLY_MODULES = frozenset((
     'ff7nx_sublines.py',
     # BUILD 665. Dead-space caves in exefs/main only.
     'ff7nx_sfxpreload.py', 'ff7nx_blankhold.py',
+    # BUILD 813. audio.fmt from memory: one cave + blob in exefs/main.
+    'ff7nx_fmtcache.py',
     # BUILD 681. Spit attacks reach the target: in-place words + a 16-word tail.
     'ff7nx_spitreach.py',
     # BUILD 682. Refuse's spinning square scale: one in-place word.
@@ -16786,6 +16789,42 @@ def apply_blank_hold(sdout, dump, plan, log=lambda *_: None, produced=()):
         if os.path.exists(tmp):
             os.remove(tmp)
         log('! blank-frame hold: %s: %s -- not installed' % (
+            type(exc).__name__, exc))
+        return []
+    os.replace(tmp, dest)
+    return [dest] if not built else []
+
+
+def apply_fmt_cache(sdout, dump, plan, log=lambda *_: None, produced=()):
+    """
+    BUILD 813. audio.fmt (the sound format records) is read from memory
+    after its first read -- every uncached sound load read 24 bytes of it
+    from storage, ~55 ms each on the world map (every footstep: PROBE-812) --
+    and (813b) the world-footstep bank of audio.dat from boot (each step's
+    17 KB variant was a ~50 ms storage read until storage had it).
+    See ff7nx_fmtcache. Fails closed. SEVENTH_NX_FMT_CACHE=0 skips it.
+    """
+    import ff7nx_fmtcache
+    if not ff7nx_fmtcache.enabled():
+        log('')
+        log('audio.fmt cache: OFF (%s=0)' % ff7nx_fmtcache.ENV)
+        return []
+    src, built = _audio_bridge_base(sdout, dump, log, produced,
+                                    'audio.fmt cache')
+    if src is None:
+        return []
+    dest = os.path.join(sdout, 'atmosphere', 'contents', TITLE_ID, 'exefs',
+                        'main')
+    log('')
+    log('audio.fmt cache ...')
+    tmp = dest + '.fmt-tmp'
+    try:
+        ff7nx_fmtcache.apply_to_nso(src, tmp, dump.nso, log,
+                                    dat_range=ff7nx_fmtcache.world_steps_range(plan))
+    except Exception as exc:                                   # noqa: BLE001
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        log('! audio.fmt cache: %s: %s -- not installed' % (
             type(exc).__name__, exc))
         return []
     os.replace(tmp, dest)

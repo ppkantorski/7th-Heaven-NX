@@ -1182,10 +1182,11 @@ def _page_all_black(pages, arrays, pal565, k, _cache=None):
     return _cache[ck]
 
 
-def art_lit_fraction(k, art_for, _cache=None, origin=None):
+def art_lit_fraction(k, art_for, _cache=None, origin=None, lit_min=25):
     """
-    Fraction of the mod's art for this cell that is LIT -- max channel > 24,
-    the same threshold `hue_broken` uses to decide a texel carries colour.
+    Fraction of the mod's art for this cell that is LIT -- max channel >=
+    `lit_min`. The default, 25 (> 24), is the threshold `hue_broken` uses to
+    decide a texel carries colour; FULLBLACK_ART passes FULLBLACK_ART_MIN.
 
     Returns 0.0 when the art cannot be read, so "I could not look" and "the
     art is black" both refuse, which is the safe direction for every caller
@@ -1198,7 +1199,11 @@ def art_lit_fraction(k, art_for, _cache=None, origin=None):
     m = np.maximum(np.maximum(((av >> 11) & 31) << 3,
                               ((av >> 5) & 63) << 2),
                    (av & 31) << 3)
-    return float((m > 24).mean())
+    # An opaque BLACK texel of the art is stored as FN.NEAR_BLACK (0x0841,
+    # RGB 8,8,8): 0x0000 would mean transparent. It is black, not lit -- at
+    # lit_min 8 it would otherwise pass (BUILD 816; nvdun2 showed 382 such
+    # cells). At the default 25 it is below the threshold anyway.
+    return float(((m >= lit_min) & (av != FN.NEAR_BLACK)).mean())
 
 
 def _pal_distance(pal565, pal, idx):
@@ -3199,6 +3204,26 @@ FULLBLACK_ART = os.environ.get('SEVENTH_NX_NO_FULLBLACK_ART') != '1'
 # The art must be lit essentially throughout. Not 1.0 -- a 768px cell is 2,304
 # texels and one dark texel at a corner is antialiasing, not an occluder.
 FULLBLACK_ART_LIT = 0.99
+# BUILD 816. "Lit" here means NOT BLACK: a max channel of at least one R5G6B5
+# step (8/255), not the >24 that `hue_broken` uses for "carries colour".
+#
+# nmkin_5's dark right side is 19 stock cells of pure black (palette 4, index
+# 78) whose Cosmos art is a flat, fully opaque dark blue of 8..24/255 (p50
+# 16). At > 24 none of it counted as lit, so all 19 stayed paletted and black
+# beside promoted neighbours of the same dark blue: black squares. The HD
+# black point used to hide it -- 12/255 grades 16 to ~4 -- but since BUILD 805
+# the black point is a user setting, and below 12 the squares show. FFNx draws
+# the art there (it replaces the whole background), so promoting matches it.
+#
+# An authored black occluder still refuses: its art is black, which the 565
+# art holds as FN.NEAR_BLACK (8,8,8) and art_lit_fraction does not count, and
+# 99% of texels at >= 8 cannot come from noise. Measured over a full build
+# (703 fields) and through the real repack: 41 stock black cells in 10 fields
+# change -- nmkin_5 19, psdun_4 12, las3_2 3, seven fields 1 each -- and
+# every other tile is unchanged; at black level 12 none of them looks
+# different. They join `_newly`, the back of the queue, so no cell loses
+# truecolor to them.
+FULLBLACK_ART_MIN = 8
 
 # ------------------------------------------------------------- FINDINGS-171
 # SETTLED. BOTH NOTES ARE RIGHT, AND THE DISPUTED SET IS FIVE TILES.
@@ -4304,8 +4329,9 @@ def dense_repack(sec3, sec9, field='', art_for=None, pals_for=None, px=256,
             if (FULLBLACK_ART and art_for is not None and _bf >= 1.0
                     and not keys[k]['l2']
                     and not _page_all_black(pages, arrays, pal565, k, _pbb)
-                    and art_lit_fraction(k, art_for, _fbc,
-                                         _org) >= FULLBLACK_ART_LIT):
+                    and art_lit_fraction(k, art_for, _fbc, _org,
+                                         lit_min=FULLBLACK_ART_MIN)
+                    >= FULLBLACK_ART_LIT):
                 _kept_tb.append(k)
                 _fbx.add(k)
                 continue

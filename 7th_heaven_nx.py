@@ -932,14 +932,16 @@ VOICE_NORM_CHOICES = [
 VOICE_NORM_LABELS = dict(VOICE_NORM_CHOICES)
 VOICE_NORM_BY_LABEL = {v: k for k, v in VOICE_NORM_CHOICES}
 
+# BUILD 815: HD lite is the shipped default (data/default_settings.json), so
+# it is the recommended entry and sits second; full HD follows it.
 SCALER_CHOICES = [
     ('', 'Original'),
-    ('hd', 'HD (recommended)'),
+    ('hd_lite', 'HD lite (recommended)'),
+    ('hd', 'HD \u2014 full hq4x'),
     ('xbr', 'xBR \u2014 edge-directed'),
     ('crisp', 'Crisp \u2014 pixelated'),
     ('soft', 'Soft \u2014 plain bilinear (developer control)'),
-    ('hd_lite', 'HD lite \u2014 lighter hq4x (GPU test)'),
-    ('hd_bilinear', 'HD bilinear \u2014 lightest hq4x (GPU test)'),
+    ('hd_bilinear', 'HD bilinear \u2014 lightest hq4x'),
 ]
 SCALER_LABELS = dict(SCALER_CHOICES)
 SCALER_BY_LABEL = {v: k for k, v in SCALER_CHOICES}
@@ -966,11 +968,13 @@ BLACK_POINT_CHOICES = [
 BLACK_POINT_LABELS = dict(BLACK_POINT_CHOICES)
 BLACK_POINT_BY_LABEL = {v: k for k, v in BLACK_POINT_CHOICES}
 
+# BUILD 815: HD fast is the shipped default, so it is the recommended entry
+# and sits second; Off is last.
 FXAA_CHOICES = [
     ('', 'Original'),
-    ('hd', 'HD (recommended)'),
+    ('hd_fast', 'HD fast (recommended)'),
+    ('hd', 'HD \u2014 full edge search'),
     ('off', 'Off'),
-    ('hd_fast', 'HD fast \u2014 shorter edge search (GPU test)'),
 ]
 FXAA_LABELS = dict(FXAA_CHOICES)
 FXAA_BY_LABEL = {v: k for k, v in FXAA_CHOICES}
@@ -1944,6 +1948,9 @@ def run_build(mods, enabled, settings_by_mod, log, progress,
     # See ff7nx_sfxpreload / ff7nx_blankhold.
     produced += build.apply_sfx_preload(SDOUT_DIR, DUMP, plan, log, produced)
     produced += build.apply_blank_hold(SDOUT_DIR, DUMP, plan, log, produced)
+    # BUILD 813. audio.fmt read from memory (world-map footstep stalls).
+    # See ff7nx_fmtcache.
+    produced += build.apply_fmt_cache(SDOUT_DIR, DUMP, plan, log, produced)
     # BUILD 675. FFNx's per-vertex model lighting. See ff7nx_lighting.
     produced += build.apply_lighting(SDOUT_DIR, DUMP, plan, log, produced)
     # BUILD 791. Its per-vertex loop (x86 0x68EA86) native, calling the
@@ -2094,6 +2101,11 @@ def launch_ui():
     # BUILD 804: saved values as they are; LOCKED fills what is missing.
     global_saved = nxsettings.effective_global(
         dict(default_globals(), **saved.get('__global__', {})))
+    # BUILD 814: Install Mods' check boxes -- mod source id -> selected.
+    # A mod not listed is selected (the default), so only the ones the user
+    # turned off need to be stored.
+    install_sel = {k: bool(v) for k, v in
+                   (global_saved.get('install_selection') or {}).items()}
     cap_label_by_value = dict(FIELD_TEX_CAP_CHOICES)
     value_by_cap_label = {v: k for k, v in FIELD_TEX_CAP_CHOICES}
     initial_cap_value = global_saved.get('field_tex_cap', 0)
@@ -2252,6 +2264,8 @@ def launch_ui():
         style.configure('Header.TLabel', font=('Helvetica', 18, 'bold'),
                         foreground=TEXT_PRIMARY)
         style.configure('Sub.TLabel', foreground=TEXT_SECONDARY)
+        # BUILD 814b: an Install Mods row whose check box is off
+        style.configure('GetModOff.TLabel', foreground=TEXT_MUTED)
         style.configure('ModName.TLabel', font=('Helvetica', 12),
                         background=BG_ROW, foreground=TEXT_PRIMARY)
         style.configure('ModNameSelected.TLabel', font=('Helvetica', 12, 'bold'),
@@ -2479,14 +2493,11 @@ def launch_ui():
         font=('Helvetica', 11)))
     # short: the header buttons are packed after this and get only the
     # width that is left, so a long label clips "Install Mods"
-    dev_tag = ttk.Label(header, text='·  DEV', style='Sub.TLabel')
-
+    # BUILD 814: the "·  DEV" tag beside this label is gone -- it no longer
+    # told users anything (Developer Settings only shows or hides rows since
+    # BUILD 804). Kept as a no-op: the Settings dialog still calls it.
     def _show_dev_tag():
-        if nxsettings.dev_mode():
-            dev_tag.pack(side='left', padx=(4, 0), after=dump_lbl)
-        else:
-            dev_tag.pack_forget()
-    _show_dev_tag()
+        pass
 
     # ---------- settings (one button; the dialog is built on demand) -----
     # Everything below used to live loose in the header: four wide combo
@@ -3589,7 +3600,7 @@ def launch_ui():
         win.title('Install Mods')
         win.configure(bg=BG_APP)
         win.transient(root)
-        win.minsize(760, 420)
+        win.minsize(860, 420)              # BUILD 814: room for Open mods folder
 
         top = ttk.Frame(win, padding=(16, 14, 16, 6))
         top.pack(side='top', fill='x')
@@ -3601,6 +3612,12 @@ def launch_ui():
         check_btn.pack(side='right')
         ttk.Button(top, text='Restore defaults',
                    command=lambda: restore_mod_defaults(win)
+                   ).pack(side='right', padx=(0, 8))
+        # BUILD 814: left of Restore defaults (packed right to left)
+        def open_mods_folder():
+            os.makedirs(MODS_DIR, exist_ok=True)
+            _reveal(MODS_DIR)
+        ttk.Button(top, text='Open mods folder', command=open_mods_folder
                    ).pack(side='right', padx=(0, 8))
 
         # Right to left: Close, Install all (Cancel while running). The
@@ -3621,15 +3638,20 @@ def launch_ui():
         area = ttk.Frame(win, padding=(16, 0))
         area.pack(side='top', fill='both', expand=True)
         _c, table = make_scrollable(area, inner_width_tracks_canvas=True)
-        table.columnconfigure(0, weight=1)
-        for col, (text, w) in enumerate((('MOD', 0), ('INSTALLED', 90),
+        # BUILD 814: column 0 is each mod's check box -- Install all only
+        # does the checked rows; the per-row Install / Update link still
+        # works for any row.
+        table.columnconfigure(1, weight=1)
+        for col, (text, w) in enumerate((('', 24), ('MOD', 0),
+                                         ('INSTALLED', 90),
                                          ('LATEST', 90), ('SIZE', 80),
                                          ('STATUS', 150))):
             table.columnconfigure(col, minsize=w)
             ttk.Label(table, text=text, style='ColHeader.TLabel').grid(
-                row=0, column=col, sticky='w', padx=(0, 10), pady=(4, 2))
+                row=0, column=col, sticky='w', padx=(0, 10 if col else 4),
+                pady=(4, 2))
         ttk.Separator(table, orient='horizontal').grid(
-            row=1, column=0, columnspan=5, sticky='ew', pady=(0, 4))
+            row=1, column=0, columnspan=6, sticky='ew', pady=(0, 4))
 
         state = {'catalog': {}, 'busy': False, 'cancel': False,
                  'installed': 0, 'jobs': []}
@@ -3671,18 +3693,44 @@ def launch_ui():
                 return 'update'
             return None
 
+        sel_vars = {}
+
+        def selected_src(src):
+            return install_sel.get(src['id'], True)
+
+        def on_select(src):
+            v = bool(sel_vars[src['id']].get())
+            rows[src['id']]['name'].configure(
+                style='TLabel' if v else 'GetModOff.TLabel')
+            if v:
+                install_sel.pop(src['id'], None)    # the default: not stored
+            else:
+                install_sel[src['id']] = False
+            save_settings_now()
+            refresh()
+
         for i, src in enumerate(sources):
             r = i + 2
-            name = ttk.Label(table, text=src['name'])
-            name.grid(row=r, column=0, sticky='w', padx=(0, 10), pady=3)
+            var = tk.BooleanVar(value=selected_src(src))
+            sel_vars[src['id']] = var
+            # takefocus=False: a clicked box would otherwise keep Tk's
+            # dotted focus ring around itself (BUILD 814b)
+            ttk.Checkbutton(table, variable=var, takefocus=False,
+                            command=lambda s=src: on_select(s)).grid(
+                row=r, column=0, sticky='w', padx=(0, 4), pady=3)
+            # an unchecked mod's name is dimmed (BUILD 814b)
+            name = ttk.Label(table, text=src['name'],
+                             style='TLabel' if selected_src(src)
+                             else 'GetModOff.TLabel')
+            name.grid(row=r, column=1, sticky='w', padx=(0, 10), pady=3)
             have = ttk.Label(table, style='Sub.TLabel')
-            have.grid(row=r, column=1, sticky='w', padx=(0, 10))
+            have.grid(row=r, column=2, sticky='w', padx=(0, 10))
             latest = ttk.Label(table, style='Sub.TLabel')
-            latest.grid(row=r, column=2, sticky='w', padx=(0, 10))
+            latest.grid(row=r, column=3, sticky='w', padx=(0, 10))
             size = ttk.Label(table, style='Sub.TLabel')
-            size.grid(row=r, column=3, sticky='w', padx=(0, 10))
+            size.grid(row=r, column=4, sticky='w', padx=(0, 10))
             cell = ttk.Frame(table)
-            cell.grid(row=r, column=4, sticky='w')
+            cell.grid(row=r, column=5, sticky='w')
             # Install / Update is a link, not a button, so the column reads
             # as text like "Up to date" beside it.
             btn = ttk.Label(cell, style='Link.TLabel', cursor='hand2')
@@ -3722,7 +3770,8 @@ def launch_ui():
         def refresh():
             for src in sources:
                 show_row(src)
-            todo = [s for s in sources if need(s)]
+            # BUILD 814: only the checked rows
+            todo = [s for s in sources if need(s) and selected_src(s)]
             idle = not state['busy']
             check_btn.state(['!disabled' if idle else 'disabled'])
             if state['jobs']:
@@ -3734,7 +3783,8 @@ def launch_ui():
             all_btn.configure(
                 text='Install all (%d)' % len(todo) if todo
                 else 'Install all',
-                command=lambda: start([s for s in sources if need(s)]))
+                command=lambda: start([s for s in sources
+                                       if need(s) and selected_src(s)]))
             all_btn.state(['!disabled' if idle and todo else 'disabled'])
 
         def worker_catalog():
@@ -3885,7 +3935,7 @@ def launch_ui():
         win.protocol('WM_DELETE_WINDOW', close)
 
         win.update_idletasks()
-        w, h = 820, 620
+        w, h = 920, 620                    # BUILD 814: was 820 (one more header button)
         x = root.winfo_rootx() + (root.winfo_width() - w) // 2
         y = root.winfo_rooty() + 40
         win.geometry('%dx%d+%d+%d' % (w, h, max(x, 0), max(y, 0)))
@@ -4010,7 +4060,7 @@ def launch_ui():
     DEV_BIO = ('Software developer with background in embedded systems, '
                'signal processing, machine learning / AI, electrical '
                'engineering, and astrophysics research.')
-    DEV_CREDITS = ('Special thanks to FFNX, 7th Heaven, Tsunamods, Ad0ky, '
+    DEV_CREDITS = ('Special thanks to FFNx, 7th Heaven, Tsunamods, Ad0ky, '
                    'and many others. \u2665\ufe0f')
     DEV_AVATAR = os.path.join(nxpaths.APP, 'assets', 'dev_avatar.png')
     DEV_AVATAR_PX = 112
@@ -4294,7 +4344,9 @@ def launch_ui():
                                  'title_screen': current_title_screen(),
                                  'gui_theme': current_theme(),
                                  'developer_settings':
-                                     bool(devset_var.get())}
+                                     bool(devset_var.get()),
+                                 # BUILD 814: Install Mods' check boxes
+                                 'install_selection': dict(install_sel)}
         # BUILD 804: saved as the vars hold them, developer mode or not.
         return persist
 
