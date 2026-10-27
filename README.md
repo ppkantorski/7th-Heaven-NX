@@ -29,7 +29,7 @@ On PC, mods like Cosmo Memory, Echo-S and Enhanced Stock UI depend on FFNx, a re
 
 ### For Players
 - Runs the mods you already know from 7th Heaven, built from the same `.iro` packages
-- **Get Mods** window that checks the 7th Heaven catalogs, then installs or updates every supported mod in one click
+- **Install Mods** window that checks the 7th Heaven catalogs, then installs or updates every supported mod in one click. Untick a mod to leave it out of Install all (remembered between runs), and **Open mods folder** takes you straight to your `mods/`
 - Per-mod options, the same ones 7th Heaven shows, with a *Modifies* column so you can see which parts of the game each choice touches
 - Load order resolved exactly like 7th Heaven (category auto-sort, first match wins), so conflicts come out the same as on PC
 - **16:9 widescreen** across fields, battles, the world map and movies, using each mod's own widescreen config
@@ -46,7 +46,7 @@ On PC, mods like Cosmo Memory, Echo-S and Enhanced Stock UI depend on FFNx, a re
 
 ### Supported Mods
 
-The **Get Mods** window lists every mod below and fetches it from the 7th Heaven catalog.
+The **Install Mods** window lists every mod below and fetches it from the 7th Heaven catalog.
 
 | Mod | Category |
 |---|---|
@@ -89,6 +89,7 @@ Where FFNx already solves a problem (field camera ranges, shadow rules, effect i
 
 **Battle**
 - More effects widened for 16:9, including Ultima's screen-filling glow, which FFNx leaves at 4:3
+- **W-Item duplication fixed.** In the original game, choosing a first item with W-Item and then backing out at the second target gives the first item back without cancelling the pick, so repeating it duplicates items. Backing out of the item list after the first pick also lost that item. Both now behave correctly: backing out undoes the first pick, and nothing is gained or lost. Set `SEVENTH_NX_WITEM_FIX=0` to keep the original behaviour
 
 **World map**
 - An orbit camera for filming: L and R swing the camera around you on foot, on chocobos and in every vehicle, without changing which way you're heading
@@ -121,11 +122,11 @@ Where FFNx already solves a problem (field camera ranges, shadow rules, effect i
 1. Download the zip for your system from the [latest release](https://github.com/ppkantorski/7th-Heaven-NX/releases/latest) and unzip it anywhere you can write to. That folder is your 7th Heaven NX folder.
 2. Dump the game's ExeFS and RomFS from your Switch with update 1.0.3_5 installed, so the update's files are merged in rather than the base game's alone (for example with [nxdumptool](https://github.com/DarkMatterCore/nxdumptool)). Put them in `dump/` inside the folder, so you have `dump/exefs/main` and `dump/romfs/ff7/workingdir/`.
 3. Run **7th Heaven NX** (`7th Heaven NX.exe` on Windows, `7th Heaven NX.app` on macOS).
-4. Open **Get Mods**, install the mods you want, and restart when it asks.
+4. Open **Install Mods**, tick the mods you want and press **Install all**. They appear in the mod list as soon as they finish.
 5. Turn mods on in the list, set their options, then press **Build SD Output**.
 6. Copy the contents of `sdout/` to the root of your SD card.
 
-FFmpeg is downloaded once on the first run, into `ffmpeg/`.
+FFmpeg is downloaded once on the first run, into `modules/ffmpeg/`.
 
 > The builds aren't code-signed. On Windows, SmartScreen may stop it the first time: choose **More info → Run anyway**. On macOS, right-click the app and choose **Open**, or run `xattr -dr com.apple.quarantine "7th Heaven NX.app"`.
 
@@ -173,8 +174,8 @@ Open **Settings** from the main window.
   - **Output resolution**: always 1080p, dynamic (1080p docked, 720p handheld), or 720p as shipped
   - **Title screen**: HD Buster Sword, whatever your mods set, or the original
 - **Graphics**
-  - **Background upscaling**: Original, HD, xBR or Crisp
-  - **Anti-aliasing**: Original, HD or Off
+  - **Background upscaling**: Original, HD lite (recommended), HD, xBR, Crisp or HD bilinear
+  - **Anti-aliasing**: Original, HD fast (recommended), HD or Off
   - **Movie shader**: Original or HD
   - **Movie quality**: higher looks better and takes longer to build
   - **Model shadows**: shadows shaped like the model instead of round blobs
@@ -195,11 +196,14 @@ Turning Developer Settings off only hides those rows. The build keeps using what
 
 ### Your 7th Heaven NX folder
 
+A release build keeps everything next to the program. Only `mods/`, `dump/` and the settings are yours to edit; the rest is created and managed by the program.
+
 ```
 7th Heaven NX/
-├── 7th Heaven NX(.exe / .app)   ← or 7th_heaven_nx.py when running from source
-├── settings.json                ← your mod list, options and settings
-├── dump/                        ← your game dump
+├── 7th Heaven NX(.exe)          ← the program (on macOS: 7th Heaven NX.app)
+├── _internal/                   ← the program's own files (Windows and Linux; inside the .app on macOS)
+├── settings.json                ← your mod list, load order, mod options and settings
+├── dump/                        ← your game dump (you provide this)
 │   ├── exefs/
 │   │   └── main
 │   └── romfs/
@@ -207,13 +211,38 @@ Turning Developer Settings off only hides those rows. The build keeps using what
 │           ├── resources/
 │           ├── shaders/
 │           └── workingdir/
-├── mods/                        ← .iro mods (Get Mods puts them here)
-├── cache/                       ← extracted mods and built archives (safe to delete)
-├── ffmpeg/                      ← downloaded on first run
-└── sdout/                       ← build output, copy this to your SD card
+├── mods/                        ← .iro mods (Install Mods puts them here)
+├── cache/                       ← extracted mods and built archives, so rebuilds are fast (safe to delete)
+├── data/                        ← per-user data written by builds
+├── modules/
+│   └── ffmpeg/                  ← FFmpeg, downloaded on the first run
+├── sdout/                       ← build output: copy its contents to your SD card
+└── 7th_heaven_nx.log            ← log file (windowed builds, which have no console)
+```
+
+Running from source, the same user folders sit next to `7th_heaven_nx.py`, alongside the code:
+
+```
+7th-Heaven-NX/
+├── 7th_heaven_nx.py             ← entry point (the only Python file at the root)
+├── src/                         ← the program's modules, by subsystem
+├── tests/                       ← test suite
+├── tools/                       ← release builder, diagnostics and probes
+├── data/                        ← static data (mod sources, default settings, tables)
+├── native/                      ← compiled ARM64 payloads patched into exefs/main, with their C sources
+├── shaders/                     ← the HD shader sets
+├── assets/                      ← icons and title art
+├── common/
+│   └── PyFF7/                   ← PyFF7, downloaded on the first run
+├── docs/                        ← developer notes (see docs/DEVELOPING.md)
+├── .venv/                       ← private Python packages, installed on the first run
+├── settings.json, dump/, mods/, cache/, sdout/   ← as above
+└── attic/                       ← local backups and retired files (not in the repo)
 ```
 
 ### What goes on the SD card
+
+A build writes only the files your mods and settings change. Anything not listed is read from the game as usual. Which of these appear depends on the mods you turn on.
 
 ```
 sdmc:/
@@ -221,20 +250,31 @@ sdmc:/
     └── contents/
         └── 0100A5B00BDC6000/
             ├── exefs/
-            │   └── main                  ← patched game module
+            │   └── main                       ← patched game module (60 FPS, widescreen, fixes and the rest)
             └── romfs/
                 └── ff7/
-                    ├── shaders/          ← HD shader set
+                    ├── resources/
+                    │   └── ff7_1.02/
+                    │       └── ff7_en         ← the game's PC exe, with the mods' data patches
+                    ├── shaders/               ← HD upscaling, anti-aliasing, movie,
+                    │                            widescreen and model shadow shaders
                     └── workingdir/
                         └── data/
-                            ├── field/    ← flevel.lgp, char.lgp
-                            ├── battle/   ← battle.lgp, magic.lgp
-                            ├── wm/       ← world_us.lgp
-                            ├── menu/     ← menu_us.lgp
-                            ├── sound/    ← audio.dat, audio.fmt
-                            ├── music_ogg/
-                            ├── movies/
-                            └── ...
+                            ├── field/         ← flevel.lgp (field scenes and backgrounds),
+                            │                    char.lgp (field models)
+                            ├── battle/        ← battle.lgp (battle models), magic.lgp (spells and summons),
+                            │                    battle scene files (stage*.dat)
+                            ├── wm/            ← world_us.lgp (world map), wm0.far (far terrain)
+                            ├── menu/          ← menu_us.lgp (menus, fonts, battle UI)
+                            ├── minigame/      ← chocobo, coaster, condor, highway, snowboard
+                            │                    and submarine archives
+                            ├── cd/            ← moviecam.lgp (movie cameras, for 60 FPS movies)
+                            ├── sound/         ← audio.dat and audio.fmt (sound effects, footsteps)
+                            ├── music_ogg/     ← music, ambience and Echo-S voice lines (one folder per field)
+                            ├── movies/        ← movies (.mp4)
+                            ├── lang-en/       ← English text: kernel/ (kernel.bin, kernel2.bin, window.bin)
+                            │                    and battle/scene.bin, plus movies/ (the localized movies)
+                            └── lang-de/, lang-es/, lang-fr/, lang-ja/   ← each language's localized movies
 ```
 
 To uninstall, delete `atmosphere/contents/0100A5B00BDC6000/`.
