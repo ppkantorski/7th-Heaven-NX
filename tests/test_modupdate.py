@@ -268,3 +268,23 @@ class CompactRestore(ModUpdate):
             self.assertFalse(build.Mod(p, self.cache).ensure_extracted())
         finally:
             G.ROOT = old_root
+
+
+class CaseTwins(ModUpdate):
+    """BUILD 851: entries differing only in case are written one after the
+    other (last wins on a case-insensitive disk), never at the same time."""
+
+    def test_twins_extract_in_order(self):
+        import iro
+        p = os.path.join(self.mods, 'Twins.iro')
+        write_iro(p, [('mod.xml', XML.format('bbbb', 'Gameplay').encode()),
+                      ('d\\Same.bin', b'first'), ('d\\same.bin', b'second!'),
+                      ('d\\other.bin', b'x' * 1000)])
+        out = os.path.join(self.tmp, 'out')
+        written, skipped, failures, excluded = iro.extract(p, out)
+        self.assertEqual(failures, [])
+        self.assertEqual(written, 4)
+        names = {n.lower() for n in os.listdir(os.path.join(out, 'd'))}
+        self.assertIn('same.bin', names)
+        last = os.path.join(out, 'd', 'same.bin')
+        self.assertEqual(open(last, 'rb').read(), b'second!')

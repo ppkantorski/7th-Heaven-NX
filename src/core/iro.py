@@ -229,6 +229,12 @@ def extract(src, dest, progress=None, skip=None):
                 room.notify_all()
 
     futures = []
+    # BUILD 851: two entries whose names differ only in case are ONE file on
+    # Windows and macOS. Written in parallel, which of them ends up on disk
+    # would be down to timing (and two threads would share the file); the
+    # later one waits for the earlier, so the last entry wins as it did when
+    # extraction was sequential. None of the supported mods has such a pair.
+    by_name = {}
     with open(src, 'rb') as f, ThreadPoolExecutor(max_workers=workers) as pool:
         _, _, entries = read_entries(f)
         check_complete(src, entries, filesize)
@@ -255,8 +261,12 @@ def extract(src, dest, progress=None, skip=None):
                 room.wait_for(lambda: flight[0] == 0
                               or flight[0] + held <= cap)
                 flight[0] += held
-            futures.append(pool.submit(finish, name, eflags, size, out,
-                                       data, held))
+            same = by_name.get(out.lower())
+            if same is not None:
+                same.result()
+            fu = pool.submit(finish, name, eflags, size, out, data, held)
+            by_name[out.lower()] = fu
+            futures.append(fu)
         written = sum(1 for fu in futures if fu.result())
     return written, skipped, failures, excluded
 
