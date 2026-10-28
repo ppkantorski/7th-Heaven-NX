@@ -46,7 +46,7 @@ HERE = nxpaths.ROOT
 
 # Shown in the header, nearest the title. Single source of truth --
 # anything else that needs it should import this rather than repeat it.
-VERSION = '1.0.3'
+VERSION = '1.0.4'
 sys.path.insert(0, HERE)
 
 import build  # noqa: E402
