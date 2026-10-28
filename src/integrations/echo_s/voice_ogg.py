@@ -1005,6 +1005,28 @@ def cache_path(source):
     return _cache_paths(source)[0]
 
 
+def _replace(source, target, tries=40, wait=0.05):
+    """os.replace, retried on Windows' PermissionError. BUILD 851.
+
+    On Windows a file that was just written is often held open for a moment
+    by something else -- real-time antivirus scanning (Defender included),
+    the search indexer, a sync client -- and renaming it (or over it) then
+    fails with WinError 5, "Access is denied". With eight workers publishing
+    thousands of clips, one eventually lands in that window and stopped the
+    whole build. The hold clears on its own, so wait and try again (up to
+    ~6 s, growing waits); anything still failing after that is a real
+    permission problem and is raised as before."""
+    import time
+    for n in range(tries):
+        try:
+            os.replace(source, target)
+            return
+        except PermissionError:
+            if os.name != 'nt' or n == tries - 1:
+                raise
+            time.sleep(min(wait * (n + 1), 0.3))
+
+
 def _publish_final_sample_loop(source, target):
     """Retag one legacy cache entry atomically, without re-encoding audio."""
     with open(source, 'rb') as handle:
@@ -1017,7 +1039,7 @@ def _publish_final_sample_loop(source, target):
         with os.fdopen(handle, 'wb') as output:
             output.write(converted)
         verify(temporary)
-        os.replace(temporary, target)
+        _replace(temporary, target)
         temporary = None
     finally:
         if temporary and os.path.exists(temporary):
@@ -1214,7 +1236,7 @@ def encode(source, target):
         with open(temporary, 'wb') as handle:
             handle.write(converted)
         measured = verify(temporary)
-        os.replace(temporary, target)
+        _replace(temporary, target)
         temporary = None
         return measured
     finally:
@@ -1334,8 +1356,30 @@ def stage(entries, output_dir, filename=voicemod.folder_voice_key_to_filename,
             raise VoiceEncodeError('voice entry %s has no source file'
                                    % filename(entry.key))
 
+    # BUILD 851. ONE CACHE ENTRY, ONE WRITER. `sources` is distinct by PATH,
+    # but the cache is keyed by CONTENT (_cache_paths), and Echo-S ships many
+    # lines whose audio is byte-identical under different names. Two workers
+    # could then encode the SAME cache entry at once: harmless on macOS and
+    # Linux (the second rename just replaces the first), but on Windows a
+    # file cannot be renamed over while another thread holds it open -- the
+    # first worker reading it back in verify() -- and os.replace failed with
+    # WinError 5 "Access is denied", stopping the build. Each cache entry now
+    # has a lock: the second worker waits, finds the finished clip and uses
+    # it (counted as cached).
+    import threading
+    entry_locks, entry_locks_guard = {}, threading.Lock()
+
+    def entry_lock(path):
+        with entry_locks_guard:
+            return entry_locks.setdefault(os.path.normcase(path),
+                                          threading.Lock())
+
     def prepare(source):
         cached, legacy = _cache_paths(source)
+        with entry_lock(cached):
+            return _prepare_locked(source, cached, legacy)
+
+    def _prepare_locked(source, cached, legacy):
         made = False
         if not os.path.isfile(cached):
             if LEGACY_IS_AUDIO_IDENTICAL and os.path.isfile(legacy):
