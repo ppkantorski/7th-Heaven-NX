@@ -11,8 +11,11 @@ ARM body is 72 KB.
 
 It is split so a shipping pass and the diagnostic probe can never collide:
 
-    [lo + 0x40,    lo + 0x300)  'ship': ff7nx_campreserve (356 bytes; 2 KB
-                                until BUILD 739)
+    [lo + 0x40,    lo + 0x200)  'ship': ff7nx_campreserve (356 bytes; 2 KB
+                                until BUILD 739, 704 until BUILD 842)
+    [lo + 0x200,   lo + 0x300)  'sleep': ff7nx_fieldpace's limiter sleep
+                                (BUILD 842) -- one shared routine and four
+                                4-word stubs, 184 bytes; 'pace' has 108 left
     [lo + 0x300,   lo + 0x800)  'amb': ff7nx_ambient (BUILD 739) -- the
                                 ambience fade and rotation runtime, which the
                                 spent padding pool has no room for
@@ -63,8 +66,12 @@ It is split so a shipping pass and the diagnostic probe can never collide:
                                 window colour sliders' press-then-repeat
     [lo + 0x3600,  lo + 0x3C00) 'campos': ff7nx_campos (BUILD 610) -- the
                                 field camera's unfloored follow position
-    [lo + 0x3C00,  lo + 0x4C00) 'pointers': ff7nx_pointers (BUILD 611) --
+    [lo + 0x3C00,  lo + 0x4A00) 'pointers': ff7nx_pointers (BUILD 611) --
                                 the pointer hand and the exit-arrow table
+    [lo + 0x4800,  lo + 0x4C00) 'boost': ff7nx_fieldpace (BUILD 847; 843
+                                had 512 B from 0x4A00) -- the 3x booster's
+                                extra logic ticks, field, battle and the battle
+                                menu pass count (800 B)
     [lo + 0x4C00,  lo + 0x6000) 'daynight': ff7nx_daynight (BUILD 614b) --
                                 the whole day/night runtime, when the
                                 padding pool has no window left for it
@@ -116,6 +123,7 @@ DEAD_BODY = 0x623D28
 SHIP_BYTES = 0x1000
 ENTRY_GUARD = 0x40
 AMB_AT = 0x300                        # BUILD 739: the upper part of 'ship'
+SLEEP_AT = 0x200                      # BUILD 842: the upper 256 B of 'ship'
 PACE_AT = 0x800
 SFXBAT_AT = 0x8C0                     # BUILD 741: was 0x900 (740); 'pace' needs 84 B
 SPEAK_AT = 0xC00                      # BUILD 708: the upper KB of 'pace'
@@ -134,6 +142,8 @@ FOLLOW_AT = 0x3200                    # BUILD 693: the upper KB of 'calendar'
 WINREP_AT = 0x3500                    # BUILD 694: the top of 'follow'
 CAMPOS_AT = 0x3600
 POINTERS_AT = 0x3C00
+BOOST_AT = 0x4800                     # BUILD 847: the top KB of 'pointers'
+                                      # (it uses 2,688 of 3,072; 843 took 512 B)
 DAYNIGHT_AT = 0x4C00
 SHADOW_AT = 0x6000                    # BUILD 661: was 0x5C00 (daynight +1 KB)
 WMTIME_AT = 0x9800                    # BUILD 667d: was 0x9000 (665e); shadow 14 KB again (667d model mark)
@@ -175,7 +185,9 @@ def part(src, which, stock=None):
         # never at the entry itself: the liveness proof above asks whether
         # any branch targets the dead function's ENTRY, and a cave placed
         # there would make the next build's proof fail on our own hook.
-        p = (lo + ENTRY_GUARD, lo + AMB_AT)
+        p = (lo + ENTRY_GUARD, lo + SLEEP_AT)
+    elif which == 'sleep':
+        p = (lo + SLEEP_AT, lo + AMB_AT)
     elif which == 'amb':
         p = (lo + AMB_AT, lo + PACE_AT)
     elif which == 'pace':
@@ -211,7 +223,9 @@ def part(src, which, stock=None):
     elif which == 'campos':
         p = (lo + CAMPOS_AT, lo + POINTERS_AT)
     elif which == 'pointers':
-        p = (lo + POINTERS_AT, lo + DAYNIGHT_AT)
+        p = (lo + POINTERS_AT, lo + BOOST_AT)
+    elif which == 'boost':
+        p = (lo + BOOST_AT, lo + DAYNIGHT_AT)
     elif which == 'daynight':
         p = (lo + DAYNIGHT_AT, lo + SHADOW_AT)
     elif which == 'shadow':

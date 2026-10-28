@@ -1200,6 +1200,29 @@ def test_the_flip_tick_obeys_the_enable_and_advance_bits():
     assert paused.clock() == (9, 30, 1, 0), 'bit 1 is clear and time moved'
 
 
+def test_a_paused_battle_stops_the_clock():
+    """BUILD 844: g_is_battle_paused (0xDC0E6C) freezes the flip tick in
+    battle; unpausing resumes from the same part-minute. Other modes ignore
+    the byte."""
+    w = World(options=0x07, hours=9, minutes=30, mode=D.DRIVER_BATTLE)
+    for _ in range(20):
+        w.run('flip')
+    assert w.frames() == 20
+    w.gset8(D.G_BATTLE_PAUSED, 1)
+    for _ in range(400):
+        assert w.run('flip') == D.FLIP_RESUME
+    assert w.clock() == (9, 30, 1, 0) and w.frames() == 20
+    w.gset8(D.G_BATTLE_PAUSED, 0)
+    for _ in range(20):
+        w.run('flip')
+    assert w.clock() == (9, 31, 1, 0)
+    world = World(options=0x07, hours=9, minutes=30, mode=D.DRIVER_WORLD)
+    world.gset8(D.G_BATTLE_PAUSED, 1)
+    for _ in range(40):
+        world.run('flip')
+    assert world.clock() == (9, 31, 1, 0), 'only a battle pauses the clock'
+
+
 def test_the_flip_tick_never_leaves_a_tint_behind():
     """It advances the clock, it does not arm anything. Battle and the world
     map are not tinted in this build, and the frame boundary is still where

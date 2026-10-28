@@ -74,6 +74,67 @@ def _build_redirect_cave(_entry, addr):
     return a.resolve()
 
 
+# BUILD 845: THE TUTORIAL MOVIE FILLS THE SCREEN -- THIS MOVIE ONLY.
+#
+# The tutorial is 4:3 (1280x960); every other FMV is 10:7. During a field FMV
+# two of our passes frame the picture so it meets the field art:
+# ff7nx_moviealign moves the movie quad down 16 game units, and
+# ff7nx_moviebars paints black bars over the frame (sides, top 0..16, bottom
+# 464..480) so models vanish under them at the FMV <-> field cuts. A 4:3
+# movie is 480 units tall, so it is pushed down and its bottom is painted
+# over. For the tutorial both passes now stand aside -- no shift, side bars
+# only -- and the picture spans the full height, as in FFNx.
+#
+# "The tutorial" is: the current field is mds7pb_1 (where this module's
+# redirect plays it) AND the playing movie is 4:3 or taller (h*4 >= w*3),
+# read from the port's movie renderer [[0x12CE280]] +0x1C / +0x20 -- the
+# same two words +0x5C90 hands to the quad. Every 10:7 FMV fails the size
+# test; every other field fails the field test.
+MOVIE_RENDERER_GOT = 0x12CE280
+RENDERER_W, RENDERER_H = 0x1C, 0x20
+FULLVIEW_ENV = 'SEVENTH_NX_TUTORIAL_FULLVIEW'
+
+
+def fullview_enabled():
+    return os.environ.get(FULLVIEW_ENV, '').strip().lower() not in (
+        '0', 'off', 'no', 'false')
+
+
+def tutorial_test(addr, base, miss):
+    """Words that branch to `miss` unless the tutorial movie is playing.
+
+    `addr(i)` is the real address of word i (ff7nx_cave layouts), `base` the
+    index of the first word emitted here. Clobbers x0-x18 and x30 (the guest
+    translator), nothing else. No `b`: every branch is conditional, so the
+    callers' cave walkers (which treat a `b` as a link) are not disturbed.
+    """
+    w = []
+
+    def at():
+        return addr(base + len(w))
+    w += A.movz_movk(0, CURRENT_FIELD_ID)
+    w.append(A.bl(at(), RESOLVE_PAGED))
+    w.append(A.ldrh(9, 0, 0))
+    w.append(A.cmp_imm(9, MDS7PB_1_FIELD_ID))
+    w.append(A.bcond(at(), miss, A.NE))
+    w.append(A.adrp(10, at(), MOVIE_RENDERER_GOT & ~0xFFF))
+    w.append(A.ldr64(10, 10, MOVIE_RENDERER_GOT & 0xFFF))
+    w.append(A.cbz64(10, at(), miss))
+    w.append(A.ldr64(10, 10, 0))
+    w.append(A.cbz64(10, at(), miss))
+    w.append(A.ldr(11, 10, RENDERER_W))
+    w.append(A.ldr(12, 10, RENDERER_H))
+    w.append(A.cbz(11, at(), miss))
+    w.append(A.add_reg_lsl(11, 11, 11, 1))       # w * 3
+    w.append(A.lsl(12, 12, 2))                   # h * 4
+    w.append(A.cmp_reg(12, 11))
+    w.append(A.bcond(at(), miss, A.LT))
+    return w
+
+
+TUTORIAL_TEST_WORDS = 18
+
+
 def _verified_hole_pool(src, text):
     module = nxmap.Main(src)
     image = bytearray(module.img)

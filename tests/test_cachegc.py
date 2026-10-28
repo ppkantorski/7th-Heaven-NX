@@ -144,6 +144,82 @@ class CacheGC(unittest.TestCase):
         self.assertFalse(os.path.exists(lc_old))
         self.assertTrue(os.path.exists(lc_new))   # current tag: not a sweep key
 
+    # ---- BUILD 848 ---------------------------------------------------
+    def test_fieldlzs_is_swept_when_flevel_was_rebuilt(self):
+        """Another archive kept no longer blocks _fieldlzs; movies (no
+        archive listed) keep the old all-archives rule."""
+        self.build()
+        G.sweep(self.mods, {'battle.lgp'})
+        self.assertTrue(self.exists('used'))
+        self.assertFalse(self.exists('stale'))
+        self.assertTrue(self.exists('mov_old'))
+
+    def test_a_kept_flevel_keeps_fieldlzs(self):
+        self.build()
+        logs = []
+        G.sweep(self.mods, {'flevel.lgp'}, logs.append)
+        self.assertTrue(self.exists('stale'))
+        self.assertTrue(any('_fieldlzs' in l and 'not swept' in l
+                            for l in logs))
+
+    def test_spell_dds_follows_magic(self):
+        used = os.path.join(self.root, '_spell_dds', 'u.tex')
+        old = os.path.join(self.root, '_spell_dds', 'o.tex')
+        for p in (used, old):
+            touch(p)
+        for kept, gone in (({'magic.lgp'}, False), ({'flevel.lgp'}, True)):
+            touch(old)
+            G.start()
+            open(used, 'rb').read()
+            G.sweep(self.mods, kept)
+            self.assertTrue(os.path.exists(used))
+            self.assertEqual(not os.path.exists(old), gone)
+
+    def test_compact_keeps_the_mtimes_and_restores_them(self):
+        here = os.path.join(self.root, 'Here')
+        with open(os.path.join(here, '.iro-signature'), 'w') as f:
+            f.write('123-456\n0\nv\n')
+        a = os.path.join(here, 'a', 'b.dds')
+        touch(a, b'z' * 10)
+        touch(os.path.join(here, 'mod.xml'))
+        os.utime(a, ns=(10 ** 18, 10 ** 18))
+        folder = os.path.join(self.mods, 'Folder')         # folder mod
+        touch(os.path.join(folder, 'mod.xml'))
+        logs = []
+        freed = G.sweep(self.mods, {'flevel.lgp'}, logs.append, compact=True)
+        self.assertGreaterEqual(freed, 10)
+        self.assertEqual(os.listdir(here), [G.COMPACT_MARK])
+        self.assertTrue(os.path.exists(os.path.join(folder, 'mod.xml')))
+        sig, files = G.read_compact_mark(here)
+        self.assertEqual(sig, '123-456')
+        self.assertEqual(files[os.path.join('a', 'b.dds')], (10, 10 ** 18))
+        # the next build's extraction: fresh mtime, same bytes
+        touch(a, b'z' * 10)
+        kept, other = G.restore_compact_mtimes(here, files)
+        self.assertEqual(os.stat(a).st_mtime_ns, 10 ** 18)
+        self.assertEqual(kept, 1)
+        # still an installed mod's cache: never an orphan
+        G.sweep_orphans(self.mods)
+        self.assertTrue(os.path.exists(here))
+
+    def test_compact_of_an_uninstalled_or_unextracted_mod(self):
+        os.remove(os.path.join(self.root, 'Here', '.iro-signature'))
+        touch(os.path.join(self.root, 'Here', 'mod.xml'))      # only listed
+        G.sweep(self.mods, set(), compact=True)
+        self.assertTrue(os.path.exists(os.path.join(self.root, 'Here',
+                                                    'mod.xml')))
+        self.assertFalse(os.path.exists(os.path.join(self.root, 'Here',
+                                                     G.COMPACT_MARK)))
+        touch(os.path.join(self.root, 'Lone', G.COMPACT_MARK))
+        G.sweep_orphans(self.mods)          # its .iro is gone: an orphan
+        self.assertFalse(os.path.exists(os.path.join(self.root, 'Lone')))
+
+    def test_compact_toggle(self):
+        os.environ.pop(G.COMPACT_ENV, None)
+        self.assertFalse(G.compact_enabled())
+        os.environ[G.COMPACT_ENV] = '1'
+        self.assertTrue(G.compact_enabled())
+        os.environ.pop(G.COMPACT_ENV)
 
 if __name__ == '__main__':
     unittest.main()

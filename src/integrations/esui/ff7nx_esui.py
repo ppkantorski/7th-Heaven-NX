@@ -94,8 +94,46 @@ LOCKED_OPTIONS = {
 }
 
 
+# BUILD 849. PC-ONLY ADD-ONS BUILT ON ESUI'S mod.xml. They copy ESUI's options
+# and folders, but what they exist for cannot run on the Switch, so the build
+# leaves them out entirely and the GUI shows every option greyed out.
+#
+#   FF7 kor ADDON HD re.Echo-S ver.L (ID ...9d47, "User Interface"): the
+#   Korean translation add-on (by ffsaga / D-rop / KISSJIN). Its game text --
+#   0tran1.txt's menu strings in ff7_en, kernel.bin, kernel2.bin, scene.bin,
+#   world mes and 703 Echo-S flevel fields -- is Hangul in a two-byte code
+#   (lead bytes 0xC0-0xCC). FF7's own text engine draws one byte per glyph
+#   from a 256-glyph font; the two-byte decoder is ali213.dll, a Windows DLL
+#   that hext\zzz_cht_patch.txt loads with LoadLibraryA (x86 0x400FB0, hooked
+#   from 0x676619). The DLL is not in the .iro (it comes with the base patch,
+#   "ff7 cht 1.23", ID ...9d43, which this add-on must load BEFORE), and the
+#   Switch runs ARM code with no DLLs: every Korean string would be drawn as
+#   pairs of wrong Latin glyphs. Its other parts (an ESUI copy, Korean
+#   minigame/disc art, subtitled movies) only make sense with that text.
+PC_ONLY = {
+    'a724de0b-f345-4af8-82a0-8ea2638f9d47': (
+        'Switch: needs the PC Korean text engine (ali213.dll)',
+        'This Korean translation add-on cannot work on the Switch: its text '
+        'is drawn by ali213.dll, a Windows text engine the base patch "ff7 '
+        'cht 1.23" installs, and the Switch cannot run it. Every Korean line '
+        'would show as wrong letters. The build leaves this mod out, so the '
+        'rest of the mod list builds exactly as without it.'),
+}
+
+
+def pc_only(mod):
+    """(short, long) reason when `mod` is a PC-only add-on the build leaves
+    out, else None."""
+    m = getattr(mod, 'manifest', None)
+    ident = str(getattr(m, 'mod_id', '') or '').strip().lower()
+    return PC_ONLY.get(ident)
+
+
 def locked_option(mod, option_id):
     """Why an option of `mod` cannot be changed on the Switch, or None."""
+    why = pc_only(mod)
+    if why:
+        return why[0]
     return LOCKED_OPTIONS.get(option_id) if handles(mod) else None
 
 

@@ -183,3 +183,88 @@ class ReferenceOrder(unittest.TestCase):
         mods = [self.M(f) for f in reversed(files)]
         self.assertEqual([m.filename for m in nx.apply_reference_order(mods)],
                          files)
+
+
+class ManualPriority(unittest.TestCase):
+    """BUILD 849: an unsupported mod the user dragged keeps its place next
+    to its neighbour; everything else keeps the computed order."""
+
+    M = ReferenceOrder.M
+
+    def names(self, mods):
+        return [m.filename for m in mods]
+
+    def test_dragged_mod_follows_its_neighbour(self):
+        ref = [self.M(x) for x in ('A', 'B', 'C', 'K')]
+        order = ['A', 'K', 'B', 'C']
+        self.assertEqual(self.names(nx.apply_manual_moves(ref, order, {'K'})),
+                         ['A', 'K', 'B', 'C'])
+        # a supported mod installed later still takes its computed place
+        ref = [self.M(x) for x in ('A', 'B', 'N', 'C', 'K')]
+        self.assertEqual(self.names(nx.apply_manual_moves(ref, order, {'K'})),
+                         ['A', 'K', 'B', 'N', 'C'])
+        # its neighbour uninstalled: the next one above, or the top
+        ref = [self.M(x) for x in ('B', 'C', 'K')]
+        self.assertEqual(self.names(nx.apply_manual_moves(ref, order, {'K'})),
+                         ['K', 'B', 'C'])
+
+    def test_nothing_dragged_is_the_computed_order(self):
+        ref = [self.M(x) for x in ('A', 'B', 'K')]
+        for order, moved in ((['K', 'A', 'B'], set()), ([], {'K'}),
+                             (['A', 'B'], {'K'})):
+            self.assertEqual(self.names(nx.apply_manual_moves(ref, order,
+                                                              moved)),
+                             ['A', 'B', 'K'])
+
+    def test_saved_state_and_supported_set(self):
+        saved = {'__global__': {'mod_load_order': ['A', 'K'],
+                                nx.MOVED_KEY: ['K', 7, None]}}
+        self.assertEqual(nx.manual_moves(saved), (['A', 'K'], {'K'}))
+        self.assertEqual(nx.manual_moves({}), ([], set()))
+        mods = [self.M('Cosmo.iro'), self.M('Echo-s'),
+                self.M('copy.iro', mod_id='B2'), self.M('Korean.iro')]
+        self.assertEqual(nx.reference_listed(mods, ReferenceOrder.SOURCES),
+                         {'Cosmo.iro', 'Echo-s', 'copy.iro'})
+
+
+class PcOnlyAddon(unittest.TestCase):
+    """BUILD 849: the Korean translation add-on is never built."""
+
+    def test_left_out_and_locked(self):
+        k = ReferenceOrder.M('FF7 kor ADDON HD re.Echo-S ver.L.iro',
+                             'a724de0b-f345-4af8-82a0-8ea2638f9d47')
+        k.display_name = 'Korean'
+        other = ReferenceOrder.M('Other.iro', 'x')
+        other.display_name = 'Other'
+        logs = []
+        active, _eff = nx._compatibility_profile(
+            [k, other], {k.filename: True, other.filename: True}, {},
+            logs.append)
+        self.assertEqual([m.filename for m in active], ['Other.iro'])
+        self.assertTrue(any('left out' in l for l in logs))
+        self.assertIn('ali213.dll', nx.ff7nx_esui.locked_option(k, 'fonts'))
+        self.assertIsNone(nx.ff7nx_esui.pc_only(other))
+
+
+class CompactRestore(ModUpdate):
+    """BUILD 848: a compacted extraction comes back with its mtimes."""
+
+    def test_compact_then_reextract_keeps_cache_identity(self):
+        import ff7nx_cachegc as G
+        p = self.mod('Gameplay')
+        old_root = G.ROOT
+        G.ROOT = self.cache
+        try:
+            m = build.Mod(p, self.cache)
+            m.ensure_extracted()
+            f = os.path.join(self.cache, 'T', 'a', 'keep.bin')
+            os.utime(f, ns=(10 ** 18, 10 ** 18))
+            G.compact_mod_caches(self.mods)
+            self.assertEqual(os.listdir(os.path.join(self.cache, 'T')),
+                             [G.COMPACT_MARK])
+            m2 = build.Mod(p, self.cache)
+            self.assertTrue(m2.ensure_extracted())
+            self.assertEqual(os.stat(f).st_mtime_ns, 10 ** 18)
+            self.assertFalse(build.Mod(p, self.cache).ensure_extracted())
+        finally:
+            G.ROOT = old_root

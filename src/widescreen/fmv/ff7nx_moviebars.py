@@ -350,6 +350,7 @@ ONE_F = 23                      # x23 already holds 0x3F800000
 (L_GATE, L_FLAG, L_LEFT, L_RIGHT, L_STOP, L_TOP, L_BOTTOM, L_OUT, L_CRED,
  L_ISSUE) = 0, 12, 13, 24, 31, 32, 43, 50, 52, 60
 N_WORDS = 91
+TUT_WORDS = 22                    # BUILD 845: the L_TUT subroutine
 BGMOVIE_FLAG = 0xCC0DC2            # modules_global_object + 0x3A
 NOP = 0xD503201F
 
@@ -475,7 +476,7 @@ def issue_block(t):
     return out
 
 
-def cave_words(addr, displaced, ext, block, credits=True):
+def cave_words(addr, displaced, ext, block, credits=True, tutorial=False):
     """
     The 76 words, laid out at addr(i).
 
@@ -517,7 +518,11 @@ def cave_words(addr, displaced, ext, block, credits=True):
     else:
         words += [NOP] * 5
     assert len(words) == L_FLAG
-    words.append(A.movz(CREDIT_FLAG, 0))            # a movie: all four bars
+    if tutorial:
+        # BUILD 845: w22 = 1 (side bars only) for the materia tutorial
+        words.append(A.bl(addr(L_FLAG), addr(N_WORDS)))
+    else:
+        words.append(A.movz(CREDIT_FLAG, 0))        # a movie: all four bars
     assert len(words) == L_LEFT
 
     # ---- left bar: x 0..m, y 0..1 ------------------------------------ 11
@@ -586,6 +591,20 @@ def cave_words(addr, displaced, ext, block, credits=True):
 
     assert len(words) == N_WORDS, 'N_WORDS is %d, body is %d' % (N_WORDS,
                                                                 len(words))
+    if tutorial:
+        # BUILD 845: L_TUT, reached by `bl` from L_FLAG. x21 is free here
+        # (restored by the epilogue) and carries the return; the test
+        # clobbers only x0-x18 and x30. No `b`, so walk() is unaffected.
+        import echo_s_tutorial as T
+        base = len(words)
+        hit = base + 2 + T.TUTORIAL_TEST_WORDS
+        words.append(A.add_imm64(21, 30, 0))            # mov x21, x30
+        words.append(A.movz(CREDIT_FLAG, 0))
+        words += T.tutorial_test(addr, base + 2, addr(hit + 1))
+        assert len(words) == hit
+        words.append(A.movz(CREDIT_FLAG, 1))            # side bars only
+        words.append(A.ret(21))
+        assert len(words) == N_WORDS + TUT_WORDS
     return words
 
 
@@ -602,6 +621,15 @@ def cave_state(t):
 
 def installed(t):
     return cave_state(t) == 'patched'
+
+
+def tutorial_enabled():
+    """BUILD 845: the materia tutorial gets side bars only."""
+    try:
+        import echo_s_tutorial as T
+    except Exception:                                          # noqa: BLE001
+        return False
+    return T.fullview_enabled()
 
 
 def check_anchors(t, log=lambda *_: None):
@@ -635,14 +663,16 @@ def walk(t):
     entry = _b_target(w32(t, HOOK), HOOK)
     if entry is None:
         return None
-    va, out = entry, []
-    while len(out) < N_WORDS and va not in [a for a, _ in out]:
+    va, out, total = entry, [], N_WORDS
+    while len(out) < total and va not in [a for a, _ in out]:
         x = w32(t, va)
         b = _b_target(x, va)
         if b is not None and b != RETURN_VA:
             va = b                             # chain link, not logic
             continue
         out.append((va, x))
+        if len(out) == L_FLAG + 1 and (x & 0xFC000000) == 0x94000000:
+            total = N_WORDS + TUT_WORDS        # BUILD 845: L_TUT follows
         va += 4
     return out
 
@@ -659,8 +689,8 @@ def walk_physical(t):
     entry = _b_target(w32(t, HOOK), HOOK)
     if entry is None:
         return []
-    va, out, logical = entry, [], 0
-    while logical < N_WORDS and va not in out:
+    va, out, logical, total = entry, [], 0, N_WORDS
+    while logical < total and va not in out:
         x = w32(t, va)
         out.append(va)
         b = _b_target(x, va)
@@ -668,6 +698,8 @@ def walk_physical(t):
             va = b
             continue
         logical += 1
+        if logical == L_FLAG + 1 and (x & 0xFC000000) == 0x94000000:
+            total = N_WORDS + TUT_WORDS        # BUILD 845: L_TUT follows
         va += 4
     return out
 
@@ -693,7 +725,8 @@ def build_patches(img, starts, ws_scale, log=print):
     entry, words = ff7nx_cave.emit_laid_out(
         pool,
         lambda entry_va, addr, _d=displaced, _e=ext, _b=block:
-            cave_words(addr, _d, _e, _b, credits_enabled()),
+            cave_words(addr, _d, _e, _b, credits_enabled(),
+                       tutorial_enabled()),
         span=0x80000)
     words[HOOK] = A.b(HOOK, entry)
     log('  movie margin bars: %d words in padding, entry +%#x' % (N_WORDS, entry))

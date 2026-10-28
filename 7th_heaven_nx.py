@@ -46,7 +46,7 @@ HERE = nxpaths.ROOT
 
 # Shown in the header, nearest the title. Single source of truth --
 # anything else that needs it should import this rather than repeat it.
-VERSION = '1.0.2'
+VERSION = '1.0.3'
 sys.path.insert(0, HERE)
 
 import build  # noqa: E402
@@ -1213,11 +1213,12 @@ def _active_order_constraints(mods):
     return out
 
 
-def discover_mods(order=None):
-    """Mods in priority order, highest first: the saved profile order
-    (`order`, settings.json's mod_load_order) for every mod it lists, as 7H
-    keeps it across updates; 7H's category auto-sort for a fresh profile and
-    for mods it does not list yet (BUILD 753)."""
+def discover_mods(order=None, moved=None):
+    """Mods in priority order, highest first: data/mod_sources.json's tested
+    order for the mods it lists, 7th Heaven's category auto-sort below them
+    for the rest (BUILD 831) -- then every mod the user dragged (`moved`,
+    BUILD 849) put back where `order` (settings.json's mod_load_order) has
+    it. See apply_manual_moves."""
     if not os.path.isdir(MODS_DIR):
         return []
     found = []
@@ -1233,7 +1234,77 @@ def discover_mods(order=None):
             # the category is known before we sort.
             mod._load_manifest()
             found.append(mod)
-    return apply_reference_order(_autosort_7h(found))
+    return apply_manual_moves(apply_reference_order(_autosort_7h(found)),
+                              order, moved)
+
+
+# BUILD 849. MANUAL PRIORITY. A mod data/mod_sources.json does not list (a
+# mod this program does not know, or one whose mod.xml is misconfigured)
+# lands below every supported mod -- the only place the program can put it
+# without knowing what it overrides. The user can drag such a mod (press and
+# hold its row) to the priority it needs. settings.json keeps the list order
+# (`mod_load_order`, written on every save) and which mods were dragged
+# (`mod_moved`); everything else keeps the computed order, so a supported
+# mod's tested place never changes. "Restore Priority" forgets the drag.
+MOVED_KEY = 'mod_moved'
+
+
+def manual_moves(saved):
+    """(order, moved) from settings.json: the saved list order and the set
+    of mods the user dragged."""
+    g = (saved or {}).get('__global__', {})
+    raw = g.get(MOVED_KEY, [])
+    moved = {x for x in raw if isinstance(x, str)} \
+        if isinstance(raw, list) else set()
+    return profile_mod_order(saved), moved
+
+
+def apply_manual_moves(mods, order, moved):
+    """`mods` (the computed order) with each dragged mod back where `order`
+    has it: right below the nearest mod above it in `order` that is already
+    placed (the top if none). Undragged mods keep their computed order, so
+    a mod installed later still lands where it belongs, and a dragged mod
+    keeps its neighbour. A dragged mod `order` does not list stays put."""
+    if not moved or not order:
+        return list(mods)
+    by_name = {m.filename: m for m in mods}
+    pos = {name: i for i, name in enumerate(order)}
+    drag = [n for n in order if n in moved and n in by_name]
+    if not drag:
+        return list(mods)
+    dragged = set(drag)
+    out = [m for m in mods if m.filename not in dragged]
+    for name in drag:
+        anchor = None
+        for prev in reversed(order[:pos[name]]):
+            if prev in by_name and any(m.filename == prev for m in out):
+                anchor = prev
+                break
+        at = 0 if anchor is None else \
+            next(i for i, m in enumerate(out) if m.filename == anchor) + 1
+        out.insert(at, by_name[name])
+    return out
+
+
+def reference_listed(mods, sources=None):
+    """File names of the mods data/mod_sources.json lists (matched as
+    apply_reference_order matches them): the supported mods, whose place
+    is the tested one and cannot be dragged."""
+    if sources is None:
+        sources = _reference_sources()
+    if not sources:
+        return set()
+
+    def stem(name):
+        return (name[:-4] if name.lower().endswith('.iro')
+                else name).casefold()
+
+    files = {(s.get('file') or '').casefold() for s in sources}
+    stems = {stem(s.get('file') or '') for s in sources}
+    ids = {str(s['id']).strip().lower() for s in sources if s.get('id')}
+    return {m.filename for m in mods
+            if m.filename.casefold() in files or stem(m.filename) in stems
+            or (_manifest_id(m) and _manifest_id(m) in ids)}
 
 
 def _reference_sources():
@@ -1394,6 +1465,11 @@ def _compatibility_profile(mods, enabled, settings_by_mod, log):
     to this build's in-memory settings and recorded in the build log.
     """
     active = [m for m in mods if enabled.get(m.filename)]
+    # BUILD 849: PC-only add-ons (ff7nx_esui.PC_ONLY) are left out whole,
+    # before any compatibility rule can touch the other mods' settings.
+    for m in [m for m in active if ff7nx_esui.pc_only(m)]:
+        active.remove(m)
+        log('%s: left out -- %s' % (m.display_name, ff7nx_esui.pc_only(m)[1]))
     by_id = {_manifest_id(m): m for m in active if _manifest_id(m)}
     effective = {m.filename: dict(settings_by_mod.get(m.filename, {}))
                  for m in active}
@@ -1601,6 +1677,7 @@ class _BuildClock:
         self.t0 = self._last_t = time.monotonic()
         self._last = None
         self.steps = []
+        self._closing = []      # BUILD 850: said after the time summary
         self._prof = None
         if os.environ.get('SEVENTH_NX_PROFILE', '').strip() == '1':
             self._prof = _Sampler(threading.get_ident())
@@ -1613,6 +1690,11 @@ class _BuildClock:
         if line:
             self._last, self._last_t = line, now
         self._log(text)
+
+    def defer(self, fn):
+        """Run `fn` (it logs the build's closing words: what to copy to
+        the SD card) after the time summary, so those are the last lines."""
+        self._closing.append(fn)
 
     def header(self):
         try:
@@ -1649,6 +1731,12 @@ class _BuildClock:
             self._log('slowest steps (time until the next log line):')
             for t, line in slow:
                 self._log('  %9s  %s' % (hms(t), line[:110]))
+        closing, self._closing = self._closing, []
+        for fn in closing:
+            try:
+                fn()
+            except Exception as exc:                           # noqa: BLE001
+                self._log('  ! %s' % exc)
 
 
 def run_build(mods, enabled, settings_by_mod, log, progress,
@@ -2107,6 +2195,8 @@ def _run_build_steps(mods, enabled, settings_by_mod, log, progress,
     # builds on everything above; it also rewrites the field frame_time in
     # the ff7_en the 60 FPS pass produced. See ff7nx_fieldpace.
     produced += build.apply_field_pacing(SDOUT_DIR, DUMP, plan, log, produced)
+    produced += build.apply_limiter_sleep(SDOUT_DIR, DUMP, plan, log, produced)
+    produced += build.apply_boost_ticks(SDOUT_DIR, DUMP, plan, log, produced)
     # BUILD 533. The zero-travel SCR2D rule; see ff7nx_campreserve.
     produced += build.apply_cam_preserve(SDOUT_DIR, DUMP, plan, log, produced)
     # BUILD 610. The camera follows the unfloored position; see ff7nx_campos.
@@ -2217,30 +2307,91 @@ def _run_build_steps(mods, enabled, settings_by_mod, log, progress,
     build.prune_stale(SDOUT_DIR, produced, log)
 
     # BUILD 754: and anything in cache/ that nothing uses any more -- mod
-    # extractions whose .iro is gone, and, after a build that rebuilt every
-    # archive, the conversion-cache entries it never read. See ff7nx_cachegc.
+    # extractions whose .iro is gone, the conversion-cache entries it never
+    # read for every archive it rebuilt (BUILD 848: per archive), and with
+    # Storage > Compact cache the mod extractions. See ff7nx_cachegc.
     try:
         import ff7nx_cachegc
-        ff7nx_cachegc.sweep(MODS_DIR, not build.ARCHIVES_NOT_REBUILT, log)
+        # BUILD 848: per archive (the set kept), and the opt-in compact.
+        ff7nx_cachegc.sweep(MODS_DIR, set(build.ARCHIVES_NOT_REBUILT), log,
+                            compact=ff7nx_cachegc.compact_enabled())
     except Exception as exc:                                    # noqa: BLE001
         log('  ! cache cleanup skipped: %s' % exc)
 
-    log('')
-    if produced:
-        log(f'done. {len(produced)} files in sdout/')
-        log('copy the contents of sdout/ onto the root of your SD card.')
-        moved = [name for name, was in audio_before.items()
-                 if was != _audio_fingerprint().get(name)]
-        if moved:
-            log('')
-            log('!! data/sound CHANGED THIS BUILD (%s). exefs/main carries '
-                'the SFX route table that indexes it, so the two are one '
-                'thing in two files -- copy data/sound as well, or the game '
-                'reads every appended sound variant at the wrong offset and '
-                'they come out as crackle.' % ', '.join(sorted(moved)))
+    # BUILD 850: what changed since the last build -- the log says, and
+    # sdout_changes/ holds just those files for the SD card.
+    try:
+        changes = build.sdout_changes(SDOUT_DIR, log=log)
+    except Exception as exc:                                    # noqa: BLE001
+        changes = None
+        log('  ! change list skipped: %s' % exc)
+
+    moved = [name for name, was in audio_before.items()
+             if was != _audio_fingerprint().get(name)] if produced else []
+
+    def _closing():
+        # BUILD 850: the last lines of the log, after the build time
+        log('')
+        if produced:
+            log(f'done. {len(produced)} files in sdout/')
+            _log_sdout_changes(changes, log)
+            if moved:
+                log('')
+                log('!! data/sound CHANGED THIS BUILD (%s). exefs/main '
+                    'carries the SFX route table that indexes it, so the two '
+                    'are one thing in two files -- copy data/sound as well, '
+                    'or the game reads every appended sound variant at the '
+                    'wrong offset and they come out as crackle.'
+                    % ', '.join(sorted(moved)))
+        else:
+            log('nothing was written.')
+
+    if callable(getattr(log, 'defer', None)):
+        log.defer(_closing)
     else:
-        log('nothing was written.')
+        _closing()
     return _finish(bool(produced))
+
+
+def _log_sdout_changes(changes, log):
+    """BUILD 850: tell the user what to copy to the SD card."""
+    if not changes or changes['first']:
+        log('copy the contents of sdout/ onto the root of your SD card.')
+        if changes:
+            log('(the next build will list only the files that change, in '
+                '%s/)' % build.CHANGES_DIR_NAME)
+        return
+    added, changed, removed = (changes['added'], changes['changed'],
+                               changes['removed'])
+    if not (added or changed or removed):
+        log('nothing changed since the last build: the SD card is up to date '
+            'if you copied that one.')
+        return
+
+    def mb(n):
+        return ('%.1f GB' % (n / 1e9)) if n >= 1e9 else ('%.1f MB' % (n / 1e6))
+
+    log('changed since the last build: %d new, %d changed, %d removed '
+        '(%s to copy).' % (len(added), len(changed), len(removed),
+                           mb(changes['bytes'])))
+    if added or changed:
+        log('copy the contents of %s/ onto the root of your SD card '
+            '(replace when asked) -- it holds only these:'
+            % build.CHANGES_DIR_NAME)
+        items = [('new', r) for r in added] + [('changed', r) for r in changed]
+        for tag, rel in items[:12]:
+            log('    %-8s %s' % (tag, rel))
+        if len(items) > 12:
+            log('    ... and %d more (all in %s)'
+                % (len(items) - 12, build.CHANGES_LIST_NAME))
+    if removed:
+        log('delete these from the SD card (this build no longer makes them):')
+        for rel in removed[:12]:
+            log('    %s' % rel)
+        if len(removed) > 12:
+            log('    ... and %d more (all in %s)'
+                % (len(removed) - 12, build.CHANGES_LIST_NAME))
+    log('(skipped copying a build since? copy all of sdout/ once instead.)')
 
 
 # ------------------------------------------------------------------- UI
@@ -2305,9 +2456,12 @@ def launch_ui():
     from tkinter import font as tkfont
 
     saved = build.load_settings(SETTINGS)
-    mods = discover_mods(profile_mod_order(saved))
+    mods = discover_mods(*manual_moves(saved))
     migrate_saved_mod_keys(saved, mods)
     seed_mod_defaults(saved, mods)
+    # BUILD 849: mods the user dragged to a new priority (see
+    # apply_manual_moves). Highlighted in the list, saved as `mod_moved`.
+    moved = set(manual_moves(saved)[1]) & {m.filename for m in mods}
     # BUILD 804: saved values as they are; LOCKED fills what is missing.
     global_saved = nxsettings.effective_global(
         dict(default_globals(), **saved.get('__global__', {})))
@@ -2785,7 +2939,7 @@ def launch_ui():
                        int(round(mid - art.height / 2.0))))
         return ImageTk.PhotoImage(im.resize((W, H), Image.LANCZOS))
 
-    dump_refresh = ttk.Label(header, cursor='hand2', padding=0)
+    dump_refresh = ttk.Label(header, padding=0)
     dump_refresh.pack(side='left', padx=(6, 0))
 
     def _redraw_refresh():
@@ -3116,6 +3270,8 @@ def launch_ui():
     # BUILD 645/646. Model shadows (battle + field); on by default, off writes nothing.
     shadows_var = tk.BooleanVar(value=bool(global_saved.get('model_shadows', True)))
     nocheat_var = tk.BooleanVar(value=bool(global_saved.get('no_cheats', True)))   # BUILD 819: on by default
+    # BUILD 848: Storage > Compact cache after build (ff7nx_cachegc); off by default.
+    compact_var = tk.BooleanVar(value=bool(global_saved.get('compact_cache', False)))
 
     lim_label_by_value = {v: l for v, l in LIMITER_FPS_CHOICES}
     lim_value_by_label = {l: v for v, l in LIMITER_FPS_CHOICES}
@@ -3328,6 +3484,13 @@ def launch_ui():
             ('check', 'Disable the right-stick cheat', nocheat_var, None,
              'Clicking the right stick no longer refills HP, MP and Limit. '
              'Stops one accidental press spoiling a playthrough.', True),
+        ]),
+        ('Storage', [
+            ('check', 'Compact cache after build', compact_var, None,
+             'Deletes the unpacked copies of your mods (about 15 GB with the '
+             'full mod list) once a build has finished. The next build '
+             'unpacks them again from the .iro files, which takes a few '
+             'minutes longer; nothing else is rebuilt.', False),
         ]),
         ('Voice', [
             ('combo', 'Dialogue loudness', voice_norm_var,
@@ -4632,6 +4795,8 @@ def launch_ui():
                 'options': settings_by_mod.get(mod.filename, {}),
             }
         persist['__global__'] = {'mod_load_order': [m.filename for m in mods],
+                                 MOVED_KEY: [m.filename for m in mods
+                                             if m.filename in moved],
                                  'field_tex_cap': current_field_tex_cap(),
                                  'world_tex_cap': current_world_tex_cap(),
                                  'battle_bg_tex_cap': current_battle_bg_tex_cap(),
@@ -4741,6 +4906,7 @@ def launch_ui():
                                  'field_frame': bool(frame_var.get()),
                                  'model_shadows': bool(shadows_var.get()),
                                  'no_cheats': bool(nocheat_var.get()),
+                                 'compact_cache': bool(compact_var.get()),
                                  'limiter_fps': current_limiter_fps(),
                                  'widescreen': current_widescreen(),
                                  'field_buffer': current_field_buffer(),
@@ -4807,6 +4973,7 @@ def launch_ui():
     frame_var.trace_add('write', save_settings_now)
     shadows_var.trace_add('write', save_settings_now)
     nocheat_var.trace_add('write', save_settings_now)
+    compact_var.trace_add('write', save_settings_now)
     lim_var.trace_add('write', save_settings_now)
     # The four added with the field-buffer work. Without these they are
     # only written on Build and on window close, which is enough to be
@@ -5123,12 +5290,78 @@ def launch_ui():
         canvas.bind('<Leave>', lambda e: canvas.unbind_all('<MouseWheel>'))
         return canvas, inner
 
-    left = ttk.Labelframe(panes, text='Mods', padding=8)
+    # BUILD 849: the pane's title carries a refresh icon (re-read mods/),
+    # and a "Restore Priority" pill sits on the same line at the right.
+    mods_hdr = ttk.Frame(panes)
+    mods_title = ttk.Label(mods_hdr, text='Mods', foreground=TEXT_SECONDARY,
+                           font=(UI_FONT, 10, 'bold'))
+    mods_title.pack(side='left')
+    mods_refresh = ttk.Label(mods_hdr, padding=0,
+                             text='\u21bb', foreground=TEXT_SECONDARY)
+    mods_refresh.pack(side='left', padx=(6, 0))
+    left = ttk.Labelframe(panes, labelwidget=mods_hdr, padding=8)
     panes.add(left, weight=1)
     _canvas, listframe = make_scrollable(left, inner_width_tracks_canvas=True)
 
+    PILL_FONT = (UI_FONT, 9, 'bold')
+    _pillf = tkfont.Font(font=PILL_FONT)
+    PILL_TEXT = 'Restore Priority'
+    PILL_H = _pillf.metrics('linespace') + 6
+    PILL_W = _pillf.measure(PILL_TEXT) + 2 * 11
+    pill = tk.Canvas(left, width=PILL_W, height=PILL_H, bg=BG_APP, bd=0,
+                     highlightthickness=0)
+    pill_state = {'on': False, 'hover': False}
+
+    def _draw_pill():
+        c = pill
+        c.delete('all')
+        c.configure(bg=BG_APP)
+        on, hov = pill_state['on'], pill_state['hover']
+        edge = ACCENT if on else BORDER
+        fill = (ACCENT if hov else BG_APP) if on else BG_APP
+        text = (ON_ACCENT if hov else ACCENT_SOFT) if on else TEXT_MUTED
+        r = PILL_H - 1
+        w = PILL_W - 1
+        for x0 in (0, w - r):
+            c.create_oval(x0, 0, x0 + r, r, fill=fill, outline=edge)
+        c.create_rectangle(r / 2.0, 0, w - r / 2.0, r, fill=fill,
+                           outline='')
+        c.create_line(r / 2.0, 0, w - r / 2.0, 0, fill=edge)
+        c.create_line(r / 2.0, r, w - r / 2.0, r, fill=edge)
+        c.create_text(PILL_W / 2.0, PILL_H / 2.0, text=PILL_TEXT,
+                      font=PILL_FONT, fill=text)
+        c.configure(cursor='hand2' if on else '')
+
+    def _pill_hover(flag):
+        pill_state['hover'] = flag
+        _draw_pill()
+
+    pill.bind('<Enter>', lambda e: _pill_hover(True))
+    pill.bind('<Leave>', lambda e: _pill_hover(False))
+    # on the title line, right edge: measured from the frame's OUTER edge
+    # (the default, inside the border, starts below the title), centred on
+    # the title's line
+    def _place_pill(_evt=None):
+        h = max(mods_hdr.winfo_reqheight(), PILL_H)
+        pill.place(in_=left, bordermode='outside', relx=1.0, x=0,
+                   y=max(0, (mods_hdr.winfo_reqheight() - PILL_H) // 2),
+                   anchor='ne')
+        return h
+
+    _place_pill()
+    _draw_pill()
+
     # Options pane, scrollable (mods can have a dozen-plus options).
-    right = ttk.Labelframe(panes, text='Options', padding=6)
+    # Built like the Mods title (a frame, not `text=`), with a blank image
+    # the size of the refresh icon, so both titles sit on one line and both
+    # boxes start at the same height.
+    opts_hdr = ttk.Frame(panes)
+    ttk.Label(opts_hdr, text='Options', foreground=TEXT_SECONDARY,
+              font=(UI_FONT, 10, 'bold')).pack(side='left')
+    opts_spacer = ttk.Label(opts_hdr, padding=0, text='\u21bb',
+                            foreground=BG_APP)
+    opts_spacer.pack(side='left', padx=(6, 0))
+    right = ttk.Labelframe(panes, labelwidget=opts_hdr, padding=6)
     panes.add(right, weight=2)
     _opt_canvas, options_body = make_scrollable(
         right, inner_width_tracks_canvas=True)
@@ -5281,6 +5514,15 @@ def launch_ui():
         if meta:
             ttk.Label(options_body, text=meta, style='Sub.TLabel'
                       ).pack(anchor='w', pady=(0, 2))
+        _pc_only = ff7nx_esui.pc_only(mod)
+        if _pc_only:
+            # BUILD 849: shown, never built (see ff7nx_esui.PC_ONLY)
+            _warn = ttk.Label(options_body, text=_pc_only[1],
+                              foreground=WARN, wraplength=420,
+                              justify='left')
+            _warn.pack(anchor='w', fill='x', pady=(2, 8))
+            _warn.bind('<Configure>', lambda e, w=_warn: w.configure(
+                wraplength=max(200, e.width - 4)))
         show_details(m)
         store = settings_by_mod.setdefault(mod.filename, {})
         summary = ttk.Frame(options_body)
@@ -5553,11 +5795,27 @@ def launch_ui():
         label.configure(bg=bg, fg=fg,
                         font=(UI_FONT, 12, 'bold' if bold else 'normal'))
 
+    def _blend(a, b, t):
+        """Colour `t` of the way from `a` to `b` (both #rrggbb)."""
+        ca = [int(a[i:i + 2], 16) for i in (1, 3, 5)]
+        cb = [int(b[i:i + 2], 16) for i in (1, 3, 5)]
+        return '#%02x%02x%02x' % tuple(int(round(x + (y - x) * t))
+                                       for x, y in zip(ca, cb))
+
+    def _moved_bg(hover=False):
+        # BUILD 849: a dragged mod's backdrop -- the row colour tinted toward
+        # the theme's accent, so a hand-placed mod is never mistaken for one
+        # in its computed place, in every theme's own colour.
+        return _blend(BG_ROW, ACCENT, 0.17 if hover else 0.11)
+
     def _restyle(filename):
         if filename not in rows:
             return
         if filename == selected.get():
             _paint_row(filename, BG_ROW_SEL, ACCENT_SOFT, True, ACCENT)
+        elif filename in moved:
+            bg = _moved_bg()
+            _paint_row(filename, bg, TEXT_PRIMARY, False, bg)
         else:
             _paint_row(filename, BG_ROW, TEXT_PRIMARY, False, BG_ROW)
 
@@ -5567,15 +5825,177 @@ def launch_ui():
         if prev and prev != mod.filename:
             _restyle(prev)
         _restyle(mod.filename)
+        _sync_pill()
         show_options(mod)
 
+    def _sync_pill():
+        pill_state['on'] = selected.get() in moved
+        _draw_pill()
+
     def on_row_enter(filename):
+        if drag['active']:
+            return
         if filename != selected.get():
-            _paint_row(filename, BG_ROW_HOVER, TEXT_PRIMARY, False, BG_ROW_HOVER)
+            bg = _moved_bg(True) if filename in moved else BG_ROW_HOVER
+            _paint_row(filename, bg, TEXT_PRIMARY, False, bg)
 
     def on_row_leave(filename):
+        if drag['active']:
+            return
         if filename != selected.get():
             _restyle(filename)
+
+    # ---------- BUILD 849: press, hold and drag ----------
+    # Only a mod data/mod_sources.json does not list can be dragged: the
+    # supported mods have a tested place. Hold the button DRAG_HOLD_MS on
+    # the row, then move: a line shows where the mod will land; release to
+    # drop it there. The mod is then marked moved (highlighted, saved) until
+    # "Restore Priority" puts it back.
+    DRAG_HOLD_MS = 350
+    drag = {'mod': None, 'timer': None, 'active': False, 'to': None,
+            'line': None}
+
+    def _draggable(mod):
+        return mod.filename not in reference_listed(mods)
+
+    def _drag_press(event, mod):
+        _drag_cancel()
+        if build_btn.instate(['disabled']) or not _draggable(mod):
+            return
+        drag['mod'] = mod
+        drag['timer'] = root.after(DRAG_HOLD_MS, lambda: _drag_start(mod))
+
+    def _drag_start(mod):
+        drag['timer'] = None
+        if drag['mod'] is not mod or mod.filename not in rows:
+            return
+        drag['active'] = True
+        row = rows[mod.filename][0]
+        for w in rows[mod.filename]:
+            try:
+                w.configure(cursor='fleur')
+            except tk.TclError:
+                pass
+        line = tk.Frame(listframe, height=2, bg=ACCENT, bd=0,
+                        highlightthickness=0)
+        drag['line'] = line
+        _paint_row(mod.filename, BG_ROW_SEL, ACCENT_SOFT, True, ACCENT)
+        _drag_motion_at(row.winfo_pointery())
+
+    def _drag_target(y_root):
+        """Index in `mods` the dragged mod would take, and the y (in the
+        list) of the line that shows it."""
+        names = [m.filename for m in mods if m.filename in rows]
+        idx, line_y = len(names), None
+        for i, fn in enumerate(names):
+            r = rows[fn][0]
+            top = r.winfo_rooty()
+            if y_root < top + r.winfo_height() / 2.0:
+                idx = i
+                line_y = r.winfo_y() - 3
+                break
+        if line_y is None and names:
+            last = rows[names[-1]][0]
+            line_y = last.winfo_y() + last.winfo_height() + 1
+        return idx, max(0, line_y or 0)
+
+    def _drag_motion_at(y_root):
+        idx, line_y = _drag_target(y_root)
+        drag['to'] = idx
+        if drag['line'] is not None:
+            drag['line'].place(x=0, y=line_y, relwidth=1.0)
+            drag['line'].lift()
+        # scroll when held near the list's top or bottom edge
+        try:
+            top = _canvas.winfo_rooty()
+            bottom = top + _canvas.winfo_height()
+            if y_root < top + 18:
+                _canvas.yview_scroll(-1, 'units')
+            elif y_root > bottom - 18:
+                _canvas.yview_scroll(1, 'units')
+        except tk.TclError:
+            pass
+
+    def _drag_motion(event):
+        if drag['active']:
+            _drag_motion_at(event.y_root)
+
+    def _drag_cancel():
+        if drag['timer'] is not None:
+            try:
+                root.after_cancel(drag['timer'])
+            except tk.TclError:
+                pass
+        drag['timer'] = None
+        if drag['line'] is not None:
+            drag['line'].destroy()
+        drag['line'] = None
+        mod, was = drag['mod'], drag['active']
+        drag.update(mod=None, active=False, to=None)
+        if was and mod is not None and mod.filename in rows:
+            for w in rows[mod.filename]:
+                try:
+                    w.configure(cursor='hand2' if w is rows[mod.filename][3]
+                                else '')
+                except tk.TclError:
+                    pass
+
+    def _drag_release(event):
+        mod, to, was = drag['mod'], drag['to'], drag['active']
+        _drag_cancel()
+        if not was or mod is None or to is None or mod not in mods:
+            return
+        frm = mods.index(mod)
+        if to > frm:
+            to -= 1
+        if to == frm:
+            _restyle(mod.filename)
+            return
+        mods.remove(mod)
+        mods.insert(to, mod)
+        moved.add(mod.filename)
+        _repack_row(mod)
+        log_write('Moved %s to priority %d of %d (by hand). Restore '
+                  'Priority puts it back.'
+                  % (mod.display_name, to + 1, len(mods)))
+        save_settings_now()
+
+    def _repack_row(mod):
+        """Show `mod`'s row at its place in `mods` -- only that row moves,
+        so nothing else is unpacked and redrawn."""
+        if mod.filename not in rows:
+            return
+        row = rows[mod.filename][0]
+        i = mods.index(mod)
+        nxt = next((rows[m.filename][0] for m in mods[i + 1:]
+                    if m.filename in rows), None)
+        row.pack_forget()
+        if nxt is not None:
+            row.pack(fill='x', pady=(0, 4), before=nxt)
+        else:
+            row.pack(fill='x', pady=(0, 4))
+        _restyle(mod.filename)
+        _sync_pill()
+
+    def restore_priority(_evt=None):
+        """Put the selected mod back where the program would place it."""
+        fn = selected.get()
+        if fn not in moved or build_btn.instate(['disabled']):
+            return
+        mod = next((m for m in mods if m.filename == fn), None)
+        moved.discard(fn)
+        ref = apply_reference_order(_autosort_7h(list(mods)))
+        mods[:] = apply_manual_moves(ref, [m.filename for m in mods], moved)
+        if mod is not None:
+            _repack_row(mod)
+        if mod is not None:
+            log_write('%s is back at its computed priority (%d of %d).'
+                      % (mod.display_name, mods.index(mod) + 1, len(mods)))
+        save_settings_now()
+
+    pill.bind('<ButtonRelease-1>', lambda e: (
+        restore_priority() if 0 <= e.x < PILL_W and 0 <= e.y < PILL_H
+        else None))
 
     # ---------- optical vertical centring ----------
     # Tk centres a label's LINE BOX: ascent above the baseline, descent below.
@@ -5746,6 +6166,11 @@ def launch_ui():
             widget.bind('<Button-1>', lambda e, m=mod: select(m))
             widget.bind('<Enter>', lambda e, f=mod.filename: on_row_enter(f))
             widget.bind('<Leave>', lambda e, f=mod.filename: on_row_leave(f))
+            # BUILD 849: press and hold to drag (unsupported mods only)
+            widget.bind('<ButtonPress-1>',
+                        lambda e, m=mod: _drag_press(e, m), add='+')
+            widget.bind('<B1-Motion>', _drag_motion, add='+')
+            widget.bind('<ButtonRelease-1>', _drag_release, add='+')
 
         if mod.filename not in settings_by_mod:
             settings_by_mod[mod.filename] = _mod_options_from_saved(mod, saved)
@@ -5791,7 +6216,7 @@ def launch_ui():
         _mods_sig[0] = sig
         had = {m.filename for m in mods}
         found = discover_mods([m.filename for m in mods]
-                              or profile_mod_order(saved))
+                              or profile_mod_order(saved), moved)
         migrate_saved_mod_keys(saved, found)
         seed_mod_defaults(saved, found)
         for row_widgets in rows.values():
@@ -5821,6 +6246,32 @@ def launch_ui():
 
     # Picks up a mod copied in by hand once the user comes back to the window.
     root.bind('<FocusIn>', lambda e: reload_mods(), add='+')
+
+    # BUILD 849: the refresh icon beside "Mods" re-reads mods/ on demand.
+    def _mods_refresh(_evt=None):
+        if build_btn.instate(['disabled']):
+            log_write('Wait for the build to finish before refreshing the '
+                      'mod list.')
+            return 'break'
+        before = [m.filename for m in mods]
+        reload_mods(force=True)
+        if [m.filename for m in mods] == before:
+            log_write('Mod list refreshed: no new or removed mods.')
+        return 'break'
+
+    mods_refresh.bind('<Button-1>', _mods_refresh)
+
+    def _redraw_mods_refresh():
+        img = _refresh_image()
+        if img is not None:
+            mods_refresh.configure(image=img, text='')
+            mods_refresh.image = img
+            # the Options title's twin: a transparent image the same size
+            blank = tk.PhotoImage(width=img.width(), height=img.height())
+            opts_spacer.configure(image=blank, text='')
+            opts_spacer.image = blank
+
+    root.after_idle(_redraw_mods_refresh)
 
     # ---------- theme, live ----------
     # Switching used to need a restart because the colours were read once.
@@ -5915,6 +6366,8 @@ def launch_ui():
         walk('.')
         try:
             _redraw_refresh()
+            _redraw_mods_refresh()
+            _draw_pill()
         except tk.TclError:
             pass
         _chk_cache.clear()
@@ -6141,6 +6594,8 @@ def launch_ui():
         os.environ[_HEADLESS_TEXCACHE_ENV] = current_texture_cache()
         os.environ[build.NO_CHEATS_ENV] = (
             '1' if _needs_nso(nocheat_var.get()) else '0')
+        os.environ['SEVENTH_NX_COMPACT_CACHE'] = (
+            '1' if compact_var.get() else '0')
         os.environ[build.LIMITER_FPS_ENV] = str(
             _needs_nso(current_limiter_fps(), 0))
         os.environ[build.ff7nx_ws.WIDESCREEN_ENV] = current_widescreen()
@@ -6435,7 +6890,7 @@ def main():
         # BUILD 804: the same values as the GUI.
         saved['__global__'] = nxsettings.effective_global(
             dict(default_globals(), **saved.get('__global__', {})))
-        mods = discover_mods(profile_mod_order(saved))
+        mods = discover_mods(*manual_moves(saved))
         migrate_saved_mod_keys(saved, mods)
         seed_mod_defaults(saved, mods)
         if build.FIELD_TEX_CAP_ENV not in os.environ:
@@ -6619,6 +7074,9 @@ def main():
             os.environ[_HEADLESS_TEXCACHE_ENV] = _tc
         os.environ[build.NO_CHEATS_ENV] = (
                 '1' if saved.get('__global__', {}).get('no_cheats') else '0')
+        os.environ.setdefault('SEVENTH_NX_COMPACT_CACHE', (
+                '1' if saved.get('__global__', {}).get('compact_cache')
+                else '0'))
         os.environ[build.LIMITER_FPS_ENV] = str(
                 saved.get('__global__', {}).get('limiter_fps', 0))
         if build.movie_convert.FIT_ENV not in os.environ:

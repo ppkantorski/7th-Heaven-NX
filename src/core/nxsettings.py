@@ -36,6 +36,7 @@ USER_KEYS = frozenset((
     'analog_360',
     'no_autorun',
     'no_cheats',
+    'compact_cache',                # BUILD 848: Storage > Compact cache after build
     'voice_normalize',
     'dock_resolution',              # BUILD 762: output resolution
     'title_screen',                 # BUILD 763b: title background

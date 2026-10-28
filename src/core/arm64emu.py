@@ -338,6 +338,11 @@ class Cpu:
                            | ((0x1F if b else 0) << 25)
                            | ((imm8 & 0x3F) << 19))
             return None
+        if (w & 0xFFC00000) == 0xFD000000:                    # str Dt,[Xn,#i]
+            # BUILD 847 (ff7nx_fieldpace booster): the frame counter double.
+            a = self._addr(rn, ((w >> 10) & 0xFFF) * 8)
+            self.mem.setu(a, self.fp[rd] & M64, 8)
+            return None
         if (w & 0xFFC00000) == 0xFD400000:                    # ldr Dt,[Xn,#i]
             # BUILD 611 (ff7nx_pointers): the x87 stack slot, a double.
             a = self._addr(rn, ((w >> 10) & 0xFFF) * 8)
@@ -451,6 +456,16 @@ class Cpu:
             self.fp[rd] = struct.unpack(
                 '<Q', struct.pack('<d', float(g(rn, True))))[0]
             return None
+        if (w & 0xFFE0FC00) == 0x1E602800:                    # fadd Dd,Dn,Dm
+            x = struct.unpack('<d', struct.pack('<Q', self.fp[rn] & M64))[0]
+            y = struct.unpack('<d', struct.pack('<Q', self.fp[rm] & M64))[0]
+            self.fp[rd] = struct.unpack('<Q', struct.pack('<d', x + y))[0]
+            return None
+        if (w & 0xFFE0FC00) == 0x1E603800:                    # fsub Dd,Dn,Dm
+            x = struct.unpack('<d', struct.pack('<Q', self.fp[rn] & M64))[0]
+            y = struct.unpack('<d', struct.pack('<Q', self.fp[rm] & M64))[0]
+            self.fp[rd] = struct.unpack('<Q', struct.pack('<d', x - y))[0]
+            return None
         if (w & 0xFFE0FC00) == 0x1E600800:                    # fmul Dd,Dn,Dm
             x = struct.unpack('<d', struct.pack('<Q', self.fp[rn]))[0]
             y = struct.unpack('<d', struct.pack('<Q', self.fp[rm]))[0]
@@ -557,6 +572,25 @@ class Cpu:
             rt2 = (w >> 10) & 0x1F
             self.mem.setu(a, 0 if rd == 31 else g(rd), 8)
             self.mem.setu(a + 8, 0 if rt2 == 31 else g(rt2), 8)
+            return None
+        if (w & 0xFFC00000) == 0x6D000000:                    # stp Da,Db,[Xn,#i]
+            # BUILD 842 (the limiter sleep saves d0..d7 around its call)
+            imm7 = (w >> 15) & 0x7F
+            if imm7 & 0x40:
+                imm7 -= 0x80
+            a = self._rd64(rn) + imm7 * 8
+            rt2 = (w >> 10) & 0x1F
+            self.mem.setu(a, self.fp[rd] & M64, 8)
+            self.mem.setu(a + 8, self.fp[rt2] & M64, 8)
+            return None
+        if (w & 0xFFC00000) == 0x6D400000:                    # ldp Da,Db,[Xn,#i]
+            imm7 = (w >> 15) & 0x7F
+            if imm7 & 0x40:
+                imm7 -= 0x80
+            a = self._rd64(rn) + imm7 * 8
+            rt2 = (w >> 10) & 0x1F
+            self.fp[rd] = self.mem.u(a, 8)
+            self.fp[rt2] = self.mem.u(a + 8, 8)
             return None
         if (w & 0xFFC00000) == 0xAD000000:                    # stp Qa,Qb,[Xn,#i]
             imm7 = (w >> 15) & 0x7F

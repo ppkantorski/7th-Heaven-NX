@@ -74,7 +74,8 @@ BUNDLE_ID = 'io.github.ppkantorski.seventhheavennx'
 OUT = os.path.join(ROOT, 'release')
 
 # Never in a zip, whatever else changes (paths relative to the project).
-FORBIDDEN = ('dump/', 'mods/', 'cache/', 'sdout/', 'attic/', 'repos/',
+FORBIDDEN = ('dump/', 'mods/', 'cache/', 'sdout/', 'sdout_changes/',
+             'sdout_changes.txt', 'attic/', 'repos/',
              'tools/', 'tests/', 'docs/', 'game_data_files/', 'release/',
              'shaders/stock/', 'data/ff7_en_switch', 'data/build_counters.json',
              'settings.json', '.venv/')

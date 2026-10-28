@@ -206,6 +206,16 @@ X_SLOTS = ((0x28, 1), (0x48, 1), (0x68, 0), (0x88, 0))   # (slot, at 640?)
 FRAME = 0xA0                       # x0..x18 + x30
 
 
+def tutorial_enabled():
+    """BUILD 845: the materia tutorial keeps its full height (see
+    echo_s_tutorial). Off with SEVENTH_NX_TUTORIAL_FULLVIEW=off."""
+    try:
+        import echo_s_tutorial as T
+    except Exception:                                          # noqa: BLE001
+        return False
+    return T.fullview_enabled()
+
+
 def fill_enabled():
     v = os.environ.get(FILL_ENV, '').strip().lower()
     return v not in ('0', 'off', 'false', 'no')
@@ -215,7 +225,7 @@ def fill_margin(ws_scale):
     return 640.0 * (1.0 / ws_scale - 1.0) / 2.0
 
 
-def fill_cave(ws_scale):
+def fill_cave(ws_scale, tutorial=None):
     """build(entry, addr) for ff7nx_cave.emit_laid_out: the ten y words,
     then the BGMOVIE test and the x stores, the displaced word, the return."""
     import a64 as A
@@ -223,6 +233,8 @@ def fill_cave(ws_scale):
     lo = struct.unpack('<I', struct.pack('<f', -m))[0]
     hi = struct.unpack('<I', struct.pack('<f', 640.0 + m))[0]
     zoom = (640.0 + 2.0 * m) / 640.0
+    if tutorial is None:
+        tutorial = tutorial_enabled()
 
     def build(entry, addr):
         w = list(cave_body())
@@ -230,6 +242,23 @@ def fill_cave(ws_scale):
         regs = list(range(0, 19)) + [30]
         for i in range(0, 20, 2):
             w.append(A.stp64_off(regs[i], regs[i + 1], SP, 8 * i))
+        if tutorial:
+            # BUILD 845: the Echo-S materia tutorial (4:3, mds7pb_1 only) is
+            # NOT moved down: put the four y values back to 0 / H so it
+            # spans the full 480 (echo_s_tutorial.tutorial_test).
+            import echo_s_tutorial as T
+            n = T.TUTORIAL_TEST_WORDS
+            nt = len(w) + n + 12                       # past the undo below
+            w += T.tutorial_test(addr, len(w), addr(nt))
+            w += [A.str_(31, SP, FRAME + off) for off in Y_ZERO]
+            w += A.movz_movk(10, SHIFT_BITS)
+            w.append(A.fmov_s_from_w(0, 10))
+            for off in Y_H:
+                w += [A.ldr_s(1, SP, FRAME + off), A.fsub_s(1, 1, 0),
+                      A.str_s(1, SP, FRAME + off)]
+            tut_skip_at = len(w)
+            w.append(None)                              # cbz wzr, skip
+            assert len(w) == nt, (len(w), nt)
         w += A.movz_movk(0, BGMOVIE_FLAG)
         w.append(A.bl(addr(len(w)), TRANSLATE))
         w.append(A.ldrb(9, 0, 0))
@@ -257,6 +286,8 @@ def fill_cave(ws_scale):
         w += [A.str_s(6, SP, FRAME + off) for off in Y_H]
         skip = len(w)
         w[skip_at] = A.cbz(9, addr(skip_at), addr(skip))
+        if tutorial:
+            w[tut_skip_at] = A.cbz(31, addr(tut_skip_at), addr(skip))
         for i in range(0, 20, 2):
             w.append(A.ldp64_off(regs[i], regs[i + 1], SP, 8 * i))
         w.append(A.add_imm64(SP, SP, FRAME))
@@ -388,7 +419,7 @@ def plan(main, revert: bool, log=print):
 def _walk_cave(img: bytes, entry: int) -> list[int]:
     """Every word of the chained cave, following each run's outgoing `b`."""
     seen, va, guard = [], entry, 0
-    while guard < 64:
+    while guard < 512:
         guard += 1
         w = w32(img, va)
         seen.append(va)

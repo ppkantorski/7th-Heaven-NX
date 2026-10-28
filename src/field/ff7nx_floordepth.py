@@ -218,6 +218,26 @@ HOLE_FIELDS = {
                           (130.0, 192.0), (124.0, 198.0), (118.0, 204.0),
                           (114.0, 210.0), (114.0, 216.0), (164.0, 216.0),
                           (164.0, 176.0))]},
+    # BUILD 846 (hardware 10-28): Cloud's shadow peeked over the planks of
+    # the right-hand table. The table top hides the floor BEHIND it, which
+    # is walkable, so its squares carry that floor's depth (620h) -- and the
+    # shadow is drawn ~34 units nearer than its floor (FFNx's offset at
+    # IDs ~1350, _ffnx_shift), with hardware nearer still (776). The top's
+    # screen outline (tile units, measured on the background: corners
+    # left, back, right, front) is a 'solid': its texels get copies that
+    # hide the floor shadow behind with `pad` units to spare. A body behind
+    # the table goes under it (the leg guard does not apply inside the
+    # outline); one in front, or at the sides, is unchanged.
+    'mds7pb_1': {'plane': 0.0, 'box': (48, 176, 16, 96),
+                 'ffnx_bias': True, 'pad': 28.0,
+                 'solid': [((64.0, 40.0), (98.7, 17.0), (161.0, 63.0),
+                            (128.0, 85.0))],
+                 # BUILD 846b (hardware 10-28): the two copies at tiles
+                 # (64, 16) and (80, 16) -- the top's back-left end, under
+                 # the pinball plate's yellow lip and light -- drew yellow
+                 # lip texels over the planks. That corner is left as it was.
+                 'keep': [((48.0, 16.0), (96.0, 16.0), (96.0, 32.0),
+                           (48.0, 32.0))]},
 }
 
 
@@ -258,6 +278,59 @@ def _deep(cfg, gx, gy, hi):
         if m.any():
             hi = np.where(m, np.inf, hi)
     return hi
+
+def _ffnx_shift(cfg, A, B, hi):
+    """BUILD 846. With cfg['ffnx_bias'], `hi` is where the shadow REALLY
+    lies: FFNx's field shadow offset (lmain_vv, 658: d' = 1.0075 d - 0.0075
+    in window depth) moved through the field's own depth curve
+    d = A - 4B / c (c = camera depth), less cfg['pad'] units. HOLE_BIAS (8)
+    is that offset at games_2's depths (IDs ~250); at mds7pb_1's (~1350) it
+    is ~34 camera units, so an 8-unit copy still let the shadow through."""
+    if not cfg.get('ffnx_bias'):
+        return hi
+    fin = np.isfinite(hi)
+    ts = np.where(fin, hi + HOLE_BIAS, 1.0)
+    d = A - 4.0 * B / ts
+    d2 = 1.0075 * d - 0.0075
+    c2 = 4.0 * B / (A - d2)
+    return np.where(fin, c2 - float(cfg.get('pad', 4.0)), hi)
+
+
+def _solid(cfg, R, o, zoom, gx, gy, cls, hi, lo):
+    """BUILD 846. Art standing IN FRONT of walkable floor -- mds7pb_1's
+    right-hand table top. Its rays pass over the table and land on the floor
+    behind it, so the walkmesh test calls those texels 'floor', and the
+    table-top squares carry the floor's depth (620h): the shadow of a model
+    standing behind the table, drawn ~34 units nearer than that floor (FFNx's
+    offset), painted over the planks. Inside each cfg['solid'] screen polygon
+    (tile units) every texel is an object hiding the floor shadow behind it
+    (plane z -11 along its ray, HOLE_BIAS as elsewhere, then _ffnx_shift)."""
+    polys = cfg.get('solid', ())
+    if not polys:
+        return cls, hi, lo, np.zeros(np.shape(gx), bool)
+    ins = np.zeros(np.shape(gx), bool)
+    for poly in polys:
+        ins |= _in_poly(poly, gx, gy)
+    if not ins.any():
+        return cls, hi, lo, ins
+    Ri = np.linalg.inv(R)
+    b = np.einsum('ij,j->i', Ri, -o)
+    D = np.einsum('ij,nj->ni', Ri, np.stack(
+        [gx.ravel() / zoom, gy.ravel() / zoom, np.ones(gx.size)], 1))
+    ts = ((-11.0 - b[2]) / D[:, 2]).reshape(np.shape(gx))
+    cls = np.where(ins, 1, cls)
+    hi = np.where(ins & (ts > 0), np.minimum(hi, ts - HOLE_BIAS), hi)
+    lo = np.where(ins, -np.inf, lo)
+    return cls, hi, lo, ins
+
+
+def _drawn_pad(cfg):
+    """how far behind `hi` the shadow is drawn (the fronts test). With
+    ffnx_bias, `pad` is a SAFETY margin (hardware draws the shadow nearer
+    than the model -- 776: 3..9 IDs), so a 1997 texel whose margin is under
+    it is re-copied too: the test is against `hi` itself."""
+    return 0.0 if cfg.get('ffnx_bias') else HOLE_BIAS - 3.0
+
 
 SAMPLES = 5                     # rays per square side
 
@@ -1030,6 +1103,7 @@ def _plan_holes_once(name, sec1, sec5, sec9):
     datas = {}
     x0, x1, y0, y1 = cfg['box']
     lsx, lsy, ldep = _legs(R, o, zoom, tris)
+    solid = {}                  # BUILD 846: (x, y) -> texels inside cfg['solid']
 
     def l2_opaque(xy, n, blended=False):
         """[(ID, n x n opaque)] of the truecolor layer-2 records at xy: the
@@ -1074,6 +1148,11 @@ def _plan_holes_once(name, sec1, sec5, sec9):
         for lid, m in l2_opaque((x, y), n):
             hid &= ~(m[ty, tx] & (dd > lid))        # already hidden (1997)
         out[ty[hid], tx[hid]] = True
+        # BUILD 846: a body behind a 'solid' (the table) is MEANT to go under
+        # it -- the leg guard does not apply to those texels
+        sm = solid.get((x, y))
+        if sm is not None and sm.shape == out.shape:
+            out &= ~sm
         return out
 
     def legs_hidden(x, y, n, mask, idv):
@@ -1093,7 +1172,8 @@ def _plan_holes_once(name, sec1, sec5, sec9):
         t = (np.arange(n) + 0.5) * 16.0 / n
         gx, gy = np.meshgrid(x + t, y + t)
         cls, hi, lo = _texels_cons(R, o, zoom, tris, gx, gy, 8.0 / n)
-        hi = _deep(cfg, gx, gy, hi)
+        cls, hi, lo, solid[(x, y)] = _solid(cfg, R, o, zoom, gx, gy, cls, hi, lo)
+        hi = _ffnx_shift(cfg, A, B, _deep(cfg, gx, gy, hi))
         obj = cls > 0
         need = obj & np.isfinite(hi)       # texels a floor shadow lies behind
         if not need.any():
@@ -1293,7 +1373,9 @@ def _plan_holes_once(name, sec1, sec5, sec9):
             t = (np.arange(n) + 0.5) * 16.0 / n
             gx, gy = np.meshgrid(x + t, y + t)
             cls, hi, lo = _texels_cons(R, o, zoom, tris, gx, gy, 8.0 / n)
-            hi = _deep(cfg, gx, gy, hi)
+            cls, hi, lo, solid[(x, y)] = _solid(cfg, R, o, zoom, gx, gy, cls,
+                                                hi, lo)
+            hi = _ffnx_shift(cfg, A, B, _deep(cfg, gx, gy, hi))
             need = (cls > 0) & np.isfinite(hi)
             if not need.any():
                 continue
@@ -1318,9 +1400,9 @@ def _plan_holes_once(name, sec1, sec5, sec9):
             over = np.zeros((n, n), bool)
             for _lid, m in l2_opaque((x, y), n, True):
                 over |= m
-            # the shadow is drawn at (hi + HOLE_BIAS - 3): hidden if fid < that / 4
+            # the shadow is drawn at (hi + pad): hidden if fid < that / 4
             expo = (need & np.isfinite(fid) & ~over & ~amb
-                    & (fid * 4.0 >= hi + HOLE_BIAS - 3.0))
+                    & (fid * 4.0 >= hi + _drawn_pad(cfg)))
             if not expo.any():
                 continue
 
@@ -1426,21 +1508,6 @@ def apply_to_flevel(archive, payloads, encode=None, log=lambda *_: None):
     if disabled() and script_disabled() and hole_disabled():
         return st
     encode = encode or archive.encode_field
-    for name in HOLE_FIELDS:                                   # BUILD 766
-        if hole_disabled() or name not in archive.index:
-            continue
-        try:
-            p = payloads.get(name)
-            raw = (lgp.lzs_decompress(p[4:]) if p
-                   else archive.decompressed(archive.index[name]))
-            parts = list(lgp.split_sections(raw))
-            parts[8], n = plan_holes(name, parts[1], parts[4], parts[8])
-            if n:
-                payloads[name] = encode(lgp.join_sections(parts))
-            st['holes'].append('%s (%s)' % (name, '%d squares' % n if n
-                                            else 'already'))
-        except Exception as exc:                               # noqa: BLE001
-            st['refused'].append((name + ' holes', str(exc)[:90]))
     for name in FIELDS:
         if name not in archive.index:
             continue
@@ -1472,6 +1539,23 @@ def apply_to_flevel(archive, payloads, encode=None, log=lambda *_: None):
                 st['refused'].append((name + ' script', str(exc)[:90]))
         if changed:
             payloads[name] = encode(lgp.join_sections(parts))
+    # BUILD 846: the holes pass runs AFTER the 620h floor pass, so a field in
+    # both (mds7pb_1) solves its copies against the depths that ship
+    for name in HOLE_FIELDS:                                   # BUILD 766
+        if hole_disabled() or name not in archive.index:
+            continue
+        try:
+            p = payloads.get(name)
+            raw = (lgp.lzs_decompress(p[4:]) if p
+                   else archive.decompressed(archive.index[name]))
+            parts = list(lgp.split_sections(raw))
+            parts[8], n = plan_holes(name, parts[1], parts[4], parts[8])
+            if n:
+                payloads[name] = encode(lgp.join_sections(parts))
+            st['holes'].append('%s (%s)' % (name, '%d squares' % n if n
+                                            else 'already'))
+        except Exception as exc:                               # noqa: BLE001
+            st['refused'].append((name + ' holes', str(exc)[:90]))
     return st
 
 

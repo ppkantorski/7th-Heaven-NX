@@ -613,6 +613,7 @@ CTX_SLOT = 0x2B0
 G_BANK1 = 0xDC08DC                    # the field variable bank
 G_OPTIONS = G_BANK1 + 0x0A
 G_MINUTES = G_BANK1 + 0x0C
+G_BATTLE_PAUSED = 0xDC0E6C            # BUILD 844: g_is_battle_paused (byte)
 G_MONTHS = G_BANK1 + 0x0D
 G_DAYS = G_BANK1 + 0x0E
 G_HOURS = G_BANK1 + 0x0F
@@ -1507,7 +1508,8 @@ def build_mode_cave(cave, addr, bss):
     return a.resolve()
 
 
-def _emit_clock(a, frames_per_minute, seed_hour, force_on, bss_reg=20):
+def _emit_clock(a, frames_per_minute, seed_hour, force_on, bss_reg=20,
+                battle_pause=False):
     """
     Load the clock, seed it if it has never run, advance it, store it back.
 
@@ -1629,6 +1631,19 @@ def _emit_clock(a, frames_per_minute, seed_hour, force_on, bss_reg=20):
     a.emit(A.lsr(9, 21, 1))
     a.emit(A.and_mask(9, 9, 1))
     a.cbz(9, 'store')
+    if battle_pause:
+        # BUILD 844: a PAUSED battle stops the clock. The flip tick runs every
+        # frame the battle is on screen, paused or not, so sitting in the
+        # pause screen ran day into night. g_is_battle_paused (guest
+        # 0xDC0E6C, FFNx's name) is what the battle loop itself reads to
+        # stop. The time is still loaded and stored, so the tint holds.
+        a.emit(A.ldr(9, bss_reg, BSS_MODE))
+        a.emit(A.cmp_imm(9, DRIVER_BATTLE))
+        a.bcond('bp_run', NE)
+        _translate_imm(a, G_BATTLE_PAUSED)
+        a.emit(A.ldrb(9, 0, 0))
+        a.cbnz(9, 'store')
+        a.label('bp_run')
     a.emit(A.add_imm(25, 25, 1))
     a.emit(A.cmp_imm(25, frames_per_minute))
     a.bcond('store', LO)
@@ -1722,7 +1737,7 @@ def build_flip_cave(cave, addr, bss, frames_per_minute, phase_table_addr,
         a.cbz(9, 'white')
 
     a.label('clock')
-    _emit_clock(a, frames_per_minute, seed_hour, force_on)
+    _emit_clock(a, frames_per_minute, seed_hour, force_on, battle_pause=True)
     # BUILD 650: both minigames are ultra-bright scenes (deeper night).
     mini = 'ultra' if ultra else 'colour'
     if condor:

@@ -852,12 +852,25 @@ class Mod:
         # 1.6 -> 1.61: 1 of 19,045 entries) re-converts every texture in it.
         # A changed file keeps its fresh mtime and invalidates exactly as
         # before.
-        previous = _cache_index(self.cache, log)
+        # BUILD 848: a cache the Storage > Compact option emptied after the
+        # last build left the .iro signature and every file's (size, mtime)
+        # behind. Same .iro: give the re-extracted files their old mtimes, so
+        # no archive fingerprint or conversion-cache key moves.
+        import ff7nx_cachegc
+        compact = ff7nx_cachegc.read_compact_mark(self.cache)
+        if compact is not None and compact[0] != want:
+            compact = None
+        previous = {} if compact else _cache_index(self.cache, log)
         shutil.rmtree(self.cache, ignore_errors=True)
         log(f'extracting {self.filename} ...')
         os.makedirs(self.cache, exist_ok=True)
         written, skipped, failures, excluded = iro.extract(
             self.path, self.cache, progress, skip=_no_switch_loader)
+        if compact:
+            kept, changed = ff7nx_cachegc.restore_compact_mtimes(
+                self.cache, compact[1])
+            log(f'  compacted cache restored: {kept} file(s) kept their cache '
+                f'identity; {changed} other')
         if previous:
             kept, changed = _restore_unchanged_mtimes(self.cache, previous)
             log(f'  {kept} file(s) identical to the previous version kept '
@@ -13288,7 +13301,10 @@ SCHEDULING_ENV = frozenset([REUSE_FLEVEL_ENV, REUSE_ALL_ENV,
                             # was started is not what it builds; in the key it
                             # made a GUI build and a release-app build of the
                             # same settings miss each other's archives.
-                            'SEVENTH_NX_DEPS_CHILD']
+                            'SEVENTH_NX_DEPS_CHILD',
+                            # BUILD 848: Storage > Compact cache only deletes
+                            # mod extractions after the build.
+                            'SEVENTH_NX_COMPACT_CACHE']
                            + list(REUSE_ARCHIVE_ENV.values()))
 
 # BUILD 326. The 60 FPS setting. It is a GUI/CLI setting, not an environment
@@ -13411,6 +13427,9 @@ FPS_MULT_TAG = 'fpsmult='
 # `exefs/main` through nso_patcher -- none of them touch an .lgp, a .tex or a
 # field file. Adding a name here is only safe under that rule.
 MAIN_ONLY_ENV = frozenset((
+    'SEVENTH_NX_LIMITER_SLEEP', 'SEVENTH_NX_BOOST_TICKS',
+    'SEVENTH_NX_BOOST_TICKS_MS',      # BUILD 847: exefs/main only
+    'SEVENTH_NX_TUTORIAL_FULLVIEW',   # BUILD 842: exefs/main only
     # BUILD 743. The two input tweaks (ff7nx_nocheats: R3's booster and the
     # stick auto-run) are one word each in exefs/main and touch no archive.
     # Left in the sweep, ticking "no cheats" off refused
@@ -14598,6 +14617,148 @@ def prune_stale(sdout, produced, log=lambda *_: None):
             json.dump(sorted(now), f)
     except OSError:
         pass
+
+
+# BUILD 850. WHAT CHANGED SINCE THE LAST BUILD.
+#
+# Copying the whole sdout (13 GB with the full mod list) to the SD card after
+# every rebuild is slow, and most of it did not change. After each build every
+# file in sdout is compared with the previous build's record (cache/
+# _sdout_manifest/<key>.state.json, never in sdout): same size and mtime ->
+# unchanged; otherwise its SHA-1 is compared with the recorded one, so a file
+# rewritten with the same bytes (an archive rebuilt identically) does not
+# count. Only rewritten files are hashed, so a rebuild costs a few seconds;
+# the first build hashes everything once.
+#
+# The result goes to the log and to CHANGES_DIR beside sdout: the new and
+# changed files only, at their sdout paths, as hard links (no extra disk;
+# copies if the volume cannot link). Copy its contents onto the SD card root
+# instead of all of sdout. Files the build no longer produces are listed to
+# delete from the card (CHANGES_LIST names all of it). The folder holds only
+# this build's changes: a user who skipped copying a build should copy sdout.
+CHANGES_DIR_NAME = 'sdout_changes'
+CHANGES_LIST_NAME = 'sdout_changes.txt'
+
+
+def _sha1_file(path, bufsize=1 << 20):
+    h = hashlib.sha1()
+    with open(path, 'rb') as f:
+        while True:
+            b = f.read(bufsize)
+            if not b:
+                break
+            h.update(b)
+    return h.hexdigest()
+
+
+def _sdout_files(root):
+    """{relpath ('/'-separated): absolute path} of every file in sdout,
+    hidden files (.DS_Store) left out."""
+    out = {}
+    for base, dirs, files in os.walk(root):
+        dirs[:] = sorted(d for d in dirs if not d.startswith('.'))
+        for fn in files:
+            if fn.startswith('.'):
+                continue
+            p = os.path.join(base, fn)
+            out[os.path.relpath(p, root).replace(os.sep, '/')] = p
+    return out
+
+
+def sdout_changes(sdout, changes_dir=None, list_path=None,
+                  log=lambda *_: None):
+    """Compare sdout with the previous build's record, rebuild changes_dir
+    and list_path, save the new record. Returns
+    {'first': bool, 'added': [...], 'changed': [...], 'removed': [...],
+     'bytes': int} (paths relative to sdout), or None on failure."""
+    root = os.path.abspath(sdout)
+    if not os.path.isdir(root):
+        return None
+    parent = os.path.dirname(root)
+    changes_dir = changes_dir or os.path.join(parent, CHANGES_DIR_NAME)
+    list_path = list_path or os.path.join(parent, CHANGES_LIST_NAME)
+    try:
+        os.makedirs(SDOUT_MANIFEST, exist_ok=True)
+    except OSError:
+        return None
+    key = hashlib.sha1(root.encode()).hexdigest()[:16]
+    rec = os.path.join(SDOUT_MANIFEST, key + '.state.json')
+    try:
+        with open(rec, encoding='utf-8') as f:
+            old = {k: tuple(v) for k, v in json.load(f).items()}
+    except (OSError, ValueError, TypeError, AttributeError):
+        old = None
+    now, added, changed = {}, [], []
+    for rel, path in sorted(_sdout_files(root).items()):
+        try:
+            st = os.stat(path)
+        except OSError:
+            continue
+        prev = (old or {}).get(rel)
+        if prev and prev[0] == st.st_size and prev[1] == st.st_mtime_ns:
+            now[rel] = prev
+            continue
+        try:
+            digest = _sha1_file(path)
+        except OSError:
+            continue
+        now[rel] = (st.st_size, st.st_mtime_ns, digest)
+        if old is None:
+            continue
+        if prev is None:
+            added.append(rel)
+        elif prev[0] != st.st_size or prev[2] != digest:
+            changed.append(rel)
+    removed = sorted(set(old or ()) - set(now))
+    first = old is None
+    # this build's changes folder: ours alone, so it is replaced whole
+    if os.path.basename(changes_dir) == CHANGES_DIR_NAME and \
+            os.path.isdir(changes_dir):
+        shutil.rmtree(changes_dir, ignore_errors=True)
+    total = 0
+    for rel in added + changed:
+        src = os.path.join(root, rel.replace('/', os.sep))
+        dst = os.path.join(changes_dir, rel.replace('/', os.sep))
+        try:
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            try:
+                os.link(src, dst)
+            except OSError:
+                shutil.copy2(src, dst)
+            total += now[rel][0]
+        except OSError as exc:
+            log(f'  ! {rel}: not put in {CHANGES_DIR_NAME}/: {exc}')
+    lines = []
+    if first:
+        lines.append('First build of this sdout: copy all of sdout/ onto the '
+                     'SD card. The next build lists only what changes.')
+    else:
+        lines.append('Changed since the last build. Copy the contents of %s/ '
+                     'onto the root of your SD card (replace when asked).'
+                     % CHANGES_DIR_NAME)
+        lines.append('')
+        for tag, items in (('NEW', added), ('CHANGED', changed),
+                           ('DELETE FROM THE SD CARD (no longer built)',
+                            removed)):
+            if items:
+                lines.append('%s (%d):' % (tag, len(items)))
+                lines.extend('  ' + r for r in items)
+                lines.append('')
+    try:
+        with open(list_path, 'w', encoding='utf-8') as f:
+            f.write('\n'.join(lines).rstrip() + '\n')
+    except OSError:
+        pass
+    try:
+        tmp = rec + '.part'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(now, f)
+        os.replace(tmp, rec)
+    except OSError:
+        pass
+    return {'first': first, 'added': added, 'changed': changed,
+            'removed': removed, 'bytes': total,
+            'dir': changes_dir, 'list': list_path}
 
 
 def apply_plan(plan, archive_paths, sdout, log=lambda *_: None,
@@ -16422,6 +16583,80 @@ def _field_tick_hz():
     """The field loop rate. BUILD 526's hybrid limiter keeps stock pacing,
     so this is the same number the other bridges use."""
     return _footstep_tick_hz()
+
+
+def apply_limiter_sleep(sdout, dump, plan, log=lambda *_: None, produced=()):
+    """BUILD 842: the field and battle limiters sleep through the idle part
+    of their wait instead of spinning a core at 100%. See ff7nx_fieldpace."""
+    if not ff7nx_fieldpace.sleep_enabled():
+        log('')
+        log('limiter sleep: off (%s=off) -- the limiters spin as stock'
+            % ff7nx_fieldpace.SLEEP_ENV)
+        return []
+    src, built = _audio_bridge_base(sdout, dump, log, produced,
+                                    'limiter sleep')
+    if src is None:
+        return []
+    dest = os.path.join(sdout, 'atmosphere', 'contents', TITLE_ID, 'exefs',
+                        'main')
+    log('')
+    log('limiter sleep ...')
+    tmp = dest + '.limitsleep-tmp'
+    try:
+        report = ff7nx_fieldpace.apply_sleep_to_nso(src, tmp, stock=dump.nso)
+    except Exception as exc:                                   # noqa: BLE001
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        log('! limiter sleep: %s: %s -- NOT INSTALLED, the limiters spin as '
+            'stock' % (type(exc).__name__, exc))
+        return []
+    os.replace(tmp, dest)
+    log('  %s: the wait sleeps %d us at a time while more than %.1f ms is '
+        'left, then spins to the deadline as before (routine +0x%X, '
+        'SleepThread +0x%X, %d bytes). %s=off restores the spin'
+        % (', '.join(report['installed']), report['quantum_us'],
+           report['margin_ms'], report['routine'], report['sleep_fn'],
+           report['bytes'], ff7nx_fieldpace.SLEEP_ENV))
+    if report['skipped']:
+        log('  ! not stock, left spinning: %s' % ', '.join(report['skipped']))
+    return [dest] if not built else []
+
+
+def apply_boost_ticks(sdout, dump, plan, log=lambda *_: None, produced=()):
+    """BUILD 847: at 3x every field and battle frame runs `multiplier` logic
+    ticks (extras are update-only / no-draw); at 1x every cave is the stock
+    call. See ff7nx_fieldpace."""
+    if not ff7nx_fieldpace.boost_enabled():
+        log('')
+        log('booster ticks: off (%s=off) -- the stock 3x'
+            % ff7nx_fieldpace.BOOST_ENV)
+        return []
+    src, built = _audio_bridge_base(sdout, dump, log, produced,
+                                    'booster ticks')
+    if src is None:
+        return []
+    dest = os.path.join(sdout, 'atmosphere', 'contents', TITLE_ID, 'exefs',
+                        'main')
+    log('')
+    log('booster ticks ...')
+    tmp = dest + '.boost-tmp'
+    try:
+        report = ff7nx_fieldpace.apply_boost_to_nso(src, tmp, stock=dump.nso)
+    except Exception as exc:                                   # noqa: BLE001
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        log('! booster ticks: %s: %s -- NOT INSTALLED, 3x stays stock'
+            % (type(exc).__name__, exc))
+        return []
+    os.replace(tmp, dest)
+    log('  %s: at 3x each frame runs 3 logic ticks -- 2 extra update-only '
+        '(field) / no-draw (battle) ticks, up to %d, within %.1f ms a frame; '
+        '%d bytes. %s=off restores the stock 3x'
+        % (', '.join(report['installed']), report['max_extra'],
+           report['budget_ms'], report['bytes'], ff7nx_fieldpace.BOOST_ENV))
+    if report['skipped']:
+        log('  ! not stock, left as is: %s' % ', '.join(report['skipped']))
+    return [dest] if not built else []
 
 
 def apply_field_pacing(sdout, dump, plan, log=lambda *_: None, produced=()):
@@ -19172,6 +19407,10 @@ def apply_echo_tutorial(sdout, dump, plan, log=lambda *_: None, produced=()):
         % (report['requested_index'], report['requested'],
            report['redirect_index'], report['redirect'], report['field'],
            report['field_id'], report['entry'], report['words']))
+    if echo_s_tutorial.fullview_enabled():
+        log('  the tutorial movie keeps its full height: ff7nx_moviealign and '
+            'ff7nx_moviebars stand aside for a 4:3 movie in mds7pb_1 only '
+            '(%s=off restores the field framing)' % echo_s_tutorial.FULLVIEW_ENV)
     # The redirect is only half of this. Slot 1 carries no file in the stock
     # game -- that is exactly why it was safe to claim -- so if the movie pass
     # did not produce one, the module now sends mds7pb_1 at a movie that is

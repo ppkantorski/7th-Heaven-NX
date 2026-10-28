@@ -227,6 +227,533 @@ def build_late_cave(_entry, addr, slack, reg=21, resume=None):
     return a.resolve()
 
 
+# BUILD 842: THE LIMITER SLEEPS INSTEAD OF SPINNING.
+#
+# Both limiters (field 0x6384E6, battle 0x41B965) wait by reading the clock
+# in a tight loop until the frame's time is up. A core sits at 100% doing
+# nothing for most of every frame -- the 80-90% CPU readout at 1x. (At 3x the
+# booster's clock runs fast, the deadline is already past when the loop
+# looks, and the CPU waits on vsync instead: same frame rate, far less CPU.)
+#
+# Each of the four wait loops ends with one branch that sends it round again
+# (the main wait and the catch-up wait, field and battle). That branch now
+# goes through a stub: if the loop is leaving, it leaves as before; if it is
+# going round and MORE THAN SLEEP_MARGIN_MS of the wait is left, it calls
+# nn::os::SleepThread for SLEEP_QUANTUM_US first. The last stretch is still
+# spun, so the release lands where it always did; only the idle part sleeps.
+#
+#   remaining = d0 - d8   (d0: the time waited for, d8: elapsed -- both
+#                          doubles, live at all four branches, measured)
+#
+# The clock counts the 19.2 MHz system tick (CPS), times the booster's
+# multiplier, so the margin is real time at 1x and a third of it at 3x --
+# still more than one quantum. A NaN compares unordered and is taken as
+# "do not sleep". The loop heads all start with a call, so the flags the
+# routine's fcmp sets are dead there.
+SLEEP_ENV = 'SEVENTH_NX_LIMITER_SLEEP'      # off / 0 restores the spin
+SLEEP_SYMBOL = '_ZN2nn2os11SleepThreadENS_8TimeSpanE'
+SLEEP_MARGIN_MS = 2.0
+SLEEP_QUANTUM_US = 250
+# (branch VA, stock word, kind, register, loop head, exit, what)
+SLEEP_SITES = (
+    (0x9E5F30, 0x34FFEFAA, 'cbz', 10, 0x9E5D24, 0x9E5F34, 'field wait'),
+    (0x9E6344, 0x35FFF108, 'cbnz', 8, 0x9E6164, 0x9E6348,
+     'field catch-up wait'),
+    (0x8F640, 0x34FFEFEA, 'cbz', 10, 0x8F43C, 0x8F644, 'battle wait'),
+    (0x8FA3C, 0x35FFF148, 'cbnz', 8, 0x8F864, 0x8FA40,
+     'battle catch-up wait'),
+)
+
+
+def sleep_enabled():
+    return os.environ.get(SLEEP_ENV, '').strip().lower() not in (
+        '0', 'off', 'no', 'false')
+
+
+def _stp_d(rt, rt2, off):
+    return 0x6D000000 | ((off // 8) << 15) | (rt2 << 10) | (31 << 5) | rt
+
+
+def _ldp_d(rt, rt2, off):
+    return 0x6D400000 | ((off // 8) << 15) | (rt2 << 10) | (31 << 5) | rt
+
+
+def build_sleep_routine(_entry, addr, sleep_fn, margin_counts, quantum_ns):
+    """Sleep one quantum when more than the margin is left; else return."""
+    a = Asm(_entry, addr)
+    a.emit(0x1E683802)                             # fsub d2, d0, d8
+    bits = struct.unpack('<Q', struct.pack('<d', float(margin_counts)))[0]
+    for hw in range(4):
+        imm = (bits >> (16 * hw)) & 0xFFFF
+        base = 0xD2800000 if hw == 0 else 0xF2800000   # movz / movk x9
+        a.emit(base | (hw << 21) | (imm << 5) | 9)
+    a.emit(0x9E670123)                             # fmov d3, x9
+    a.emit(0x1E632040)                             # fcmp d2, d3
+    a.bcond('done', A.LE)                          # <= margin or NaN: spin
+    a.emit(A.sub_imm64(31, 31, 0xE0))
+    for r in range(0, 18, 2):                      # x0..x17
+        a.emit(A.stp64_off(r, r + 1, 31, 8 * r))
+    a.emit(A.str64(30, 31, 0x90))                  # x30
+    for k, r in enumerate(range(0, 8, 2)):         # d0..d7
+        a.emit(_stp_d(r, r + 1, 0xA0 + 16 * k))
+    a.emit(A.movz(0, quantum_ns & 0xFFFF))
+    a.emit(A.movk_hi(0, quantum_ns >> 16))         # w0 -> x0, zero-extended
+    a.emit(A.bl(a.pc(), sleep_fn))                 # SleepThread(TimeSpan ns)
+    for k, r in enumerate(range(0, 8, 2)):
+        a.emit(_ldp_d(r, r + 1, 0xA0 + 16 * k))
+    a.emit(A.ldr64(30, 31, 0x90))
+    for r in range(0, 18, 2):
+        a.emit(A.ldp64_off(r, r + 1, 31, 8 * r))
+    a.emit(A.add_imm64(31, 31, 0xE0))
+    a.label('done')
+    a.emit(0xD65F03C0)                             # ret
+    return a.resolve()
+
+
+def build_sleep_stub(_entry, addr, kind, reg, loop, leave, routine):
+    """The loop's own branch, with the routine called on the way round."""
+    a = Asm(_entry, addr)
+    if kind == 'cbz':
+        a.cbnz(reg, 'leave')                       # loops while reg == 0
+    else:
+        a.cbz(reg, 'leave')                        # loops while reg != 0
+    a.emit(A.bl(a.pc(), routine))
+    a.emit(A.b(a.pc(), loop))
+    a.label('leave')
+    a.emit(A.b(a.pc(), leave))
+    return a.resolve()
+
+
+def apply_sleep_to_nso(src, dest, stock=None):
+    """Install the limiter sleep on every wait loop still stock. A loop
+    whose branch is not the stock word is left spinning and reported."""
+    import ff7nx_deadspace as DS
+    import nsosyms
+    with open(src, 'rb') as handle:
+        blob = handle.read()
+    segs, raw, space = ff7nx_tables.open_module(blob)
+    text = space.text
+    _m, plt = nsosyms.imports(src)
+    sleep_fn = next((va for va, name in plt.items() if name == SLEEP_SYMBOL),
+                    None)
+    if sleep_fn is None:
+        raise ValueError('%s is not imported by this module' % SLEEP_SYMBOL)
+    sites, skipped = [], []
+    for site in SLEEP_SITES:
+        got = struct.unpack_from('<I', text, site[0])[0]
+        (sites if got == site[1] else skipped).append(site)
+    if not sites:
+        raise ValueError('no wait loop holds its stock branch')
+    dead = DS.Bump(*DS.part(src, 'sleep', stock))
+    margin = int(round(SLEEP_MARGIN_MS * CPS / 1000.0))
+    quantum = SLEEP_QUANTUM_US * 1000
+    routine = dead.put(lambda e, ad: build_sleep_routine(
+        e, ad, sleep_fn, margin, quantum))
+    placed = {}
+    for va, _w, kind, reg, loop, leave, _what in sites:
+        stub = dead.put(lambda e, ad, k=kind, r=reg, lp=loop, lv=leave:
+                        build_sleep_stub(e, ad, k, r, lp, lv, routine))
+        placed[va] = A.b(va, stub)
+    placed.update(dead.placed)
+    for va, w in placed.items():
+        struct.pack_into('<I', text, va, w)
+    out = AC.pack(blob, space.commit(), 0)
+    with open(dest, 'wb') as handle:
+        handle.write(out)
+    return {'routine': routine, 'sleep_fn': sleep_fn,
+            'installed': [s[6] for s in sites],
+            'skipped': [s[6] for s in skipped],
+            'margin_ms': SLEEP_MARGIN_MS, 'quantum_us': SLEEP_QUANTUM_US,
+            'bytes': 4 * len(dead.placed)}
+
+
+# BUILD 847: THE 3x BOOSTER RUNS `multiplier` LOGIC TICKS PER PRESENTED
+# FRAME, IN EVERY FIELD AND BATTLE FRAME, WITHOUT EXTRA DRAWS.
+#
+# WHY 3x WAS INCONSISTENT. The booster (L3) only multiplies the port's
+# virtual clock (+0x6720, multiplier at +0x12C99B8). Presents are vsync-bound,
+# so speed comes only from how many logic ticks a presented frame runs. Stock,
+# the only extra tick is the limiter's catch-up ("debt") path, and since the
+# late gates (BUILD 531 field, 534 battle) the debt flag rises only when the
+# frame is late for 60 by more than 2 ms. On the 3x clock that is a real frame
+# time of more than ~6.2 ms. So at 3x:
+#
+#   light frames (< ~6.2 ms real work)    no debt -> 1 tick  -> 1x, low CPU
+#   medium frames                         debt    -> 2 ticks -> 2x
+#   heavy field frames                    debt    -> 2 ticks AND 2 draws, which
+#                                         no longer fit a vsync -> ~1x
+#
+# (x86 0x905AD4, the flag 0x6388EE tests before its limiter, is initialised to
+# 1 in ff7_en and has no writer: that "no limiter" branch never runs. Battle
+# skips the debt path only on its early branch, [ebp-0x10] == 0.)
+#
+# BUILD 843 repeated the catch-up iteration. It was wrong three ways: frames
+# with no debt still ran 1 tick; every field repeat redrew (draw_everything,
+# up to ~16 ms in busy fields) -> ~40 fps; every battle repeat ran with the
+# draw flag set (66c3b2(1)) so models were submitted three times a frame ->
+# flicker.
+#
+# WHAT THIS DOES (multiplier > 1 only; at 1x each cave is the stock call):
+#
+#   field  (field_sub_6388EE 0x94B820). Before the frame's draw_everything
+#          (+0x94B898), `multiplier - 1` extra ticks: the stock reset/begin
+#          (649770, 638C03, 646479), frame counter += 1.0, the field update
+#          x86 0x60E96C (logic and anim) and its stock exit checks -- the
+#          stock catch-up iteration (+0x94B93C..+0x94BA90) minus its limiter
+#          wait and its first draw. The frame then draws once, as stock. A
+#          logic+anim tick costs ~0.4 ms (BUILD 787 profile). A failed exit
+#          check skips the draw and returns to +0x94BC10, exactly as the stock
+#          catch-up does. (847 ran the extras after the draw: each began a
+#          new graphics frame nothing drew, the flip skipped it -> black.) The debt flag (0xCFFA98) is cleared, so the next
+#          frame takes the normal path (one draw) instead of the catch-up.
+#          No extras while a movie plays (movie_object->is_playing): some
+#          movie code paces itself per field tick.
+#   battle (battle_loop 0x41BAB3). Before the frame's own 66c3b2/update
+#          (+0x90568 normal path, +0x90500 early path), `multiplier - 1` extra
+#          NO-DRAW ticks: 66c3b2(0), frame counter += 1.0, update 0x41C0BB --
+#          exactly the stock catch-up's first tick, which draws nothing
+#          (66c3bf gates every battle draw, the fxinterp hooks included). On
+#          the normal path the debt flag (0x9AD1D4) is cleared and the frame's
+#          own 66c3b2 argument is set to 1, so the frame is "N no-draw ticks,
+#          one drawing tick, render": the stock catch-up shape with more
+#          no-draw ticks, and no catch-up wait.
+#
+#   menu   (BUILD 847c) battle_loop's menu pass count (+0x90AE8) becomes
+#          k x multiplier, so the battle menu -- which fills the ATB gauges --
+#          runs 3 passes per drawn frame at 3x (see MENU_SITE).
+#
+# Extras stop early once they have used BOOST_BUDGET_MS of real time
+# (cntpct_el0) in a frame, so a spike (a first-time sound load) cannot stack.
+BOOST_ENV = 'SEVENTH_NX_BOOST_TICKS'        # off / 0 = stock 3x
+BOOST_MS_ENV = 'SEVENTH_NX_BOOST_TICKS_MS'  # extras' real-time budget per frame
+BOOST_MULT = 0x12C99B8
+BOOST_MAX_EXTRA = 4
+BOOST_BUDGET_MS = 4.0
+MRS_CNTPCT = 0xD53BE020                     # mrs Xt, cntpct_el0 (19.2 MHz)
+TRANSLATE = 0x10FC3A0
+CTX_GOT = 0x12CE2B0                         # -> the emulated x86 context
+MOVIE_GOT = 0x12CE7C0                       # -> -> movie_object
+MOVIE_IS_PLAYING = 0x1FC
+FIELD_DEBT_FLAG = 0xCFFA98
+FIELD_EXIT_FLAG = 0xCFF280                  # stock check: != 0 -> stop
+FIELD_COUNTER_STEP = 0x7B78A0               # 1.0, the catch-up's += [..]
+BATTLE_DEBT_FLAG = 0x9AD1D4
+BATTLE_COUNTER_STEP = 0x7B74B8              # 1.0
+GAME_OBJ_COUNTER = 0x40                     # game_obj->field_40, a double
+# the field frame's draw (BUILD 847b: was the tail +0x94BC0C, after the
+# draw -- extras there began new graphics frames that nothing drew, the flip
+# skipped them and the screen went black)
+FIELD_SITE = 0x94B898                       # bl draw_everything (x86 0x63A60B)
+FIELD_DRAW = 0x9E6E80
+FIELD_EPILOGUE = 0x94BC10
+FIELD_RESET = 0x946330                      # x86 0x649770
+FIELD_BEGIN = 0x9E8270                      # x86 0x638C03 (arg)
+FIELD_BEGIN2 = 0x9E8420                     # x86 0x646479
+FIELD_UPDATE = 0x94BD30                     # x86 0x60E96C (arg) -> eax
+# battle_loop's two 66c3b2 calls
+SET_DRAW = 0xAD8D30                         # x86 0x66C3B2 (flag)
+BATTLE_UPDATE = 0x91B10                     # x86 0x41C0BB (arg)
+BATTLE_SITES = ((0x90568, True, 'battle'), (0x90500, False, 'battle early'))
+# BUILD 847c: the battle MENU's per-frame pass count. battle_loop's render
+# runs battle_menu_update (x86 0x6CE8B3) in a counted loop, drawing the menu
+# (0x6CEE84, and 6cdbfc(1)) only on the last pass:
+#     41BDE5  mov [ebp-0x18], 4     ; vanilla 4 (15 fps battle, 60 Hz menu)
+# which ff7nx_60fps sets to 1 (+0x90AE8 `mov w8, #1`), ff7nx_30fps to 2. The
+# menu module is what fills the ATB gauges (and the limit gauge, the reel,
+# the menu's own animations), once per DRAWN frame -- so the extra battle
+# updates never sped it up and the ATB bars stayed at 1x (stock 3x too). At
+# 3x the count becomes k x multiplier: the vanilla multi-pass menu, draw on
+# the last pass only. The word is a `bl` to a 7-word cave that leaves the
+# count in w8 (x0, the translated [ebp-0x18], is live and untouched).
+MENU_SITE = 0x90AE8
+MENU_ORR4 = 0x321E03E8                      # orr w8, wzr, #4 (vanilla)
+
+
+def boost_enabled():
+    # BUILD 847: on by default (843 was off: see above). =off restores the
+    # stock 3x; at 1x every cave is the stock call either way.
+    return os.environ.get(BOOST_ENV, '').strip().lower() not in (
+        '0', 'off', 'no', 'false')
+
+
+def boost_budget_counts():
+    v = os.environ.get(BOOST_MS_ENV, '').strip()
+    try:
+        ms = float(v) if v else BOOST_BUDGET_MS
+    except ValueError:
+        ms = BOOST_BUDGET_MS
+    return max(1, int(round(max(0.1, min(ms, 16.0)) * CPS / 1000.0)))
+
+
+def _fadd_d(rd, rn, rm):
+    return 0x1E602800 | (rm << 16) | (rn << 5) | rd
+
+
+def _str_d(rt, rn, imm=0):
+    return 0xFD000000 | ((imm >> 3) << 10) | (rn << 5) | rt
+
+
+def _boost_head(a, budget):
+    """Prologue shared by the caves: frame, x20 = context, w10 = mult (goes
+    to 'out' at 1x), x21 = start tick, w22 = extras, x23 = budget."""
+    a.emit(A.stp64_pre(29, 30, 31, -0x40))
+    a.emit(A.stp64_off(19, 20, 31, 0x10))
+    a.emit(A.stp64_off(21, 22, 31, 0x20))
+    a.emit(A.stp64_off(23, 24, 31, 0x30))
+    a.emit(A.adrp(9, a.pc(), BOOST_MULT & ~0xFFF))
+    a.emit(A.ldr(10, 9, BOOST_MULT & 0xFFF))      # multiplier
+    a.emit(A.sub_imm(22, 10, 1))                  # extras = mult - 1
+    a.emit(A.cmp_imm(22, 1))
+    a.bcond('out', A.LT)                          # 1x (or junk <= 1): stock
+    a.emit(A.cmp_imm(22, BOOST_MAX_EXTRA))
+    a.bcond('capped', A.LE)
+    a.emit(A.movz(22, BOOST_MAX_EXTRA))
+    a.label('capped')
+    a.emit(A.adrp(20, a.pc(), CTX_GOT & ~0xFFF))
+    a.emit(A.ldr64(20, 20, CTX_GOT & 0xFFF))      # x86 context
+    AC.mov32(a, 23, budget)
+
+
+def _boost_guest_zero(a, guest):
+    AC.mov32(a, 0, guest)
+    a.emit(A.bl(a.pc(), TRANSLATE))
+    a.emit(A.str_(31, 0, 0))
+
+
+def _boost_counter(a, step):
+    """game_obj->field_40 += [step] (1.0) -- the stock catch-up's x87 add,
+    done natively: [ebp+8] is game_obj in both callers."""
+    a.emit(A.ldr(8, 20, 0x14))                    # ebp
+    a.emit(A.add_imm(0, 8, 8))
+    a.emit(A.bl(a.pc(), TRANSLATE))
+    a.emit(A.ldr(8, 0, 0))                        # game_obj
+    a.emit(A.add_imm(0, 8, GAME_OBJ_COUNTER))
+    a.emit(A.bl(a.pc(), TRANSLATE))
+    a.emit(A.mov_reg64(19, 0))
+    AC.mov32(a, 0, step)
+    a.emit(A.bl(a.pc(), TRANSLATE))
+    a.emit(0xFD400001)                            # ldr d1, [x0]
+    a.emit(0xFD400260)                            # ldr d0, [x19]
+    a.emit(_fadd_d(0, 0, 1))
+    a.emit(_str_d(0, 19))
+
+
+def _boost_push_arg_call(a, fn, pop=True):
+    """push [ebp+8]; reserve the return slot; bl fn; (pop the argument) --
+    the stock words of +0x94BA20..+0x94BA60, temp w19 for w21."""
+    a.emit(A.ldr(8, 20, 0x14))
+    a.emit(A.add_imm(0, 8, 8))
+    a.emit(A.bl(a.pc(), TRANSLATE))
+    a.emit(A.ldr(8, 20, 0x10))
+    a.emit(A.ldr(19, 0, 0))                       # arg
+    a.emit(A.sub_imm(0, 8, 4))
+    a.emit(A.str_(19, 20, 4))                     # ecx = arg (as stock)
+    a.emit(A.str_(0, 20, 0x10))                   # esp -= 4
+    a.emit(A.bl(a.pc(), TRANSLATE))
+    a.emit(A.str_(19, 0, 0))                      # [esp] = arg
+    _boost_esp(a, -4)                             # the return slot
+    a.emit(A.bl(a.pc(), fn))                      # callee pops the slot
+    if pop:
+        _boost_esp(a, 4)
+
+
+def _boost_esp(a, delta):
+    a.emit(A.ldr(8, 20, 0x10))
+    a.emit(A.add_imm(8, 8, delta) if delta > 0 else A.sub_imm(8, 8, -delta))
+    a.emit(A.str_(8, 20, 0x10))
+
+
+def _boost_tail(a):
+    """Stop when the extras have used the budget; else count down."""
+    a.emit(MRS_CNTPCT | 8)
+    a.emit(A.sub_reg64(8, 8, 21))
+    a.emit(A.cmp_reg64(8, 23))
+    a.bcond('out', A.HS)
+    a.emit(A.sub_imm(22, 22, 1))
+    a.cbnz(22, 'loop')
+
+
+def _boost_foot(a):
+    a.label('out')
+    a.emit(A.ldp64_off(23, 24, 31, 0x30))
+    a.emit(A.ldp64_off(21, 22, 31, 0x20))
+    a.emit(A.ldp64_off(19, 20, 31, 0x10))
+    a.emit(A.ldp64_post(29, 30, 31, 0x40))
+
+
+def build_field_boost_cave(_entry, addr, budget):
+    """Replaces the frame's `bl draw_everything` at +0x94B898. The extras,
+    then the stock draw as a tail call (x30 = +0x94B89C). A failed exit
+    check skips the draw and returns to the epilogue +0x94BC10, as the
+    stock catch-up does."""
+    a = Asm(_entry, addr)
+    _boost_head(a, budget)
+    _boost_guest_zero(a, FIELD_DEBT_FLAG)         # this frame: normal path
+    a.emit(A.adrp(9, a.pc(), MOVIE_GOT & ~0xFFF))
+    a.emit(A.ldr64(9, 9, MOVIE_GOT & 0xFFF))
+    a.cbz64(9, 'go')
+    a.emit(A.ldr64(9, 9, 0))
+    a.cbz64(9, 'go')
+    a.emit(A.ldr(9, 9, MOVIE_IS_PLAYING))
+    a.cbnz(9, 'out')                              # a movie plays: stock
+    a.label('go')
+    a.emit(MRS_CNTPCT | 21)
+    a.label('loop')
+    _boost_esp(a, -4)                             # +0x94B93C..: reset/begin
+    a.emit(A.bl(a.pc(), FIELD_RESET))
+    _boost_push_arg_call(a, FIELD_BEGIN, pop=False)
+    a.emit(A.bl(a.pc(), FIELD_BEGIN2))            # takes the arg's slot
+    _boost_counter(a, FIELD_COUNTER_STEP)
+    _boost_push_arg_call(a, FIELD_UPDATE)         # eax = update(arg)
+    a.emit(A.ldr(8, 20, 0))                       # the stock exit checks
+    a.cbz(8, 'fail')
+    AC.mov32(a, 0, FIELD_EXIT_FLAG)
+    a.emit(A.bl(a.pc(), TRANSLATE))
+    a.emit(A.ldr(8, 0, 0))
+    a.cbnz(8, 'fail')
+    _boost_tail(a)
+    _boost_foot(a)
+    a.emit(A.b(a.pc(), FIELD_DRAW))               # the stock draw
+    a.label('fail')
+    a.emit(A.ldp64_off(23, 24, 31, 0x30))
+    a.emit(A.ldp64_off(21, 22, 31, 0x20))
+    a.emit(A.ldp64_off(19, 20, 31, 0x10))
+    a.emit(A.ldp64_post(29, 30, 31, 0x40))
+    a.emit(A.adrp(30, a.pc(), FIELD_EPILOGUE & ~0xFFF))
+    a.emit(A.add_imm64(30, 30, FIELD_EPILOGUE & 0xFFF))
+    a.emit(A.ret())
+    return a.resolve()
+
+
+def build_battle_boost_cave(_entry, addr, budget):
+    """One cave, two entries, each replacing a `bl 66c3b2` in battle_loop:
+    word 0 for the early path (+0x90500), word 2 for the normal path
+    (+0x90568). The extras, then the stock call as a tail call with the
+    original x30."""
+    a = Asm(_entry, addr)
+    a.emit(A.movz(16, 0))                         # +0: early path
+    a.b('common')
+    a.emit(A.movz(16, 1))                         # +8: normal path
+    a.label('common')
+    _boost_head(a, budget)
+    a.cbz(16, 'go')                               # w16 is intact here
+    _boost_guest_zero(a, BATTLE_DEBT_FLAG)        # +0x905B0 re-reads it
+    a.emit(A.ldr(8, 20, 0x10))                    # the frame's own flag:
+    a.emit(A.add_imm(0, 8, 4))                    # [esp+4] := 1 (it was 0
+    a.emit(A.bl(a.pc(), TRANSLATE))               # when the debt was set)
+    a.emit(A.movz(8, 1))
+    a.emit(A.str_(8, 0, 0))
+    a.label('go')
+    a.emit(MRS_CNTPCT | 21)
+    a.label('loop')
+    a.emit(A.ldr(8, 20, 0x10))                    # push 0
+    a.emit(A.sub_imm(0, 8, 4))
+    a.emit(A.str_(0, 20, 0x10))
+    a.emit(A.bl(a.pc(), TRANSLATE))
+    a.emit(A.str_(31, 0, 0))
+    _boost_esp(a, -4)
+    a.emit(A.bl(a.pc(), SET_DRAW))                # 66c3b2(0): no draw
+    _boost_esp(a, 4)
+    _boost_counter(a, BATTLE_COUNTER_STEP)
+    _boost_push_arg_call(a, BATTLE_UPDATE)
+    _boost_tail(a)
+    _boost_foot(a)
+    a.emit(A.b(a.pc(), SET_DRAW))                 # the stock call
+    return a.resolve()
+
+
+BATTLE_ENTRY = {False: 0, True: 8}               # cave offset per site
+
+
+def menu_site_count(word):
+    """k of the menu pass count word, or None when it is not a plain
+    `mov w8, #k` (1..8) / the vanilla `orr w8, wzr, #4`."""
+    if word == MENU_ORR4:
+        return 4
+    if (word & 0xFFE0001F) == 0x52800008:
+        k = (word >> 5) & 0xFFFF
+        if 1 <= k <= 8:
+            return k
+    return None
+
+
+def build_menu_boost_cave(_entry, addr, k):
+    """w8 = k * clamp(multiplier, 1, 1 + BOOST_MAX_EXTRA); only x9 and the
+    flags besides. Returns to +0x90AEC."""
+    a = Asm(_entry, addr)
+    a.emit(A.adrp(9, a.pc(), BOOST_MULT & ~0xFFF))
+    a.emit(A.ldr(8, 9, BOOST_MULT & 0xFFF))
+    a.emit(A.cmp_imm(8, 1))
+    a.bcond('lo', A.LT)
+    a.emit(A.cmp_imm(8, 1 + BOOST_MAX_EXTRA))
+    a.bcond('ok', A.LE)
+    a.emit(A.movz(8, 1 + BOOST_MAX_EXTRA))
+    a.b('ok')
+    a.label('lo')
+    a.emit(A.movz(8, 1))
+    a.label('ok')
+    if k != 1:
+        a.emit(A.movz(9, k))
+        a.emit(A.mul(8, 8, 9))
+    a.emit(A.ret())
+    return a.resolve()
+
+
+def apply_boost_to_nso(src, dest, stock=None, budget=None, region=None):
+    """Install the field tail cave and the battle cave on every site still
+    holding its stock call. `region` overrides the dead-space part (a test
+    main patched from an earlier test main that used it)."""
+    import ff7nx_deadspace as DS
+    with open(src, 'rb') as handle:
+        blob = handle.read()
+    segs, raw, space = ff7nx_tables.open_module(blob)
+    text = space.text
+    budget = boost_budget_counts() if budget is None else budget
+    sites = [(FIELD_SITE, FIELD_DRAW, 'field', None)]
+    sites += [(va, SET_DRAW, what, normal)
+              for va, normal, what in BATTLE_SITES]
+    todo, skipped = [], []
+    for site in sites:
+        ok = struct.unpack_from('<I', text, site[0])[0] == A.bl(site[0],
+                                                                site[1])
+        (todo if ok else skipped).append(site)
+    menu_k = menu_site_count(struct.unpack_from('<I', text, MENU_SITE)[0])
+    if not todo:
+        raise ValueError('no booster site holds its stock call')
+    lo, hi = region if region else DS.part(src, 'boost', stock)
+    dead = DS.Bump(lo, hi)
+    caves = {}
+    battle = None
+    for va, _callee, what, normal in todo:
+        if normal is None:
+            cave = dead.put(lambda e, ad: build_field_boost_cave(e, ad,
+                                                                 budget))
+        else:
+            if battle is None:
+                battle = dead.put(lambda e, ad: build_battle_boost_cave(
+                    e, ad, budget))
+            cave = battle + BATTLE_ENTRY[normal]
+        caves[what] = cave
+        dead.placed[va] = A.bl(va, cave)
+    if menu_k is None:
+        skipped.append((MENU_SITE, None, 'battle menu', None))
+    else:
+        cave = dead.put(lambda e, ad: build_menu_boost_cave(e, ad, menu_k))
+        dead.placed[MENU_SITE] = A.bl(MENU_SITE, cave)
+        caves['battle menu'] = cave
+        todo.append((MENU_SITE, None, 'battle menu', None))
+    for va, w in dead.placed.items():
+        struct.pack_into('<I', text, va, w)
+    out = AC.pack(blob, space.commit(), 0)
+    with open(dest, 'wb') as handle:
+        handle.write(out)
+    return {'installed': [s[2] for s in todo],
+            'skipped': [s[2] for s in skipped], 'caves': caves,
+            'max_extra': BOOST_MAX_EXTRA,
+            'budget_ms': budget * 1000.0 / CPS,
+            'bytes': dead.at - lo}
+
+
 def mode():
     """'gate' (default): the late gate only. 'hybrid': the gate plus the 526
     release-based deadline. 'stock': nothing."""
