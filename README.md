@@ -20,7 +20,7 @@ On PC, mods like Cosmo Memory, Echo-S and Enhanced Stock UI depend on FFNx, a re
 
 ## Screenshots
 
-[![7th Heaven NX main window](.pics/screenshot_1.png)](https://github.com/ppkantorski/7th-Heaven-NX#screenshots)
+[![7th Heaven NX main window](.pics/gui_screenshot.png)](https://github.com/ppkantorski/7th-Heaven-NX#screenshots)
 
 ---
 
