@@ -79,6 +79,11 @@ ENTRY_GUARD = 0x40
 #: grew the blob 3,584 -> 5,300 bytes; facial's caves take 3,552 of the
 #: 6,416 bytes it keeps (measured with the voice flap on).
 FACIAL_AT = 0x1800
+#: BUILD 855: the top WORLD_TOP bytes of the body belong to ff7nx_fieldpace's
+#: world map (its two limiter-sleep stubs and the 3x booster cave); facial
+#: keeps [lo + FACIAL_AT, hi - WORLD_TOP): 4,880 bytes, of which it uses at
+#: most 3,552 (measured with the voice flap on).
+WORLD_TOP = 0x600
 HOOKS = (
     # (x86 routine, ARM entry, displaced word, blob entry)
     (0x5D1BA4, 0x7853F0, 0xFC1C0FE8, 'fx_material'),   # str d8,[sp,#-0x40]!

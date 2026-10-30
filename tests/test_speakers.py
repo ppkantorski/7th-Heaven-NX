@@ -364,3 +364,75 @@ def test_cahc_loses_the_chibi_weapon_part(tmp_path):
     out2, n2 = D.strip_scene_weapons('char.lgp', {}, {'cahc.hrc': str(van)},
                                      str(tmp_path / 'c'))
     assert n2 == 0 and out2 == {}
+
+
+def test_asides_are_nobody_however_echo_s_writes_them():
+    """BUILD 853: a box that is wholly "(...)" is not said aloud."""
+    A = S.is_aside
+    assert A('Cloud\n(He’s not even listening.)')               # jet
+    assert A('Tifa\n“(Cloud,you’re so reliable!)”')             # blin67_2
+    assert A('“(Oh,man,not again!)”')                           # onna_5
+    assert A('(I guess only Bugenhagen\n can open it.)')         # cosin2
+    assert A('Jessie\n“(Money…)”{NEW}\n“(Well,a lot was\n  promised.)”')
+    assert A('{RED XIII}\n“(I am Nanaki,son of Seto.)”')
+    assert A('  (Phew…\n   Thank god for that!)')
+    # spoken, or spoken with an aside: the speaker keeps the mouth
+    assert not A('Cloud\n“Hm.”')
+    assert not A('Barret\n“Fine. (Whatever.)”')
+    assert not A('Tifa\n“(Sigh) Let’s go.”')
+    assert not A('(Sigh) Fine. (Whatever.)')
+    assert not A('Jessie\n“(Money…)”{NEW}\n“Well,a lot was promised.”')
+    assert not A('Run by holding CANCEL')
+    assert S.header_of('Tifa\n“(Hang in there!)”') == ('Tifa', 'thought')
+    assert S.header_of('“(You tell him.)”') == (None, 'thought')
+    assert S.header_of('Tifa\n“Hang in there!”') == ('Tifa', 'hdr')
+    assert S.choices_are_asides('{CHOICE}(Better cooperate)\n'
+                                '{CHOICE}(Punch his lights out)')
+    assert not S.choices_are_asides('{CHOICE}Let’s get going\n'
+                                    '{CHOICE}(No,not yet)')
+
+
+def test_quoted_aside_and_thought_choice_are_tagged_nobody(monkeypatch):
+    monkeypatch.setattr(S, 'model_loader_names', lambda _s: LOADER)
+    actors = ['dir', 'cl', 'ba', 'jesy', 'weadge']
+    strings = [
+        enc('Barret\n“(Damn it.)”'),                    # 0 quoted aside
+        enc('“(Psh. Whatever.)”'),                      # 1 unnamed aside
+        enc('Barret\n“Fine. (Whatever.)”'),             # 2 mixed: spoken
+    ]
+    scripts = {0: [], 1: [char(0)], 2: [char(1), mes(0), mes(1), mes(2)],
+               3: [char(2)], 4: [char(3)]}
+    sec = field(actors, scripts, strings, akao=b'AKAO' + bytes(12))
+    values, _r, _s = S.analyse(sec, b'x', 't')
+    v = {sid: val for sid, (val, _w) in values.items()}
+    assert v[0] == S.V_NOBODY
+    assert v[1] == S.V_NOBODY
+    assert v[2] == S.V_DEFAULT              # Barret's own line, his mouth
+
+
+def test_858_aside_pages_of_a_mixed_box(monkeypatch):
+    """BUILD 858: onna_2's "“Oh my! You shouldn't be in here!”{NEW}(Ugh…
+    A frisky customer.)" keeps her mouth on page 0 and marks page 1."""
+    t = '“Oh my!\n  You shouldn’t be in here!”{NEW}\n(Ugh… A frisky customer.)'
+    assert S.page_kinds(t) == ['spoken', 'aside']
+    assert S.aside_mask(t) == 0b10
+    assert not S.is_aside(t)
+    assert S.aside_mask('Jessie\n“(Money…)”{NEW}\n“(Well.)”') == 0  # all aside
+    assert S.aside_mask('Cloud\n“Hm.”') == 0
+    many = '{NEW}'.join(['“A”', '(b)'] * 5)
+    assert S.aside_mask(many) == 0b0101010                # pages 0..6 only
+    monkeypatch.setattr(S, 'model_loader_names', lambda _s: LOADER)
+    actors = ['dir', 'cl', 'ba', 'jesy', 'weadge']
+    strings = [enc('Barret\n“Go.”'), bytes(enc('Barret\n“Go.”')[:-1])
+               + bytes((0xE8,)) + enc('(Damn.)')]
+    scripts = {0: [], 1: [char(0)], 2: [char(1), mes(0), mes(1)],
+               3: [char(2)], 4: [char(3)]}
+    sec = field(actors, scripts, strings, akao=b'AKAO' + bytes(12))
+    out, st = S.tag_section(sec, b'x', 't')
+    assert st['tagged'] and st['aside_pages'] == 1
+    s = S.Script(out)
+    tag = s.string(s.count - 1)
+    n = s.count - 1
+    assert tag[:4] == S.MAGIC and tag[4 + n:6 + n] == S.PAGE_MARK
+    assert list(tag[6 + n:6 + 2 * n]) == [0, 0b10] and tag[-1] == 0xFF
+    assert 0xFF not in tag[:-1]

@@ -275,9 +275,14 @@ def test_module_pass_words():
         # BUILD 715: the minimap at the top, 28 units down (it sat 28 above
         # the bottom: 240 - (220 - 8*8) - 7*8 = 28); the full map stays at 28
         (y_at, _c, y_new, _x), (s_at, _d, s_new, _y) = W.MINIMAP_Y_WORDS
-        assert word(y_at) == A.movz(9, 25) == y_new      # BUILD 729: = the right margin
+        # BUILD 857: y = (312*s + 11*size) / 16 -- minimap 25 (729: = the
+        # right margin), full map 36, centred in the 240-unit UI
+        assert word(y_at) == A.movz(9, 312) == y_new and s_new is None
         assert abs(25 - (320 * 16 / 12 - 53.33 - (388 - 14 * 8 + 9 * 8))) < 0.5
-        assert word(s_at) == A.mov_reg(23, 9) == s_new
+        assert word(s_at) == A.bl(s_at, r['mapy'])
+        for i, w in enumerate(W.mapy_words()):
+            assert word(r['mapy'] + 4 * i) == w
+        assert r['mapy'] >= r['entry'] + r['code']
         assert 240 - (220 - 8 * 8) - 7 * 8 == 28 == 220 - 8 * 24
         assert word(W.PITCH_SITE) == A.b(W.PITCH_SITE, r['pitch'])
         # BUILD 700: the Highwind's 4/256 level-flight slant is gone, its
@@ -484,3 +489,27 @@ def test_the_terrain_draw_is_timed_transparently():
         assert ins[3] == 'bl #%#x' % W.TERR_CALLS[0][1]
         assert ins[9] == 'sub x16, x16, #0x24'            # pf_t_terr = own_window - 36
         assert ins[13] == 'ldp x29, x30, [sp], #0x10' and ins[14].startswith('ret')
+
+
+def test_full_map_centred_minimap_stays():
+    """BUILD 857: MAPY on its real words -- 25*s for the minimap (size 8*s),
+    36*s for the full map (size 24*s, 168 units: (240 - 168) / 2 = 36)."""
+    import arm64emu as E
+    for s in (1, 2, 3, 4, 6):
+        for size, want in ((8 * s, 25 * s), (24 * s, 36 * s)):
+            cave = 0x10000
+            code = {W.MAPY_SITE: A.bl(W.MAPY_SITE, cave)}
+            code.update({cave + 4 * i: w for i, w in enumerate(W.mapy_words())})
+            cpu = E.Cpu(E.Mem())
+            for q in range(31):
+                cpu.x[q] = 0x1000 + q
+            cpu.x[9] = 312 * s
+            cpu.x[8] = 8 * size
+            end = cpu.run(W.MAPY_SITE, code, start_pc=W.MAPY_SITE)
+            assert end == W.MAPY_SITE + 4
+            assert cpu.x[23] == want, (s, size)
+            assert cpu.x[8] == 8 * size and cpu.x[9] == 312 * s
+            assert all(cpu.x[q] == 0x1000 + q for q in range(31)
+                       if q not in (8, 9, 10, 23, 30))
+    assert 240 - 7 * 24 == 2 * W.MAP_FULL_TOP
+

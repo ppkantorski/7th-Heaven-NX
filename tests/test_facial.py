@@ -879,7 +879,7 @@ CHOICE_LINE = bytes([0xE0]) + b'Go' + bytes([0xE7, 0xE0]) + b'Stay' + bytes([0xF
 
 
 def _tagged_world(model, op, strings, tag=None, entity=7, at=3, models=None,
-                  player=None, speaker_before=0):
+                  player=None, speaker_before=0, pages=None, window=0):
     """An opcode `op` at the entity's ip, its dialog operand at +2 (MESSAGE)
     or +3 (ASK) naming string `at`; `strings` fills the table, and `tag`, a
     {string id: byte} map, becomes the SPK1 string at the table's end."""
@@ -895,7 +895,7 @@ def _tagged_world(model, op, strings, tag=None, entity=7, at=3, models=None,
     w.gset32(F.G_SCRIPT_CODE, GUEST_CODE)
     ip, table = 0x40, 0x200
     w.mem.setu(w.host(F.G_SCRIPT_IP + entity * 2), ip, 2)
-    code = (0x40, 0, at) if op == 0x40 else (0x48, 0, 0, at, 0, 1)
+    code = (0x40, window, at) if op == 0x40 else (0x48, 0, window, at, 0, 1)
     for i, b in enumerate(code):
         w.gset8(GUEST_CODE + ip + i, b)
     w.gset8(GUEST_CODE + 4, table & 0xFF)
@@ -905,7 +905,14 @@ def _tagged_world(model, op, strings, tag=None, entity=7, at=3, models=None,
         body = bytearray(len(strings))
         for sid, v in tag.items():
             body[sid] = v
-        strings.append(bytes(F.SPEAKER_MAGIC) + bytes(body) + bytes([0xFF]))
+        tail = b''
+        if pages is not None:                       # BUILD 858
+            pm = bytearray(len(strings))
+            for sid, m in pages.items():
+                pm[sid] = m
+            tail = bytes(F.PAGE_MARK) + bytes(pm)
+        strings.append(bytes(F.SPEAKER_MAGIC) + bytes(body) + tail
+                       + bytes([0xFF]))
     w.gset8(GUEST_CODE + table, len(strings) & 0xFF)
     w.gset8(GUEST_CODE + table + 1, len(strings) >> 8)
     off = 2 + 2 * len(strings)
@@ -962,6 +969,40 @@ def test_a_message_after_an_ask_resumes_the_message_handler():
         w.gset8(GUEST_CODE + 0x40 + i, b)
     assert w.run('speak') == F.SPEAK_RESUME
     assert w.mem.u(w.bss + F.HDR_SPEAKER, 4) == 5
+
+
+def test_the_speak_cave_records_the_aside_pages_and_window():
+    """BUILD 858: onna_2's "“You shouldn't be in here!”{NEW}(Ugh... A
+    frisky customer.)" -- page 1 is an aside; the tag's page mask and the
+    MESSAGE's window land in HDR_ASIDE."""
+    w = _tagged_world(4, 0x40, [TIFA_LINE] * 4, tag={3: 0xC1},
+                      pages={3: 0b10}, window=2)
+    assert w.run('speak') == F.SPEAK_RESUME
+    assert w.mem.u(w.bss + F.HDR_SPEAKER, 4) == 5
+    assert w.mem.u(w.bss + F.HDR_ASIDE, 4) == (2 << 8) | 0b10
+    # an old tag without PAGE_MARK, and an untagged line: no aside page
+    w = _tagged_world(4, 0x40, [TIFA_LINE] * 4, tag={3: 0xC1}, window=2)
+    w.mem.setu(w.bss + F.HDR_ASIDE, 0x7F, 4)
+    assert w.run('speak') == F.SPEAK_RESUME
+    assert w.mem.u(w.bss + F.HDR_ASIDE, 4) == 2 << 8
+    w = _tagged_world(4, 0x48, [TIFA_LINE] * 4, window=1)
+    assert w.run('askspeak') == F.ASK_SPEAK_RESUME
+    assert w.mem.u(w.bss + F.HDR_ASIDE, 4) == 1 << 8
+
+
+def test_an_aside_page_does_not_flap():
+    """BUILD 858: the voice runtime's page counter for the speaking window
+    is on an aside page -> the mouth stays shut; the spoken page flaps."""
+    for page, flaps in ((0, True), (1, False), (2, True), (9, True)):
+        w = _speaking(['mouth_aaaa_2'])
+        w.mem.setu(w.bss + F.HDR_ASIDE, (3 << 8) | 0b10, 4)
+        w.mem.setu(VOICE_BSS + F.VOICE_PAGE_OFF + 3, page, 1)
+        seen = set()
+        for _ in range(8):
+            w.set_esp(w.esp)
+            assert w.run() == F.BLINK_RESUME
+            seen.add(w.slot8(F.SL_MOUTH_REQ))
+        assert (F.MOUTH_FLAP_INDEX in seen) == flaps, (page, seen)
 
 
 def test_without_a_voice_base_not_one_flap_word_is_emitted():

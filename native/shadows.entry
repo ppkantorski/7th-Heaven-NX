@@ -1,8 +1,8 @@
 sh_pre 00000000
-sh_begin 00001d10
-sh_end 000028d0
-sh_blob_done 00002920
-sh_field 00002bc0
-sh_world 00002c40
-sh_wcam 00002c90
-sh_wblob 00003100
+sh_begin 00001eb0
+sh_end 00002a70
+sh_blob_done 00002ac0
+sh_field 00002d60
+sh_world 00002de0
+sh_wcam 00002e30
+sh_wblob 000032a0

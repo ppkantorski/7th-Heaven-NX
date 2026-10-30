@@ -241,6 +241,101 @@ HOLE_FIELDS = {
 }
 
 
+# BUILD 861b. games (Wonder Square's lobby), hardware 10-29: Cloud's shadow
+# showed on the cylinder left of the stairs up to the TV station ("a region
+# no one can even walk to ... the simplest solution would just be a shadow
+# mask covering this entire portion"). That face is 1997 art with no depth:
+# layer-1 squares (ID 4095) and, lower down, layer-2 ones at ID 4081. The
+# stair and landing walkmesh (x -36..52) ends at its right edge, and a
+# shadow cast from the stairs lands on the stair plane's extension, in front
+# of it (BUILD 861 measured the sword's, camera (-42, 89.5)). Each square
+# listed here goes to layer 2 at 'id' -- the depth of the cylinder's own
+# 1997 squares beside it (384..388) -- so it hides those shadows (they lie
+# at IDs 395..421 there, past FFNx's offset and a 28-unit pad) and draws
+# exactly as before: nothing else is drawn at those squares but the lamp
+# post (ID 4) and its glow (ID 0, blended), both still in front. Bodies:
+# none standing anywhere on the walkmesh reaches rows 112; rows 80..96 are
+# reached only by someone on the far left of the landing (IDs 430+), who
+# stands behind the cylinder -- the 1997 square at (-144, 96), ID 384,
+# already hides him the same way.
+MASK_OFF_ENV = 'SEVENTH_NX_NO_SHADOW_MASK'
+MASK_FIELDS = {
+    'games': {'id': 384, 'tiles': ((-176, 80), (-160, 80), (-176, 96),
+                                   (-160, 96), (-176, 112), (-160, 112))},
+}
+
+
+def mask_disabled():
+    return os.environ.get(MASK_OFF_ENV, '').strip().lower() in (
+        '1', 'true', 'yes', 'on')
+
+
+def plan_mask(name, sec9):
+    """(new section 9, squares masked). Plain layer-1 squares (ID 4095) at
+    the listed tiles move to layer 2 at cfg['id']; plain layer-2 ones at ID
+    4081 take that ID. Refused if any other plain layer-2 square at those
+    tiles is deeper than the new ID (the order inside a cell would change)
+    or a layer-1 tile shares the spot. Idempotent."""
+    cfg = MASK_FIELDS[name]
+    nid, tiles = cfg['id'], set(cfg['tiles'])
+    s9 = bytes(sec9)
+    A, B = depth_curve(s9)
+    big = int(round((A - B / nid) * 1e7))
+    rows = {r[0]: r for r in _rows(s9)}
+    if 1 not in rows or 2 not in rows:
+        raise ValueError('no layer 1 or 2')
+    _l, c1, f1, n1 = rows[1]
+    _l, c2, f2, n2 = rows[2]
+    if f2 <= f1:
+        raise ValueError('layer order')
+    out = bytearray(s9)
+    n = 0
+    for i in range(n2):
+        o_ = f2 + i * REC
+        x, y = struct.unpack_from('<hh', s9, o_ + 2)
+        if (x, y) not in tiles:
+            continue
+        idv = struct.unpack_from('<h', s9, o_ + 24)[0]
+        plain = not (s9[o_ + 26] or s9[o_ + 28])
+        if plain and idv == 4081:
+            struct.pack_into('<h', out, o_ + 24, nid)
+            struct.pack_into('<I', out, o_ + 38, big)
+            n += 1
+        elif plain and nid < idv != 4081:
+            raise ValueError('layer-2 square at %s is ID %d' % ((x, y), idv))
+    spots = collections.Counter(
+        struct.unpack_from('<hh', s9, f1 + i * REC + 2) for i in range(n1))
+    move, keep = [], []
+    for i in range(n1):
+        r = bytearray(out[f1 + i * REC:f1 + (i + 1) * REC])
+        xy = struct.unpack_from('<hh', r, 2)
+        if (xy in tiles and not (r[26] or r[28])
+                and struct.unpack_from('<h', r, 24)[0] == 4095):
+            if spots[xy] != 1:
+                raise ValueError('layer-1 tiles share %s' % (xy,))
+            struct.pack_into('<HH', r, 18, 16, 16)
+            struct.pack_into('<h', r, 24, nid)
+            struct.pack_into('<I', r, 38, big)
+            move.append(bytes(r))
+        else:
+            keep.append(bytes(r))
+    if move:
+        mid = bytes(out[f1 + n1 * REC:f2])
+        new = (bytes(out[:f1]) + b''.join(keep) + mid
+               + bytes(out[f2:f2 + n2 * REC]) + b''.join(move)
+               + bytes(out[f2 + n2 * REC:]))
+        if len(new) != len(s9):
+            raise ValueError('size changed')
+        out = bytearray(new)
+        struct.pack_into('<H', out, c1, len(keep))
+        shift = (n1 - len(keep)) * REC
+        struct.pack_into('<H', out, c2 - shift, n2 + len(move))
+        rows2 = {r[0]: r for r in _rows(bytes(out))}
+        if rows2[1][3] != len(keep) or rows2[2][3] != n2 + len(move):
+            raise ValueError('re-walk disagrees')
+    return bytes(out), n + len(move)
+
+
 def _in_poly(poly, x, y):
     """even-odd point-in-polygon, vectorised over x/y arrays"""
     inside = np.zeros(np.shape(x), bool)
@@ -1505,7 +1600,8 @@ def script_disabled():
 def apply_to_flevel(archive, payloads, encode=None, log=lambda *_: None):
     import lgp
     st = {'names': [], 'refused': [], 'script': [], 'holes': []}
-    if disabled() and script_disabled() and hole_disabled():
+    if (disabled() and script_disabled() and hole_disabled()
+            and mask_disabled()):
         return st
     encode = encode or archive.encode_field
     for name in FIELDS:
@@ -1556,6 +1652,21 @@ def apply_to_flevel(archive, payloads, encode=None, log=lambda *_: None):
                                             else 'already'))
         except Exception as exc:                               # noqa: BLE001
             st['refused'].append((name + ' holes', str(exc)[:90]))
+    for name in MASK_FIELDS:                                   # BUILD 861b
+        if mask_disabled() or name not in archive.index:
+            continue
+        try:
+            p = payloads.get(name)
+            raw = (lgp.lzs_decompress(p[4:]) if p
+                   else archive.decompressed(archive.index[name]))
+            parts = list(lgp.split_sections(raw))
+            parts[8], n = plan_mask(name, parts[8])
+            if n:
+                payloads[name] = encode(lgp.join_sections(parts))
+            st.setdefault('masks', []).append(
+                '%s (%s)' % (name, '%d squares' % n if n else 'already'))
+        except Exception as exc:                               # noqa: BLE001
+            st['refused'].append((name + ' mask', str(exc)[:90]))
     return st
 
 
@@ -1575,6 +1686,10 @@ def summarise(st):
                    'floor (walkmesh holes, raised walkways) hides the field '
                    'shadows behind it: %s. %s=1 disables.'
                    % (', '.join(st['holes']), HOLE_OFF_ENV))
+    if st.get('masks'):
+        out.append('  SHADOW MASK (BUILD 861b): art nobody can stand behind '
+                   'hides the field shadows behind it: %s. %s=1 disables.'
+                   % (', '.join(st['masks']), MASK_OFF_ENV))
     for name, why in st.get('refused', ()):
         out.append('  ! floor depth %s: unchanged -- %s' % (name, why))
     return '\n'.join(out)

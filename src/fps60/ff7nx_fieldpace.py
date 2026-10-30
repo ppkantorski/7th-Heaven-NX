@@ -263,6 +263,19 @@ SLEEP_SITES = (
     (0x8FA3C, 0x35FFF148, 'cbnz', 8, 0x8F864, 0x8FA40,
      'battle catch-up wait'),
 )
+# BUILD 855: the world map's limiter (x86 0x74C7E4, ARM +0xF1EE40) spins the
+# same way -- its own copy of the field limiter. Its normal wait loops while
+# elapsed (d8) < frame_time (d0), as the four above; its catch-up wait
+# (debt) loops while (cps/22 - debt) (d8) > elapsed (d0), so the time left
+# is d8 - d0 there ('swap'). Measured from the translated body; their stubs
+# and the swapped routine live in the world part (world_dead_part).
+# (branch VA, stock word, kind, register, loop head, exit, what, swap)
+WORLD_SLEEP_SITES = (
+    (0xF1F5D4, 0x35FFF128, 'cbnz', 8, 0xF1F3F8, 0xF1F5D8, 'world wait',
+     False),
+    (0xF1F1D0, 0x34FFEFEA, 'cbz', 10, 0xF1EFCC, 0xF1F1D4,
+     'world catch-up wait', True),
+)
 
 
 def sleep_enabled():
@@ -278,10 +291,12 @@ def _ldp_d(rt, rt2, off):
     return 0x6D400000 | ((off // 8) << 15) | (rt2 << 10) | (31 << 5) | rt
 
 
-def build_sleep_routine(_entry, addr, sleep_fn, margin_counts, quantum_ns):
-    """Sleep one quantum when more than the margin is left; else return."""
+def build_sleep_routine(_entry, addr, sleep_fn, margin_counts, quantum_ns,
+                        swap=False):
+    """Sleep one quantum when more than the margin is left; else return.
+    `swap` (BUILD 855, the world catch-up wait): the time left is d8 - d0."""
     a = Asm(_entry, addr)
-    a.emit(0x1E683802)                             # fsub d2, d0, d8
+    a.emit(0x1E603902 if swap else 0x1E683802)     # fsub d2, d8, d0 / d0, d8
     bits = struct.unpack('<Q', struct.pack('<d', float(margin_counts)))[0]
     for hw in range(4):
         imm = (bits >> (16 * hw)) & 0xFFFF
@@ -342,19 +357,49 @@ def apply_sleep_to_nso(src, dest, stock=None):
     for site in SLEEP_SITES:
         got = struct.unpack_from('<I', text, site[0])[0]
         (sites if got == site[1] else skipped).append(site)
-    if not sites:
+    wstock = [w for w in WORLD_SLEEP_SITES
+              if struct.unpack_from('<I', text, w[0])[0] == w[1]]
+    if not sites and not wstock:
         raise ValueError('no wait loop holds its stock branch')
-    dead = DS.Bump(*DS.part(src, 'sleep', stock))
     margin = int(round(SLEEP_MARGIN_MS * CPS / 1000.0))
     quantum = SLEEP_QUANTUM_US * 1000
-    routine = dead.put(lambda e, ad: build_sleep_routine(
-        e, ad, sleep_fn, margin, quantum))
     placed = {}
+    routine = None
+    if sites:
+        dead = DS.Bump(*DS.part(src, 'sleep', stock))
+        routine = dead.put(lambda e, ad: build_sleep_routine(
+            e, ad, sleep_fn, margin, quantum))
+    else:
+        dead = DS.Bump(0, 0)
     for va, _w, kind, reg, loop, leave, _what in sites:
         stub = dead.put(lambda e, ad, k=kind, r=reg, lp=loop, lv=leave:
                         build_sleep_stub(e, ad, k, r, lp, lv, routine))
         placed[va] = A.b(va, stub)
     placed.update(dead.placed)
+    # BUILD 855: the world map's two waits
+    wsites = [w for w in WORLD_SLEEP_SITES
+              if struct.unpack_from('<I', text, w[0])[0] == w[1]]
+    skipped += [w for w in WORLD_SLEEP_SITES if w not in wsites]
+    if wsites:
+        try:
+            wlo, whi = world_dead_part(src, stock, 'sleep')
+        except ValueError:
+            skipped += wsites
+            wsites = []
+    if wsites:
+        wdead = DS.Bump(wlo, whi)
+        swapped = wdead.put(lambda e, ad: build_sleep_routine(
+            e, ad, sleep_fn, margin, quantum, swap=True))
+        if routine is None:
+            routine = wdead.put(lambda e, ad: build_sleep_routine(
+                e, ad, sleep_fn, margin, quantum))
+        for va, _w, kind, reg, loop, leave, _what, swap in wsites:
+            stub = wdead.put(lambda e, ad, k=kind, r=reg, lp=loop, lv=leave,
+                             rt=(swapped if swap else routine):
+                             build_sleep_stub(e, ad, k, r, lp, lv, rt))
+            placed[va] = A.b(va, stub)
+        placed.update(wdead.placed)
+    sites = list(sites) + wsites
     for va, w in placed.items():
         struct.pack_into('<I', text, va, w)
     out = AC.pack(blob, space.commit(), 0)
@@ -665,6 +710,416 @@ def build_battle_boost_cave(_entry, addr, budget):
 BATTLE_ENTRY = {False: 0, True: 8}               # cave offset per site
 
 
+# BUILD 855: THE WORLD MAP. world_main_loop (x86 0x74BE49, ARM +0xF1E0D0) is
+# the field's shape: limiter (0x74C7E4, a spin -- see WORLD_SLEEP_SITES),
+# input/texture housekeeping, setbg + clear, begin_scene, then one pass:
+#     74c973(debt ? 0 : 1)            the draw flag [0x96994C]; every world
+#                                     draw (the [0xDE68FC] callbacks 0x74C179
+#                                     /0x74C3F0/0x74C589, the model and
+#                                     effect draws) returns at once on 0
+#     [0xDE6940] = 74db8c(0xCC1644, 0xCC1648, 0xCC0D80, 0)   the update
+#     [0xDE68FC](); 666df4; 6656d1; 660e95(1); 66e641([0xE2C3F4])
+# and, when the limiter left debt ([0xDE69EC]), the catch-up: debt off,
+# [0xDE69F8] = 1, draw flag 1, counter += [0x7B7EC0] (1.0), the
+# housekeeping (666ddd 6656a4 666da3 666dc0, 660370, 41a21e(0)) and the pass
+# again -- so a debt frame is one no-draw tick and one drawing tick inside
+# one scene, and every other frame one tick. The booster only speeds the
+# clock, presents are vsync-bound: the world map stayed at 1x.
+#
+# BUILD 855b (hardware 10-28: at 3x, sprite pieces and texture-sheet
+# fragments stuck in the top-left corner over everything). The stock
+# catch-up's no-draw tick still SUBMITS: 666df4 (the poly sets at
+# obj+0x938, 660d96), 6656d1 (obj+0x920 -> 66562b, 660e95/660c3a),
+# 660e95(1) (driver+0x84) and 66e641 draw whatever the update queued, and
+# with the draw flag 0 the world view was never set up for it -- so the
+# effect sprites queued by the update landed at the screen origin. Rare at
+# 1x (debt frames); every frame at 3x. The extras now submit nothing: input,
+# update, then the housekeeping (666ddd 6656a4 666da3 666dc0), which resets
+# the render lists -- dropping the extra tick's queued polygons and readying
+# the next tick, as the frame's own top-of-loop call does for the first.
+#
+# The cave replaces the pass's `bl 74db8c` (+0xF1E598, arguments pushed).
+# At multiplier > 1 it first turns this frame's debt off (debt 0, limiter on
+# next frame) and runs `multiplier - 1` extra NO-DRAW ticks -- the stock
+# catch-up tick with the draw flag 0, minus its 660370 (which restarts the
+# limiter's clock: the next frame would wait for the extras' time again) and
+# minus the [0xDE68FC] call (a no-op with the flag 0) -- then sets the flag to
+# 1 and tail-calls the stock update: "N no-draw ticks, one drawing tick", the
+# battle cave's shape. Same budget and cap. At 1x it is the stock call.
+# (855b: the extra ticks submit nothing at all -- see above.)
+WORLD_SITE = 0xF1E598                       # bl 74db8c (x86 0x74BF5D)
+WORLD_UPDATE = 0xF29100                     # x86 0x74DB8C (4 args) -> eax
+WORLD_DRAW_FLAG = 0x96994C
+WORLD_DEBT_FLAG = 0xDE69EC
+WORLD_LIMIT_FLAG = 0xDE69F8                 # 1 = run the limiter next frame
+WORLD_RESULT = 0xDE6940
+WORLD_COUNTER_STEP = 0x7B7EC0               # 1.0
+WORLD_UPDATE_ARGS = (0xCC1644, 0xCC1648, 0xCC0D80, 0)
+WORLD_HOUSE = (0xAB06B0, 0xAA7650, 0xAB0210, 0xAB0410)   # 666ddd 6656a4
+                                                         # 666da3 666dc0
+WORLD_INPUT = 0x29FD0                       # x86 0x41A21E (0)
+WORLD_AFTER = (0xAB0770, 0xAA7780)          # 666df4 6656d1 (obj)
+WORLD_FLUSH = 0xA87860                      # x86 0x660E95 (1, obj)
+WORLD_SUBMIT = 0xAD81A0                     # x86 0x66E641 ([0xE2C3F4], obj)
+WORLD_SUBMIT_ARG = 0xE2C3F4
+WORLD_SLEEP_BYTES = 0x180                   # the world part's first 384 B
+WORLD_DIVISOR = 0x969958                    # the world limiter's fps (double)
+# BUILD 855c: THE EXTRAS FIT THE FRAME. A world tick is far heavier than a
+# field one (hardware 10-28: at 3x the frame rate dropped and the CPU rose
+# with the Highwind just hovering), so a fixed 4 ms budget either costs
+# frames or wastes speed. 32 bytes of module BSS hold a controller: the
+# frame period P (cave entry to cave entry, cntpct), the extras' budget, its
+# ceiling, and the last extra tick's cost. A frame that came late (P >
+# T + T/8, T = CPS / the world fps) cuts the ceiling and the budget by a
+# quarter each; an on-time one grows the budget by T/128 up to the ceiling,
+# which itself regrows by T/16384 a frame (~0.06 ms a second) up to 5T/8.
+# An extra runs only when the time already used plus the last tick's cost
+# fits the budget. A pause or mode change (P > 5T) restarts at T/2 under
+# 5T/8. (855c capped it all at T/4 = 4.2 ms and started at T/8: a world tick
+# costs more than that on the Switch, so no extra ever started -- hardware
+# 10-28, "3x does nothing now". The frame's own feedback is the limit now.)
+# So the world map runs as many ticks as the frame has room for -- 3x where
+# it fits, less where a tick does not fit -- and keeps its frame rate.
+WORLD_STATE_PREV = 0
+WORLD_STATE_BUDGET = 8
+WORLD_STATE_CEIL = 16                       # 855c/d only; unused since 855e
+WORLD_STATE_TAP = 16                        # 855f: the tap count before an extra
+# 855f: 0x7667B2 lands / leaves a vehicle on a TAP of button 0x40: it counts
+# the ticks the button is held in [0xE3A870] and acts on release only when
+# the count is 1..14. At 3x that is 3 ticks a frame, so a normal tap (5+
+# frames) counted past 14 and was ignored -- "click B enough times and it
+# eventually lands". Extra ticks never advance the count past 1, so it counts
+# frames as at 1x.
+WORLD_TAP_COUNT = 0xE3A870
+WORLD_STATE_SKIP = 40                       # 855g: 1 = this extra skips 0x75079D
+# 855g: 0x75079D is not only the terrain: it also runs the landing / exit
+# step. With [0xE3A86C] (0x7667B2's land state) at 2 it calls 0x766417, which
+# sets the party's step-out position; the next 0x7667B2 lands only if that
+# position moved, else the Highwind climbs again ("touches the ground, then
+# goes back up"). An extra that skipped the call lost the step. So an extra
+# runs the full call while a land / exit is under way ([0xE3A86C] != 0, or
+# 0x75079D's other 0x766417 caller [0xE28CC0] == 1).
+WORLD_LAND_STATE = 0xE3A86C
+WORLD_EXIT_FLAG = 0xE28CC0
+WORLD_STATE_TICK = 24
+WORLD_STATE_EXTRA = 32                      # 855e: 1/2 while extras run
+WORLD_STATE_BYTES = 48
+# BUILD 855e (hardware 10-28 of 855d: "it speeds up briefly, then stops and
+# stays at 1x"). Why a world tick is so heavy: world_mode_loop's update
+# (x86 0x74DB8C) DRAWS THE TERRAIN itself -- its call to 0x75079D (+0xF2A390)
+# builds the 5x5 window (world_sub_751EFC, and worldfar's whole far field on
+# top) on every tick, with no draw-flag test -- so each extra tick rebuilt
+# and threw away the whole landscape. The extras now skip that one call
+# (WORLD_TERRAIN_SITE, its own 8-word cave: it pops the call's return slot as
+# the callee would); the frame's own tick draws it as before. The block
+# window it keeps follows the player once a frame, which a tick's movement
+# never outruns (the window is 5x5 around the last drawn position).
+# The controller is simpler too: one budget, -1/4 on a late frame (not
+# under T/16), +T/64 on an on-time one, up to 5T/8; and a frame with no extra
+# lets the remembered tick cost fade by 1/8, so a probe follows.
+WORLD_TERRAIN_SITE = 0xF2A390               # bl 0x75079D in 0x74DB8C
+WORLD_TERRAIN = 0xF35A40                    # x86 0x75079D
+WORLD_PART_BYTES = 0x600                    # = ff7nx_fxinterp.WORLD_TOP
+
+
+def world_dead_part(src, stock=None, which='sleep'):
+    """(lo, hi) of one half of the world part -- the top WORLD_PART_BYTES of
+    the dead body ff7nx_fxinterp and ff7nx_facial share (x86 0x4079B8;
+    facial keeps 4,880 of its 6,416 bytes and uses at most 3,552): 'sleep'
+    is its first WORLD_SLEEP_BYTES, 'boost' the rest. Refused when that half
+    is not stock bytes."""
+    import ff7nx_fxinterp as FX
+    lo, hi = FX.dead_region(src, None)
+    hi &= ~15
+    lo = hi - WORLD_PART_BYTES
+    if which == 'sleep':
+        hi = lo + WORLD_SLEEP_BYTES
+    elif which == 'boost':
+        lo += WORLD_SLEEP_BYTES
+    else:
+        raise ValueError(which)
+    if stock is not None and nxmap.Main(stock).text[lo:hi] != \
+            nxmap.Main(src).text[lo:hi]:
+        raise ValueError('the world %s part was already written' % which)
+    return lo, hi
+
+
+# 855c: shifted-register forms the controller needs (a64 has the 32-bit
+# ones only); every one is decoded through capstone in test_boostticks.
+def _add_lsl64(rd, rn, rm, sh):
+    return 0x8B000000 | (rm << 16) | (sh << 10) | (rn << 5) | rd
+
+
+def _add_lsr64(rd, rn, rm, sh):
+    return 0x8B400000 | (rm << 16) | (sh << 10) | (rn << 5) | rd
+
+
+def _sub_lsr64(rd, rn, rm, sh):
+    return 0xCB400000 | (rm << 16) | (sh << 10) | (rn << 5) | rd
+
+
+def _lsr64(rd, rn, sh):
+    """LSR Xd, Xn, #sh -- UBFM Xd, Xn, #sh, #63."""
+    return 0xD340FC00 | (sh << 16) | (rn << 5) | rd
+
+
+def _g_store(a, guest, value=None, reg=None):
+    """[guest] = value (a literal) or w<reg> (callee-saved)."""
+    AC.mov32(a, 0, guest)
+    a.emit(A.bl(a.pc(), TRANSLATE))
+    if reg is None:
+        AC.mov32(a, 8, value)
+        reg = 8
+    a.emit(A.str_(reg, 0, 0))
+
+
+def _wbl(a, name):
+    a.fixups.append((len(a.words), name, 'bl'))
+    a.emit(0)
+
+
+def _wpush(a, value=None, reg=None):
+    if reg is None:
+        AC.mov32(a, 1, value)
+    else:
+        a.emit(A.mov_reg(1, reg))
+    _wbl(a, 'push')
+
+
+def _wcall(a, fn, nargs):
+    _boost_esp(a, -4)                              # the return slot
+    a.emit(A.bl(a.pc(), fn))                       # the callee pops it
+    _boost_esp(a, 4 * nargs)
+
+
+def build_world_terrain_cave(_entry, addr, state):
+    """855e: the terrain call skipped while extras run; 855g: only an extra
+    the boost cave marked ([state+SKIP], no land / exit under way)."""
+    a = Asm(_entry, addr)
+    AC.bss_ptr(a, 16, state)
+    a.emit(A.ldr64(17, 16, WORLD_STATE_SKIP))
+    a.fixups.append((len(a.words), 'skip', 'cbnz64x', 17))   # cbnz x17
+    a.emit(0)
+    a.emit(A.b(a.pc(), WORLD_TERRAIN))             # the stock call
+    a.label('skip')
+    a.emit(A.adrp(16, a.pc(), CTX_GOT & ~0xFFF))
+    a.emit(A.ldr64(16, 16, CTX_GOT & 0xFFF))
+    a.emit(A.ldr(17, 16, 0x10))
+    a.emit(A.add_imm(17, 17, 4))                   # the callee's ret pops
+    a.emit(A.str_(17, 16, 0x10))                   # its return slot
+    a.emit(A.ret())
+    cb = [f for f in a.fixups if f[2] == 'cbnz64x']
+    a.fixups = [f for f in a.fixups if f[2] != 'cbnz64x']
+    words = a.resolve()
+    for i, name, _k, reg in cb:
+        off = (a.labels[name] - a.addr(i)) >> 2
+        words[i] = 0xB5000000 | ((off & 0x7FFFF) << 5) | reg
+    return words
+
+
+def build_world_boost_cave(_entry, addr, budget, state=None):
+    """Replaces world_main_loop's pass `bl 74db8c` at +0xF1E598.
+
+    855c: `state` is 32 bytes of module BSS for the frame-time controller
+    (WORLD_STATE_*). None builds the 855b fixed-budget cave."""
+    a = Asm(_entry, addr)
+    a.emit(A.stp64_pre(29, 30, 31, -0x50))
+    a.emit(A.stp64_off(19, 20, 31, 0x10))
+    a.emit(A.stp64_off(21, 22, 31, 0x20))
+    a.emit(A.stp64_off(23, 24, 31, 0x30))
+    a.emit(A.stp64_off(25, 26, 31, 0x40))
+    a.emit(A.adrp(9, a.pc(), BOOST_MULT & ~0xFFF))
+    a.emit(A.ldr(10, 9, BOOST_MULT & 0xFFF))
+    a.emit(A.sub_imm(22, 10, 1))                  # extras = mult - 1
+    a.emit(A.cmp_imm(22, 1))
+    a.bcond('out', A.LT)                          # 1x: the stock call
+    a.emit(A.cmp_imm(22, BOOST_MAX_EXTRA))
+    a.bcond('capped', A.LE)
+    a.emit(A.movz(22, BOOST_MAX_EXTRA))
+    a.label('capped')
+    a.emit(A.adrp(20, a.pc(), CTX_GOT & ~0xFFF))
+    a.emit(A.ldr64(20, 20, CTX_GOT & 0xFFF))
+    a.emit(A.ldr(8, 20, 0x14))                     # obj = [ebp + 8]
+    a.emit(A.add_imm(0, 8, 8))
+    a.emit(A.bl(a.pc(), TRANSLATE))
+    a.emit(A.ldr(24, 0, 0))
+    _g_store(a, WORLD_DEBT_FLAG, 0)                # no catch-up this frame
+    _g_store(a, WORLD_LIMIT_FLAG, 1)               # the limiter runs next
+    if state is None:
+        AC.mov32(a, 23, budget)
+        a.emit(A.movz(26, 0))                      # no tick-cost estimate
+    else:
+        # T = CPS / [0x969958], the world frame in clock counts
+        AC.mov32(a, 0, WORLD_DIVISOR)
+        a.emit(A.bl(a.pc(), TRANSLATE))
+        a.emit(0xFD400000)                         # ldr d0, [x0]
+        bits = struct.unpack('<Q', struct.pack('<d', float(CPS)))[0]
+        for hw in range(4):
+            imm = (bits >> (16 * hw)) & 0xFFFF
+            base = 0xD2800000 if hw == 0 else 0xF2800000
+            a.emit(base | (hw << 21) | (imm << 5) | 9)
+        a.emit(0x9E670121)                         # fmov d1, x9
+        a.emit(A.fdiv_d(2, 1, 0))                  # d2 = CPS / divisor
+        a.emit(0x9E790059)                         # fcvtzu x25, d2
+        AC.mov32(a, 9, CPS // 60)
+        a.emit(A.cmp_reg64(25, 31))                # junk divisor: 60
+        a.emit(A.csel64(25, 9, 25, A.EQ))
+        AC.mov32(a, 10, CPS)
+        a.emit(A.cmp_reg64(25, 10))                # (0 / NaN / < 1 fps)
+        a.emit(A.csel64(25, 9, 25, A.HI))
+        a.emit(MRS_CNTPCT | 21)                    # now
+        AC.bss_ptr(a, 9, state)
+        a.emit(A.ldr64(10, 9, WORLD_STATE_PREV))
+        a.emit(A.str64(21, 9, WORLD_STATE_PREV))
+        a.emit(A.ldr64(23, 9, WORLD_STATE_BUDGET))
+        a.emit(A.sub_reg64(12, 21, 10))            # P = now - prev
+        a.cbz64(10, 'init')
+        a.cbz64(23, 'init')
+        a.emit(_add_lsl64(13, 25, 25, 2))          # 5T
+        a.emit(A.cmp_reg64(12, 13))
+        a.bcond('init', A.HI)                      # a pause, a mode change
+        a.emit(_add_lsr64(13, 25, 25, 3))          # T + T/8
+        a.emit(A.cmp_reg64(12, 13))
+        a.bcond('hit', 0x9)                        # ls
+        a.emit(_sub_lsr64(23, 23, 23, 2))          # late: budget -= 1/4
+        a.emit(_lsr64(13, 25, 4))                  # ... not under T/16
+        a.emit(A.cmp_reg64(23, 13))
+        a.emit(A.csel64(23, 13, 23, 0x3))          # lo
+        a.b('store')
+        a.label('hit')
+        a.emit(_add_lsr64(23, 23, 25, 6))          # on time: += T/64
+        a.emit(_lsr64(13, 25, 1))                  # ... up to 5T/8
+        a.emit(_add_lsr64(13, 13, 25, 3))
+        a.emit(A.cmp_reg64(23, 13))
+        a.emit(A.csel64(23, 13, 23, A.HI))
+        a.b('store')
+        a.label('init')
+        a.emit(_lsr64(23, 25, 1))                  # budget T/2
+        a.label('store')
+        a.emit(A.str64(23, 9, WORLD_STATE_BUDGET))
+        a.emit(A.ldr64(26, 9, WORLD_STATE_TICK))   # last tick's cost
+        a.emit(A.movz(10, 1))
+        a.emit(A.str64(10, 9, WORLD_STATE_EXTRA))  # 1: extras, none ran yet
+    if state is None:
+        a.emit(MRS_CNTPCT | 21)
+    a.label('loop')
+    # 855c: an extra starts only when it is expected to finish in budget
+    a.emit(MRS_CNTPCT | 8)
+    a.emit(A.sub_reg64(8, 8, 21))
+    a.emit(A.add_reg64(8, 8, 26))
+    a.emit(A.cmp_reg64(8, 23))
+    a.bcond('done', A.HI)
+    a.emit(MRS_CNTPCT | 26)                        # this tick's start
+    _g_store(a, WORLD_DRAW_FLAG, 0)                # a no-draw tick
+    _boost_counter(a, WORLD_COUNTER_STEP)          # (uses x19)
+    if state is not None:
+        AC.mov32(a, 0, WORLD_TAP_COUNT)            # 855f: remember the count
+        a.emit(A.bl(a.pc(), TRANSLATE))
+        a.emit(A.ldr(8, 0, 0))
+        AC.bss_ptr(a, 9, state)
+        a.emit(A.str_(8, 9, WORLD_STATE_TAP))
+        # 855g: skip 0x75079D unless a land / exit is under way
+        a.emit(A.movz(19, 1))
+        AC.mov32(a, 0, WORLD_LAND_STATE)
+        a.emit(A.bl(a.pc(), TRANSLATE))
+        a.emit(A.ldr(8, 0, 0))
+        a.cbz(8, 'noland')
+        a.emit(A.movz(19, 0))
+        a.label('noland')
+        AC.mov32(a, 0, WORLD_EXIT_FLAG)
+        a.emit(A.bl(a.pc(), TRANSLATE))
+        a.emit(A.ldr(8, 0, 0))
+        a.emit(A.cmp_imm(8, 1))
+        a.bcond('noexit', A.NE)
+        a.emit(A.movz(19, 0))
+        a.label('noexit')
+        AC.bss_ptr(a, 9, state)
+        a.emit(A.str64(19, 9, WORLD_STATE_SKIP))
+    for v in reversed(WORLD_UPDATE_ARGS):
+        _wpush(a, v)
+    _wcall(a, WORLD_UPDATE, 4)
+    a.emit(A.ldr(19, 20, 0))                       # eax
+    _g_store(a, WORLD_RESULT, reg=19)
+    if state is not None:
+        # 855f: an extra may start a tap (0 -> 1) but not lengthen it
+        AC.mov32(a, 0, WORLD_TAP_COUNT)
+        a.emit(A.bl(a.pc(), TRANSLATE))
+        a.emit(A.ldr(8, 0, 0))
+        AC.bss_ptr(a, 9, state)
+        a.emit(A.ldr(10, 9, WORLD_STATE_TAP))
+        a.cbz(10, 'tapped')
+        a.emit(A.add_imm(11, 10, 1))
+        a.emit(A.cmp_reg(8, 11))
+        a.bcond('tapped', A.NE)
+        a.emit(A.str_(10, 0, 0))
+        a.label('tapped')
+    # 855b: nothing of this tick is submitted. The housekeeping resets the
+    # render lists (6a28c0 / 68f839 / 670f4f -> 6a5686), so running it HERE
+    # drops whatever the no-draw update still queued and readies the next
+    # tick -- the frame's own top-of-loop call did the same for the first.
+    for fn in WORLD_HOUSE:
+        _wpush(a, reg=24)
+        _wcall(a, fn, 1)
+    # 855c: the input is read AFTER the tick, for the next one -- the
+    # frame's own read (x86 0x74BE9C) is the first tick's, so a press is
+    # seen by exactly one tick (855b read it again before each extra, which
+    # cleared the press before any tick saw it: "rapidly click land")
+    _wpush(a, 0)
+    _wcall(a, WORLD_INPUT, 1)
+    a.emit(MRS_CNTPCT | 8)
+    a.emit(A.sub_reg64(26, 8, 26))                 # this tick's cost
+    if state is not None:
+        AC.bss_ptr(a, 9, state)
+        a.emit(A.str64(26, 9, WORLD_STATE_TICK))
+        a.emit(A.movz(10, 2))
+        a.emit(A.str64(10, 9, WORLD_STATE_EXTRA))  # 2: an extra ran
+    else:
+        a.emit(A.movz(26, 0))
+    a.emit(A.sub_imm(22, 22, 1))
+    a.cbnz(22, 'loop')
+    a.label('done')
+    if state is not None:
+        # 855e: a frame that ran no extra lets the remembered tick cost
+        # fade (1/8 a frame), so one heavy tick cannot stop the boost for
+        # good -- the next probe measures it again
+        AC.bss_ptr(a, 9, state)
+        a.emit(A.ldr64(10, 9, WORLD_STATE_EXTRA))
+        a.emit(A.cmp_imm(10, 1))
+        a.bcond('ran', A.NE)
+        a.emit(A.ldr64(11, 9, WORLD_STATE_TICK))
+        a.emit(_sub_lsr64(11, 11, 11, 3))
+        a.emit(A.str64(11, 9, WORLD_STATE_TICK))
+        a.label('ran')
+        a.emit(A.str64(31, 9, WORLD_STATE_EXTRA))  # 0: the frame's own tick
+        a.emit(A.str64(31, 9, WORLD_STATE_SKIP))   # 855g: it runs 0x75079D
+    _g_store(a, WORLD_DRAW_FLAG, 1)                # the frame's own tick draws
+    a.label('out')
+    a.emit(A.ldp64_off(25, 26, 31, 0x40))
+    a.emit(A.ldp64_off(23, 24, 31, 0x30))
+    a.emit(A.ldp64_off(21, 22, 31, 0x20))
+    a.emit(A.ldp64_off(19, 20, 31, 0x10))
+    a.emit(A.ldp64_post(29, 30, 31, 0x50))
+    a.emit(A.b(a.pc(), WORLD_UPDATE))              # the stock call
+    # push w1 onto the guest stack
+    a.label('push')
+    a.emit(A.stp64_pre(29, 30, 31, -0x20))
+    a.emit(A.str_(1, 31, 0x10))
+    a.emit(A.ldr(8, 20, 0x10))
+    a.emit(A.sub_imm(0, 8, 4))
+    a.emit(A.str_(0, 20, 0x10))
+    a.emit(A.bl(a.pc(), TRANSLATE))
+    a.emit(A.ldr(9, 31, 0x10))
+    a.emit(A.str_(9, 0, 0))
+    a.emit(A.ldp64_post(29, 30, 31, 0x20))
+    a.emit(A.ret())
+    bls = [f for f in a.fixups if f[2] == 'bl']
+    a.fixups = [f for f in a.fixups if f[2] != 'bl']
+    words = a.resolve()
+    for i, name, _k in bls:
+        words[i] = A.bl(a.addr(i), a.labels[name])
+    return words
+
+
 def menu_site_count(word):
     """k of the menu pass count word, or None when it is not a plain
     `mov w8, #k` (1..8) / the vanilla `orr w8, wzr, #4`."""
@@ -709,6 +1164,8 @@ def apply_boost_to_nso(src, dest, stock=None, budget=None, region=None):
     segs, raw, space = ff7nx_tables.open_module(blob)
     text = space.text
     budget = boost_budget_counts() if budget is None else budget
+    bss_grow = 0
+    wstate = None
     sites = [(FIELD_SITE, FIELD_DRAW, 'field', None)]
     sites += [(va, SET_DRAW, what, normal)
               for va, normal, what in BATTLE_SITES]
@@ -718,9 +1175,14 @@ def apply_boost_to_nso(src, dest, stock=None, budget=None, region=None):
                                                                 site[1])
         (todo if ok else skipped).append(site)
     menu_k = menu_site_count(struct.unpack_from('<I', text, MENU_SITE)[0])
-    if not todo:
+    world_stock = struct.unpack_from('<I', text, WORLD_SITE)[0] == \
+        A.bl(WORLD_SITE, WORLD_UPDATE)
+    if not todo and not world_stock:
         raise ValueError('no booster site holds its stock call')
-    lo, hi = region if region else DS.part(src, 'boost', stock)
+    if todo or menu_k is not None:
+        lo, hi = region if region else DS.part(src, 'boost', stock)
+    else:
+        lo = hi = 0                     # only the world map is left to do
     dead = DS.Bump(lo, hi)
     caves = {}
     battle = None
@@ -735,6 +1197,31 @@ def apply_boost_to_nso(src, dest, stock=None, budget=None, region=None):
             cave = battle + BATTLE_ENTRY[normal]
         caves[what] = cave
         dead.placed[va] = A.bl(va, cave)
+    # BUILD 855: the world map, in its own part
+    if world_stock:
+        try:
+            wlo, whi = world_dead_part(src, stock, 'boost')
+            wdead = DS.Bump(wlo, whi)
+            wstate = (AC.scratch_base(blob, segs) + 15) & ~15
+            bss_grow = (wstate - AC.scratch_base(blob, segs)
+                        + WORLD_STATE_BYTES + AC.bss_tail_slack(segs))
+            cave = wdead.put(lambda e, ad: build_world_boost_cave(
+                e, ad, budget, state=wstate))
+            wdead.placed[WORLD_SITE] = A.bl(WORLD_SITE, cave)
+            if struct.unpack_from('<I', text, WORLD_TERRAIN_SITE)[0] == \
+                    A.bl(WORLD_TERRAIN_SITE, WORLD_TERRAIN):
+                tcave = wdead.put(lambda e, ad: build_world_terrain_cave(
+                    e, ad, wstate))
+                wdead.placed[WORLD_TERRAIN_SITE] = A.bl(WORLD_TERRAIN_SITE,
+                                                        tcave)
+                caves['world terrain'] = tcave
+            dead.placed.update(wdead.placed)
+            caves['world'] = cave
+            todo.append((WORLD_SITE, WORLD_UPDATE, 'world', None))
+        except ValueError:
+            skipped.append((WORLD_SITE, WORLD_UPDATE, 'world', None))
+    else:
+        skipped.append((WORLD_SITE, WORLD_UPDATE, 'world', None))
     if menu_k is None:
         skipped.append((MENU_SITE, None, 'battle menu', None))
     else:
@@ -744,10 +1231,10 @@ def apply_boost_to_nso(src, dest, stock=None, budget=None, region=None):
         todo.append((MENU_SITE, None, 'battle menu', None))
     for va, w in dead.placed.items():
         struct.pack_into('<I', text, va, w)
-    out = AC.pack(blob, space.commit(), 0)
+    out = AC.pack(blob, space.commit(), bss_grow)
     with open(dest, 'wb') as handle:
         handle.write(out)
-    return {'installed': [s[2] for s in todo],
+    return {'installed': [s[2] for s in todo], 'world_state': wstate,
             'skipped': [s[2] for s in skipped], 'caves': caves,
             'max_extra': BOOST_MAX_EXTRA,
             'budget_ms': budget * 1000.0 / CPS,

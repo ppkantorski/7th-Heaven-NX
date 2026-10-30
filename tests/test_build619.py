@@ -1347,7 +1347,8 @@ def test_palstates_620k_ghotel_state_cells_meet_the_margin():
         pytest.skip('no ghotel 620j build')
     H = list(pickle.load(open(pk, 'rb')))
     H2 = list(H)
-    H2[8], n = P.edge_feather('ghotel', H[8])
+    H2[8], n = P.edge_feather('ghotel', H[8], force=True)
+    assert P.edge_feather('ghotel', H[8]) == (H[8], 0)   # BUILD 862: off
     assert n >= 8 and len(H2[8]) == len(H[8])
 
     def jumps(parts, st):

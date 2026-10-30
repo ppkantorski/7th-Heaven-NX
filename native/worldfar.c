@@ -217,10 +217,14 @@ typedef u32 (*callx_fn)(u32 x86, u32 nargs, ...);
 #define BTN_ZL          (1ull << 8)
 #define BTN_ZR          (1ull << 9)
 /* BUILD 803: ZL+ZR on their own is the view toggle + camera reset (it was
-   R3). "On their own": no other button at any point of the hold -- A B X Y,
-   L3 R3, L R, + -, the d-pad, SL/SR (bits 0..15 but ZL/ZR, 24..27). The
-   stick directions (16..23) do not count. */
-#define BTN_RESET_OTHER (0xFCFFull | (0xFull << 24))
+   R3). "On their own": no other button at any point of the hold -- X Y,
+   L3 R3, L R, + -, the d-pad, SL/SR (bits 2..15 but ZL/ZR, 24..27). The
+   stick directions (16..23) do not count. BUILD 856: nor do A and B (bits
+   0, 1) -- the click works while A or B is held too (flying the Highwind,
+   riding: A is often down). (worldfar.bin patched in place: the one
+   `movz x2, #0xfcff` -> `#0xfcfc` at blob +0xB88, the instruction this
+   constant compiles to; nothing else in the blob depends on it.) */
+#define BTN_RESET_OTHER (0xFCFCull | (0xFull << 24))
 
 typedef struct {
     u32 tris, verts, norms;         /* offsets into data */

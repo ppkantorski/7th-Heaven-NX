@@ -249,6 +249,15 @@ class Cpu:
         if (w & 0xFFFFFC00) == 0x9E670000:                    # fmov Dd, Xn
             self.fp[rd] = (0 if rn == 31 else self.x[rn]) & M64
             return None
+        if (w & 0xFFFFFC00) == 0x9E790000:                    # fcvtzu Xd, Dn
+            v = struct.unpack('<d', struct.pack('<Q', self.fp[rn] & M64))[0]
+            if v != v or v <= 0:
+                r = 0
+            else:
+                r = min((1 << 64) - 1, int(v)) if v != float('inf') \
+                    else (1 << 64) - 1
+            self.set(rd, r & M64)
+            return None
         if (w & 0xFFFFFC00) == 0x9E780000:                    # fcvtzs Xd, Dn
             v = struct.unpack('<d', struct.pack('<Q', self.fp[rn] & M64))[0]
             if v != v:
@@ -848,9 +857,19 @@ class Cpu:
                 self.c = (nzcv >> 1) & 1
                 self.v = nzcv & 1
             return None
-        if (w & 0xFF200000) == 0x8B000000:                    # add Xd,Xn,Xm
+        if (w & 0xFF200000) == 0x8B000000:                    # add Xd,Xn,Xm,sh
             amt = (w >> 10) & 0x3F
-            return self._wr64(rd, self._rd64(rn) + ((self.get(rm) << amt) & M64))
+            typ = (w >> 22) & 3
+            v = self.get(rm) & M64
+            if typ == 0:
+                v = (v << amt) & M64
+            elif typ == 1:
+                v = v >> amt
+            elif typ == 2:
+                v = (s64(v) >> amt) & M64
+            else:
+                raise Unsupported('add shift type %d at 0x%X' % (typ, pc))
+            return self._wr64(rd, self._rd64(rn) + v)
         if (w & 0xFFE0FFE0) == 0x2A0003E0:                    # mov Wd,Wm
             return s(rd, g(rm, True), True)
         if (w & 0xFFE0FC00) == 0x1B007C00:                    # mul Wd,Wn,Wm
@@ -911,6 +930,19 @@ class Cpu:
                      False)
         if (w & 0xFFE0FC00) == 0xCB000000:                    # sub Xd,Xn,Xm
             return s(rd, (gz(rn, False) - gz(rm, False)) & M64, False)
+        if (w & 0xFF200000) == 0xCB000000:                    # sub Xd,Xn,Xm,sh
+            amt = (w >> 10) & 0x3F
+            typ = (w >> 22) & 3
+            v = gz(rm, False) & M64
+            if typ == 0:
+                v = (v << amt) & M64
+            elif typ == 1:
+                v = v >> amt
+            elif typ == 2:
+                v = (s64(v) >> amt) & M64
+            else:
+                raise Unsupported('sub shift type %d at 0x%X' % (typ, pc))
+            return s(rd, (gz(rn, False) - v) & M64, False)
         if (w & 0xFFE0FC00) == 0x1AC02400:                    # lsr Wd,Wn,Wm
             return s(rd, (g(rn, True) >> (g(rm, True) & 31)) & M32, True)
         if (w & 0x9F000000) == 0x10000000:                    # adr Xd,label

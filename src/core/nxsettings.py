@@ -43,6 +43,7 @@ USER_KEYS = frozenset((
     'gui_theme',                    # window colours (nxthemes); not a build input
     'install_selection',            # BUILD 814: Install Mods' check boxes; not a build input
     'developer_settings',           # Settings > GUI toggle: same as SEVENTH_NX_DEV
+    'text_autosize',                # BUILD 860: Display > Autosize dialogue boxes
 ))
 
 # The shipped configuration: the developer settings' defaults, and what

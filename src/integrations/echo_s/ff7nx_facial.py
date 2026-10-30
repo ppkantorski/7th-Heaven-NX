@@ -171,6 +171,9 @@ SPEAK_FROM_OFF = 0x70
 # move to. Reading it is the whole coupling between the two features; without
 # a base the lip flap is not emitted at all.
 VOICE_PLAYER_OFF = 0x000
+VOICE_PAGE_OFF = 0x240                # ff7nx_voice: u8[256] page per window
+ASIDE_PAGES = 7                       # ff7nx_speakers.MASK_PAGES
+PAGE_MARK = (0x30, 0x27)              # ff7nx_speakers.PAGE_MARK, "PG"
 MOUTH_FLAP_INDEX = 2                  # the open mouth the 10 sets ship
 # The flap toggles every 1 << shift frames, so 3 at 60 FPS and 2 at 30 give
 # the same ~3.7 openings a second -- inside the 3-6 syllables a second of
@@ -277,6 +280,9 @@ HDR_GENL_LEN = 0x2C                   # u32
 HDR_GENR = 0x30                       # 12 bytes, generic right basename
 HDR_GENR_LEN = 0x3C                   # u32
 HDR_LR = 0x40                         # u64, X30 across the shared subroutine
+# BUILD 858: the speaking window's aside pages -- bits 0..6 the page mask
+# from the speaker tag (ff7nx_speakers.PAGE_MARK), bits 8..15 its window id
+HDR_ASIDE = 0x48                      # u32
 SLOTS_OFF = 0x50
 GEN_MAX = 11                          # what fits before the NUL in 12 bytes
 
@@ -796,6 +802,23 @@ def build_blink_cave(cave, addr, bss, load_entry, mload_entry,
         AC.bss_ptr(a, 27, voice_bss + VOICE_PLAYER_OFF)
         a.emit(A.ldr64(9, 27, 0))
         a.cbz64(9, 'have_mouth')
+        # BUILD 858: a page of the box the tag marks as an aside -- the
+        # voice runtime's page counter for the speaking window says which
+        # page is up -- does not move the mouth
+        a.emit(A.ldr(9, 24, HDR_ASIDE))
+        a.emit(A.and_mask(10, 9, 7))
+        a.cbz(10, 'flap')
+        a.emit(A.lsr(9, 9, 8))
+        a.emit(A.and_mask(9, 9, 8))
+        AC.bss_ptr(a, 27, voice_bss + VOICE_PAGE_OFF)
+        a.emit(A.add_reg64(27, 27, 9))
+        a.emit(A.ldrb(9, 27, 0))
+        a.emit(A.cmp_imm(9, ASIDE_PAGES))
+        a.bcond('flap', HS)
+        a.emit(lsrv(10, 10, 9))
+        a.emit(A.and_mask(10, 10, 1))
+        a.cbnz(10, 'have_mouth')
+        a.label('flap')
         a.emit(A.ldr(9, 24, HDR_FLAP))
         a.emit(A.add_imm(9, 9, 1))
         a.emit(A.str_(9, 24, HDR_FLAP))
@@ -954,6 +977,9 @@ def build_speak_cave(cave, addr, bss, out=None):
     a.emit(A.ldr(9, A.SP, SPEAK_FROM_OFF))
     a.emit(A.add_reg(21, 21, 9))                # ASK: one byte further
     _gld8(a, 21, 2, 22)                         # string id
+    _gld8(a, 21, 1, 9)                          # window id (BUILD 858)
+    a.emit(A.lsl(9, 9, 8))
+    a.emit(A.str_(9, 24, HDR_ASIDE))            # no aside page known yet
     _gld8(a, 20, 4, 27)                         # string table offset, lo
     _gld8(a, 20, 5, 9)
     a.emit(orr_lsl8(27, 27, 9))
@@ -977,6 +1003,22 @@ def build_speak_cave(cave, addr, bss, out=None):
         _gld8(a, 28, i, 9)
         a.emit(A.cmp_imm(9, byte))
         a.bcond('rule', NE)
+    # BUILD 858: the aside-page masks behind PAGE_MARK, one per string
+    a.emit(A.add_reg(26, 28, 21))               # tag + strings
+    _gld8(a, 26, len(SPEAKER_MAGIC), 9)
+    a.emit(A.cmp_imm(9, PAGE_MARK[0]))
+    a.bcond('no_pages', NE)
+    _gld8(a, 26, len(SPEAKER_MAGIC) + 1, 9)
+    a.emit(A.cmp_imm(9, PAGE_MARK[1]))
+    a.bcond('no_pages', NE)
+    a.emit(A.add_reg(26, 26, 22))
+    _gld8(a, 26, len(SPEAKER_MAGIC) + 2, 9)     # this line's mask
+    a.emit(A.and_mask(9, 9, 7))
+    a.emit(A.ldr(10, 24, HDR_ASIDE))
+    a.emit(orr_reg(10, 10, 9))
+    a.emit(A.str_(10, 24, HDR_ASIDE))
+    a.label('no_pages')
+    a.emit(A.movz(26, 0))
     a.emit(A.add_reg(21, 28, 22))
     _gld8(a, 21, len(SPEAKER_MAGIC), 21)        # this line's byte
     a.cbz(21, 'rule')                           # no opinion
@@ -1749,6 +1791,7 @@ def _dead_part(src, exe, stock, text):
     exe_bytes = open(exe, 'rb').read() if exe else None
     lo, hi = FX.dead_region(src, exe_bytes)
     lo += FX.FACIAL_AT
+    hi = (hi & ~15) - FX.WORLD_TOP     # BUILD 855: the world map's part
     if hi - lo < 0x400:
         raise ValueError('facial: dead part too small')
     if stock is not None:

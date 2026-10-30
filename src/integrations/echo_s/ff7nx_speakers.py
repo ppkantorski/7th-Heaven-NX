@@ -27,6 +27,9 @@ THE RULES, IN ORDER
     no header, no quote         narration, a tutorial, "Obtained Potion!",
                                 a sign, a menu: NOBODY
     header, then "(...)"        a thought: NOBODY -- nothing is said aloud
+    a box that is all "(...)"   a thought too (BUILD 853), quoted or not,
+                                with or without a header, over every page;
+                                an ASK whose options are all "(...)" as well
     quote with no header        an unnamed NPC: the issuing entity
     header names the issuer     the issuing entity
     header names another entity of this field that has a model
@@ -363,8 +366,103 @@ def decode(raw):
     return ''.join(out)
 
 
+_QUOTES = '“”"‘’'
+
+
+def _enclosed(s):
+    """Is `s` one parenthesis pair from its first character to its last --
+    "(A barrel.)" yes, "(Sigh) Fine. (Whatever.)" no?"""
+    if len(s) < 2 or s[0] != '(' or s[-1] != ')':
+        return False
+    depth = 0
+    for i, ch in enumerate(s):
+        depth += (ch == '(') - (ch == ')')
+        if depth <= 0 and i < len(s) - 1:
+            return False
+    return depth == 0
+
+
+def is_aside(text):
+    """
+    BUILD 853. Is every page of this box one parenthesised aside -- an
+    internal monologue or a muttered thought, which nobody says aloud?
+
+    Echo-S writes them three ways, all measured in the shipped flevel:
+
+        Cloud\n(He's not even listening.)        header, bare     (jet)
+        Tifa\n“(Cloud,you're so reliable!)”      header, quoted   (blin67_2)
+        “(Oh,man,not again!)”                    no header        (onna_5)
+
+    and a box can run over several pages ({NEW}), each its own aside
+    (mds7pb_2's Jessie). A page that also says something aloud --
+    "Fine. (Whatever.)" -- is not an aside, so a mixed box keeps its speaker.
+    Each page loses a leading name header the way header_of reads one, then
+    its whitespace and outer quote marks; what is left must be a single
+    balanced "(...)".
+    """
+    kinds = page_kinds(text)
+    return bool(kinds) and all(k != 'spoken' for k in kinds) and \
+        'aside' in kinds
+
+
+def page_kinds(text):
+    """BUILD 858: 'aside', 'spoken' or 'empty' for every page of the box,
+    in order (split at {NEW}, the pages the voice runtime counts)."""
+    for var, name in NAME_VARS.items():
+        text = text.replace(var, name)
+    text = re.sub(r'\{PARTY #\d\}', 'PARTY', text)
+    out = []
+    for page in text.split('{NEW}'):
+        p = re.sub(r'\{[^}]*\}', '', page).strip()
+        if not p:
+            out.append('empty')
+            continue
+        if '\n' in p:
+            head, rest = p.split('\n', 1)
+            rest = rest.lstrip(' \t')
+            if len(head) <= MAX_HEADER and head.strip() and \
+                    rest[:1] in '“"‘(' and not head.lstrip()[:1] in '“"‘(':
+                p = rest
+        p = p.strip()
+        while len(p) >= 2 and p[0] in _QUOTES and p[-1] in _QUOTES:
+            p = p[1:-1].strip()
+        out.append('aside' if _enclosed(re.sub(r'\s+', ' ', p))
+                   else 'spoken')
+    return out
+
+
+# BUILD 858 (user, 10-29: "(Ugh... A frisky customer.)" in the Honey Bee Inn
+# still moves the mouth). That line is the SECOND page of a box whose first
+# page is spoken, so 853's per-box rule kept the speaker. The tag now also
+# carries, per string, a mask of its aside pages (bit n = page n, pages 0..6),
+# behind PAGE_MARK after the per-string bytes; the lip flap skips a page whose
+# bit is set (ff7nx_facial reads the voice runtime's page counter).
+PAGE_MARK = bytes((0x30, 0x27))              # "PG" in FF7's field codec
+MASK_PAGES = 7                               # masks stay 0..0x7F, never 0xFF
+
+
+def aside_mask(text):
+    """Bit n set for page n (< 7) that is an aside, in a box that also has
+    a spoken page; 0 for a box with no aside page or no spoken one."""
+    kinds = page_kinds(text)
+    if 'spoken' not in kinds or 'aside' not in kinds:
+        return 0
+    return sum(1 << i for i, k in enumerate(kinds[:MASK_PAGES])
+               if k == 'aside')
+
+
 def header_of(text):
-    """(name, kind) with kind 'hdr', 'thought', 'quote' or 'none'."""
+    """(name, kind) with kind 'hdr', 'thought', 'quote' or 'none'.
+
+    BUILD 853: any box that is wholly a parenthesised aside (is_aside) is a
+    'thought', quoted or not, with or without a header (name None without)."""
+    name, kind = _header_of(text)
+    if kind != 'none' and is_aside(text):
+        return name, 'thought'
+    return name, kind
+
+
+def _header_of(text):
     for var, name in NAME_VARS.items():
         text = text.replace(var, name)
     text = re.sub(r'\{PARTY #\d\}', 'PARTY', text)
@@ -387,6 +485,14 @@ def header_of(text):
             if rest[:1] == '(':
                 return name, 'thought'
     return None, 'none'
+
+
+def choices_are_asides(text):
+    """BUILD 853. Is every {CHOICE} option of an ASK a "(...)" aside?"""
+    opts = [o for o in text.split('{CHOICE}')[1:]]
+    opts = [re.sub(r'\{[^}]*\}', '', o).strip() for o in opts]
+    opts = [o for o in opts if o]
+    return bool(opts) and all(_enclosed(re.sub(r'\s+', ' ', o)) for o in opts)
 
 
 def header_key(name):
@@ -533,7 +639,8 @@ def analyse(sec1, sec3=b'', field=''):
     votes = collections.defaultdict(collections.Counter)
     for ai, sid in msgs:
         name, kind = lines[sid][1]
-        if ai in keys and keys[ai] is None and kind in ('hdr', 'thought'):
+        if ai in keys and keys[ai] is None and kind in ('hdr', 'thought') \
+                and name:
             k = header_key(name)
             if k:
                 votes[ai][k] += 1
@@ -635,21 +742,33 @@ def analyse(sec1, sec3=b'', field=''):
     # voice (md8_2's 2_0/2_1). Every voiced ASK in the game is one of these.
     # An ASK with a question first is left to the rule; none is voiced but
     # cosin1_1's, which is a MESSAGE too and keeps that line's answer.
+    # BUILD 853: when every option is a parenthesised aside ("{CHOICE}(Better
+    # cooperate)") the player is thinking, not saying it: nobody. An ASK
+    # mixing a spoken option with a thought keeps the player's mouth -- the
+    # tag is per string, not per option.
     for sid in sorted(asks - set(out)):
         if s.string(sid).lstrip(b'\x00')[:1] == bytes((CHOICE,)):
-            out[sid] = (V_PLAYER, 'choice')
+            out[sid] = (V_NOBODY, 'thought choice') \
+                if choices_are_asides(decode(s.string(sid))) \
+                else (V_PLAYER, 'choice')
     return out, report, s
 
 
-def tag_bytes(values, count):
-    """The tag string for a table of `count` strings, or None if not needed."""
+def tag_bytes(values, count, masks=None):
+    """The tag string for a table of `count` strings, or None if not needed.
+    BUILD 858: `masks` {sid: aside page mask} rides behind PAGE_MARK."""
     body = bytearray(count)
     for sid, (v, _why) in values.items():
         if sid < count:
             body[sid] = v
-    if not any(body):
+    pages = bytearray(count)
+    for sid, m in (masks or {}).items():
+        if sid < count:
+            pages[sid] = m & 0x7F
+    if not any(body) and not any(pages):
         return None
-    return MAGIC + bytes(body) + bytes((TERMINATOR,))
+    tail = PAGE_MARK + bytes(pages) if any(pages) else b''
+    return MAGIC + bytes(body) + tail + bytes((TERMINATOR,))
 
 
 def has_tag(sec1):
@@ -697,10 +816,19 @@ def tag_section(sec1, sec3=b'', field=''):
     if has_tag(sec1):
         return bytes(sec1), {'tagged': False, 'already': True}
     values, report, s = analyse(sec1, sec3, field)
-    blob = tag_bytes(values, s.count)
+    masks = {}
+    for sid in range(s.count):
+        try:
+            m = aside_mask(decode(s.string(sid)))
+        except Exception:                                   # noqa: BLE001
+            m = 0
+        if m and values.get(sid, (V_DEFAULT,))[0] != V_NOBODY:
+            masks[sid] = m
+    blob = tag_bytes(values, s.count, masks)
     stats = collections.Counter(why for _v, why in values.values())
     stats = {'tagged': blob is not None, 'lines': dict(stats),
-             'changed': sum(1 for v, _w in values.values() if v)}
+             'changed': sum(1 for v, _w in values.values() if v),
+             'aside_pages': len(masks)}
     if blob is None:
         return bytes(sec1), stats
     return append_string(sec1, blob), stats

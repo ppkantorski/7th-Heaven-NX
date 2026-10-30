@@ -209,9 +209,31 @@ MINIMAP_WORDS = ((0xF3C75C, 0x52802789, 388, 'mov w9, #316'),
 # position is a whole number of units, so 25: 75 px at 720p, 112.5 vs 114
 # at 1080p. Constant 25, everything else as 715.
 MINIMAP_TOP = 25
-MINIMAP_Y_WORDS = ((0xF3C7A4, 0x52801B89, A.movz(9, MINIMAP_TOP), 'mov w9, #220'),
-                   (0xF3C7C8, 0x4B080137, A.mov_reg(23, 9),
-                    'sub w23, w9, w8'))
+# BUILD 857 (user, 10-28: the full map "is a bit higher than it should be
+# ... can you vertically center it please", the minimap stays). 715/729 put
+# BOTH at y = 25*s; the full map (size 24*s, 7*size = 168 units) centred in
+# the 240-unit UI sits at (240 - 168) / 2 = 36. One line through both:
+#     y = 25*s + 11/16 * (size - 8*s)      (minimap 25*s, full map 36*s)
+#     16*y = 312*s + 11*size
+# The constant becomes 312 (w9 = 312*s, held in edx until the end), and the
+# `sub` site calls MAPY: w23 = (w9 + 11*size) >> 4 from w8 = 8*size (8 + 2 +
+# 1 eighths), exact for both sizes. 5 words after the blob; x30 is the
+# routine's own scratch here (it calls the translator around it).
+MAP_FULL_TOP = 36
+MAP_Y16_S = 16 * MINIMAP_TOP - 8 * (MAP_FULL_TOP - MINIMAP_TOP)     # 312
+assert MAP_FULL_TOP - MINIMAP_TOP == 11 and MAP_Y16_S == 312
+MAPY_SITE = 0xF3C7C8
+MINIMAP_Y_WORDS = ((0xF3C7A4, 0x52801B89, A.movz(9, MAP_Y16_S), 'mov w9, #220'),
+                   (MAPY_SITE, 0x4B080137, None, 'sub w23, w9, w8'))
+
+
+def mapy_words():
+    """w23 = (w9 + 11*size) >> 4, w8 = 8*size; x10 the only scratch."""
+    return [0x0B08012A,                           # add w10, w9, w8
+            0x0B480940 | 10,                      # add w10, w10, w8, lsr #2
+            0x0B480D40 | 10,                      # add w10, w10, w8, lsr #3
+            0x13047D57,                           # asr w23, w10, #4
+            A.ret()]
 # BUILD 699/700: the Highwind flies level. Its model pitch (x86 0x763585,
 # the ridden Highwind's draw) is [0xE39BB4] - 0x40, in 256ths of a turn:
 # the 0x40 (a quarter turn) stands the model the right way up, and
@@ -691,9 +713,12 @@ def apply_to_nso(src, dest, stock=None, own=None):
         places[name] = at
         at = (at + 4 * n + 15) & ~15
     entry = at
-    if entry + len(code) > hi:
+    # BUILD 857: the full map's y, after the blob (nothing above moves)
+    places['mapy'] = (entry + len(code) + 15) & ~15
+    if places['mapy'] + 4 * len(mapy_words()) > hi:
         raise ValueError('worldfar does not fit its dead-space part '
-                         '(%d bytes of %d)' % (entry + len(code) - lo, hi - lo))
+                         '(%d bytes of %d)' % (places['mapy'] + 20 - lo,
+                                               hi - lo))
     for va in range(lo, entry, 4):
         struct.pack_into('<I', text, va, 0)
     P = places
@@ -745,7 +770,11 @@ def apply_to_nso(src, dest, stock=None, own=None):
     for va, _w, new, _what in MINIMAP_WORDS:
         struct.pack_into('<I', text, va, A.movz(9, new))
     for va, _w, word, _what in MINIMAP_Y_WORDS:                  # BUILD 715
+        if word is None:                                         # BUILD 857
+            word = A.bl(va, P['mapy'])
         struct.pack_into('<I', text, va, word)
+    for i, word in enumerate(mapy_words()):
+        struct.pack_into('<I', text, P['mapy'] + 4 * i, word)
     struct.pack_into('<I', text, HW_LEVEL_SITE, HW_LEVEL_NEW)   # BUILD 699
     for pairs, value, reg in ((PRIM_LIMIT, PRIM_BYTES, 9),
                               (PRIM_SECOND, PRIM_BYTES, 9),

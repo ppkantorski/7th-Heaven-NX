@@ -39,6 +39,27 @@ FIX (BUILD 778), the pair kept and the WINNER made the newer frame:
 Every frame now shows once per cycle in order; the cycle length is
 unchanged. SEVENTH_NX_NO_WATERLOOP=1 disables.
 
+BUILD 860c: ONE FRAME AT A TIME, AND WHY 776 WAS RIGHT AFTER ALL. Hardware
+10-29 (a 60 fps capture, the water matched picture by picture against the
+frame sim): with 778's pairs the console showed 1:0, 1:4 and 2:4 for 20
+frames each, never showed 1:3 or 2:3, and flashed 1:1 for one frame before
+1:0 -- the stream still paused three times a cycle. Which of two equal-depth
+frames wins on the console is not the record order 778 assumed. And the
+reason 776's one-frame loop was abandoned ("a whole portion of the water
+missing", 10-22) was not the loop: it was the driver's field depth copy
+drawing through the screen colour target (ff7nx_depthcopy, BUILD 860h),
+present with any loop until Mog walks out. Every one of the 16 frames covers the whole stream
+(measured on the built pages: the same coverage per tile in every frame),
+so ONE frame on at a time needs no winner at all:
+
+  init      BGON 1:0, BGON 1:0           (was BGON 1:0, BGON 1:1)
+  step m    BGOFF frame m, BGON frame m+1 (was BGON frame m+2)
+
+16 pictures, each on for exactly 5 ticks, in order, every cycle; the cycle
+is the vanilla 80 ticks. In-place operand edits only (same opcodes, same
+size, no jump target moves). The records, the palettes and the LDPALs are
+left exactly as the archive has them; no copy records.
+
 Licensed under GPLv3
 Copyright (c) 2026 ppkantorski
 """
@@ -53,19 +74,20 @@ import numpy as np
 OFF_ENV = 'SEVENTH_NX_NO_WATERLOOP'
 FIELDS = ('mogu_1',)
 FRAMES = [(1, i) for i in range(8)] + [(2, i) for i in range(8)]
-COPY = (4, 0)            # the duplicate of frame 1:0 (param 4, state bit 0)
+COPY = (4, 0)            # 778's duplicate of frame 1:0 (gone since 860c;
+#                          round_corner still clears it if a payload has it)
 WATER_PAGES = (24, 25)
 WATER_PALS = (2, 3, 10, 11)
 REC = 52
-NOP = 0x5F
 
 
 def _op(code, param, bit):
     return bytes((code, 0, param, bit))
 
 
-def _loop(wrap):
-    """The 16-step loop body: BGOFF k / BGON k+2 / WAIT 5 (no WAIT last)."""
+def _loop_pairs(wrap):
+    """The vanilla 16-step loop body: BGOFF k / BGON k+2 / WAIT 5 (no WAIT
+    last); `wrap` is what step 14 turns on."""
     out = b''
     for m in range(16):
         on = FRAMES[(m + 2) % 16]
@@ -77,13 +99,24 @@ def _loop(wrap):
     return out
 
 
-LOOP_OLD, LOOP_NEW = _loop(FRAMES[0]), _loop(COPY)
+def _loop_one():
+    """BUILD 860c: BGOFF k / BGON k+1 / WAIT 5 (no WAIT last)."""
+    out = b''
+    for m in range(16):
+        out += _op(0xE1, *FRAMES[m]) + _op(0xE0, *FRAMES[(m + 1) % 16])
+        if m < 15:
+            out += b'\x24\x05\x00'
+    return out
+
+
+LOOP_OLD, LOOP_ONE = _loop_pairs(FRAMES[0]), _loop_one()
 # the loop head: LDPAL 1->2, 3->3, 5->10, 7->11 (16 colours each), WAIT 4
 HEAD_OLD = (bytes.fromhex('e60001020f' 'e60003030f' 'e600050a0f'
                           'e600070b0f') + b'\x24\x04\x00')
-HEAD_NEW = (_op(0xE1, *COPY) + _op(0xE0, *FRAMES[0]) + bytes([NOP] * 12)
-            + b'\x24\x04\x00')
-assert len(HEAD_OLD) == len(HEAD_NEW) and len(LOOP_OLD) == len(LOOP_NEW)
+# the entity's init: BGON 1:0, BGON 1:1, RET, then the first STPAL
+INIT_OLD = _op(0xE0, 1, 0) + _op(0xE0, 1, 1) + bytes.fromhex('00e5000200')
+INIT_ONE = _op(0xE0, 1, 0) + _op(0xE0, 1, 0) + bytes.fromhex('00e5000200')
+assert len(LOOP_OLD) == len(LOOP_ONE) and len(INIT_OLD) == len(INIT_ONE)
 
 
 def disabled():
@@ -93,90 +126,18 @@ def disabled():
 
 def fix_script(sec0):
     """(section 0, changed). Refuses unless both sites are there once."""
-    if sec0.count(HEAD_NEW + LOOP_NEW) == 1:
+    if (sec0.count(HEAD_OLD + LOOP_ONE) == 1
+            and sec0.count(INIT_ONE) == 1):
         return sec0, False                          # already done
     blk = HEAD_OLD + LOOP_OLD
     if sec0.count(blk) != 1:
         raise ValueError('the water loop is not where expected')
-    out = sec0.replace(blk, HEAD_NEW + LOOP_NEW)
+    if sec0.count(INIT_OLD) != 1:
+        raise ValueError('the water init is not where expected')
+    out = sec0.replace(blk, HEAD_OLD + LOOP_ONE).replace(INIT_OLD, INIT_ONE)
     if len(out) != len(sec0):
         raise ValueError('size changed')
     return out, True
-
-
-def _frame(r):
-    """(param, bit) of a water record, else None."""
-    if not r[28] or r[26] not in (1, 2) or r[34] not in WATER_PAGES:
-        return None
-    st = r[27]
-    if st == 0 or st & (st - 1):
-        return None
-    return r[26], st.bit_length() - 1
-
-
-def fix_records(sec9):
-    """(section 9, tiles). Newest-first per tile, plus the 1:0 copy."""
-    import diag_common as DC
-    import ff7nx_floordepth as FD
-    import field_bg_native as FN
-    pl, _ts, _te, px = DC.parse_pages(sec9)
-    pages = {p.slot: p for p in pl if p is not None}
-    if any(pages.get(s) is None or pages[s].depth != 2 for s in WATER_PAGES):
-        raise ValueError('water pages are not truecolor')
-    rows = {r[0]: r for r in FD._rows(sec9)}
-    for lay, _c, first, n in rows.values():
-        for i in range(n):
-            r = sec9[first + i * REC:first + (i + 1) * REC]
-            if r[26] == COPY[0]:
-                raise ValueError('param %d already in use' % COPY[0])
-            pg = r[34] if r[28] else r[32]
-            if r[22] in WATER_PALS and (pg not in pages
-                                        or pages[pg].depth == 1):
-                raise ValueError('palette %d drawn from a paletted page'
-                                 % r[22])
-    _l, c2, f2, n2 = rows[2]
-    tiles = {}
-    for i in range(n2):
-        o = f2 + i * REC
-        r = sec9[o:o + REC]
-        fr = _frame(r)
-        if fr is None:
-            continue
-        key = struct.unpack_from('<hh', r, 2)
-        tiles.setdefault(key, {})
-        if fr in tiles[key]:
-            raise ValueError('two records for one frame at %r' % (key,))
-        tiles[key][fr] = i
-    if not tiles or any(len(v) != 16 for v in tiles.values()):
-        raise ValueError('water tiles are not 16 frames each')
-    for key, v in tiles.items():
-        if len({struct.unpack_from('<h', sec9, f2 + i * REC + 24)[0]
-                for i in v.values()}) != 1:
-            raise ValueError('frames at %r are not at one depth' % (key,))
-    buf = bytearray(sec9)
-    newest = sorted(FRAMES, key=lambda f: (-f[0], -f[1]))
-    copies = []
-    first = min(i for v in tiles.values() for i in v.values())
-    for key, v in sorted(tiles.items(), key=lambda kv: min(kv[1].values())):
-        slots = sorted(v.values())
-        recs = {fr: sec9[f2 + i * REC:f2 + (i + 1) * REC]
-                for fr, i in v.items()}
-        for slot, fr in zip(slots, newest):
-            buf[f2 + slot * REC:f2 + (slot + 1) * REC] = recs[fr]
-        c = bytearray(recs[FRAMES[0]])
-        c[26], c[27] = COPY[0], 1 << COPY[1]
-        copies.append(bytes(c))
-    at = f2 + first * REC
-    out = bytes(buf[:at]) + b''.join(copies) + bytes(buf[at:])
-    out = bytearray(out)
-    struct.pack_into('<H', out, c2, n2 + len(copies))
-    out = bytes(out)
-    if {r_[0]: r_ for r_ in FD._rows(out)}[2][3] != n2 + len(copies):
-        raise ValueError('re-walk disagrees after the insert')
-    # the texture block only moved; re-encode it where the walk now ends
-    plist, t0, t1 = FN.parse_texture_block(out, px)
-    out = FN.replace_texture_block(out, plist, t0, t1)
-    return out, len(copies)
 
 
 # BUILD 780. User, 10-22, on the frame-sim picture of the stream: "i would
@@ -265,7 +226,7 @@ def round_corner(sec9):
 
 def apply_to_flevel(archive, payloads, encode=None, log=lambda *_: None):
     import lgp
-    st = {'names': [], 'refused': [], 'tiles': 0}
+    st = {'names': [], 'refused': []}
     if disabled():
         return st
     encode = encode or archive.encode_field
@@ -279,10 +240,8 @@ def apply_to_flevel(archive, payloads, encode=None, log=lambda *_: None):
                    else archive.decompressed(entry))
             parts = list(lgp.split_sections(raw))
             new0, changed = fix_script(parts[0])
-            n = 0
             if changed:
-                new9, n = fix_records(parts[8])
-                parts[0], parts[8] = new0, new9
+                parts[0] = new0
             try:
                 parts[8], c = round_corner(parts[8])
             except Exception as exc:                           # noqa: BLE001
@@ -296,17 +255,15 @@ def apply_to_flevel(archive, payloads, encode=None, log=lambda *_: None):
             continue
         payloads[name] = encode(lgp.join_sections(parts))
         st['names'].append(name)
-        st['tiles'] += n
     return st
 
 
 def summarise(st):
     out = []
     if st.get('names'):
-        out.append('  WATER LOOP (BUILD 778): %s -- newest frame of each pair '
-                   'drawn first, a 1:0 copy for the wrap (%d tiles). '
-                   '%s=1 disables.'
-                   % (', '.join(st['names']), st.get('tiles', 0), OFF_ENV))
+        out.append('  WATER LOOP (BUILD 860c): %s -- one frame on at a time, '
+                   'each of the 16 for 5 ticks in order. %s=1 disables.'
+                   % (', '.join(st['names']), OFF_ENV))
         if st.get('corner'):
             out.append('  WATER CORNER (BUILD 780): %d texels outside the '
                        'rounded upper-left corner cleared.' % st['corner'])

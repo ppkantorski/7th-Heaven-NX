@@ -132,6 +132,8 @@ typedef struct {
     u32 marked;             /* BUILD 667d: rs blend mode carries the model mark */
     s32 morig;              /* ... the blend mode it replaced */
     u8 *cam;                /* BUILD 670: ff7nx_subcam's state (fast_stub), or 0 */
+    float clip[4];          /* BUILD 861: world x of a camera point = clip . p + clip[3] */
+    u32 clipon;             /* ... in use for this field model (games' stairs) */
 } Ctx;
 
 /* BUILD 646i: guest (x86) memory, through the port's own page table (what
@@ -637,6 +639,50 @@ static __attribute__((noinline, section(".text.sh_pre"))) int ride_low(Ctx *c, s
     return ride;
 }
 
+/* BUILD 861: gldgate (field 497), the Gold Saucer's tubes (hardware
+ * 10-29: "your model shadow is still showing up in locations on the field
+ * as you are jumping into the hole, or returning from inside the hole").
+ * Triangles 38..51 are the tubes' slopes (z 55 at the rim to -124 inside);
+ * JUMP (x86 0x615CA3) goes in onto 38/41/43/45/47/49/50 and, after an XYZI
+ * there, out onto the platform (7, 10..12, 14..16). During a jump the game
+ * names its START triangle until the last step (0x634F9F), so the shadow
+ * lay on the tube's slope going out, and on the platform's plane over the
+ * rim going in. Now: rising (state +0x70 = 1, vertical speed +0x2C still
+ * above gravity x step, 16000 x +0x32 -- 0x634F46/0x63510C) the shadow
+ * belongs to the start triangle, falling to the destination (+0x7A); in a
+ * tube, none. So going in it shows until the top of the jump, coming out
+ * from the top of the jump on. Returns the triangle, or -2: no shadow.
+ * The event is read straight from host memory (one page; the array is
+ * static, x86 0x634D4D addresses it as 0xCC1670 + 0x88 i), else as is. */
+#define FID_GLDGATE 497
+/* BUILD 861: games (Wonder Square's lobby, field 505), the stairs up to the
+ * TV station (hardware 10-29: "my character's shadow is peaking through the
+ * wall when i walk up the staircase"). The stair and landing walkmesh
+ * (triangles 0..9) ends at x -36; left of it stands the cylinder whose
+ * lower half is 1997 layer-2 art at ID 4081 (no depth). A part's shadow
+ * landing past the edge lay on the stair plane's extension, in front of
+ * that art -- the sword's, a thin dark bar on the cylinder (measured on
+ * the screenshot: camera (-42, 89.5), Cloud at (-9, -59, 121) on triangle
+ * 4, the bar at world x < -56). A depth fix cannot do it: that extension is
+ * as near as anyone standing on the floor in front of the cylinder. So on
+ * those triangles a part whose shadow origin lands left of STAIR_EDGE (12
+ * past the walkmesh) casts none; FFNx's receivers are the walkmesh itself
+ * and show nothing there either. */
+#define FID_GAMES   505
+#define STAIR_EDGE  48.0f
+#define FIELD_EVENT0 0xCC1670u   /* the event array itself (*FIELD_EVENTS) */
+static __attribute__((noinline, section(".text.sh_pre"))) s32 tube_jump(Ctx *c, s32 gt)
+{
+    s32 i = c->mrow[c->slot];
+    u32 g = FIELD_EVENT0 + 0x88u * (u32)i;
+    u8 *e = i >= 0 && (g & 0xFFFu) <= 0x1000u - 0x88u ? g2h(c, g) : 0;
+    if (e && e[0x63] == 3
+        && *(short *)(e + 0x70) == 1
+        && *(s32 *)(e + 0x2C) <= 16000 * (s32)*(short *)(e + 0x32))
+        gt = *(short *)(e + 0x7A);
+    return gt >= 38 && gt <= 51 ? -2 : gt;
+}
+
 static __attribute__((unused, noinline, section(".text.sh_pre"))) int staged(Ctx *c, s32 tri, float x, float y, float tz)
 {
     u32 level, wo, base, acc, n, i;
@@ -746,6 +792,7 @@ static int field_floor(Ctx *c, const float *m, float *b)
      * own triangle and FFNx's fade it is gone; the one staged NPC that
      * should cast nothing is named: del2 (field 443), the window lady on
      * triangle 120. */
+    c->clipon = 0;
     {
         s32 fid;
         if (rdg16(c, 0xCFF468u, &fid)) {
@@ -757,6 +804,12 @@ static int field_floor(Ctx *c, const float *m, float *b)
              * shadow there lies on nothing (hardware 10-14) -- none. */
             if (fid == 723 || fid == 724)
                 return 0;
+            /* BUILD 861: gldgate's tubes */
+            if (fid == FID_GLDGATE && (gt = tube_jump(c, gt)) < -1)
+                return 0;
+            /* BUILD 861: games' staircase (triangles 0..9, x -36..52): no
+             * part's shadow past STAIR_EDGE (sh_pre) */
+            c->clipon = fid == FID_GAMES && (u32)gt <= 9;
         }
     }
     own = gt;
@@ -872,6 +925,21 @@ static int field_floor(Ctx *c, const float *m, float *b)
      * swap (x, z, -y) = FLIGHT, eye = centre + dir. */
     for (i = 0; i < 3; i++)
         c->light[i] = C[4 * i] * FLIGHT_X + C[4 * i + 1] * FLIGHT_Y + C[4 * i + 2] * FLIGHT_Z * s;
+    /* BUILD 861: a part origin p (camera space) lands on this floor along
+     * the light at q = p - ((p - b12) . n / (l . n)) l; its world x is
+     * ai0 . (q - T), linear in p: clip . p + clip[3] (+ STAIR_EDGE) */
+    if (c->clipon) {
+        float cl = 0.0f, ln = 0.0f, dd = 0.0f;
+        for (i = 0; i < 3; i++) {
+            cl += ai[i] * c->light[i];
+            ln += c->light[i] * b[4 + i];
+            dd += b[12 + i] * b[4 + i];
+        }
+        k = cl / ln;            /* ln: FFNx's light is never along the floor */
+        for (i = 0; i < 3; i++)
+            c->clip[i] = ai[i] - k * b[4 + i];
+        c->clip[3] = STAIR_EDGE + k * dd - ai[0] * C[3] - ai[1] * C[7] - ai[2] * C[11];
+    }
     return 1;
 }
 
@@ -918,7 +986,7 @@ _Static_assert(OFF(dent) == 0x348, "CTX_DENT");
 _Static_assert(OFF(marked) == 0x378, "CTX_MARKED");
 _Static_assert(OFF(morig) == 0x37C, "CTX_MORIG");
 _Static_assert(OFF(cam) == 0x380, "CTX_CAM");
-_Static_assert(sizeof(Ctx) <= 0x390, "STATE_BYTES");
+_Static_assert(sizeof(Ctx) <= 0x3A0, "STATE_BYTES");
 #undef OFF
 
 /* BUILD 645q: the fast path. The GL device object is **dev; its vtable: */
@@ -995,8 +1063,18 @@ u32 sh_pre(Ctx *c, u8 *rs, u32 nidx)
             *(s32 *)(rs + RS_BLEND) = (s32)(MARK_BIT | (c->fade << 8) | 4u);
         }
     }
-    if (c->mode == MODE_ACTOR && c->have_blob && nidx >= MIN_SHADOW_INDICES)
+    if (c->mode == MODE_ACTOR && c->have_blob && nidx >= MIN_SHADOW_INDICES) {
+        /* BUILD 861: games' stairs -- where this part's origin lands on
+         * the floor plane along the light, in world x */
+        if (c->field == 1 && c->clipon) {
+            float x = c->clip[3];
+            for (i = 0; i < 3; i++)
+                x += c->clip[i] * rd(rs, RS_MODEL + 48 + 4 * i);
+            if (x < 0.0f)
+                return ACT_DRAW;
+        }
         return ACT_SHADOW;
+    }
     return ACT_DRAW;
 }
 

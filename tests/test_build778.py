@@ -1,6 +1,6 @@
-"""BUILD 778: mogu_1's water (pairs kept, newest drawn first, the wrap
-copy) and its corner tile (blackcell never uses an FX-band page), games_2's
-rectangle, nmkin_3's steam cut, fship_2's frame edges, rckt2's dead arrow.
+"""BUILD 778: mogu_1's water (one frame at a time since BUILD 860c) and
+its corner tile (blackcell never uses an FX-band page), games_2's rectangle,
+nmkin_3's steam cut, fship_2's frame edges, rckt2's dead arrow.
 
 Licensed under GPLv3
 Copyright (c) 2026 ppkantorski
@@ -27,31 +27,27 @@ import ff7nx_ventcrop as VC  # noqa: E402
 import ff7nx_waterloop as W  # noqa: E402
 
 
-def test_waterloop_script_keeps_pairs_and_wraps_through_the_copy():
-    sec = b'\x00' * 16 + W.HEAD_OLD + W.LOOP_OLD + b'\x12\x10'
+def test_waterloop_script_one_frame_at_a_time():
+    """BUILD 860c (supersedes 778's pairs): the init turns on frame 1:0
+    only and every step swaps the frame on for the next one, so exactly one
+    water frame is on at any time and all 16 show once a cycle, in order."""
+    sec = (b'\x00' * 8 + W.INIT_OLD + b'\x00' * 8 + W.HEAD_OLD + W.LOOP_OLD
+           + b'\x12\x10')
     out, changed = W.fix_script(sec)
     assert changed and len(out) == len(sec)
     assert W.fix_script(out) == (out, False)
     with pytest.raises(ValueError):
         W.fix_script(b'\x00' * 64)
-    # simulate one cycle: the frame drawn first among those on is shown
-    order = [W.COPY] + sorted(W.FRAMES, key=lambda f: (-f[0], -f[1]))
-    on = {(1, 0), (1, 1)}
-    shown = []
-    on.discard(W.COPY)
-    on.add(W.FRAMES[0])
-    shown.append(next(f for f in order if f in on))
+    on = {(1, 0)}
+    shown = [(1, 0)]
     for m in range(16):
-        step = W.LOOP_NEW[11 * m:11 * m + 8]
+        step = W.LOOP_ONE[11 * m:11 * m + 8]
         assert step[0] == 0xE1 and step[4] == 0xE0
         on.discard((step[2], step[3]))
         on.add((step[6], step[7]))
-        assert len(on) == 2                    # always a pair: full coverage
-        if m < 15:
-            shown.append(next(f for f in order if f in on))
-    pics = [(1, 0) if f == W.COPY else f for f in shown]
-    assert sorted(pics) == sorted(W.FRAMES)     # each picture once a cycle
-    assert pics == W.FRAMES[1:] + W.FRAMES[:1]  # in order, nothing held
+        assert len(on) == 1
+        shown.append(next(iter(on)))
+    assert shown[:16] == W.FRAMES and shown[16] == W.FRAMES[0]
 
 
 def test_blackcell_never_offers_an_fx_band_page():

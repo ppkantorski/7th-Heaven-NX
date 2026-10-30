@@ -157,7 +157,7 @@ DEV_GOT = 0x12CE510                         # -> the GL device (passed, unused)
 # framebuffer has no stencil buffer (hardware test). Shadowed pixels are
 # marked in the framebuffer's alpha instead, in the shadow's one draw
 # (native/shadows.c sh_begin).
-STATE_BYTES = 0x390                         # sizeof(Ctx) = 0x208 (646e FEET rows, 646i pages)
+STATE_BYTES = 0x3A0                         # sizeof(Ctx) = 0x208 (646e FEET rows, 646i pages)
 MODE_BLOB, MODE_ACTOR = 1, 2
 
 SHADOW_ALPHA = '0.40'                       # 645-645n: black at this alpha

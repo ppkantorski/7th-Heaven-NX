@@ -1075,12 +1075,26 @@ def plan_field(name, parts, vparts, art, mb_cap=35.0, raw_cap=None,
                 animated = set(_pulse_order(lv, tg, vc)[:n_anim])
             else:
                 animated = None
+            tol = spec.get('static_tol')
+            n_static = 0
             for layer, i, r in tg:
                 gone.add((layer, i))
                 if animated is not None and vc[r] not in animated:
                     imgs = lv[vc[r]]
                     new_recs.append((layer, r, 0, 0, imgs[len(imgs) // 2]))
                     continue
+                if tol is not None:
+                    # BUILD 858: a tile Cosmos draws the same in every
+                    # state (onna_4: half the lamp tiles, within 4/255 --
+                    # sheet noise) is one record under the effect's own
+                    # parameter and bits, not one per state
+                    st_ = np.stack([np.asarray(x, np.float32)
+                                    for x in lv[vc[r]]])
+                    mean = st_.mean(0)
+                    if float(np.abs(st_ - mean).max()) <= tol:
+                        new_recs.append((layer, r, r[26], r[27], mean))
+                        n_static += 1
+                        continue
                 for n_, (st, img) in enumerate(zip(spec['states'],
                                                    lv[vc[r]])):
                     if 'params' in spec:          # one parameter per state
@@ -1093,7 +1107,9 @@ def plan_field(name, parts, vparts, art, mb_cap=35.0, raw_cap=None,
                         new_recs.append((layer, r, spec['param'], 1 << st,
                                          img))
             info['effects'].append('palette %d: %d records x %d levels'
-                                   % (q, len(tg), len(spec['states'])))
+                                   % (q, len(tg), len(spec['states']))
+                                   + (', %d static' % n_static
+                                      if n_static else ''))
             if animated is not None:
                 info['animated_cells'] = len(animated)
                 info['static_cells'] = len(set(vc.values())) - len(animated)
@@ -1258,8 +1274,28 @@ def plan_field(name, parts, vparts, art, mb_cap=35.0, raw_cap=None,
 # into the ground record under it across that one column (smoothstep, 0 at
 # the margin's edge): the margin meets plain ground, the animation keeps its
 # full look one column in. Only cells no other record reads are written.
+#
+# BUILD 862: OFF BY DEFAULT. Hardware 10-29: entering the SPEED grave (state
+# 1) and the STATION grave (state 64) showed a vertical band of blue speckle
+# exactly on these faded cells -- the same rows (speed y 136..232, station
+# y 88..232) and the smoothstep's middle columns (4..11 of 16), nowhere
+# else and in no other state. The software render of the same bytes is
+# clean, so the console draws these mixed texels differently; the cells go
+# back to Cosmos's own frames. 620k2 found the user's 10-07 "discontinuity"
+# was in Cosmos's fog (fixed by _soften_split), not this seam, which only
+# shows while a grave is open. SEVENTH_NX_EDGE_FEATHER=1 turns it back on.
 EDGE_FEATHER = {'ghotel': {'param': 2, 'edges': (-160, 144)}}
 FEATHER_OFF_ENV = 'SEVENTH_NX_NO_EDGE_FEATHER'
+FEATHER_ON_ENV = 'SEVENTH_NX_EDGE_FEATHER'
+
+
+def _feather_on():
+    env = os.environ
+    if env.get(FEATHER_OFF_ENV, '').strip().lower() in ('1', 'true', 'yes',
+                                                        'on'):
+        return False
+    return env.get(FEATHER_ON_ENV, '').strip().lower() in ('1', 'true', 'yes',
+                                                           'on')
 
 
 def _page_offsets(sec9):
@@ -1281,12 +1317,12 @@ def _page_offsets(sec9):
     return out, px
 
 
-def edge_feather(name, sec9):
+def edge_feather(name, sec9, force=False):
     """(new section 9, cells faded) -- refuses nothing; cells it cannot
-    prove safe are left as they are."""
+    prove safe are left as they are. Off unless SEVENTH_NX_EDGE_FEATHER=1
+    (BUILD 862) or `force`."""
     cfg = EDGE_FEATHER.get(name)
-    if cfg is None or os.environ.get(FEATHER_OFF_ENV, '').strip().lower() \
-            in ('1', 'true', 'yes', 'on'):
+    if cfg is None or not (force or _feather_on()):
         return sec9, 0
     import diag_common as DC
     s9 = bytearray(sec9)

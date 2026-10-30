@@ -403,20 +403,26 @@ FIELD_BG_PAGE_PX_CHOICES = [
 # a different picture at each: 4.5 MB is twelve pages at 256px and three at
 # 512px, and that is the whole reason this is in bytes and not pages.
 FIELD_BG_BUDGET_CHOICES = [
-    (0.0,  'Unlimited \u2014 right at 256px, NOT at 512px'),
-    (3.0,  '3.0 MB \u2014  2 pages at 512px,  8 at 256px (safest at 512)'),
-    (4.5,  '4.5 MB \u2014  3 pages at 512px, 12 at 256px'),
-    (4.0,  '4.0 MB \u2014 conservative (only ONE 768px page fits)'),
-    (5.0,  '5.0 MB'),
-    (5.5,  '5.5 MB \u2014 the old default'),
-    (5.75, '5.75 MB \u2014 a little more headroom'),
-    (6.0,  '6.0 MB \u2014 6.06 MB was measured black once, at 512px'),
+    # BUILD 859 (user, 10-29: "right at 256px and not right at 512px may be
+    # misleading and stale"). Labelled for 768px pages, the default page
+    # size, where one truecolor page is about 3.5 MB of runtime memory; the
+    # old 256px/512px page counts and hardware notes were from builds before
+    # 768px pages and are in docs/notes/SETTINGS-HELP-ARCHIVE-755.md.
+    (0.0,  'Unlimited \u2014 no budget (default)'),
+    (3.0,  '3.0 MB \u2014 no 768px page fits'),
+    (4.0,  '4.0 MB \u2014 one 768px page'),
+    (4.5,  '4.5 MB \u2014 one 768px page, a little headroom'),
+    (5.0,  '5.0 MB \u2014 one 768px page'),
+    (5.5,  '5.5 MB \u2014 one 768px page (the old default)'),
+    (5.75, '5.75 MB \u2014 one 768px page'),
+    (6.0,  '6.0 MB \u2014 one 768px page'),
     (7.5,  '7.5 MB \u2014 two 768px pages'),
-    (9.0,  '9.0 MB'),
+    (9.0,  '9.0 MB \u2014 two 768px pages'),
     (11.0, '11.0 MB \u2014 three 768px pages'),
-    (14.0, '14.0 MB \u2014 clean on hardware, at 512px'),
-    (18.0, '18.0 MB \u2014 black bars were measured here, at 512px'),
+    (14.0, '14.0 MB \u2014 three 768px pages'),
+    (18.0, '18.0 MB \u2014 five 768px pages'),
 ]
+
 
 # Whether a field promotes EVERY page it can or none at all.
 #
@@ -2265,6 +2271,9 @@ def _run_build_steps(mods, enabled, settings_by_mod, log, progress,
     # BUILD 747. FFNx's effect interpolation (decorated battle effects drawn
     # at 60 Hz). Its own dead translated body + BSS. See ff7nx_fxinterp.
     produced += build.apply_fxinterp(SDOUT_DIR, DUMP, log, produced)
+    # BUILD 852. Bahamut ZERO's star field from the live view, every frame.
+    # See ff7nx_bzsky.
+    produced += build.apply_bzsky(SDOUT_DIR, DUMP, log, produced)
     produced += build.apply_uvwrap(SDOUT_DIR, DUMP, log, produced)
     # The custom PIXEL shader sets (background scaler, FXAA). These touch no
     # module at all, so they can go anywhere -- but they must go BEFORE
@@ -2285,6 +2294,12 @@ def _run_build_steps(mods, enabled, settings_by_mod, log, progress,
     produced += build.apply_ui_top(SDOUT_DIR, DUMP, log, produced)
     # BUILD 809. W-Item duplication / lost first item, in place (no cave).
     produced += build.apply_witem(SDOUT_DIR, DUMP, log, produced)
+    # BUILD 860. Autosize dialogue boxes (FFNx's option), off by default.
+    # Its own dead translated body, no BSS. See ff7nx_autosize.
+    produced += build.apply_text_autosize(SDOUT_DIR, DUMP, log, produced)
+    # BUILD 860h. The field depth copy draws with no colour target, not the
+    # screen's (mogu_1's water cut at 3/4 width). See ff7nx_depthcopy.
+    produced += build.apply_depth_copy(SDOUT_DIR, DUMP, log, produced)
     # BUILD 761. Experimental: 1080p / 900p output when the game starts
     # docked, 720p handheld. Nothing is written while the setting is off.
     # After every feature pass, so each of them places its caves exactly as
@@ -3004,7 +3019,7 @@ def launch_ui():
         except OSError:             # no file browser to hand it to
             pass
 
-    dump_lbl.configure(cursor='hand2')
+    dump_lbl.configure(cursor='')
     dump_lbl.bind('<Button-1>', _dump_click)
     dump_lbl.bind('<Enter>', lambda _e: dump_lbl.configure(
         font=(UI_FONT, 11, 'underline')))
@@ -3270,6 +3285,17 @@ def launch_ui():
     # BUILD 645/646. Model shadows (battle + field); on by default, off writes nothing.
     shadows_var = tk.BooleanVar(value=bool(global_saved.get('model_shadows', True)))
     nocheat_var = tk.BooleanVar(value=bool(global_saved.get('no_cheats', True)))   # BUILD 819: on by default
+    # BUILD 859: Controls > W-Item bug fix (ff7nx_witem), on by default; off
+    # keeps the original game's W-Item duplication
+    witem_var = tk.BooleanVar(value=bool(global_saved.get('witem_fix', True)))
+    # BUILD 859: Voice > Advanced facial animations (ff7nx_facial's runtime:
+    # expressions and the voice lip flap), on by default
+    facial_var = tk.BooleanVar(value=bool(global_saved.get('advanced_facial',
+                                                          True)))
+    # BUILD 860: Display > Autosize dialogue boxes (ff7nx_autosize, FFNx's
+    # ff7_field_autosize_text_box), off by default as in FFNx
+    autosize_var = tk.BooleanVar(value=bool(global_saved.get('text_autosize',
+                                                            False)))
     # BUILD 848: Storage > Compact cache after build (ff7nx_cachegc); off by default.
     compact_var = tk.BooleanVar(value=bool(global_saved.get('compact_cache', False)))
 
@@ -3453,6 +3479,11 @@ def launch_ui():
              'Buster Sword: a hand-refined HD painting of the sword, where '
              'the original title has it. As the mods set it: what 7th Heaven '
              'would show.', True),
+            ('check', 'Autosize dialogue boxes', autosize_var, None,
+             'Sizes each dialogue box to its text when it opens, as FFNx\'s '
+             'option of the same name: no wide boxes around short lines, no '
+             'long lines running into the border. Boxes never get taller '
+             'than the game made them.', True),
         ]),
         ('Graphics', [
             ('combo', 'Background upscaling', scaler_var,
@@ -3484,6 +3515,11 @@ def launch_ui():
             ('check', 'Disable the right-stick cheat', nocheat_var, None,
              'Clicking the right stick no longer refills HP, MP and Limit. '
              'Stops one accidental press spoiling a playthrough.', True),
+            ('check', 'W-Item bug fix', witem_var, None,
+             'Fixes the W-Item bug: cancelling the second pick no longer '
+             'duplicates the first item, and backing out no longer loses it. '
+             'Turn off to keep the original game\'s duplication glitch.',
+             True),
         ]),
         ('Storage', [
             ('check', 'Compact cache after build', compact_var, None,
@@ -3497,6 +3533,10 @@ def launch_ui():
              _choices(VOICE_NORM_CHOICES, user_hide=('loudness:-15.3', 'peak:-1.1')),
              'Evens out Echo-S voice lines so quiet and loud ones sound '
              'alike. Changing it re-encodes the voice clips once.', False),
+            ('check', 'Advanced facial animations', facial_var, None,
+             'Characters blink, change expression and move their mouths '
+             'while a voiced line plays. Off keeps the original game\'s '
+             'simple blink.', True),
         ]),
     ]
 
@@ -3573,7 +3613,8 @@ def launch_ui():
             ('combo', 'Memory budget', fbud_var,
              _choices(FIELD_BG_BUDGET_CHOICES),
              'Ceiling on truecolor texture memory per field, in runtime '
-             'megabytes.', True),
+             'megabytes. Unlimited is the default; page counts are for '
+             '768px pages.', True),
         ]),
         ('Developer — texture caps', [
             ('combo', 'Field models', cap_var,
@@ -3842,7 +3883,7 @@ def launch_ui():
                 chk.unbind('<Button-1>')
                 chk.configure(cursor='')
             else:
-                lbl.configure(cursor='hand2')
+                lbl.configure(cursor='')
                 lbl.bind('<Button-1>', chk._toggle)
             return row
 
@@ -4099,6 +4140,7 @@ def launch_ui():
         if current is not None:
             show_options(current)
         save_settings_now()
+        _sync_dflt()
         later = len(want) - done
         log_write('Mod settings restored to defaults for %d mod%s.%s' % (
             done, '' if done == 1 else 's',
@@ -4263,7 +4305,7 @@ def launch_ui():
             cell.grid(row=r, column=5, sticky='w')
             # Install / Update is a link, not a button, so the column reads
             # as text like "Up to date" beside it.
-            btn = ttk.Label(cell, style='Link.TLabel', cursor='hand2')
+            btn = ttk.Label(cell, style='Link.TLabel', cursor='')
             btn.bind('<Button-1>', lambda e, b=btn: b.command())
             note = ttk.Label(cell, style='Sub.TLabel')
             rows[src['id']] = dict(name=name, have=have, latest=latest,
@@ -4706,7 +4748,7 @@ def launch_ui():
 
         def url_label(parent, url, **grid):
             lbl = tk.Label(parent, text=url.split('://', 1)[1], bg=BG_ROW,
-                           fg=ACCENT_SOFT, cursor='hand2',
+                           fg=ACCENT_SOFT, cursor='',
                            font=(UI_FONT, 12, 'underline'))
             lbl.grid(sticky='w', **grid)
             lbl.bind('<Button-1>', lambda _e: webbrowser.open(url))
@@ -4906,6 +4948,9 @@ def launch_ui():
                                  'field_frame': bool(frame_var.get()),
                                  'model_shadows': bool(shadows_var.get()),
                                  'no_cheats': bool(nocheat_var.get()),
+                                 'witem_fix': bool(witem_var.get()),
+                                 'advanced_facial': bool(facial_var.get()),
+                                 'text_autosize': bool(autosize_var.get()),
                                  'compact_cache': bool(compact_var.get()),
                                  'limiter_fps': current_limiter_fps(),
                                  'widescreen': current_widescreen(),
@@ -4973,6 +5018,9 @@ def launch_ui():
     frame_var.trace_add('write', save_settings_now)
     shadows_var.trace_add('write', save_settings_now)
     nocheat_var.trace_add('write', save_settings_now)
+    witem_var.trace_add('write', save_settings_now)
+    facial_var.trace_add('write', save_settings_now)
+    autosize_var.trace_add('write', save_settings_now)
     compact_var.trace_add('write', save_settings_now)
     lim_var.trace_add('write', save_settings_now)
     # The four added with the field-buffer work. Without these they are
@@ -5305,51 +5353,64 @@ def launch_ui():
 
     PILL_FONT = (UI_FONT, 9, 'bold')
     _pillf = tkfont.Font(font=PILL_FONT)
-    PILL_TEXT = 'Restore Priority'
     PILL_H = _pillf.metrics('linespace') + 6
-    PILL_W = _pillf.measure(PILL_TEXT) + 2 * 11
-    pill = tk.Canvas(left, width=PILL_W, height=PILL_H, bg=BG_APP, bd=0,
-                     highlightthickness=0)
-    pill_state = {'on': False, 'hover': False}
 
-    def _draw_pill():
-        c = pill
-        c.delete('all')
-        c.configure(bg=BG_APP)
-        on, hov = pill_state['on'], pill_state['hover']
-        edge = ACCENT if on else BORDER
-        fill = (ACCENT if hov else BG_APP) if on else BG_APP
-        text = (ON_ACCENT if hov else ACCENT_SOFT) if on else TEXT_MUTED
-        r = PILL_H - 1
-        w = PILL_W - 1
-        for x0 in (0, w - r):
-            c.create_oval(x0, 0, x0 + r, r, fill=fill, outline=edge)
-        c.create_rectangle(r / 2.0, 0, w - r / 2.0, r, fill=fill,
-                           outline='')
-        c.create_line(r / 2.0, 0, w - r / 2.0, 0, fill=edge)
-        c.create_line(r / 2.0, r, w - r / 2.0, r, fill=edge)
-        c.create_text(PILL_W / 2.0, PILL_H / 2.0, text=PILL_TEXT,
-                      font=PILL_FONT, fill=text)
-        c.configure(cursor='hand2' if on else '')
+    # BUILD 859: the pills are hidden, not greyed, when they do not apply.
+    # They are `place`d over the frame's title line, so showing or hiding one
+    # never moves the title, the refresh icon or the boxes below.
+    def _make_pill(frame, hdr, text):
+        w_ = _pillf.measure(text) + 2 * 11
+        c = tk.Canvas(frame, width=w_, height=PILL_H, bg=BG_APP, bd=0,
+                      highlightthickness=0)
+        st = {'on': True, 'hover': False, 'shown': False, 'text': text,
+              'w': w_, 'frame': frame, 'hdr': hdr}
 
-    def _pill_hover(flag):
-        pill_state['hover'] = flag
-        _draw_pill()
+        def draw():
+            c.delete('all')
+            c.configure(bg=BG_APP)
+            on, hov = st['on'], st['hover']
+            edge = ACCENT if on else BORDER
+            fill = (ACCENT if hov else BG_APP) if on else BG_APP
+            ink = (ON_ACCENT if hov else ACCENT_SOFT) if on else TEXT_MUTED
+            r = PILL_H - 1
+            w = w_ - 1
+            for x0 in (0, w - r):
+                c.create_oval(x0, 0, x0 + r, r, fill=fill, outline=edge)
+            c.create_rectangle(r / 2.0, 0, w - r / 2.0, r, fill=fill,
+                               outline='')
+            c.create_line(r / 2.0, 0, w - r / 2.0, 0, fill=edge)
+            c.create_line(r / 2.0, r, w - r / 2.0, r, fill=edge)
+            c.create_text(w_ / 2.0, PILL_H / 2.0, text=text,
+                          font=PILL_FONT, fill=ink)
+            c.configure(cursor='')
 
-    pill.bind('<Enter>', lambda e: _pill_hover(True))
-    pill.bind('<Leave>', lambda e: _pill_hover(False))
-    # on the title line, right edge: measured from the frame's OUTER edge
-    # (the default, inside the border, starts below the title), centred on
-    # the title's line
-    def _place_pill(_evt=None):
-        h = max(mods_hdr.winfo_reqheight(), PILL_H)
-        pill.place(in_=left, bordermode='outside', relx=1.0, x=0,
-                   y=max(0, (mods_hdr.winfo_reqheight() - PILL_H) // 2),
-                   anchor='ne')
-        return h
+        def hover(flag):
+            st['hover'] = flag
+            draw()
 
-    _place_pill()
-    _draw_pill()
+        def show(flag):
+            # on the title line, right edge: measured from the frame's OUTER
+            # edge (the default, inside the border, starts below the title),
+            # centred on the title's line
+            if flag and not st['shown']:
+                c.place(in_=frame, bordermode='outside', relx=1.0, x=0,
+                        y=max(0, (hdr.winfo_reqheight() - PILL_H) // 2),
+                        anchor='ne')
+            elif not flag and st['shown']:
+                c.place_forget()
+                st['hover'] = False
+            st['shown'] = bool(flag)
+            draw()
+
+        c.bind('<Enter>', lambda e: hover(True))
+        c.bind('<Leave>', lambda e: hover(False))
+        return c, st, draw, show
+
+    PILL_TEXT = 'Restore priority'
+    pill, pill_state, _draw_prio, _show_prio = _make_pill(
+        left, mods_hdr, PILL_TEXT)
+    PILL_W = pill_state['w']
+    _draw_prio()
 
     # Options pane, scrollable (mods can have a dozen-plus options).
     # Built like the Mods title (a frame, not `text=`), with a blank image
@@ -5363,6 +5424,14 @@ def launch_ui():
     opts_spacer.pack(side='left', padx=(6, 0))
     right = ttk.Labelframe(panes, labelwidget=opts_hdr, padding=6)
     panes.add(right, weight=2)
+    # BUILD 859: "Restore defaults" for the selected mod, the Options twin of
+    # "Restore priority"; shown only while there are mods
+    dpill, dpill_state, _draw_dflt, _show_dflt = _make_pill(
+        right, opts_hdr, 'Restore defaults')
+
+    def _draw_pill():
+        _draw_prio()
+        _draw_dflt()
     _opt_canvas, options_body = make_scrollable(
         right, inner_width_tracks_canvas=True)
 
@@ -5378,6 +5447,7 @@ def launch_ui():
                 note.place_forget()
             else:
                 note.place(relx=0.5, rely=0.5, anchor='center')
+        _show_dflt(bool(mods))
 
     selected = tk.StringVar(value=mods[0].filename if mods else '')
 
@@ -5426,7 +5496,7 @@ def launch_ui():
                     selectbackground=BG_ROW_SEL, selectforeground=fg,
                     inactiveselectbackground=BG_ROW_SEL, takefocus=0)
         t.tag_configure('link', foreground=ACCENT_SOFT, underline=True)
-        t.tag_bind('link', '<Enter>', lambda e: t.configure(cursor='hand2'))
+        t.tag_bind('link', '<Enter>', lambda e: t.configure(cursor='arrow'))
         t.tag_bind('link', '<Leave>', lambda e: t.configure(cursor='arrow'))
         pos = 0
         for i, m in enumerate(_URL.finditer(text)):
@@ -5469,7 +5539,7 @@ def launch_ui():
             row.pack(anchor='w', pady=(2, 6))
             for i, (label, url) in enumerate(links):
                 lbl = ttk.Label(row, text=label, style='Link.TLabel',
-                                cursor='hand2')
+                                cursor='')
                 lbl.pack(side='left', padx=(0 if i == 0 else 14, 0))
                 lbl.bind('<Button-1>', lambda e, u=url: open_url(u))
         if m.description:
@@ -5649,6 +5719,7 @@ def launch_ui():
                         break
                 save_settings_now()
                 refresh_summary()
+                _sync_dflt()
 
             combo.bind('<<ComboboxSelected>>', on_pick)
             store.setdefault(opt.id, current)
@@ -5738,7 +5809,7 @@ def launch_ui():
             # geometry lands as a visible offset -- so zero them and let the
             # image alone define the size.
             super().__init__(parent, bg=bg, bd=0, highlightthickness=0,
-                             padx=0, pady=0, cursor='hand2')
+                             padx=0, pady=0, cursor='')
             self._var = variable
             self._bg = bg
             self._command = command
@@ -5827,10 +5898,19 @@ def launch_ui():
         _restyle(mod.filename)
         _sync_pill()
         show_options(mod)
+        _sync_dflt()
 
     def _sync_pill():
-        pill_state['on'] = selected.get() in moved
-        _draw_pill()
+        # BUILD 859: shown only on a mod outside the supported list (the
+        # only ones that can be dragged); live while it has been moved,
+        # shaded and inert while it sits where the program put it
+        fn = selected.get()
+        mod = next((m for m in mods if m.filename == fn), None)
+        if mod is None or not _draggable(mod):
+            _show_prio(False)
+            return
+        pill_state['on'] = fn in moved
+        _show_prio(True)
 
     def on_row_enter(filename):
         if drag['active']:
@@ -5935,8 +6015,7 @@ def launch_ui():
         if was and mod is not None and mod.filename in rows:
             for w in rows[mod.filename]:
                 try:
-                    w.configure(cursor='hand2' if w is rows[mod.filename][3]
-                                else '')
+                    w.configure(cursor='')
                 except tk.TclError:
                     pass
 
@@ -5996,6 +6075,47 @@ def launch_ui():
     pill.bind('<ButtonRelease-1>', lambda e: (
         restore_priority() if 0 <= e.x < PILL_W and 0 <= e.y < PILL_H
         else None))
+
+    def _defaults_for(mod):
+        entry = default_mod_settings().get(mod.filename)
+        return _mod_options_from_saved(
+            mod, {mod.filename: entry} if entry is not None else {}), \
+            entry is not None
+
+    def _sync_dflt():
+        """BUILD 859: "Restore defaults" is live (accent) only while the
+        selected mod's options differ from what it would restore."""
+        mod = next((m for m in mods if m.filename == selected.get()), None)
+        differs = False
+        if mod is not None:
+            want, _listed = _defaults_for(mod)
+            have = settings_by_mod.get(mod.filename, {})
+            differs = any(have.get(k, v) != v for k, v in want.items())
+        if dpill_state['on'] != differs:
+            dpill_state['on'] = differs
+            _draw_dflt()
+
+    def restore_selected_defaults(_evt=None):
+        """BUILD 859: the selected mod's options back to their defaults --
+        the tested settings in data/default_mod_settings.json for a
+        supported mod, the mod's own (manifest) defaults otherwise. Its
+        on/off tick is left as it is."""
+        fn = selected.get()
+        mod = next((m for m in mods if m.filename == fn), None)
+        if mod is None or build_btn.instate(['disabled']) or \
+                not dpill_state['on']:
+            return
+        settings_by_mod[fn], listed = _defaults_for(mod)
+        show_options(mod)
+        save_settings_now()
+        _sync_dflt()
+        log_write('%s: options restored to %s.' % (
+            mod.display_name, 'the tested defaults' if listed
+            else "the mod's own defaults"))
+
+    dpill.bind('<ButtonRelease-1>', lambda e: (
+        restore_selected_defaults()
+        if 0 <= e.x < dpill_state['w'] and 0 <= e.y < PILL_H else None))
 
     # ---------- optical vertical centring ----------
     # Tk centres a label's LINE BOX: ascent above the baseline, descent below.
@@ -6142,7 +6262,7 @@ def launch_ui():
 
         # bd/pady/highlightthickness zeroed so the label's box is exactly
         # the text, with nothing of its own to bias the centring
-        label = tk.Label(row, text=mod.display_name, cursor='hand2',
+        label = tk.Label(row, text=mod.display_name, cursor='',
                          bg=BG_ROW, fg=TEXT_PRIMARY, anchor='w',
                          font=ROW_FONT, bd=0, pady=0, padx=0,
                          highlightthickness=0)
@@ -6594,6 +6714,10 @@ def launch_ui():
         os.environ[_HEADLESS_TEXCACHE_ENV] = current_texture_cache()
         os.environ[build.NO_CHEATS_ENV] = (
             '1' if _needs_nso(nocheat_var.get()) else '0')
+        os.environ[build.WITEM_FIX_ENV] = '1' if witem_var.get() else '0'
+        os.environ[build.ADV_FACIAL_ENV] = '1' if facial_var.get() else '0'
+        os.environ[build.TEXT_AUTOSIZE_ENV] = (
+            '1' if autosize_var.get() else '0')
         os.environ['SEVENTH_NX_COMPACT_CACHE'] = (
             '1' if compact_var.get() else '0')
         os.environ[build.LIMITER_FPS_ENV] = str(
@@ -7074,6 +7198,15 @@ def main():
             os.environ[_HEADLESS_TEXCACHE_ENV] = _tc
         os.environ[build.NO_CHEATS_ENV] = (
                 '1' if saved.get('__global__', {}).get('no_cheats') else '0')
+        os.environ.setdefault(build.WITEM_FIX_ENV, (
+                '1' if saved.get('__global__', {}).get('witem_fix', True)
+                else '0'))
+        os.environ.setdefault(build.ADV_FACIAL_ENV, (
+                '1' if saved.get('__global__', {}).get('advanced_facial', True)
+                else '0'))
+        os.environ.setdefault(build.TEXT_AUTOSIZE_ENV, (
+                '1' if saved.get('__global__', {}).get('text_autosize', False)
+                else '0'))
         os.environ.setdefault('SEVENTH_NX_COMPACT_CACHE', (
                 '1' if saved.get('__global__', {}).get('compact_cache')
                 else '0'))

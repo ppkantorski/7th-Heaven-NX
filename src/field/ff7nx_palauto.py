@@ -49,13 +49,14 @@ from __future__ import annotations
 import collections
 import math
 import os
+import re
 import struct
 
 import numpy as np
 
 # BUILD 671: in flevel.lgp's key (build.py), so a fast build cannot keep an
 # archive made by an older reading.
-VERSION = 717
+VERSION = 859
 OFF_ENV = 'SEVENTH_NX_NO_PAL_AUTO'
 ONLY_ENV = 'SEVENTH_NX_PAL_AUTO_ONLY'
 SKIP_ENV = 'SEVENTH_NX_PAL_AUTO_SKIP'
@@ -167,11 +168,62 @@ VALUE_OPS = (0xE9, 0xEA, 0xDF, 0xEF)      # ADPAL MPPAL2 MPPAL ADPAL2
 
 
 # --------------------------------------------------------------- analysis
-def find_effects(sec0):
+# BUILD 854. Effects the generic proof below cannot follow but that were
+# proved by hand, keyed by the EXACT bytes of the routine that drives them
+# (any other script -- another mod, another version -- does not match and
+# gets the generic rules only).
+#
+# onna_4, entity lg23+ (+0x874..): palettes 12 and 14 blink through a shuttle
+# that keeps each palette's original colours in palette 15 and buffer 0x20
+# so the next ADPAL starts from them (FF7 has no "copy of the field's own
+# palette" otherwise). Traced instruction by instruction, every pass loads
+#     palette 12 = ADPAL(original 12, var5[5])   (FF..F7 step 2, 5 values)
+#     palette 14 = ADPAL(original 14, var5[6])   (FF..F4 step 1, 12 values)
+# and palette 15, the shuttle's store, is drawn by no record. The generic
+# checks refuse it only because buffer 0x30 is also what palette 15 and the
+# other palette load from. Cosmos ships 6 and 12 frames for them.
+SHUTTLES = {
+    'onna_4': (bytes.fromhex(
+        'e5000e20ff240400e600200fffe5000c20ff240400e90055502030050505ffe6'
+        '00300cff240100e7002030ffe5000f20ff240100e600300fff24010014500100'
+        '0013145005f80207875005021005805001011011145005fe0307855005021005'
+        '80500100e90055502030060606ffe600300eff240100e7002030ffe5000f20ff'
+        '240100e600300fff240100145002000013145006f40207875006011005805002'
+        '011011145006ff030785500601100580500200129e00'),
+        # q: (offset of its ADPAL in the bytes above, source palette)
+        {12: (0x15, 12), 14: (0x64, 14)}),
+}
+
+
+def _shuttle_effects(sec0, field, writers):
+    spec = SHUTTLES.get((field or '').lower())
+    if spec is None:
+        return []
+    sig, pals = spec
+    at = sec0.find(sig)
+    if at < 0 or sec0.find(sig, at + 1) >= 0:
+        return []
+    out = []
+    for q, (rel, src) in sorted(pals.items()):
+        o = at + rel
+        if sec0[o] != 0xE9 or sec0[o + 10] != 0xE6 or \
+                sec0[o + 13] != q or len(writers.get(q, ())) != 1:
+            return []
+        vo = _value_op(sec0, o, 0xE9)
+        addrs = {lit for bk, lit in vo['ch'] if bk}
+        if {bk for bk, _l in vo['ch'] if bk} != {5} or len(addrs) != 1:
+            return []
+        out.append({'q': q, 'src_pal': src, 'op': 0xE9, 'vo': vo,
+                    'cp': None, 'var': addrs.pop(), 'sites': [(o, 15)]})
+    return out
+
+
+def find_effects(sec0, field=None):
     """[{q, src_pal, op, vo, var, sites: [(offset, length, cppal size)]}]
     for every palette whose every writer is `value op [CPPAL S->D] LDPAL`
     with one identical value op driven by one bank-5 variable. Raises for
-    the field when a palette is written in a way this cannot follow."""
+    the field when a palette is written in a way this cannot follow.
+    `field` admits the hand-proved SHUTTLES effects of that field too."""
     s = sec0
     st = _stream(s)
     writers = collections.defaultdict(list)
@@ -278,6 +330,9 @@ def find_effects(sec0):
         effects.append({'q': q, 'src_pal': src_pal, 'op': vop, 'vo': vo,
                         'cp': cp, 'var': addrs.pop(),
                         'sites': [(o_, l_) for o_, l_, _a, _j in sites]})
+    have = {e['q'] for e in effects}
+    effects += [e for e in _shuttle_effects(s, field, writers)
+                if e['q'] not in have]
     return effects
 
 
@@ -285,6 +340,15 @@ def _refs(sec0, o, op, z):
     """[(operand offset, bank, addresses covered)] for the variable operands
     of one instruction; None when its layout is unknown."""
     import ff7nx_opbanks as OB
+    if op == 0x28 and z >= 3 and sec0[o + 1] == z:
+        # BUILD 854. KAWAI (the model's eye/mouth/light sub-opcodes the
+        # facial animation and Echo-S script): length-prefixed, and every
+        # parameter is a literal -- the handler (x86 0x620136) stores the
+        # sub-opcode and a pointer to the bytes for the model loop and reads
+        # no variable bank. Unknown before, so any KAWAI carrying the effect
+        # variable's index as a byte refused the whole effect (onna_4's
+        # blinking lights and 18 others).
+        return []
     t = OB.OPS.get(op)
     if t is None or t[0] != z:
         return None
@@ -904,6 +968,19 @@ def pair_fit(frames, k=2, iters=12):
     return list(A), list(L), float(e.mean()), float(np.percentile(e, 99.9))
 
 
+# BUILD 854: at most this many tiles of one effect may fall back to one
+# image per state inside pair mode (exact_records)
+PAIR_EXACT_MAX = 4
+
+
+def exact_records(frames, block):
+    """[(param, state bits, image)] showing frame i alone: parameter
+    block[i // 4], state bit i % 4 -- the same switch pair mode drives, so
+    the tile follows the effect exactly."""
+    return [(block[i // 4], 1 << (i % 4), img)
+            for i, img in enumerate(frames)]
+
+
 def pair_records(fit, k, block, pb):
     """[(param, state bits, image)]: q = i // 4 picks the parameter
     block[q], r = i % 4 the state bit (BGON var5[q], var5[r])."""
@@ -953,8 +1030,8 @@ def multi_follow(length, var, prev, delta):
 
 
 def grow(sec0, edits):
-    """Section 0 with each (offset, old length, new bytes) applied, new
-    bytes at least as long: routine entries, the string offset, the AKAO
+    """Section 0 with each (offset, old length, new bytes) applied (BUILD
+    858: shorter, or a zero-length insertion, too): routine entries, the string offset, the AKAO
     table and every jump across a grown site move with the code. Raises if
     a jump lands inside a site, or a site holds a jump."""
     import echo_s_flevel as ES
@@ -963,9 +1040,6 @@ def grow(sec0, edits):
     for (o1, l1, _b1), (o2, _l2, _b2) in zip(edits, edits[1:]):
         if o1 + l1 > o2:
             raise ValueError('sites overlap')
-    for o, l, b in edits:
-        if len(b) < l:
-            raise ValueError('site shrinks')
 
     def moved(x):
         return x + sum(len(b) - l for o, l, b in edits if o + l <= x)
@@ -982,7 +1056,9 @@ def grow(sec0, edits):
         tgt = o - val if back else at + val
         if inside(o) or inside(tgt):
             raise ValueError('jump at %d into or inside a site' % o)
-        if any(o <= e[0] < o + z for e in edits):
+        # (BUILD 858: a zero-length insertion may sit right before a jump)
+        if any(o <= e[0] < o + z and not (e[1] == 0 and e[0] == o)
+               for e in edits):
             raise ValueError('site starts inside a jump at %d' % o)
         nval = (moved(o) - moved(tgt)) if back else (moved(tgt) - moved(at))
         if nval != val:
@@ -1022,38 +1098,266 @@ def grow(sec0, edits):
     return out
 
 
+# ------------------------------------------- BUILD 858: the tick budget
+# The field interpreter gives an actor 8 opcodes a tick (ff7nx_ticksim).
+# onna_4's lg23+ steps var5[6] and loads palette 14 in one tick of exactly
+# 8 opcodes (IF IF MINUS SKIP SKIP ADPAL LDPAL WAIT); BUILD 854's 8-opcode
+# pair switch ran out after its BGCLR, so palette 14's lamps went dark for
+# one tick every pass and each pass took a tick longer (hardware 10-28,
+# "lights that are rapidly flickering"). Every rewritten site now has the
+# vanilla site's opcode count, its visible switch last (where LDPAL was),
+# and the whole field is proven against the vanilla script in the tick
+# model before it ships (tick_proof): the state on screen must match
+# vanilla's palette state on every tick.
+TICK_TICKS = 1200
+TICK_WHY = 'tick proof'
+RELAXED_RATE = 0.6
+RELAXED_LAG = 2
+ONE_COPY_MB_ENV = 'SEVENTH_NX_PAL_AUTO_MB'
+ONE_COPY_MB = 40.0
+
+
+def one_copy_mb_cap():
+    try:
+        return float(os.environ.get(ONE_COPY_MB_ENV) or ONE_COPY_MB)
+    except ValueError:
+        return ONE_COPY_MB
+STATIC_TOL = 4.0          # palstates: a tile within this of one image
+
+
+def _ops_in(stream, so, sl):
+    return [(o, op, z) for _a, o, op, z in stream if so <= o < so + sl]
+
+
+def site_single(kv, P, var):
+    """BGCLR P; BGON P,var5[var] behind NOPs to `kv` opcodes."""
+    if kv < 2:
+        raise ValueError('a %d-opcode site cannot switch' % kv)
+    return (bytes((OP_NOP,)) * (kv - 2)
+            + bytes((0xE4, 0x00, P, 0xE0, 0x05, P, var)))
+
+
+def site_multi(kv, var, prev, inline=False):
+    """(site bytes, deferred bytes): BGOFF var5[prev]; BGON var5[var];
+    var5[prev] = var5[var] behind NOPs to `kv` opcodes. A 2-opcode site
+    keeps the switch and defers the bookkeeping (the SET) to after the
+    next WAIT -- the tick the vanilla script spends on a WAIT has room."""
+    off = bytes((0xE1, 0x50, prev, 0x00))
+    on = bytes((0xE0, 0x50, var, 0x00))
+    keep = bytes((0x80, 0x55, prev, var))
+    if kv >= 3:
+        return bytes((OP_NOP,)) * (kv - 3) + off + on + keep, b''
+    if kv == 2 and inline:
+        # no WAIT to defer to (a loop paced by its BACK), or the deferred
+        # SET failed the proof: one opcode more in the site's own tick
+        return off + on + keep, b''
+    if kv == 2:
+        return off + on, keep
+    raise ValueError('a %d-opcode site cannot switch' % kv)
+
+
+def _after_next_wait(stream, so, at):
+    """Offset after the first WAIT at or past `at` in the routine of the
+    instruction at `so`."""
+    rt = next(a for a, o, _op, _z in stream if o == so)
+    for a, o, op, z in stream:
+        if a == rt and o >= at and op == 0x24:
+            return o + z
+    return None
+
+
+MULTI_VARIANTS = 4
+
+
+def _multi_variant(stream, sec0, so, sl, kv, var, prev, n):
+    """The edits for one multi-mode site, variant `n` (tried in order until
+    tick_proof passes):
+      0  BGOFF; BGON at the site, the SET after the next WAIT (needs the
+         variable unchanged until then);
+      1  all three at the site, and the next WAIT one tick shorter (gone
+         if it was 1) -- the vanilla tick was full, so its WAIT slips a
+         tick and this gives the tick back (mds7plr2, nvmkin32);
+      2  all three at the site;
+      3  the same, held to the RELAXED proof (tick_proof(relaxed=True)):
+         every state, in order, never a torn or empty tick, but the pass
+         may run a tick longer -- the last resort before staying paletted,
+         for a loop whose vanilla tick is full on some paths and not on
+         others (mds7plr2, nvmkin32).
+    A 3+-opcode site has one form."""
+    if kv >= 3:
+        return [(so, sl, site_multi(kv, var, prev)[0])]
+    wat = _after_next_wait(stream, so, so + sl)
+    if n == 0 and wat is not None:
+        code, later = site_multi(kv, var, prev)
+        return [(so, sl, code), (wat, 0, later)]
+    code = site_multi(kv, var, prev, inline=True)[0]
+    out = [(so, sl, code)]
+    if n == 1 and wat is not None:
+        wo = wat - 3
+        w = struct.unpack_from('<H', sec0, wo + 1)[0]
+        out.append((wo, 3, bytes((0x24,)) + struct.pack('<H', w - 1)
+                    if w >= 2 else b''))
+    return out
+
+
+def _mover(edits):
+    def moved(x):
+        return x + sum(len(b) - l for o, l, b in edits if o + l <= x)
+    return moved
+
+
+def _decode(pr, bg):
+    """The state index the background shows for one proof record."""
+    mode = pr['mode']
+    if mode == 'single':
+        bits = bg.get(pr['P'], 0)
+        if bits and bits & (bits - 1) == 0:
+            return bits.bit_length() - 1
+        return None
+    blk = pr['block']
+    on = [p for p in blk if bg.get(p, 0)]
+    if mode == 'multi':
+        if len(on) == 1 and bg[on[0]] == 1:
+            return on[0] - blk[0]
+        return None
+    if len(on) != 1:
+        return None
+    bits = bg[on[0]]
+    if bits & (bits - 1) or bg.get(pr['pb'], 0) != bits:
+        return None
+    return 4 * (on[0] - blk[0]) + bits.bit_length() - 1
+
+
+def tick_proof(vsec0, nsec0, edits, pr, ticks=TICK_TICKS, relaxed=False):
+    """None when, on every tick, the rewritten script shows the state the
+    vanilla script's palette shows; else why not. 'unverified: ...' when
+    the tick model cannot follow the actors. `relaxed`: the same states in
+    the same order with no empty or torn tick, at no less than RELAXED_RATE
+    of vanilla's pace (a pass a tick longer)."""
+    import ff7nx_ticksim as TS
+    moved = _mover(edits)
+    s0v = TS.script0_entries(vsec0)
+    vstarts, nstarts = set(), set()
+    for so, _sl in pr['sites']:
+        rv = TS.routine_of(vsec0, so)
+        if rv is None or rv[0] not in s0v:
+            return 'unverified: site outside a script 0'
+        vstarts.add(rv[0])
+        nstarts.add(moved(rv[0]))
+    s0n = TS.script0_entries(nsec0)
+    vt = TS.run_many(vsec0, vstarts, ticks, watch=[(5, pr['var'])],
+                     inits=set(s0v))
+    nt = TS.run_many(nsec0, nstarts, ticks, inits=set(s0n))
+    if vt is None or nt is None:
+        return 'unverified: the tick model cannot follow the actors'
+    stream = _stream(vsec0)
+    first = {so: so for so, _sl in pr['sites']}
+    last = {}
+    for so, sl in pr['sites']:
+        ops = _ops_in(stream, so, sl)
+        last[ops[-1][0]] = so
+    idx = {v: i for i, v in enumerate(pr['states'])}
+    cur, pend = None, {}
+    want = []
+    for ran, _bg in vt:
+        for _ai, o, _op, vals in ran:
+            if o in first:
+                pend[o] = vals[0]
+            if o in last:
+                v = pend.get(last[o])
+                if v in idx:
+                    cur = idx[v]
+        want.append(cur)
+    got = [_decode(pr, bg) for _ran, bg in nt]
+    t0 = next((t for t, w in enumerate(want) if w is not None), None)
+    if t0 is None:
+        return 'unverified: the vanilla actors never load the palette'
+    if relaxed:
+        if any(g is None for g in got[t0 + RELAXED_LAG:]):
+            return 'relaxed: an empty or torn tick'
+        ws = [w for i, w in enumerate(want[t0:]) if i == 0 or
+              w != want[t0 + i - 1]]
+        gs = [g for i, g in enumerate(got[t0 + RELAXED_LAG:])
+              if i == 0 or g != got[t0 + RELAXED_LAG + i - 1]]
+        if gs[1:] != ws[1:len(gs)] or len(gs) < RELAXED_RATE * len(ws):
+            return 'relaxed: states out of order or too slow'
+        return None
+    for t in range(t0, ticks):
+        if got[t] != want[t]:
+            return ('tick %d shows state %s, vanilla %s'
+                    % (t, got[t], want[t]))
+    return None
+
+
 def plan_field(name, parts, vparts, art, mb_cap=35.0, raw_cap=None):
     """(sec0, sec9, info) through ff7nx_palstates.plan_field, or raises.
     BUILD 716: script-switched layers are followed (gate_of); a field where
     that would leave another FX palette paletted is planned exactly as
     build 714 planned it (its switched layer refused)."""
-    try:
-        return _plan_all(name, parts, vparts, art, mb_cap, raw_cap, True)
-    except ValueError as exc:
-        if not str(exc).startswith(PARTIAL):
-            raise
-    return _plan_all(name, parts, vparts, art, mb_cap, raw_cap, False)
+    exclude, variant = set(), {}
+    while True:
+        opts = (frozenset(exclude), tuple(sorted(variant.items())))
+        try:
+            try:
+                return _plan_all(name, parts, vparts, art, mb_cap, raw_cap,
+                                 True, opts)
+            except ValueError as exc:
+                if not str(exc).startswith(PARTIAL):
+                    raise
+            return _plan_all(name, parts, vparts, art, mb_cap, raw_cap,
+                             False, opts)
+        except ValueError as exc:
+            # BUILD 858: a palette whose rewrite fails the proof tries the
+            # next site variant (_multi_variant); one that fails them all
+            # stays paletted, and the field's other effects still go
+            m = re.search(TICK_WHY + r': palette (\d+)', str(exc))
+            if m is None:
+                raise
+            q = int(m.group(1))
+            if variant.get(q, 0) < MULTI_VARIANTS - 1:
+                variant[q] = variant.get(q, 0) + 1
+            elif q not in exclude:
+                exclude.add(q)
+            else:
+                raise
 
 
 PARTIAL = 'switched layer converts but not the rest'
 
 
-def _plan_all(name, parts, vparts, art, mb_cap, raw_cap, gates):
+def _plan_all(name, parts, vparts, art, mb_cap, raw_cap, gates,
+              opts=(frozenset(), frozenset())):
     """BUILD 714: when one copy per state does not fit (FX band, texture
     budget), the multi-parameter effects are tried again in PAIR mode."""
     try:
         return _plan(name, parts, vparts, art, mb_cap, raw_cap, False,
-                     gates=gates)
+                     gates=gates, opts=opts)
     except ValueError as exc:
         msg = str(exc)
         if 'do not fit the FX band' not in msg and 'MB cap' not in msg \
-                and 'binding cap' not in msg and 'shared variable' not in msg:
+                and 'binding cap' not in msg and 'shared variable' not in msg \
+                and TICK_WHY not in msg:
             raise
+        # BUILD 858: one copy per state keeps vanilla's timing exactly
+        # (pair mode's 8-opcode switch rarely fits a tick), so it gets
+        # the user's 40 MB (10-28: "35 mb is more of a rough
+        # recommendation ... our worst field actually hits 40 mb without
+        # issues") before pair mode is tried
+        big = one_copy_mb_cap()
+        if 'MB cap' in msg and big > mb_cap:
+            try:
+                return _plan(name, parts, vparts, art, big, raw_cap, False,
+                             gates=gates, opts=opts)
+            except ValueError as exc3:
+                msg3 = str(exc3)
+                if 'MB cap' not in msg3 and 'FX band' not in msg3 and \
+                        'binding cap' not in msg3 and TICK_WHY not in msg3:
+                    raise
         last = None
         for k4 in PAIR_K4_STEPS:
             try:
                 return _plan(name, parts, vparts, art, mb_cap, raw_cap, True,
-                             k4, gates=gates)
+                             k4, gates=gates, opts=opts)
             except ValueError as exc2:
                 last = str(exc2)
                 if last.startswith(PARTIAL):
@@ -1064,7 +1368,8 @@ def _plan_all(name, parts, vparts, art, mb_cap, raw_cap, gates):
         raise ValueError('%s; pair mode: %s' % (msg, last)) from None
 
 
-def _plan(name, parts, vparts, art, mb_cap, raw_cap, pair, k4=0, gates=True):
+def _plan(name, parts, vparts, art, mb_cap, raw_cap, pair, k4=0, gates=True,
+          opts=(frozenset(), frozenset())):
     """plan_field's work; `pair` switches multi-parameter effects to PAIR
     mode."""
     import diag_common as DC
@@ -1076,7 +1381,7 @@ def _plan(name, parts, vparts, art, mb_cap, raw_cap, pair, k4=0, gates=True):
     if px != 768:
         raise ValueError('page size %d' % px)
     pm = {p.slot: p for p in pages_l if p is not None}
-    effects = find_effects(sec0)
+    effects = find_effects(sec0, name)
     if not effects:
         raise ValueError('no single-variable palette effect')
     cols, _hdr, npg, cpp = MB.palette_colours(parts[3])
@@ -1095,9 +1400,15 @@ def _plan(name, parts, vparts, art, mb_cap, raw_cap, pair, k4=0, gates=True):
     group = collections.defaultdict(list)
     for ef in effects:
         group[ef['var']].append(ef)
+    exclude, variants = opts
+    variants = dict(variants)
     done = {}
     for ef in effects:
         q = ef['q']
+        if q in exclude:
+            refused.append('palette %d: its rewrite does not keep the '
+                           'script\'s tick timing (BUILD 858)' % q)
+            continue
         try:
             gate = None
             try:
@@ -1261,6 +1572,8 @@ def _plan(name, parts, vparts, art, mb_cap, raw_cap, pair, k4=0, gates=True):
         except Exception as exc:                               # noqa: BLE001
             refused.append('palette %d: %s' % (q, str(exc)[:70]))
     edits = []
+    proofs = []                   # BUILD 858: what tick_proof checks
+    stream0 = _stream(sec0)
     gate_extra = {}               # BUILD 716: BG op offset -> [size, bytes]
     # BUILD 714 PAIR mode: every cell of every multi-state effect is fitted
     # both ways; the `k4` cells whose 7-image fit loses least take it
@@ -1272,12 +1585,22 @@ def _plan(name, parts, vparts, art, mb_cap, raw_cap, pair, k4=0, gates=True):
                 continue
             if not (d['ordered'] and d['additive']):
                 continue
+            loose = []
             for c, fr in d['art'].items():
                 f2 = pair_fit(fr, 2)
                 f4 = pair_fit(fr, 4) if k4 else None
-                cellfit[(q, c)] = [2, f2, f4]
-                if f4 is not None:
+                cellfit[(q, c)] = [2, f2, f4, fr]
+                if f2[3] > PAIR_MAX_ERR:
+                    loose.append((f2[3], c))
+                elif f4 is not None:
                     cand.append((f4[3], q, c))
+            # BUILD 854: a tile whose states the pair model cannot follow
+            # (onna_4's lamp core: Cosmos's frames change SHAPE, a texel
+            # running 10..149..92) keeps every state as its own image, as
+            # one-copy-per-state would -- as long as only a few do
+            if len(loose) <= PAIR_EXACT_MAX:
+                for _e, c in loose:
+                    cellfit[(q, c)][0] = 'x'
         for _e, q, c in sorted(cand)[:k4]:
             cellfit[(q, c)][0] = 4
     for var, efs in group.items():
@@ -1315,7 +1638,8 @@ def _plan(name, parts, vparts, art, mb_cap, raw_cap, pair, k4=0, gates=True):
                           'brightness order'
                     break
                 fit = {c: cellfit[(q_, c)] for c in d['art']}
-                errs = [v[1] if v[0] == 2 else v[2] for v in fit.values()]
+                errs = [v[1] if v[0] == 2 else v[2] if v[0] == 4
+                        else (None, None, 0.0, 0.0) for v in fit.values()]
                 worst = max(f[3] for f in errs)
                 mean = float(np.mean([f[2] for f in errs]))
                 if worst > PAIR_MAX_ERR or mean > PAIR_MAX_MEAN:
@@ -1360,11 +1684,16 @@ def _plan(name, parts, vparts, art, mb_cap, raw_cap, pair, k4=0, gates=True):
                                               signed=d['signed']))
                     lead = P
                 for so, sl in sites:
-                    new0[so:so + sl] = bg_fill(sl, P, ef['var'])
+                    # BUILD 858: the vanilla site's opcode count, the
+                    # switch last (it was bg_fill's BGCLR/BGON padding)
+                    kv = len(_ops_in(stream0, so, sl))
+                    edits.append((so, sl, site_single(kv, P, ef['var'])))
+                proofs.append({'q': q, 'mode': 'single', 'P': P})
                 gcode = gate_codes('single', ef['var'], P=P)
                 specs.append({'palette': q, 'mode': 'levels', 'param': P,
                               'states': tuple(range(n)), 'art': artmap,
-                              'record_param': rp, 'record_bits': rbits})
+                              'record_param': rp, 'record_bits': rbits,
+                              'static_tol': STATIC_TOL})
                 how = 'param %d' % P
             elif pair:
                 fit, worst, mean = fits[q]
@@ -1391,14 +1720,18 @@ def _plan(name, parts, vparts, art, mb_cap, raw_cap, pair, k4=0, gates=True):
                     lead = block[0]
                 gcode = gate_codes('pair', ef['var'], prev=prev, tb=tb,
                                    pb=pb)
+                proofs.append({'q': q, 'mode': 'pair', 'block': block,
+                               'pb': pb})
                 for so, sl in sites:
                     edits.append((so, sl, pair_code(ef['var'], prev, tb, pb,
                                                     block[0] - lead)))
                 layers = {}
-                for c, (k_, f2, f4) in fit.items():
-                    layers[c] = pair_records(f2 if k_ == 2 else f4, k_,
-                                             block, pb)
+                for c, (k_, f2, f4, fr) in fit.items():
+                    layers[c] = (exact_records(fr, block) if k_ == 'x' else
+                                 pair_records(f2 if k_ == 2 else f4, k_,
+                                              block, pb))
                 n4 = sum(1 for v in fit.values() if v[0] == 4)
+                nx = sum(1 for v in fit.values() if v[0] == 'x')
                 specs.append({'palette': q, 'mode': 'layers',
                               'art': layers, 'record_param': rp,
                               'record_bits': rbits})
@@ -1406,6 +1739,8 @@ def _plan(name, parts, vparts, art, mb_cap, raw_cap, pair, k4=0, gates=True):
                        '%d tiles 7 images, fit within %.1f (mean %.2f)'
                        % (block[0], block[-1], pb, prev, tb, n4, len(fit),
                           worst, mean))
+                if nx:
+                    how += ', %d tile(s) one image per state' % nx
             else:
                 block = _free_block(free, n)
                 if block is None:
@@ -1426,20 +1761,29 @@ def _plan(name, parts, vparts, art, mb_cap, raw_cap, pair, k4=0, gates=True):
                                               signed=d['signed']))
                     lead = block[0]
                     for so, sl in sites:
-                        new0[so:so + sl] = bg_multi(
-                            sl, ef['var'], prev, filler[0] if filler else None)
+                        # BUILD 858: the vanilla site's opcode count
+                        kv = len(_ops_in(stream0, so, sl))
+                        edits.extend(_multi_variant(
+                            stream0, sec0, so, sl, kv, ef['var'], prev,
+                            variants.get(q, 0)))
                 else:
                     for so, sl in sites:
                         new0[so:so + sl] = multi_follow(sl, ef['var'], prev,
                                                         block[0] - lead)
                 tmp_used.add(prev)
+                proofs.append({'q': q, 'mode': 'multi', 'block': block})
                 gcode = gate_codes('multi', ef['var'], prev=prev)
                 specs.append({'palette': q, 'mode': 'levels',
                               'params': tuple(block),
                               'states': tuple(range(n)), 'art': artmap,
-                              'record_param': rp, 'record_bits': rbits})
+                              'record_param': rp, 'record_bits': rbits,
+                              'static_tol': STATIC_TOL})
                 how = 'params %d..%d, var5[%d] remembers the shown one' % (
                     block[0], block[-1], prev)
+            if proofs and 'var' not in proofs[-1]:
+                proofs[-1].update({
+                    'var': ef['var'], 'sites': sites, 'gate': d['gate'],
+                    'states': [x & 255 for x in range(lo, hi + 1, step)]})
             if d['gate']:
                 gp, _gm, gops = d['gate']
                 vv = _free_var(bytes(new0), taken=vars_done | tmp_used)
@@ -1475,11 +1819,32 @@ def _plan(name, parts, vparts, art, mb_cap, raw_cap, pair, k4=0, gates=True):
         edits.append((o_, z_, bytes(new0[o_:o_ + z_]) + extra))
     if edits:
         new0 = bytearray(grow(bytes(new0), edits))
+    proved = []
+    for pr in proofs:
+        if pr['gate']:
+            proved.append('palette %d: switched layer, not modelled'
+                          % pr['q'])
+            continue
+        loose = pr['mode'] == 'multi' and \
+            variants.get(pr['q'], 0) >= MULTI_VARIANTS - 1
+        why = tick_proof(sec0, bytes(new0), edits, pr, relaxed=loose)
+        if why is None and loose:
+            proved.append('palette %d: every state in order, a tick slower '
+                          'per pass than vanilla' % pr['q'])
+        elif why is None:
+            proved.append('palette %d: every tick matches vanilla'
+                          % pr['q'])
+        elif why.startswith('unverified'):
+            proved.append('palette %d: %s' % (pr['q'], why))
+        else:
+            raise ValueError('%s: palette %d (%s): %s'
+                             % (TICK_WHY, pr['q'], pr['mode'], why))
     sec0n, sec9n, info = PS.plan_field(name, parts, vparts, art, mb_cap,
                                        raw_cap, specs=specs,
                                        sec0=bytes(new0))
     info['auto'] = notes
     info['auto_refused'] = refused
+    info['ticks'] = proved
     return sec0n, sec9n, info
 
 
@@ -1527,8 +1892,10 @@ def apply_to_flevel(archive, payloads, art, encode=None, mb_cap=35.0,
         _fxcomplete_after(name, parts, archive, entry, art, mb_cap, raw_cap,
                           info)
         payloads[name] = encode(lgp.join_sections(parts))
+        kept = [r for r in info.get('auto_refused', ())
+                if 'tick timing' in r]                  # BUILD 858
         total['names'].append('%s (%s; %.1f MB)' % (
-            name, ', '.join(info['auto']), info['mb']))
+            name, ', '.join(list(info['auto']) + kept), info['mb']))
     return total
 
 

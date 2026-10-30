@@ -202,7 +202,7 @@ def test_apply_stock_main(tmp_path):
         assert struct.unpack_from('<I', t, st)[0] == A.bl(st, r['stubs']['world'])
     assert struct.unpack_from('<I', t, SH.WCAM_CALL)[0] == A.bl(SH.WCAM_CALL, r['stubs']['wcam'])
     assert struct.unpack_from('<I', t, SH.WBLOB_CALL)[0] == A.bl(SH.WBLOB_CALL, r['stubs']['wblob'])
-    assert r['bytes'] <= 0x3800                      # the 14 KB part (667d)
+    assert r['bytes'] <= 0x3980                      # the part (861: 14,720 B)
     with pytest.raises(ValueError):
         SH.apply_to_nso(str(out), str(tmp_path / 'again'), stock)
 
@@ -836,7 +836,7 @@ def test_ctx_offsets_match_the_c_static_asserts():
     for name, val in (('CTX_ENTRY', SH.CTX_ENTRY), ('CTX_BIAS', SH.CTX_BIAS),
                       ('CTX_PEND/FASTDONE', SH.CTX_PEND), ('CTX_FIELD', SH.CTX_FIELD)):
         assert ('== 0x%X' % val) in src.replace('0x%x' % val, '0x%X' % val), name
-    assert SH.CTX_FASTDONE == SH.CTX_PEND + 4 and SH.STATE_BYTES == 0x390
+    assert SH.CTX_FASTDONE == SH.CTX_PEND + 4 and SH.STATE_BYTES == 0x3A0      # 861: clip[4], clipon
     assert ('OFF(cam) == 0x%X' % SH.CTX_CAM) in src                  # 670
 
 

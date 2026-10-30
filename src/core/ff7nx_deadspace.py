@@ -77,14 +77,18 @@ It is split so a shipping pass and the diagnostic probe can never collide:
                                 padding pool has no window left for it
                                 (4 KB since BUILD 650's ultra-bright night,
                                 5 KB since 661's minigame background split)
-    [lo + 0x6000,  lo + 0x9800) 'shadow': ff7nx_shadows (BUILD 645; 4 KB
+    [lo + 0x6000,  lo + 0x9980) 'shadow': ff7nx_shadows (BUILD 645; 4 KB
                                 since 645h, 6 KB since 646i, 8 KB since 647,
                                 10 KB since 647e, 9 KB in 650, 10 KB in 651, 12 KB since 655,
                                 14 KB since 662, 12 KB since 665e, 14 KB
-                                since 667d) -- model shadows
-    [lo + 0x9800,  lo + 0xA000) 'wmtime': ff7nx_wmtime (BUILD 649) -- the
+                                since 667d, 14,720 B since 861) -- model shadows
+    [lo + 0x9980,  lo + 0x9DC0) 'wmtime': ff7nx_wmtime (BUILD 649) -- the
                                 world map's night and sunset looks on the
-                                day/night clock
+                                day/night clock (uses 1,056 bytes; 2 KB
+                                until BUILD 852, 1,152 until 861)
+    [lo + 0x9DC0,  lo + 0xA000) 'bzsky': ff7nx_bzsky (BUILD 852) -- Bahamut
+                                ZERO's star field built from the live view
+                                every frame
     [lo + 0xA000,  lo + 0xA840) 'light': ff7nx_lighting (BUILD 675) --
                                 FFNx's per-vertex model lighting. Was
                                 'sfxpre' (ff7nx_sfxpreload, BUILD 665: opt-in,
@@ -146,7 +150,10 @@ BOOST_AT = 0x4800                     # BUILD 847: the top KB of 'pointers'
                                       # (it uses 2,688 of 3,072; 843 took 512 B)
 DAYNIGHT_AT = 0x4C00
 SHADOW_AT = 0x6000                    # BUILD 661: was 0x5C00 (daynight +1 KB)
-WMTIME_AT = 0x9800                    # BUILD 667d: was 0x9000 (665e); shadow 14 KB again (667d model mark)
+WMTIME_AT = 0x9980                    # BUILD 861: was 0x9800 (667d); shadow +384 B
+                                      # (gldgate tubes, games' stair edge)
+BZSKY_AT = 0x9DC0                     # BUILD 861: was 0x9C80 (852); wmtime keeps
+                                      # 1,088 B (uses 1,056), bzsky 576 (uses 540)
 SFXPRE_AT = 0xA000                    # BUILD 667d: was 0x9800 (665e). 3,840 bytes: too small for
                                       # the (now opt-in) sfx preload, which then logs and skips
 LIGHT_AT = 0xA000                     # BUILD 675: ff7nx_lighting (the old 'sfxpre' part)
@@ -231,7 +238,9 @@ def part(src, which, stock=None):
     elif which == 'shadow':
         p = (lo + SHADOW_AT, lo + WMTIME_AT)
     elif which == 'wmtime':
-        p = (lo + WMTIME_AT, lo + SFXPRE_AT)
+        p = (lo + WMTIME_AT, lo + BZSKY_AT)
+    elif which == 'bzsky':
+        p = (lo + BZSKY_AT, lo + SFXPRE_AT)
     elif which == 'sfxpre':
         # BUILD 675: its space is 'light' (it never fitted; it logs and skips)
         p = (lo + SFXPRE_AT, lo + SFXPRE_AT)

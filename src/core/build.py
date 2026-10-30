@@ -11067,8 +11067,8 @@ def _build_flevel(archive_path, chunks, field_files, romfs, log,
     hf_line = ff7nx_hillfix.summarise(hf_stats)
     if hf_line:
         log(hf_line)
-    # BUILD 776/778. mogu_1's stream held a frame twice a cycle; the pair
-    # stays, the newer frame is drawn first. See ff7nx_waterloop.
+    # BUILD 776/778/860c. mogu_1's stream held frames; since 860c one frame
+    # is on at a time, each of the 16 for 5 ticks. See ff7nx_waterloop.
     wl_stats = ff7nx_waterloop.apply_to_flevel(
         archive, payloads,
         encode=lambda raw: _encode_field_cached(archive, raw), log=log)
@@ -11250,6 +11250,10 @@ MOVIE_30FPS_ENV = 'SEVENTH_NX_MOVIE_30FPS'
 ANALOG_360_ENV = 'SEVENTH_NX_ANALOG_360'
 NO_AUTORUN_ENV = 'SEVENTH_NX_NO_AUTORUN'
 NO_CHEATS_ENV = 'SEVENTH_NX_NO_CHEATS'
+# BUILD 859: the GUI's W-Item bug fix and Advanced facial animations toggles
+WITEM_FIX_ENV = 'SEVENTH_NX_WITEM_FIX'          # ff7nx_witem.ENV
+ADV_FACIAL_ENV = 'SEVENTH_NX_ADV_FACIAL'        # '0' = no facial runtime
+TEXT_AUTOSIZE_ENV = 'SEVENTH_NX_TEXT_AUTOSIZE'  # BUILD 860: ff7nx_autosize.ENV
 LIMITER_FPS_ENV = 'SEVENTH_NX_LIMITER_FPS'
 SMOOTH_SCRIPTED_ENV = 'SEVENTH_NX_SMOOTH_SCRIPTED'
 
@@ -13427,8 +13431,11 @@ FPS_MULT_TAG = 'fpsmult='
 # `exefs/main` through nso_patcher -- none of them touch an .lgp, a .tex or a
 # field file. Adding a name here is only safe under that rule.
 MAIN_ONLY_ENV = frozenset((
+    'SEVENTH_NX_TEXT_AUTOSIZE',       # BUILD 860: exefs/main only
+    'SEVENTH_NX_DEPTH_COPY_FIX',      # BUILD 860h: ff7nx_depthcopy.ENV
     'SEVENTH_NX_LIMITER_SLEEP', 'SEVENTH_NX_BOOST_TICKS',
     'SEVENTH_NX_BOOST_TICKS_MS',      # BUILD 847: exefs/main only
+    'SEVENTH_NX_BZ_SKY',              # BUILD 852: exefs/main only
     'SEVENTH_NX_TUTORIAL_FULLVIEW',   # BUILD 842: exefs/main only
     # BUILD 743. The two input tweaks (ff7nx_nocheats: R3's booster and the
     # stick auto-run) are one word each in exefs/main and touch no archive.
@@ -13492,6 +13499,7 @@ MAIN_ONLY_ENV = frozenset((
     'SEVENTH_NX_FB_WINDOW',      # ff7nx_fbwindow
     'SEVENTH_NX_FB_PATH',        # ff7nx_fbpath
     'SEVENTH_NX_WITEM_FIX',      # ff7nx_witem       W-Item dup / lost item
+    'SEVENTH_NX_ADV_FACIAL',     # ff7nx_facial      BUILD 859 GUI toggle
     'SEVENTH_NX_FX_IFRIT_WAVE',  # ff7nx_battlewide  the heat-wave widening
     'SEVENTH_NX_FX_IFRIT_TALL',  # ff7nx_battlewide  ... and its height
     'SEVENTH_NX_FX_IFRIT_SRC',   # ff7nx_ifritsrc    the capture descriptors
@@ -13605,6 +13613,7 @@ MAIN_ONLY_ENV = frozenset((
 # `exefs/main` and nothing else, so editing one cannot change archive bytes.
 MAIN_ONLY_MODULES = frozenset((
     'ff7nx_fxinterp.py',         # BUILD 747: exefs/main only
+    'ff7nx_bzsky.py',            # BUILD 852: exefs/main only
     'ff7nx_uvwrap.py',           # BUILD 749: exefs/main only
     'ff7nx_cachegc.py',          # BUILD 754: deletes cache entries, writes no output
     'ff7nx_dockres.py',          # BUILD 761: exefs/main only
@@ -13706,6 +13715,10 @@ MAIN_ONLY_MODULES = frozenset((
     'ff7nx_uitop.py',
     # BUILD 809. W-Item duplication / lost first item: 42 words in place.
     'ff7nx_witem.py',
+    # BUILD 860. Autosize dialogue boxes: one dead translated body.
+    'ff7nx_autosize.py',
+    # BUILD 860h. Field depth copy without a colour target: one word.
+    'ff7nx_depthcopy.py',
 ))
 
 # The shader half of the same rule.
@@ -17365,6 +17378,53 @@ def apply_fxinterp(sdout, dump, log=lambda *_: None, produced=()):
     return [dest] if not built else []
 
 
+def apply_bzsky(sdout, dump, log=lambda *_: None, produced=()):
+    """
+    BUILD 852. Bahamut ZERO's star field: its draw (x86 0x4859AA) rebuilds
+    the summon's composite matrix from the live view on every frame and slides
+    the orbit's yaw between ticks, instead of reading the one the OneCall main
+    loop leaves once a tick. Needs the 60 FPS effect throttle. Fails closed.
+    SEVENTH_NX_BZ_SKY=0 leaves the background stepping. See ff7nx_bzsky.
+    """
+    import ff7nx_bzsky
+    if not ff7nx_bzsky.enabled():
+        log('')
+        log('Bahamut ZERO sky: stock (%s=0)' % ff7nx_bzsky.ENV)
+        return []
+    if not fps_60_requested():
+        return []
+    src, built = _audio_bridge_base(sdout, dump, log, produced,
+                                    'Bahamut ZERO sky')
+    if src is None:
+        return []
+    dest = os.path.join(sdout, 'atmosphere', 'contents', TITLE_ID, 'exefs',
+                        'main')
+    log('')
+    log('Bahamut ZERO sky (BUILD 852) ...')
+    tmp = dest + '.bzsky-tmp'
+    exe = getattr(dump, 'exe', None)
+    exe_bytes = None
+    if exe and os.path.isfile(str(exe)):
+        with open(str(exe), 'rb') as handle:
+            exe_bytes = handle.read()
+    try:
+        report = ff7nx_bzsky.apply_to_nso(src, tmp, stock=dump.nso,
+                                          exe=exe_bytes,
+                                          freq=fps_battle_mult(), log=log)
+    except Exception as exc:                                   # noqa: BLE001
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        log('! Bahamut ZERO sky: %s: %s -- not installed; the star field '
+            'steps at the game rate as before' % (type(exc).__name__, exc))
+        return []
+    os.replace(tmp, dest)
+    log('  the star field follows the live camera every frame and the orbit '
+        'slides between ticks (1/%d steps); cave +0x%X, %d bytes. %s=0 '
+        'reverts' % (report['freq'], report['cave'], report['bytes'],
+                     ff7nx_bzsky.ENV))
+    return [dest] if not built else []
+
+
 def apply_uvwrap(sdout, dump, log=lambda *_: None, produced=()):
     """
     BUILD 749. Scrolling-UV battle effects: no per-vertex wrap at x86
@@ -17533,6 +17593,80 @@ def apply_witem(sdout, dump, log=lambda *_: None, produced=()):
     except Exception as exc:                                   # noqa: BLE001
         ok = False
         log('! W-Item fix: %s: %s -- not installed'
+            % (type(exc).__name__, exc))
+    if not ok:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        return []
+    os.replace(tmp, dest)
+    return [dest] if not built else []
+
+
+def apply_depth_copy(sdout, dump, log=lambda *_: None, produced=()):
+    """
+    BUILD 860h. The driver's field depth copy (+0x10DECA0) asked for "no
+    colour target" with an array of nulls, which the device skips, so it
+    drew through whatever colour target the previous pass left bound -- the
+    1080-row screen target on a field frame with no model drawn. Its quad
+    then covered only the bottom-left 1920x1080 of the 2560x1440 field
+    depth, and mogu_1's water was cut at 3/4 width until Mog walked out
+    (860g GL probe). One word: pass NULL, the device's own depth-only path.
+    Fails closed. SEVENTH_NX_DEPTH_COPY_FIX=0 keeps it stock. See
+    ff7nx_depthcopy.
+    """
+    import ff7nx_depthcopy
+    if not ff7nx_depthcopy.enabled():
+        log('')
+        log('depth copy: stock (%s=0)' % ff7nx_depthcopy.ENV)
+        return []
+    src, built = _audio_bridge_base(sdout, dump, log, produced, 'depth copy')
+    if src is None:
+        return []
+    dest = os.path.join(sdout, 'atmosphere', 'contents', TITLE_ID, 'exefs',
+                        'main')
+    log('')
+    log('depth copy ...')
+    tmp = dest + '.dcopy-tmp'
+    try:
+        ok = ff7nx_depthcopy.apply_to_nso(src, tmp, log)
+    except Exception as exc:                                   # noqa: BLE001
+        ok = False
+        log('! depth copy: %s: %s -- not installed'
+            % (type(exc).__name__, exc))
+    if not ok:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        return []
+    os.replace(tmp, dest)
+    return [dest] if not built else []
+
+
+def apply_text_autosize(sdout, dump, log=lambda *_: None, produced=()):
+    """
+    BUILD 860. Autosize dialogue boxes: FFNx's ff7_field_autosize_text_box
+    (off by default there and here). Field and world dialogue windows sized
+    to their text on their first opening frame, never taller than the
+    script made them. Its own dead translated body (x86 0x63CFD0), no BSS;
+    fails closed. Off writes nothing. See ff7nx_autosize.
+    """
+    import ff7nx_autosize
+    if not ff7nx_autosize.enabled():
+        return []
+    src, built = _audio_bridge_base(sdout, dump, log, produced,
+                                    'autosize dialogue boxes')
+    if src is None:
+        return []
+    dest = os.path.join(sdout, 'atmosphere', 'contents', TITLE_ID, 'exefs',
+                        'main')
+    log('')
+    log('autosize dialogue boxes ...')
+    tmp = dest + '.autosize-tmp'
+    try:
+        ff7nx_autosize.apply_to_nso(src, tmp, stock=dump.nso, log=log)
+        ok = True
+    except Exception as exc:                                   # noqa: BLE001
+        ok = False
+        log('! autosize dialogue boxes: %s: %s -- not installed'
             % (type(exc).__name__, exc))
     if not ok:
         if os.path.exists(tmp):
@@ -19285,6 +19419,13 @@ def apply_facial(sdout, dump, plan, log=lambda *_: None, produced=()):
     still blinks on the stock two-frame path.
     """
     if not getattr(plan, 'facial_art', False):
+        return []
+    if os.environ.get(ADV_FACIAL_ENV, '1').strip().lower() in (
+            '0', 'off', 'no', 'false'):
+        # BUILD 859: Voice > Advanced facial animations off -- the art may
+        # still ship, the game blinks on its stock two-frame path
+        log('')
+        log('advanced facial animation: off (Voice settings)')
         return []
     src, built = _audio_bridge_base(sdout, dump, log, produced,
                                     'facial animation')
