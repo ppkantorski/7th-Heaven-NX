@@ -3346,9 +3346,9 @@ def launch_ui():
     facial_var = tk.BooleanVar(value=bool(global_saved.get('advanced_facial',
                                                           True)))
     # BUILD 860: Display > Autosize dialogue boxes (ff7nx_autosize, FFNx's
-    # ff7_field_autosize_text_box), off by default as in FFNx
+    # ff7_field_autosize_text_box), on by default (1.0.5)
     autosize_var = tk.BooleanVar(value=bool(global_saved.get('text_autosize',
-                                                            False)))
+                                                            True)))
     # BUILD 848: Storage > Compact cache after build (ff7nx_cachegc); off by default.
     compact_var = tk.BooleanVar(value=bool(global_saved.get('compact_cache', False)))
 
@@ -3533,10 +3533,8 @@ def launch_ui():
              'the original title has it. As the mods set it: what 7th Heaven '
              'would show.', True),
             ('check', 'Autosize dialogue boxes', autosize_var, None,
-             'Sizes each dialogue box to its text when it opens, as FFNx\'s '
-             'option of the same name: no wide boxes around short lines, no '
-             'long lines running into the border. Boxes never get taller '
-             'than the game made them.', True),
+             'Sizes each dialogue box to fit its text: no wide boxes around '
+             'short lines, and no long lines running into the border.', True),
         ]),
         ('Graphics', [
             ('combo', 'Background upscaling', scaler_var,
@@ -3569,9 +3567,8 @@ def launch_ui():
              'Clicking the right stick no longer refills HP, MP and Limit. '
              'Stops one accidental press spoiling a playthrough.', True),
             ('check', 'W-Item bug fix', witem_var, None,
-             'Fixes the W-Item bug: cancelling the second pick no longer '
-             'duplicates the first item, and backing out no longer loses it. '
-             'Turn off to keep the original game\'s duplication glitch.',
+             'Turn off to keep the original game\'s W-Item duplication '
+             'glitch.',
              True),
         ]),
         ('Storage', [
@@ -7300,7 +7297,7 @@ def main():
                 '1' if saved.get('__global__', {}).get('advanced_facial', True)
                 else '0'))
         os.environ.setdefault(build.TEXT_AUTOSIZE_ENV, (
-                '1' if saved.get('__global__', {}).get('text_autosize', False)
+                '1' if saved.get('__global__', {}).get('text_autosize', True)
                 else '0'))
         os.environ.setdefault('SEVENTH_NX_COMPACT_CACHE', (
                 '1' if saved.get('__global__', {}).get('compact_cache')

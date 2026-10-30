@@ -80,7 +80,7 @@ NAME_INDEX, NAMES, NAME_STRIDE = 0x919928, 0xDBFD9C, 0x84
 
 
 def enabled(env=None):
-    v = (os.environ if env is None else env).get(ENV, '0').strip().lower()
+    v = (os.environ if env is None else env).get(ENV, '1').strip().lower()
     return v in ('1', 'on', 'true', 'yes')
 
 
