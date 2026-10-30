@@ -46,7 +46,7 @@ HERE = nxpaths.ROOT
 
 # Shown in the header, nearest the title. Single source of truth --
 # anything else that needs it should import this rather than repeat it.
-VERSION = '1.0.4'
+VERSION = '1.0.5'
 sys.path.insert(0, HERE)
 
 import build  # noqa: E402
@@ -1371,7 +1371,27 @@ def apply_reference_order(mods, sources=None):
         else:
             other.append(m)
     known.sort(key=lambda t: t[0])
-    return [m for _r, m in known] + other
+    out = [m for _r, m in known]
+    # BUILD 865. An unlisted mod takes the place 7th Heaven's category
+    # auto-sort gives it AMONG the supported ones -- right after the last
+    # listed mod that sorts at or above it -- rather than the bottom of the
+    # list. Ninostyle HD (Field Models) landed under Cosmos Gaia (World
+    # Textures) instead of next to Ninostyle Chibi. `other` arrives in
+    # auto-sort order, so unlisted mods keep their order among themselves.
+    listed = set(map(id, out))
+
+    def key(m):
+        return (mod_load_rank(m), _name_key(m.display_name))
+    for m in other:
+        at = 0
+        for i, k in enumerate(out):
+            if id(k) in listed:
+                if key(k) <= key(m):
+                    at = i + 1
+            elif at == i:
+                at = i + 1          # after unlisted mods already placed here
+        out.insert(at, m)
+    return out
 
 
 def apply_profile_order(mods, order):
@@ -1459,6 +1479,11 @@ def _fps_patch_mode(fps_on, active, settings, log):
             % mod.display_name)
         return 30
     return 60
+
+
+NINOSTYLE_HD_ID = '2b25060c-c60e-426e-ac46-f85439e903e9'
+NINOSTYLE_CHIBI_IDS = {'2b25060c-c60e-426e-ac46-f85439e903e2',   # Chibi
+                       '3b25060c-c60e-426e-ac46-f85479e983e5'}   # Fixes
 
 
 def _compatibility_profile(mods, enabled, settings_by_mod, log):
@@ -1829,10 +1854,34 @@ def _run_build_steps(mods, enabled, settings_by_mod, log, progress,
         log('Expected e.g. .../workingdir/data/field/char.lgp')
         return False
 
+    # BUILD 864. PC x86 code options (ff7nx_pccode) build at their default, so a saved
+    # "on" cannot trip a 7th Heaven compatibility rule for code that never
+    # runs here (PS3Tweaks' In-Battle PHS forbids ESUI battle views).
+    settings_by_mod = {k: dict(v) for k, v in settings_by_mod.items()}
+    for mod in mods:
+        opts = settings_by_mod.get(mod.filename)
+        if not opts or mod.manifest is None:
+            continue
+        for opt in mod.manifest.options:
+            if opt.id in opts and \
+                    build.ff7nx_pccode.locked_option(mod, opt.id):
+                opts[opt.id] = opt.default
     active, effective_settings = _compatibility_profile(
         mods, enabled, settings_by_mod, log)
     if active is None:
         return False
+    # BUILD 865. Ninostyle HD replaces the Chibi field models; it is not
+    # layered on them. Both on mixes the two sets FILE BY FILE in char.lgp
+    # (8,286 shared names: one model's skeleton from one set, its parts from
+    # the other), so HD -- the one you switched on -- wins whole and the
+    # Chibi base and its Fixes & Additions are left out of this build.
+    if any(_manifest_id(m) == NINOSTYLE_HD_ID for m in active):
+        out = [m for m in active if _manifest_id(m) in NINOSTYLE_CHIBI_IDS]
+        if out:
+            log('Ninostyle HD is on: %s left out -- HD is a replacement for '
+                'the Chibi models, and the two sets cannot be mixed'
+                % ', '.join(m.display_name for m in out))
+            active = [m for m in active if m not in out]
     if not active:
         log('nothing enabled.')
         return False
@@ -2060,6 +2109,9 @@ def _run_build_steps(mods, enabled, settings_by_mod, log, progress,
     # BUILD 620. Double Input Bugfix: the mod's x86 code patches as ARM64
     # words (four at most, in place). Nothing unless the mod is enabled.
     produced += build.apply_difix(SDOUT_DIR, DUMP, log, produced)
+    # BUILD 866. HEXT constant patches (PS3Tweaks' status speed, morph
+    # damage, EXP share...) translated to ARM64 words -- ff7nx_hextarm.
+    produced += build.apply_hextarm(SDOUT_DIR, DUMP, plan, log, produced)
     # Resized SYW TEX payloads carry a per-file integer scale in two inert
     # header words. All three u/v reciprocal pairs in _load_texture apply that
     # scale when each graphics object is constructed, so every consumer keeps
@@ -2621,6 +2673,7 @@ def launch_ui():
     # On a smaller screen the window shrinks to fit, either way, and the
     # splits stay proportional because they are fractions.
     WIN_W, WIN_H = 1090, 1128
+    FIT_MOD_ROWS = 19           # BUILD 867: most mods the window grows for
     WIN_SPLIT_X, WIN_SPLIT_Y = 0.425, 0.739
     _sw, _sh = root.winfo_screenwidth(), root.winfo_screenheight()
     _ww, _wh = min(WIN_W, _sw - 40), min(WIN_H, _sh - 100)
@@ -5694,6 +5747,14 @@ def launch_ui():
                 # BUILD 641: shown at the value the build applies
                 current = build.ff7nx_nitpick.locked_value(mod, opt.id, clb=_clb)
                 var.set(_opt_label(opt.label_for(current)))
+            # BUILD 864. PC x86 code options (PS3Tweaks): greyed out at their default,
+            # which is what the build does with them (ff7nx_pccode).
+            if not locked:
+                locked = build.ff7nx_pccode.locked_option(mod, opt.id)
+                if locked:
+                    current = build.ff7nx_pccode.locked_value(mod, opt.id)
+                    var.set(_opt_label(opt.label_for(current)))
+                    store[opt.id] = current
             combo = ttk.Combobox(grid, textvariable=var, values=labels,
                                  state='disabled' if locked else 'readonly',
                                  width=16)
@@ -6895,6 +6956,40 @@ def launch_ui():
         try:
             panes.sashpos(0, int(panes.winfo_width() * WIN_SPLIT_X))
             vsplit.sashpos(0, int(vsplit.winfo_height() * WIN_SPLIT_Y))
+        except tk.TclError:
+            return
+        root.after(30, _fit_mod_list)
+
+    def _fit_mod_list():
+        # BUILD 863: the header row added in 1.0.4 pushed the list down, so
+        # the default 1128 no longer showed every mod. When the screen has
+        # room, grow the window just enough that the whole list fits with no
+        # scroll bar; the log keeps its height. A short screen keeps the
+        # clamp above (the list scrolls, as before).
+        root.update_idletasks()
+        try:
+            bbox = _canvas.bbox('all')
+            need = (bbox[3] - bbox[1]) if bbox else 0
+            # BUILD 867: grow for at most FIT_MOD_ROWS mods. Past that the
+            # window would outgrow its default by a row per mod (and on a
+            # tall screen get taller than anyone wants), so the rest scroll.
+            _r = list(rows.values())
+            if len(_r) > FIT_MOD_ROWS:
+                _w = _r[FIT_MOD_ROWS - 1][0]
+                need = min(need, _w.winfo_y() + _w.winfo_height() + 4)
+            short = need - _canvas.winfo_height()
+            if short <= 0:
+                return
+            log_h = vsplit.winfo_height() - vsplit.sashpos(0)
+            cur_h = root.winfo_height()
+            new_h = min(cur_h + short + 2, root.winfo_screenheight() - 100)
+            if new_h <= cur_h:
+                return
+            y = max(30, (root.winfo_screenheight() - new_h) // 2 - 20)
+            root.geometry('%dx%d+%d+%d' % (root.winfo_width(), new_h,
+                                           root.winfo_x(), y))
+            root.update_idletasks()
+            vsplit.sashpos(0, max(0, vsplit.winfo_height() - log_h))
         except tk.TclError:
             pass
     root.after(50, _initial_splits)

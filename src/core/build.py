@@ -46,6 +46,7 @@ import echo_s_tutorial
 import ff7nx_echomusic
 import ff7nx_calendar
 import ff7nx_esui
+import ff7nx_pccode
 import ff7nx_titlemusic
 import ff7nx_sqlogo
 import ff7nx_nitpick
@@ -1042,6 +1043,17 @@ class Mod:
                     'ActiveWhen. 7th Heaven applies %s unconditionally. '
                     'Turn it back on unless you meant to exclude it.'
                     % (ident, ', '.join(dropped) or ident))
+        # BUILD 864. PC x86 code folders (PS3Tweaks): left out whole, data and all --
+        # see ff7nx_pccode for why half of one is worse than none.
+        if folders:
+            kept = []
+            for f in folders:
+                why = ff7nx_pccode.dropped(self, f)
+                if why is None:
+                    kept.append(f)
+                elif log:
+                    log('    - %s: left out (%s)' % (f, why))
+            folders = kept
         out = []
         declared = bool(self.manifest and self.manifest.folders)
         resolve = self._folder_resolver()
@@ -1215,6 +1227,8 @@ class Plan:
         self.folder_conflicts = []   # (folder_a, folder_b, count)
         self.folder_of = {}          # archive -> {lowname: source folder}
         self.hext_files = []         # [(path, mod)] FFNx exe patches to bake
+        self.hextarm = []            # [(path, mod, words)] BUILD 866: HEXT
+        #                              constants carried as ARM64 words
         self.field_dds_sources = []  # [(iro path, allowed folder prefixes)]
                                      # carrying upscaled field background art
                                      # -- see field_bg_repack.ArtProvider
@@ -1676,6 +1690,26 @@ def build_plan(mods, settings_by_mod, catalogs, log=lambda *_: None,
             log('! double-input fix: its HEXT files are not the ones this '
                 'build knows (%s); left to the exe path, which skips code '
                 'patches' % exc)
+    # BUILD 866. Code HEXT that only changes constants (PS3Tweaks' status
+    # speed, morph damage, EXP share...) is translated to ARM64 words by
+    # ff7nx_hextarm and leaves the exe list; apply_hextarm writes it.
+    _keep = []
+    for f, m in plan.hext_files:
+        words = None
+        if not ff7nx_pccode.disabled() and not ff7nx_pccode.exempt(m):
+            try:
+                with open(f, 'rb') as fh:
+                    words = ff7nx_pccode.translate(fh.read())
+            except OSError:
+                words = None
+        if words:
+            plan.hextarm.append((f, m, words))
+        else:
+            _keep.append((f, m))
+    plan.hext_files = _keep
+    for f, m, words in plan.hextarm:
+        log('%s: %s -- %d x86 constant(s) translated to ARM64 (exefs/main)'
+            % (m.display_name, os.path.relpath(f, m.cache), len(words)))
     if plan.hext_files:
         log(f'found {len(plan.hext_files)} HEXT exe-patch file(s) '
             '(will bake into ff7 exe if a base exe is provided)')
@@ -15209,6 +15243,32 @@ def apply_plan(plan, archive_paths, sdout, log=lambda *_: None,
         rel, found = _loose_destination(holder, name, dump, log)
         dest = os.path.join(romfs, *rel.split('/'))
         os.makedirs(os.path.dirname(dest), exist_ok=True)
+        # BUILD 864. A PC KERNEL.BIN (PS3Tweaks' Control Sephiroth) goes in as the
+        # records it changes, re-framed in the Switch container -- the same
+        # merge Echo-S's kernel gets, for the same reason. A file that is not
+        # a 27-record kernel is left out rather than dropped over the port's.
+        if holder == 'kernel' and name == 'kernel.bin' and found \
+                and dump is not None and dump.workingdir:
+            import echo_s_kernel
+            stock = os.path.join(dump.workingdir, *rel.split('/'))
+            try:
+                with open(stock, 'rb') as f:
+                    base = f.read()
+                with open(loose_src, 'rb') as f:
+                    modded = f.read()
+                merged, changed = echo_s_kernel.merge_gzip_container(
+                    base, modded, preserve_weapon_sfx=True)
+            except Exception as exc:                           # noqa: BLE001
+                log('! %s: KERNEL.BIN not taken (%s)'
+                    % (_mod.display_name, exc))
+                continue
+            with open(dest, 'wb') as f:
+                f.write(merged)
+            log('  %s: KERNEL.BIN records %s merged'
+                % (_mod.display_name, ', '.join(map(str, changed)) or 'none'))
+            produced.append(dest)
+            placed.append((rel, True))
+            continue
         shutil.copyfile(loose_src, dest)
         produced.append(dest)
         placed.append((rel, found is not None))
@@ -16497,6 +16557,77 @@ def apply_difix(sdout, dump, log=lambda *_: None, produced=()):
     log('  DOUBLE INPUT FIX (BUILD 620): %s -- translated 0x41B099/0x41B108 '
         'words in exefs/main. %s=1 disables.'
         % (ff7nx_difix.describe(cur), ff7nx_difix.OFF_ENV))
+    return [dest] if not built else []
+
+
+def apply_hextarm(sdout, dump, plan, log=lambda *_: None, produced=()):
+    """
+    BUILD 866. HEXT constant patches as ARM64 words in exefs/main -- see
+    ff7nx_hextarm. Each word must be stock or already this value; anything
+    else (another pass got there first) refuses that file whole.
+    """
+    todo = getattr(plan, 'hextarm', None) if plan is not None else None
+    if not todo:
+        return []
+    if dump is None or not dump.nso:
+        log('! HEXT -> ARM64: needs exefs/main from a full game dump; skipped')
+        return []
+    from pathlib import Path as _P
+    import nso_patcher
+    dest = os.path.join(sdout, 'atmosphere', 'contents', TITLE_ID, 'exefs',
+                        'main')
+    fresh = {os.path.normpath(os.path.abspath(p)) for p in produced}
+    built = os.path.normpath(os.path.abspath(dest)) in fresh
+    src = dest if built else dump.nso
+    if not built and os.path.exists(dest):
+        try:
+            same = (os.path.getsize(dest) == os.path.getsize(dump.nso)
+                    and open(dest, 'rb').read() == open(dump.nso, 'rb').read())
+        except OSError:
+            same = False
+        if not same:
+            log('! HEXT -> ARM64: existing main was not produced by this '
+                'build; delete sdout/ and rebuild')
+            return []
+    log('')
+    log('HEXT constants -> ARM64 ...')
+    nso = nso_patcher.read_nso(_P(str(src)))
+    import nxmap
+    img = nxmap.Main(str(src)).img
+    final = {}
+    for path, mod, words in todo:
+        bad = None
+        for off, stock, new, _note in words:
+            have = struct.unpack_from('<I', img, off)[0]
+            if have not in (stock, new) and off not in final:
+                bad = '+0x%X is %08X, neither stock %08X nor %08X' % (
+                    off, have, stock, new)
+                break
+        if bad:
+            log('! %s %s: %s -- not applied'
+                % (mod.display_name, os.path.basename(path), bad))
+            continue
+        for off, stock, new, note in words:
+            final[off] = new
+            log('  %s: +0x%X %08X  (%s)' % (mod.display_name, off, new, note))
+    changed = {o: w for o, w in final.items()
+               if struct.unpack_from('<I', img, o)[0] != w}
+    if not changed:
+        return []
+
+    def hx(v):
+        return ' '.join('%02X' % b for b in struct.pack('<I', v))
+    spec = {'name': 'hextarm: HEXT constants (ARM64 translation)',
+            'patches': [{'name': '+0x%X' % o, 'va': hex(o),
+                         'expect': hx(struct.unpack_from('<I', img, o)[0]),
+                         'set': hx(w)} for o, w in sorted(changed.items())]}
+    nso_patcher.apply_spec(nso, spec)
+    tmp = dest + '.hextarm-tmp'
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    with open(tmp, 'wb') as f:
+        f.write(nso_patcher.rebuild(nso))
+    os.replace(tmp, dest)
+    log('  %d word(s) written' % len(changed))
     return [dest] if not built else []
 
 
