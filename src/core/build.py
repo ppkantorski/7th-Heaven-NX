@@ -16709,8 +16709,9 @@ def apply_hextarm(sdout, dump, plan, log=lambda *_: None, produced=()):
                     off, final[off], new)
                 break
             if have not in (stock, new) and off not in final:
-                bad = '+0x%X is %08X, neither stock %08X nor %08X' % (
-                    off, have, stock, new)
+                bad = ('+0x%X is %08X, neither stock %08X nor %08X: another '
+                       'feature of this build already changed that code and '
+                       'keeps it' % (off, have, stock, new))
                 break
         if bad:
             log('! %s %s: %s -- not applied'

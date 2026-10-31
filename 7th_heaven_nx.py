@@ -2109,9 +2109,6 @@ def _run_build_steps(mods, enabled, settings_by_mod, log, progress,
     # BUILD 620. Double Input Bugfix: the mod's x86 code patches as ARM64
     # words (four at most, in place). Nothing unless the mod is enabled.
     produced += build.apply_difix(SDOUT_DIR, DUMP, log, produced)
-    # BUILD 866. HEXT constant patches (PS3Tweaks' status speed, morph
-    # damage, EXP share...) translated to ARM64 words -- ff7nx_hextarm.
-    produced += build.apply_hextarm(SDOUT_DIR, DUMP, plan, log, produced)
     # Resized SYW TEX payloads carry a per-file integer scale in two inert
     # header words. All three u/v reciprocal pairs in _load_texture apply that
     # scale when each graphics object is constructed, so every consumer keeps
@@ -2366,6 +2363,15 @@ def _run_build_steps(mods, enabled, settings_by_mod, log, progress,
     # ahead of the shadows, spit-reach, fx-plane and UI-on-top passes, so the
     # UI-on-top cave found the probe's wrapper at its call site and refused:
     # a probe build silently tested the battle UI without its fix.
+    # BUILD 866. HEXT constant patches (PS3Tweaks' status speed, morph
+    # damage, EXP share...) translated to ARM64 words -- ff7nx_hextarm.
+    # BUILD 869: the LAST feature pass (was right after apply_difix). Every
+    # word it writes must still be stock, so running last means a PS3Tweaks
+    # option that shares a word with another pass is the one refused
+    # (logged). Before, it went first and the other pass refused instead:
+    # Break Damage Limit or Two Accessories took out all of Enhanced Stock
+    # UI, whose status and equip menu ports patch the same call sites.
+    produced += build.apply_hextarm(SDOUT_DIR, DUMP, plan, log, produced)
     produced += build.apply_frame_probe(SDOUT_DIR, DUMP, plan, log, produced)
 
     # Everything the build produces is known now, so anything a PREVIOUS
