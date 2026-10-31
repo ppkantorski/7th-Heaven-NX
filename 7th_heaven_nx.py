@@ -2387,8 +2387,13 @@ def _run_build_steps(mods, enabled, settings_by_mod, log, progress,
 
     # BUILD 850: what changed since the last build -- the log says, and
     # sdout_changes/ holds just those files for the SD card.
+    # BUILD 869: only with Settings > Storage > "Write a changes folder".
     try:
-        changes = build.sdout_changes(SDOUT_DIR, log=log)
+        if build.changes_dir_enabled():
+            changes = build.sdout_changes(SDOUT_DIR, log=log)
+        else:
+            changes = None
+            build.sdout_changes_off(SDOUT_DIR)
     except Exception as exc:                                    # noqa: BLE001
         changes = None
         log('  ! change list skipped: %s' % exc)
@@ -3351,6 +3356,8 @@ def launch_ui():
                                                             True)))
     # BUILD 848: Storage > Compact cache after build (ff7nx_cachegc); off by default.
     compact_var = tk.BooleanVar(value=bool(global_saved.get('compact_cache', False)))
+    # BUILD 869: Storage > Write a changes folder (build.sdout_changes); off by default.
+    changes_var = tk.BooleanVar(value=bool(global_saved.get('changes_folder', False)))
 
     lim_label_by_value = {v: l for v, l in LIMITER_FPS_CHOICES}
     lim_value_by_label = {l: v for v, l in LIMITER_FPS_CHOICES}
@@ -3577,6 +3584,13 @@ def launch_ui():
              'full mod list) once a build has finished. The next build '
              'unpacks them again from the .iro files, which takes a few '
              'minutes longer; nothing else is rebuilt.', False),
+            ('check', 'Write a changes folder', changes_var, None,
+             'After each build, also writes sdout_changes/ beside sdout/ '
+             'with only the files that changed since the last build, so you '
+             'can copy just those to an SD card that already has the last '
+             'build. The changed files are copied, so it uses that much '
+             'extra disk space. sdout/ is always the complete build either '
+             'way.', False),
         ]),
         ('Voice', [
             ('combo', 'Dialogue loudness', voice_norm_var,
@@ -5002,6 +5016,7 @@ def launch_ui():
                                  'advanced_facial': bool(facial_var.get()),
                                  'text_autosize': bool(autosize_var.get()),
                                  'compact_cache': bool(compact_var.get()),
+                                 'changes_folder': bool(changes_var.get()),
                                  'limiter_fps': current_limiter_fps(),
                                  'widescreen': current_widescreen(),
                                  'field_buffer': current_field_buffer(),
@@ -5072,6 +5087,7 @@ def launch_ui():
     facial_var.trace_add('write', save_settings_now)
     autosize_var.trace_add('write', save_settings_now)
     compact_var.trace_add('write', save_settings_now)
+    changes_var.trace_add('write', save_settings_now)
     lim_var.trace_add('write', save_settings_now)
     # The four added with the field-buffer work. Without these they are
     # only written on Build and on window close, which is enough to be
@@ -5112,7 +5128,12 @@ def launch_ui():
     content = ttk.Frame(vsplit)
     vsplit.add(content, weight=4)
 
-    logframe = ttk.Labelframe(vsplit, text='Log', padding=(2, 2))
+    # BUILD 869: a frame title, like Mods/Options, so a "Save log" pill can
+    # sit on the title line at the right
+    log_hdr = ttk.Frame(vsplit)
+    ttk.Label(log_hdr, text='Log', foreground=TEXT_SECONDARY,
+              font=(UI_FONT, 10, 'bold')).pack(side='left')
+    logframe = ttk.Labelframe(vsplit, labelwidget=log_hdr, padding=(2, 2))
     vsplit.add(logframe, weight=1)
 
     # ---------- log: drawn on a Canvas, banner behind the text -----------
@@ -5479,9 +5500,42 @@ def launch_ui():
     dpill, dpill_state, _draw_dflt, _show_dflt = _make_pill(
         right, opts_hdr, 'Restore defaults')
 
+    # BUILD 869: "Save log" on the Log title line: the whole log to
+    # build_log_<timestamp>.txt wherever the user picks.
+    spill, spill_state, _draw_save, _show_save = _make_pill(
+        logframe, log_hdr, 'Save log')
+    _show_save(True)
+
+    def save_log(_evt=None):
+        from tkinter import filedialog
+        lines = _log['lines']
+        if not lines or not any(lines):
+            messagebox.showinfo('Save log', 'The log is empty.')
+            return
+        name = 'build_log_%s.txt' % time.strftime('%Y-%m-%d_%H-%M-%S')
+        path = filedialog.asksaveasfilename(
+            title='Save log', initialfile=name, defaultextension='.txt',
+            initialdir=os.path.expanduser('~'),
+            filetypes=[('Text files', '*.txt'), ('All files', '*.*')])
+        if not path:
+            return
+        try:
+            with open(path, 'w', encoding='utf-8', newline='\n') as fh:
+                fh.write('\n'.join(lines).rstrip('\n') + '\n')
+        except OSError as exc:
+            messagebox.showerror('Save log', 'Could not save the log:\n%s'
+                                 % exc)
+            return
+        log_write('log saved to %s' % path)
+
+    spill.bind('<ButtonRelease-1>', lambda e: (
+        save_log() if 0 <= e.x < spill_state['w'] and 0 <= e.y < PILL_H
+        else None))
+
     def _draw_pill():
         _draw_prio()
         _draw_dflt()
+        _draw_save()
     _opt_canvas, options_body = make_scrollable(
         right, inner_width_tracks_canvas=True)
 
@@ -6778,6 +6832,7 @@ def launch_ui():
             '1' if autosize_var.get() else '0')
         os.environ['SEVENTH_NX_COMPACT_CACHE'] = (
             '1' if compact_var.get() else '0')
+        os.environ[build.CHANGES_DIR_ENV] = '1' if changes_var.get() else '0'
         os.environ[build.LIMITER_FPS_ENV] = str(
             _needs_nso(current_limiter_fps(), 0))
         os.environ[build.ff7nx_ws.WIDESCREEN_ENV] = current_widescreen()
@@ -7301,6 +7356,9 @@ def main():
                 else '0'))
         os.environ.setdefault('SEVENTH_NX_COMPACT_CACHE', (
                 '1' if saved.get('__global__', {}).get('compact_cache')
+                else '0'))
+        os.environ.setdefault(build.CHANGES_DIR_ENV, (
+                '1' if saved.get('__global__', {}).get('changes_folder')
                 else '0'))
         os.environ[build.LIMITER_FPS_ENV] = str(
                 saved.get('__global__', {}).get('limiter_fps', 0))

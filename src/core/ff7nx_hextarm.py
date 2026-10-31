@@ -244,6 +244,14 @@ def plan(exe, module, hext_text):
     patches = list(exe_patch.parse_hext(hext_text))
     if not patches:
         raise Refused('no patches')
+    # BUILD 868: options that jump into a code cave, ported by hand.
+    import ff7nx_ps3tweaks
+    try:
+        caved = ff7nx_ps3tweaks.plan(exe, module, patches)
+    except ff7nx_ps3tweaks.Refused as e:
+        raise Refused(str(e))
+    if caved is not None:
+        return caved
     hand = _HAND.get(frozenset((va, bytes(blob)) for va, blob in patches))
     if hand is not None:
         for off, stock, _new, _n in hand:
@@ -327,7 +335,11 @@ def plan(exe, module, hext_text):
         a0, a1 = module.extent(fstart)
         body = list(arm.disasm(bytes(module.img[a0:a1]), a0))
         for ins, mn, ov, nv in edits:
-            same = [i for i in old if i.mnemonic == mn
+            # BUILD 868: a `push imm` is an ARM64 `mov` of the constant too
+            # (often one register shared by several pushes and stores), so
+            # it counts among a `mov`'s candidates
+            same = [i for i in old if (i.mnemonic == mn or (
+                mn == 'mov' and i.mnemonic == 'push'))
                     and _x86_imm(i) == ov]
             k = [i.address for i in same].index(ins.address)
             want = _KIND[mn]

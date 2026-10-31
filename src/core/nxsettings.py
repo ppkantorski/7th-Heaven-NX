@@ -37,6 +37,7 @@ USER_KEYS = frozenset((
     'no_autorun',
     'no_cheats',
     'compact_cache',                # BUILD 848: Storage > Compact cache after build
+    'changes_folder',               # BUILD 869: Storage > Write a changes folder
     'voice_normalize',
     'dock_resolution',              # BUILD 762: output resolution
     'title_screen',                 # BUILD 763b: title background

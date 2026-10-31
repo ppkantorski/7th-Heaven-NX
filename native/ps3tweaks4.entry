@@ -1,0 +1,15 @@
+pt_g2h 00000000
+x3_arm_10E2720 000000c4
+x3_arm_10E3E30 000000c0
+x3_arm_10E4110 000000c8
+x3_fn_6C6B1B 000000bc
+x3_fn_6CBFFA 000000cc
+x3_fn_74580A 000000d0
+x3e_ta_eqdesc_0 000001a4
+x3e_ta_equip_0 000001c8
+x3e_ta_remove_0 000001e8
+x3h_ta_equip_acc2 00000178
+x3h_ta_phs_e 00000108
+x3h_ta_status_e 00000134
+x3w_ta_cursor 0000016c
+x3w_ta_rows 00000160

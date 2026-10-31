@@ -71,11 +71,12 @@ BUILT_IN = {
 _cache = {}
 _xlate = {}
 _tool = None
+_tool_error = None     # why the translator is unavailable, for the GUI
 
 
 def _translator():
     """(stock ff7_en bytes, nxmap.Main of the stock main) or None."""
-    global _tool
+    global _tool, _tool_error
     if _tool is None:
         _tool = False
         try:
@@ -84,14 +85,18 @@ def _translator():
             import nxmap
             import nxpaths
             if not ff7nx_hextarm.available():
+                _tool_error = 'capstone is not installed'
                 return None
             dump = build.find_game_dump(nxpaths.ROOT)
             if dump is not None and dump.exe and dump.nso:
                 with open(dump.exe, 'rb') as f:
                     exe = f.read()
                 _tool = (exe, nxmap.Main(dump.nso))
-        except Exception:                                      # noqa: BLE001
+            else:
+                _tool_error = 'needs the full game dump (ff7_en + exefs/main)'
+        except BaseException as exc:                           # noqa: BLE001
             _tool = False
+            _tool_error = '%s: %s' % (type(exc).__name__, exc)
     return _tool or None
 
 
@@ -114,6 +119,92 @@ def translate(raw):
             words = None
     _xlate[raw] = words
     return words
+
+
+def groups(raws):
+    """BUILD 868: HEXT files that port only together -- a PS3Tweaks option
+    and the files layered on it (Two Accessories' ESUICompat; the Enemy
+    Randomizer with Double Bosses and the scaling files). raws: [(key,
+    text)] of one mod, in load order. Returns [(keys, words)] for each group
+    (up to four files, the largest first) whose patches together are one
+    ported option; a file in no group is translated alone, as before."""
+    import itertools
+    import ff7nx_ps3tweaks
+    parsed = []
+    for key, raw in raws:
+        if isinstance(raw, bytes):
+            raw = raw.decode('utf-8', 'replace')
+        try:
+            parsed.append((key, raw, list(exe_patch.parse_hext(raw))))
+        except Exception:                                      # noqa: BLE001
+            continue
+    ports = [set(p.code) | set(p.data) for p in ff7nx_ps3tweaks.PORTS]
+    out, used = [], set()
+    for n, (ka, ra, pa) in enumerate(parsed):
+        if ka in used or not pa or ff7nx_ps3tweaks.match(pa) is None:
+            continue
+        keys_a = {va for va, _b in pa}
+        room = [pk for pk in ports if keys_a <= pk]
+        cand = [(j, x) for j, x in enumerate(parsed)
+                if x[0] != ka and x[0] not in used and x[2] and
+                any({va for va, _b in x[2]} <= pk for pk in room)]
+        hit = None
+        for size in (3, 2, 1):
+            for combo in itertools.combinations(cand, size):
+                files = sorted(combo + ((n, parsed[n]),))   # load order
+                patches = [p for _j, x in files for p in x[2]]
+                if ff7nx_ps3tweaks.match(patches) is None:
+                    continue
+                words = translate('\n'.join(x[1] for _j, x in files))
+                if words:
+                    hit = ([ka] + [x[0] for _j, x in files if x[0] != ka],
+                           words)
+                    break
+            if hit:
+                break
+        if hit:
+            out.append((tuple(hit[0]), hit[1]))
+            used.update(hit[0])
+    return out
+
+
+def pairable(raws):
+    """BUILD 868: the keys of every file in SOME group groups() could make
+    of these (a choice of options): each file of a ported option that ports
+    only with another (Double Bosses over the Enemy Randomizer), whichever
+    of the mod's options are picked with it. raws: as groups()."""
+    import itertools
+    import ff7nx_ps3tweaks
+    parsed = []
+    for key, raw in raws:
+        if isinstance(raw, bytes):
+            raw = raw.decode('utf-8', 'replace')
+        try:
+            pats = list(exe_patch.parse_hext(raw))
+        except Exception:                                      # noqa: BLE001
+            continue
+        if pats:
+            parsed.append((key, pats))
+    ports = [set(p.code) | set(p.data) for p in ff7nx_ps3tweaks.PORTS]
+    order = {k: n for n, (k, _p) in enumerate(parsed)}
+    out = set()
+    for ka, pa in parsed:
+        if ff7nx_ps3tweaks.match(pa) is None:
+            continue
+        keys_a = {va for va, _b in pa}
+        room = [pk for pk in ports if keys_a <= pk]
+        cand = [x for x in parsed if x[0] != ka and
+                any({va for va, _b in x[1]} <= pk for pk in room)]
+        for size in (1, 2, 3):
+            for combo in itertools.combinations(cand, size):
+                if all(x[0] in out for x in combo):
+                    continue
+                files = sorted(list(combo) + [(ka, pa)],    # load order
+                               key=lambda x: order[x[0]])
+                if ff7nx_ps3tweaks.match([p for _k, x in files
+                                          for p in x]) is not None:
+                    out.update(k for k, _x in files)
+    return out
 
 
 def disabled():
@@ -186,6 +277,9 @@ def analyse(mod):
 
     entries = [e.replace('\\', '/') for e in mod.entries()]
     lows = [(e, e.lower()) for e in entries]
+    # files that port together with another of this mod's (BUILD 868)
+    paired = pairable(
+        [(e, _read(mod, e) or b'') for e, low in lows if _is_hext(low)])
     folders = list(dict.fromkeys(_norm(f) for f, _c in man.folders if f))
     info = {}
     for f in folders:
@@ -207,7 +301,8 @@ def analyse(mod):
                 n = sum(1 for va, _b in pats if X86_TEXT[0] <= va < X86_TEXT[1])
                 # BUILD 866: a file ff7nx_hextarm can carry to ARM64 is not
                 # PC-only any more.
-                if n and translate(_read(mod, e) or b'') is None:
+                if n and e not in paired and \
+                        translate(_read(mod, e) or b'') is None:
                     code += n
                 continue
             tail = low[len(pre):]
@@ -228,7 +323,11 @@ def analyse(mod):
         changed = True
         while changed:
             changed = False
-            taken = [r for f in dropped for r in info[f]['ranges']]
+            # (not a built-in fix's: what it writes, the Switch build
+            # writes its own way -- WItemFix's price word in the table the
+            # Item Randomizer's ShopPrices sets as well is no cave)
+            taken = [r for f in dropped for r in info[f]['ranges']
+                     if f.rsplit('/', 1)[-1] not in BUILT_IN]
             for f, i in info.items():
                 if f in dropped or i['content']:
                     continue
@@ -273,8 +372,12 @@ def locked_option(mod, option_id):
     if mine:
         if all(f in gone for f in mine):
             hints = [gone[f] for f in mine if gone[f].startswith('Built in')]
-            return hints[0] if hints else 'PC only: x86 game code, which ' \
-                'the Switch port does not run'
+            if hints:
+                return hints[0]
+            why = 'PC only: x86 game code, which the Switch port does not run'
+            if _tool_error:
+                why += ' (translator off: %s)' % _tool_error
+            return why
         return None
     own = (man.mod_id or '').lower()
     turns_on = [theirs for my, _v, mid, theirs, req in man.compat_settings

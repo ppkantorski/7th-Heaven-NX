@@ -1257,39 +1257,28 @@ def _attempt(work, argument):
 
 def _link_or_copy(source, target):
     """
-    Hard-link the cached clip into place; copy when that is not possible.
+    Put a real copy of the cached clip at `target`. Returns whether it wrote.
 
-    Every step degrades rather than raising, because none of them is the
-    point. The point is that the right bytes end up at `target`: a hard link
-    is merely how 2.8 GB avoids existing twice. A cache directory on a
-    different filesystem from sdout, a mount that refuses `link`, one that
-    refuses to unlink an existing link -- all of them end in a plain copy, and
-    the build carries on.
+    BUILD 869: a copy, never a hard link. sdout has to be the complete build
+    on its own; a link made each clip the same file as its cache entry. The
+    copy keeps the cache's mtime (copy2), so a clip already copied by an
+    earlier build is left alone (the cache entry is still opened, so
+    ff7nx_cachegc sees it used). A target that IS the cache entry (a link
+    from before this build) is replaced by a copy.
     """
     os.makedirs(os.path.dirname(target), exist_ok=True)
-    if os.path.exists(target):
-        try:
-            if os.path.samefile(source, target):
-                return False          # already the same inode: nothing to do
-        except OSError:
-            pass
-        try:
-            os.unlink(target)
-        except OSError:
-            # Cannot remove it, so cannot link over it: overwrite in place.
-            # `samefile` said no or could not tell; if it could not tell and
-            # they ARE the same file, copying would write the cache entry
-            # through its own link, so that case is caught and skipped rather
-            # than allowed to shred the cache.
-            try:
-                shutil.copyfile(source, target)
-            except shutil.SameFileError:
-                return False
-            return True
     try:
-        os.link(source, target)
+        s, d = os.stat(source), os.stat(target)
+        if ((s.st_dev, s.st_ino) != (d.st_dev, d.st_ino)
+                and s.st_size == d.st_size
+                and s.st_mtime_ns == d.st_mtime_ns):
+            open(source, 'rb').close()
+            return False
     except OSError:
-        shutil.copyfile(source, target)
+        pass
+    tmp = target + '.part'
+    shutil.copy2(source, tmp)
+    os.replace(tmp, target)
     return True
 
 

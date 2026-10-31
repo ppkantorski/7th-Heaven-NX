@@ -469,11 +469,11 @@ class Cache(unittest.TestCase):
         self.assertEqual(again['kept'], len(self.sample))
         self.assertEqual(again['linked'], 0)
 
-    def test_staged_clips_are_links_not_copies(self):
-        """2.8 GB is worth not having twice on disk."""
+    def test_staged_clips_are_copies_not_links(self):
+        """BUILD 869: sdout holds real files, never links into cache/."""
         report = VO.stage(self.sample, self.out)
         for path in report['produced']:
-            self.assertGreaterEqual(os.stat(path).st_nlink, 2, path)
+            self.assertEqual(os.stat(path).st_nlink, 1, path)
 
     def test_the_bitrate_is_part_of_the_key(self):
         """

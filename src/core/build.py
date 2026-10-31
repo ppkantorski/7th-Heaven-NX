@@ -1694,7 +1694,32 @@ def build_plan(mods, settings_by_mod, catalogs, log=lambda *_: None,
     # speed, morph damage, EXP share...) is translated to ARM64 words by
     # ff7nx_hextarm and leaves the exe list; apply_hextarm writes it.
     _keep = []
+    # BUILD 868: a mod's files that port only together go as one
+    _paired = {}
+    if not ff7nx_pccode.disabled():
+        _by_mod = {}
+        for f, m in plan.hext_files:
+            if not ff7nx_pccode.exempt(m):
+                _by_mod.setdefault(id(m), []).append((f, m))
+        for _fs in _by_mod.values():
+            if len(_fs) < 2:
+                continue
+            _raws = []
+            for f, _m in _fs:
+                try:
+                    with open(f, 'rb') as fh:
+                        _raws.append((f, fh.read()))
+                except OSError:
+                    pass
+            for _keys, words in ff7nx_pccode.groups(_raws):
+                _paired[_keys[0]] = words
+                for _k in _keys[1:]:
+                    _paired[_k] = None
     for f, m in plan.hext_files:
+        if f in _paired:
+            if _paired[f]:
+                plan.hextarm.append((f, m, _paired[f]))
+            continue
         words = None
         if not ff7nx_pccode.disabled() and not ff7nx_pccode.exempt(m):
             try:
@@ -1708,8 +1733,12 @@ def build_plan(mods, settings_by_mod, catalogs, log=lambda *_: None,
             _keep.append((f, m))
     plan.hext_files = _keep
     for f, m, words in plan.hextarm:
-        log('%s: %s -- %d x86 constant(s) translated to ARM64 (exefs/main)'
-            % (m.display_name, os.path.relpath(f, m.cache), len(words)))
+        # BUILD 868: a cave option is one ported routine, not N constants
+        port = next((n.split(':')[0] for *_w, n in words if ': ' in n), None)
+        what = ('ported to ARM64 (%s, %d words)' % (port, len(words)) if port
+                else '%d x86 constant(s) translated to ARM64' % len(words))
+        log('%s: %s -- %s (exefs/main)'
+            % (m.display_name, os.path.relpath(f, m.cache), what))
     if plan.hext_files:
         log(f'found {len(plan.hext_files)} HEXT exe-patch file(s) '
             '(will bake into ff7 exe if a base exe is provided)')
@@ -11397,19 +11426,31 @@ def _movie_cache_dir(sdout_root):
                         'cache', 'movies')
 
 
-def _link_or_copy(src, dest):
-    """Hardlink the cached encode into place, falling back to a copy.
+def _copy_into_sdout(src, dest):
+    """Put a real copy of the cached encode in sdout.
 
-    A hardlink is instant and costs no extra disk; the copy is there for the
-    case that matters in practice -- sdout on a different filesystem from the
-    cache, e.g. written straight to an SD card."""
+    BUILD 869: a copy, never a hard link. sdout has to be the complete build
+    on its own: a link made sdout's movies the same files as cache/movies,
+    so whatever happened to one happened to the other, and every file
+    browser counted them in both places. The copy keeps the cache's mtime
+    (copy2), so an unchanged movie is recognised next build and not copied
+    again; the cache entry is still opened then, so ff7nx_cachegc sees it
+    used."""
     os.makedirs(os.path.dirname(dest), exist_ok=True)
-    if os.path.exists(dest):
-        os.remove(dest)
     try:
-        os.link(src, dest)
+        s, d = os.stat(src), os.stat(dest)
+        if ((s.st_dev, s.st_ino) != (d.st_dev, d.st_ino)
+                and s.st_size == d.st_size
+                and s.st_mtime_ns == d.st_mtime_ns):
+            open(src, 'rb').close()
+            return
     except OSError:
-        shutil.copyfile(src, dest)
+        pass
+    if os.path.lexists(dest):
+        os.remove(dest)
+    tmp = dest + '.part'
+    shutil.copy2(src, tmp)
+    os.replace(tmp, dest)
 
 
 def movie_workers(jobs=0):
@@ -11422,6 +11463,30 @@ def movie_workers(jobs=0):
     if want <= 0:
         want = max(1, min(4, nxpaths.cpu_threads() // 4))
     return max(1, min(want, jobs or want))
+
+
+def _keep_previous_movies(romfs, dests, produced, log):
+    """BUILD 869: keep the previous build's movie at each of `dests` that
+    this build did not write (every movie under romfs when `dests` is None),
+    so prune_stale cannot delete it. A failed encode is the only way here."""
+    if dests is None:
+        dests = []
+        for base, _dirs, files in os.walk(romfs):
+            if os.path.basename(base).lower() == 'movies':
+                dests += [os.path.join(base, f) for f in files
+                          if f.lower().endswith('.mp4')]
+    have = {os.path.normpath(os.path.abspath(p)) for p in produced if p}
+    kept = [d for d in sorted(set(dests))
+            if os.path.normpath(os.path.abspath(d)) not in have
+            and os.path.isfile(d)]
+    produced.extend(kept)
+    if kept:
+        log('!! %d movie(s) were not built this time, so the previous '
+            "build's copies were kept in sdout (%s%s). Check the movie lines "
+            'above (a full disk or a missing ffmpeg) and rebuild.'
+            % (len(kept), ', '.join(os.path.basename(k) for k in kept[:6]),
+               ' ...' if len(kept) > 6 else ''))
+    return kept
 
 
 def _emplace_movies(plan, romfs, sdout, dump, log, progress, produced):
@@ -11448,6 +11513,7 @@ def _emplace_movies(plan, romfs, sdout, dump, log, progress, produced):
     if not movie_convert.have_ffmpeg():
         log(f'! {len(plan.movies)} movie(s) skipped: ffmpeg/ffprobe not found '
             'on PATH. Install ffmpeg and rebuild; nothing else is affected.')
+        _keep_previous_movies(romfs, None, produced, log)
         return
 
     # EVERY movies directory in the dump, not just data/movies.
@@ -11636,7 +11702,7 @@ def _emplace_movies(plan, romfs, sdout, dump, log, progress, produced):
                 cached_file = os.path.join(cache, f'{tag}.{key}.mp4')
 
                 if os.path.exists(cached_file):
-                    _link_or_copy(cached_file, dest)
+                    _copy_into_sdout(cached_file, dest)
                     cached += 1
                     produced.append(dest)
                     if (reldir, stem) == (movie_convert.MOVIE_DIR,
@@ -11668,8 +11734,11 @@ def _emplace_movies(plan, romfs, sdout, dump, log, progress, produced):
                 if movie_convert.already_target(info, fit=fit_this, colour=colour) \
                         and info['has_audio'] and at_rate \
                         and not music and not voice:
-                    shutil.copyfile(src, cached_file)
-                    _link_or_copy(cached_file, dest)
+                    # BUILD 869: through a .part file, like convert(), so
+                    # an interrupted copy is never reused as a cache hit
+                    shutil.copyfile(src, cached_file + '.part')
+                    os.replace(cached_file + '.part', cached_file)
+                    _copy_into_sdout(cached_file, dest)
                     copied += 1
                     produced.append(dest)
                     if (reldir, stem) == (movie_convert.MOVIE_DIR,
@@ -11702,7 +11771,7 @@ def _emplace_movies(plan, romfs, sdout, dump, log, progress, produced):
                     _mv_lock.acquire()
                 took = time.time() - t0
                 spent += took
-                _link_or_copy(cached_file, dest)
+                _copy_into_sdout(cached_file, dest)
                 done += 1
                 produced.append(dest)
                 if (reldir, stem) == (movie_convert.MOVIE_DIR,
@@ -11769,6 +11838,13 @@ def _emplace_movies(plan, romfs, sdout, dump, log, progress, produced):
     else:
         for a in _mv_jobs:
             _movie_one(*a)
+    # BUILD 869: a movie this build failed to make keeps the previous build's
+    # copy. Without this, prune_stale deleted every movie a failed step did
+    # not write (a missing ffmpeg, a full disk: 4.6 GB of sdout gone at once)
+    # and the game fell back to its 15 fps originals against 30 fps caves.
+    _keep_previous_movies(
+        romfs, [os.path.join(romfs, *r.split('/'), st + '.mp4')
+                for _i, r, st in _mv_jobs], produced, log)
     if _mv_stop[0]:
         return
 
@@ -13342,7 +13418,10 @@ SCHEDULING_ENV = frozenset([REUSE_FLEVEL_ENV, REUSE_ALL_ENV,
                             'SEVENTH_NX_DEPS_CHILD',
                             # BUILD 848: Storage > Compact cache only deletes
                             # mod extractions after the build.
-                            'SEVENTH_NX_COMPACT_CACHE']
+                            'SEVENTH_NX_COMPACT_CACHE',
+                            # BUILD 869: only decides whether sdout_changes/
+                            # is written after the build.
+                            'SEVENTH_NX_CHANGES_DIR']
                            + list(REUSE_ARCHIVE_ENV.values()))
 
 # BUILD 326. The 60 FPS setting. It is a GUI/CLI setting, not an environment
@@ -14678,12 +14757,37 @@ def prune_stale(sdout, produced, log=lambda *_: None):
 # the first build hashes everything once.
 #
 # The result goes to the log and to CHANGES_DIR beside sdout: the new and
-# changed files only, at their sdout paths, as hard links (no extra disk;
-# copies if the volume cannot link). Copy its contents onto the SD card root
+# changed files only, at their sdout paths, as real copies (BUILD 869: they
+# were hard links, which made the two folders one set of files). Copy its contents onto the SD card root
 # instead of all of sdout. Files the build no longer produces are listed to
 # delete from the card (CHANGES_LIST names all of it). The folder holds only
 # this build's changes: a user who skipped copying a build should copy sdout.
 CHANGES_DIR_NAME = 'sdout_changes'
+# BUILD 869: Settings > Storage > "Write a changes folder", off by default.
+CHANGES_DIR_ENV = 'SEVENTH_NX_CHANGES_DIR'
+
+
+def changes_dir_enabled():
+    return os.environ.get(CHANGES_DIR_ENV, '').strip().lower() in (
+        '1', 'on', 'yes', 'true')
+
+
+def sdout_changes_off(sdout):
+    """BUILD 869: the changes folder is turned off. Remove the folder, its
+    list and the record it compares against, so nothing stale is left beside
+    sdout and turning it back on starts from a full copy."""
+    root = os.path.abspath(sdout)
+    parent = os.path.dirname(root)
+    d = os.path.join(parent, CHANGES_DIR_NAME)
+    if os.path.isdir(d):
+        shutil.rmtree(d, ignore_errors=True)
+    for p in (os.path.join(parent, CHANGES_LIST_NAME),
+              os.path.join(SDOUT_MANIFEST, hashlib.sha1(
+                  root.encode()).hexdigest()[:16] + '.state.json')):
+        try:
+            os.remove(p)
+        except OSError:
+            pass
 CHANGES_LIST_NAME = 'sdout_changes.txt'
 
 
@@ -14768,10 +14872,11 @@ def sdout_changes(sdout, changes_dir=None, list_path=None,
         dst = os.path.join(changes_dir, rel.replace('/', os.sep))
         try:
             os.makedirs(os.path.dirname(dst), exist_ok=True)
-            try:
-                os.link(src, dst)
-            except OSError:
-                shutil.copy2(src, dst)
+            # BUILD 869: a real copy, never a hard link. A link is the same
+            # file as sdout's, so anything done to one (moved, edited,
+            # deleted by a sync tool) happened to sdout too, and file
+            # browsers showed the two folders as if they were split.
+            shutil.copy2(src, dst)
             total += now[rel][0]
         except OSError as exc:
             log(f'  ! {rel}: not put in {CHANGES_DIR_NAME}/: {exc}')
@@ -16599,6 +16704,10 @@ def apply_hextarm(sdout, dump, plan, log=lambda *_: None, produced=()):
         bad = None
         for off, stock, new, _note in words:
             have = struct.unpack_from('<I', img, off)[0]
+            if off in final and final[off] != new:
+                bad = '+0x%X already set to %08X by another option, not %08X' % (
+                    off, final[off], new)
+                break
             if have not in (stock, new) and off not in final:
                 bad = '+0x%X is %08X, neither stock %08X nor %08X' % (
                     off, have, stock, new)
@@ -16609,6 +16718,12 @@ def apply_hextarm(sdout, dump, plan, log=lambda *_: None, produced=()):
             continue
         for off, stock, new, note in words:
             final[off] = new
+        if len(words) > 8:          # BUILD 868: a ported cave
+            notes = list(dict.fromkeys(n for *_w, n in words))
+            log('  %s: %d words (%s)' % (mod.display_name, len(words),
+                                         '; '.join(notes)))
+            continue
+        for off, stock, new, note in words:
             log('  %s: +0x%X %08X  (%s)' % (mod.display_name, off, new, note))
     changed = {o: w for o, w in final.items()
                if struct.unpack_from('<I', img, o)[0] != w}

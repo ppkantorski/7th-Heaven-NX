@@ -304,8 +304,9 @@ def test_stub_runs_the_displaced_word_and_returns():
         assert w[bls[0]] == A.bl(0x3000 + 4 * bls[0], 0x5000)
 
 
-def test_env_default_off():
-    assert not AS.enabled({})
+def test_env_default_on():
+    # BUILD 867: on by default
+    assert AS.enabled({})
     assert AS.enabled({AS.ENV: '1'})
     assert not AS.enabled({AS.ENV: '0'})
 

@@ -40,8 +40,8 @@ in the module (no branch, no relocation but the map's own record) and in
 the exe (no call or jump, its address nowhere in ff7_en), and refused if
 another pass already wrote it. No BSS: as_open keeps no state.
 
-Off by default, as in FFNx. GUI: Settings -> "Autosize dialogue boxes"
-(not a developer setting). SEVENTH_NX_TEXT_AUTOSIZE=1 turns it on; off writes
+On by default (BUILD 867; FFNx has it off). GUI: Settings -> "Autosize dialogue boxes"
+(not a developer setting). SEVENTH_NX_TEXT_AUTOSIZE=0 turns it off; off writes
 nothing at all.
 
 Licensed under GPLv3

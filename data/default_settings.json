@@ -40,6 +40,7 @@
     "advanced_facial": true,
     "text_autosize": true,
     "compact_cache": false,
+    "changes_folder": false,
     "limiter_fps": 66,
     "widescreen": "ws-3d",
     "field_buffer": 6,
