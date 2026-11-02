@@ -3053,6 +3053,21 @@ def _register_input_tweaks():
 
 ANALOG_GROUP = 'analog-360'
 ANALOG_DIAG_ENV = 'SEVENTH_NX_ANALOG_DIAG'
+# BUILD 869: the same cave also carries "Stick moves relative to the screen".
+# The group is on when either option is; these two say which parts it has.
+# ANALOG_ROT unset means the 360 rotation is on (a plain --enable analog-360).
+ANALOG_ROT_ENV = 'SEVENTH_NX_ANALOG_ROT'
+STICK_SCREEN_ENV = 'SEVENTH_NX_STICK_SCREEN'
+
+
+def analog_parts():
+    """(rot360, screen) for the field cave."""
+    rot = os.environ.get(ANALOG_ROT_ENV, '').strip().lower() not in (
+        '0', 'false', 'no', 'off')
+    # BUILD 872: part of 360 movement by default; =0 builds it without.
+    scr = os.environ.get(STICK_SCREEN_ENV, '').strip().lower() not in (
+        '0', 'false', 'no', 'off')
+    return rot, scr
 
 
 def analog_diag():
@@ -3112,6 +3127,9 @@ def analog_360_caves(enabled, log=print):
     except ImportError as exc:
         raise SystemExit('ABORT  %s requested but %s' % (ANALOG_GROUP, exc))
     diag = analog_diag()
+    rot360, screen = analog_parts()
+    if not rot360 and not screen:
+        return []
     if diag:
         log('  !!  %s=1: the stick is IGNORED and every held direction is '
             'rotated 45 degrees.' % ANALOG_DIAG_ENV)
@@ -3181,11 +3199,20 @@ def analog_360_caves(enabled, log=print):
                            (12, 0x51006120)],    # sub  w0, w9, #0x18
                    'assert': obj_resolution + keybuf + consumer + translator,
                    'place': 'padding'},
-             label='360 movement: field control direction  [rev2 '
-                   'chain-resolved object]'
+             label=('360 movement' if rot360 else 'field stick')
+                   + (' + screen-relative stick' if screen and not diag
+                      else '')
+                   + ': field control direction  [rev2 chain-resolved object]'
                    + ('  [DIAGNOSTIC: fixed 45 degrees]' if diag else ''),
              build=AC.build_field_cave,
-             diag=diag),
+             diag=diag, rot360=rot360, screen=screen,
+             # BUILD 870: the screen-relative cave is 171 words. A full build
+             # with every supported mod leaves well under that in padding, so
+             # it goes in a dead translated body of its own instead -- one no
+             # other pass names -- and the padding the 360 cave used to take
+             # is left free. See _place_dead_body_cave.
+             dead_x86=(SCREEN_STICK_DEAD_X86 if screen and not diag
+                       else None)),
     ]
 
 
@@ -3235,6 +3262,66 @@ def nocheats_caves(enabled, log=print):
              build=None)
         for k, va in enumerate(NC.BUTTON_STORES)
     ]
+
+
+# BUILD 870: x86 0x6C10EE, proven dead in the module (no ARM caller, no
+# function-pointer word) and in ff7_en (no call, jump or address word). No
+# other pass names it or anything near it -- grep for 0x6C0/0x6C1 before
+# giving it to anything else. Its ARM body is 2,384 bytes; the cave needs 684.
+SCREEN_STICK_DEAD_X86 = 0x6C10EE
+DEAD_CAVE_GUARD = 0x40          # never at the entry (see ff7nx_deadspace), and
+DEAD_CAVE_TAIL = 0x40           # clear of the epilogue, as ps3tweaks does
+
+# The exe the build is patching, set by main() before patch_nso runs, so the
+# dead-body proof checks the ff7_en that actually ships.
+_DEAD_PROOF_EXE = None
+
+
+def _dead_body_region(nso_path, x86, text):
+    """(lo, hi) inside x86 `x86`'s ARM body, proven dead and still stock."""
+    import nxmap
+    import ff7nx_fieldbg
+    import ff7nx_fxinterp
+    m = nxmap.Main(nso_path)
+    why = ff7nx_fieldbg._liveness(m, x86)
+    if not why:
+        exe = _DEAD_PROOF_EXE
+        if exe is None:
+            import nxpaths
+            path = os.path.join(nxpaths.ROOT, 'dump', 'romfs', 'ff7',
+                                'resources', 'ff7_1.02', 'ff7_en')
+            with open(path, 'rb') as handle:
+                exe = handle.read()
+        why = ff7nx_fxinterp._x86_unreferenced(exe, x86)
+    if why:
+        raise ValueError('x86 0x%X is not dead: %s' % (x86, why))
+    lo, hi = m.extent(x86)
+    lo = (lo + DEAD_CAVE_GUARD + 15) & ~15
+    hi = hi - DEAD_CAVE_TAIL
+    if bytes(text[lo:hi]) != m.text[lo:hi]:
+        raise ValueError('its body at +0x%X was already changed by another '
+                         'pass' % lo)
+    return lo, hi
+
+
+def _place_dead_body_cave(c, text, nso_path, build, log=print):
+    """Write cave `c` contiguously into its proven-dead body. Returns
+    (entry, {va: word}), or None (logged) if the body cannot take it."""
+    x86 = c['dead_x86']
+    try:
+        lo, hi = _dead_body_region(nso_path, x86, text)
+    except ValueError as exc:
+        log('  !!  %s: dead body refused (%s) -- using padding instead'
+            % (c['label'], exc))
+        return None
+    words = build(lo)
+    if lo + 4 * len(words) > hi:
+        log('  !!  %s: %d words do not fit the %d-word dead body at x86 0x%X '
+            '-- using padding instead'
+            % (c['label'], len(words), (hi - lo) // 4, x86))
+        return None
+    placed = {lo + 4 * i: w for i, w in enumerate(words)}
+    return lo, placed
 
 
 def _place_padding_caves(padded, text, raw, segs, nso_path, log=print):
@@ -3313,6 +3400,24 @@ def _place_padding_caves(padded, text, raw, segs, nso_path, log=print):
 
     for c in padded:
         hook = c['site']['hook']
+        if c.get('dead_x86') and c.get('build') is _AC.build_field_cave:
+            got = _place_dead_body_cave(
+                c, text, nso_path,
+                lambda cave, s=snap_va, t=atan_va, d=c.get('diag', False),
+                r=c.get('rot360', True), sc=c.get('screen', False):
+                _AC.build_field_cave(cave, s, t, None, d, r, sc), log)
+            if got is not None:
+                entry, placed = got
+                for va, w in placed.items():
+                    struct.pack_into('<I', text, va, w)
+                struct.pack_into('<I', text, hook, 0x14000000
+                                 | (((entry - hook) >> 2) & 0x3FFFFFF))
+                c['placed'] = placed
+                c['tables'] = (snap_va, atan_va)
+                log('  ok  +0x%06X  -> dead body x86 0x%X, entry 0x%06X '
+                    '(%3d words, no padding used)  %s'
+                    % (hook, c['dead_x86'], entry, len(placed), c['label']))
+                continue
         try:
             if c.get('place_body') is not None:
                 # A straight-line cave: body, then the instruction it
@@ -3325,8 +3430,10 @@ def _place_padding_caves(padded, text, raw, segs, nso_path, log=print):
             else:
                 if c['build'] is _AC.build_field_cave:
                     build = (lambda cave, addr=None, s=snap_va, t=atan_va,
-                             d=c.get('diag', False):
-                             _AC.build_field_cave(cave, s, t, addr, d))
+                             d=c.get('diag', False),
+                             r=c.get('rot360', True),
+                             sc=c.get('screen', False):
+                             _AC.build_field_cave(cave, s, t, addr, d, r, sc))
                 else:
                     build = c['build']
                 entry, placed = ff7nx_cave.emit_laid_out(pool, build)
@@ -4276,6 +4383,34 @@ EFFECT60_CAMERA = (('vincent_limit_satan_slam_camera_45CF2A', 0x45CF2A),)
 SATANCAM_ENV = 'SEVENTH_NX_FX_SATANCAM'
 
 
+def _analog_scratch_check(dispatch):
+    """BUILD 873: the 360 cave's scratch must not share a byte with any other
+    BSS user in the block: the throttle fields, INTERP_CUR, both camera
+    scratches. Before 873 it sat on INTERP_CUR."""
+    import ff7nx_analog as _AN
+    lo, hi = _AN.ANALOG_BASE, _AN.ANALOG_BASE + _AN.ANALOG_BYTES
+    taken = [('INTERP_CUR', INTERP_CUR, INTERP_CUR + 16)]
+    e100 = (DISPATCH_SITES.get('effect100') or {}).get('throttle')
+    if e100:
+        cam = (e100['model_next'] + 0x64 * 6 + 7) & ~7
+        taken.append(('effect100/effect60 camera scratch', cam, cam + 128))
+        taken.append(('effect100 model block', e100['ctr'], e100['model_next']
+                      + 0x64 * 6))
+    for site in DISPATCH_SITES.values():
+        thr = site.get('throttle') if isinstance(site, dict) else None
+        for k, v in (thr or {}).items():
+            if isinstance(v, int) and THROTTLE_BASE <= v < 0x3FED000:
+                taken.append((k, v, v + 8))
+    for name, a, b in taken:
+        if a < hi and lo < b:
+            raise SystemExit('ABORT  360 movement scratch +0x%X..+0x%X '
+                             'overlaps %s (+0x%X..+0x%X)'
+                             % (lo, hi, name, a, b))
+    if FLAG_BASE + _AN.ANALOG_GROW < hi:          # FLAG_BASE = stock BSS end
+        raise SystemExit('ABORT  ANALOG_GROW 0x%X does not cover the 360 '
+                         'movement scratch end +0x%X' % (_AN.ANALOG_GROW, hi))
+
+
 def _effect60_cam_scratch():
     """64 bytes right after effect100's camera scratch, inside the block."""
     e100 = DISPATCH_SITES['effect100']['throttle']
@@ -5105,6 +5240,7 @@ def patch_nso(data, patches, verify_only=False, log=print, extra=(),
             # build without this group keeps the bss growth it always had and
             # still reproduces its old md5 exactly.
             import ff7nx_analog as _AN
+            _analog_scratch_check(dispatch)
             _BSS_GROW = max(_BSS_GROW, _AN.ANALOG_GROW)
             log('      360 movement scratch at module +0x%X, bssSize grown '
                 'by 0x%X' % (_AN.ANALOG_BASE, _AN.ANALOG_GROW))
@@ -5979,6 +6115,8 @@ def main():
 
     exe = open(a.exe, 'rb').read()
     nso = open(a.nso, 'rb').read()
+    global _DEAD_PROOF_EXE
+    _DEAD_PROOF_EXE = exe
 
     print()
     # WHICH exe gets identified.

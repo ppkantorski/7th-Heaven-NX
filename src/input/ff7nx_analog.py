@@ -275,8 +275,19 @@ def offset(ix, iy, keymask):
 #     +0x00  w  the field_id the base was captured for
 #     +0x04  w  captured flag
 #     +0x08  w  base control direction (sign-extended), valid iff +0x04 != 0
-ANALOG_BASE = 0x3FEC4A8          # after THROTTLE_BASE (0x3FEC3C8) + 0xE0
-ANALOG_GROW = 0x1A0              # total bss growth when this group is on
+# BUILD 869 (screen-relative stick): +0x0C w  the camera's screen-up base,
+# valid with +0x08 (ff7nx_analog_cave.build_screen_cave)
+SCREEN_OFFSET = 128              # base = dir256(camera right) + this
+# BUILD 873: MOVED. It was 0x3FEC4A8 = THROTTLE_BASE + 0xE0, written when the
+# throttle block was 0xE0 bytes. The block has since grown to 0x7C0 and BUILD
+# 747 put ff7nx_fxinterp's 16-byte INTERP_CUR record at exactly 0x3FEC4A8, so
+# with 60 FPS and 360 movement both on, the field cave and the battle FX
+# interpolation each overwrote the other's scratch. It now takes the last
+# free bytes of the throttle block's reservation, after effect60's camera
+# scratch (which ends at +0x3FECB68); ff7nx_60fps checks the gap at build time.
+ANALOG_BASE = 0x3FECB68
+ANALOG_BYTES = 0x10              # +0x00..+0x0C, one word each
+ANALOG_GROW = 0x860              # bss growth covering ANALOG_BASE + 0x20
 
 FIELD_HOOK = 0x947CF0
 FIELD_ORIG = 0x29422728          # ldp w8, w9, [x25, #0x10]

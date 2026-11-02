@@ -94,11 +94,22 @@ typedef struct {
     float dm[9];
 } Part;
 
+/* BUILD 876: each lit vertex's unlit colour and its last lit result, keyed
+ * by the guest address the result is written to (8,192 slots) */
+#define LT_VC 8192
+typedef struct {
+    u32 out;        /* key: where the lit colour goes (guest), 0 = empty */
+    u32 last;       /* what we wrote there last, B | G << 8 | R << 16 */
+    u32 base;       /* the unlit colour it was lit from, the same way */
+} Vc;
+
 typedef struct {
     Lt hdr;
     Rec rec[LT_SLOTS];
     Part part[LT_PARTS];
+    Vc vc[LT_VC];
 } LtAll;
+
 
 /* the set's slot among 4 probed from its hash (10 bits: 1024 slots): its
  * own, else (bind) an empty one, else the first; NULL on lookup if none */
@@ -140,6 +151,123 @@ static inline __attribute__((always_inline)) float K(u32 bits)
 }
 
 static inline __attribute__((always_inline)) float sat2(float d) { return d > 0.0f ? d * d : 0.0f; }
+
+/* BUILD 876p (DIAGNOSTIC, -DLT_PROBE only; tools/probes/lightprobe.py):
+ * gaia's flicker. Per polygon set the field relights (0x64CA65/0x64C382):
+ * how its relight found its light (own part record, the light's last
+ * setup, or the stock path) and how much its first lit vertex changes
+ * from one relight to the next. The probe's state follows LtAll in BSS.
+ * Armed by a first L3 click, dumped (svcBreak) by a second one. */
+#ifdef LT_PROBE
+#define PR_N 42
+typedef struct {
+    u32 ps;
+    u8 hit, nopart, mism, bits;     /* bits 0-5: vtx own/slot/stock, mv own/slot/stock; 6-7 light */
+    u8 big, small, maxd, seen;      /* first-vertex change per relight: >= 12, 1..11, largest */
+    u8 r, g, b, first;
+} PE;
+typedef struct {
+    u32 c[16];
+    u32 lights[4];
+    u32 armed, prev;
+    u32 stale;                      /* this relight's part had no record of its own */
+    PE *cur;
+    PE e[PR_N];
+    /* 876p2: the last 32 relights of the first part relit after arming */
+    u32 head, open;
+    u8 ev[32][16];
+} Probe;
+#define PR(s) ((Probe *)((LtAll *)(s) + 1))
+static __attribute__((noinline, section(".text.lt"))) u32 pr_sat(u32 x) { return x < 255 ? x + 1 : 255; }
+static __attribute__((noinline, section(".text.lt"))) PE *pr_find(Probe *pr, u32 ps, u32 light)
+{
+    u32 i, li;
+    for (i = 0; i < PR_N; i++)
+        if (pr->e[i].ps == ps)
+            return &pr->e[i];
+    for (li = 0; li < 4; li++) {
+        if (pr->lights[li] == light)
+            break;
+        if (!pr->lights[li]) {
+            pr->lights[li] = light;
+            break;
+        }
+    }
+    if (li > 3)
+        li = 3;
+    for (i = 0; i < PR_N; i++)
+        if (!pr->e[i].ps) {
+            pr->e[i].ps = ps;
+            pr->e[i].bits = (u8)(li << 6);
+            return &pr->e[i];
+        }
+    pr->c[15]++;
+    return 0;
+}
+static __attribute__((noinline, section(".text.lt"))) u32 pr_f2b(float f)
+{
+    f = f * K(0x43000000u);             /* x128: intensity 1.0 = 128 */
+    return f < 0.0f ? 0 : f >= K(0x437F0000u) ? 255 : (u32)(int)f;
+}
+/* 876p2: the open event's inputs: the matrix's ambient column, vertex colour */
+static __attribute__((noinline, section(".text.lt"))) void pr_in(Lt *s, const float *M, const float *V)
+{
+    Probe *pr = PR(s);
+    u8 *v;
+    if (!pr->armed || !pr->open || pr->cur != &pr->e[0] || !pr->cur->first)
+        return;
+    v = pr->ev[(pr->head - 1) & 31];
+    v[4] = (u8)pr_f2b(M[3]); v[5] = (u8)pr_f2b(M[7]); v[6] = (u8)pr_f2b(M[11]);
+    v[11] = V ? (u8)pr_f2b(V[2] * K(0x3C000000u)) : 0xEE;   /* /128 then x128: V's red as a byte */
+}
+/* path 0..5 as bits above; r g b the first output of the part's relight */
+static __attribute__((noinline, section(".text.lt"))) void pr_out(Lt *s, u32 path, u32 r, u32 g, u32 b)
+{
+    Probe *pr = PR(s);
+    PE *e = pr->cur;
+    u32 d, t;
+    if (!pr->armed)
+        return;
+    if (pr->stale && (path == 0 || path == 3))
+        path++;                         /* "own" cache, but another part's */
+    if (path == 2) pr->c[13]++;
+    else if (path < 2) pr->c[11 + path]++;
+    else if (path == 5) pr->c[14] += 0x10000;
+    else pr->c[14]++;
+    if (!e)
+        return;
+    e->bits |= (u8)(1u << path);
+    if (!e->first)
+        return;
+    if (pr->open && e == &pr->e[0]) {
+        u8 *v = pr->ev[(pr->head - 1) & 31];
+        v[0] |= (u8)(path << 4);
+        v[1] = (u8)r; v[2] = (u8)g; v[3] = (u8)b;
+        pr->open = 0;
+    }
+    e->first = 0;
+    if (e->seen) {
+        d = r > e->r ? r - e->r : e->r - r;
+        t = g > e->g ? g - e->g : e->g - g; if (t > d) d = t;
+        t = b > e->b ? b - e->b : e->b - b; if (t > d) d = t;
+        if (d >= 12) e->big = (u8)pr_sat(e->big);
+        else if (d) e->small = (u8)pr_sat(e->small);
+        if (d > e->maxd) e->maxd = (u8)d;
+    }
+    e->seen = 1;
+    e->r = (u8)r; e->g = (u8)g; e->b = (u8)b;
+}
+static __attribute__((noinline, section(".text.lt"))) u32 pr_hash(const float *f, u32 n)
+{
+    u32 h = 0, i;
+    for (i = 0; i < n; i++)
+        h = (h << 5 | h >> 27) ^ ((const u32 *)f)[i];
+    return h ^ h >> 16;
+}
+#define PR_SETUP(s) do { Probe *pr_ = PR(s); if (pr_->armed) pr_->c[2]++; pr_->cur = 0; pr_->stale = 0; } while (0)
+#else
+#define PR_SETUP(s) do { } while (0)
+#endif
 
 static __attribute__((noinline, section(".text.lt"))) void intens(const Lt *s, const float *M, const float *n, float *I)
 {
@@ -195,6 +323,7 @@ void lt_setup(Lt *s, u32 esp, g2h_t g2h)
     Rec *r;
     const float *D, *B, *C;
     int i, c;
+    PR_SETUP(s);
     s->m = 0;
     a1 = *(u32 *)g2h(esp + 4);
     bone = *(u32 *)g2h(esp + 8);
@@ -231,31 +360,74 @@ void lt_setup(Lt *s, u32 esp, g2h_t g2h)
     r->fresh = 1;
 }
 
+/* BUILD 876: gaia's flicker (hardware probes 876p/876p2, gaia_1, Cloud
+ * standing still). The field's relight, 0x64CA65, lights each vertex IN
+ * PLACE: it reads the vertex's colour (record +0x10, through 0x69BF90 into
+ * the float vcolour), and 0x68DD1E writes the lit colour back to the same
+ * +0x10. Cloud was relit twice a frame with the same light, ambient and
+ * bone; one pass started from his real colour (255 -> 214), the other from
+ * the colour the pass before had already lit (214 -> 180), and the frame
+ * showed whichever ran last: arms, hair, shoulders jumped 12-64 levels.
+ * FFNx never shows it (its shader lights the unlit colour at draw time).
+ * Now every lit vertex remembers its unlit colour and the colour we wrote:
+ * an input that is exactly our last output is lit from the remembered
+ * colour instead, so lighting a vertex twice gives the same result as once.
+ * Any other input is a new unlit colour (the game reloaded or changed it). */
 /* in place of the native +0x10F23C0(M, normal, vcolour floats, alpha src,
  * out bytes) -- same arguments, same result, FFNx's intensity */
 __attribute__((section(".text.lt")))
 u32 lt_vtx(u32 m, u32 n, u32 vc, u32 al, u32 out, Lt *s, g2h_t g2h, orig5_t orig)
 {
-    float I[3], p;
+    float I[3], B[3], p;
     const float *M, *N, *V;
     u8 *O;
+    u32 in;
+    Vc *e;
     int ch;
+#ifdef LT_PROBE
+    u32 own = m && m == s->m;
+    if (m && vc)
+        pr_in(s, (const float *)g2h(m), (const float *)g2h(vc));
+    if (!n || !vc || !al || !out || !have(s, m, g2h)) {
+        u32 r = orig(m, n, vc, al, out);
+        if (out) {
+            O = (u8 *)g2h(out);
+            pr_out(s, 2, O[2], O[1], O[0]);
+        }
+        return r;
+    }
+#else
     if (!n || !vc || !al || !out || !have(s, m, g2h)) {
             return orig(m, n, vc, al, out);
     }
+#endif
     M = (const float *)g2h(m);
     N = (const float *)g2h(n);
     V = (const float *)g2h(vc);
     intens(s, M, N, I);
     O = (u8 *)g2h(out);
+    e = &((LtAll *)s)->vc[((out >> 2) * 2654435761u) >> 19];   /* 13 bits */
+    in = 0;
+    for (ch = 0; ch < 3; ch++)          /* the colour as 0x69BF90 read it: byte k -> V[k] */
+        in |= (u32)(u8)(int)V[ch] << (8 * ch);
+    if (e->out != out || in != e->last) {
+        e->out = out;                   /* a new unlit colour */
+        e->base = in;
+    }
+    for (ch = 0; ch < 3; ch++)
+        B[ch] = (float)((e->base >> (8 * ch)) & 0xFF);
     for (ch = 0; ch < 3; ch++) {        /* row 0 (R) -> byte 2 and vcolour +8, ... */
-        p = V[2 - ch] * I[ch];
+        p = B[2 - ch] * I[ch];
         if (!(p < K(0x437F0000u)))          /* 255.0 */
             O[2 - ch] = 0xFF;
         else
             O[2 - ch] = (u8)(int)p;
     }
     O[3] = *((u8 *)g2h(al) + 3);
+    e->last = O[0] | (u32)O[1] << 8 | (u32)O[2] << 16;
+#ifdef LT_PROBE
+    pr_out(s, own ? 0 : 1, O[2], O[1], O[0]);
+#endif
     return out;
 }
 
@@ -294,13 +466,29 @@ void lt_mvfix(Lt *s, u32 esp, g2h_t g2h)
     m = *(u32 *)g2h(esp + 4);
     n = *(u32 *)g2h(esp + 8);
     out = *(u32 *)g2h(esp + 12);
+#ifdef LT_PROBE
+    u32 own = m && m == s->m;
+    if (m)
+        pr_in(s, (const float *)g2h(m), 0);
+    if (!n || !out || wm_terrain(esp, n, g2h) || !have(s, m, g2h)) {
+        if (out && n) {
+            O = (float *)g2h(out);
+            pr_out(s, 5, pr_f2b(O[0]), pr_f2b(O[1]), pr_f2b(O[2]));
+        }
+        return;
+    }
+#else
     if (!n || !out || wm_terrain(esp, n, g2h) || !have(s, m, g2h))
         return;
+#endif
     intens(s, (const float *)g2h(m), (const float *)g2h(n), I);
     O = (float *)g2h(out);
     O[0] = I[0];
     O[1] = I[1];
     O[2] = I[2];
+#ifdef LT_PROBE
+    pr_out(s, own ? 3 : 4, pr_f2b(I[0]), pr_f2b(I[1]), pr_f2b(I[2]));
+#endif
 }
 
 /* 679: at the entry of 0x68E92D (kind 0) or of 0x64CA65 / 0x64C382 (kind
@@ -316,12 +504,31 @@ void lt_entry(Lt *s, u32 esp, g2h_t g2h, u32 kind)
     int i, c;
     ps = *(u32 *)g2h(esp + 4);
     light = *(u32 *)g2h(esp + 8);
+#ifdef LT_PROBE
+    Probe *pr = PR(s);
+    PE *e = 0;
+    pr->cur = 0;
+    pr->stale = 0;
+    if (pr->armed) {
+        pr->c[kind ? 7 : 3]++;
+        if (kind && ps && light) {
+            e = pr_find(pr, ps, light);
+            pr->cur = e;
+            if (e)
+                e->first = 1;
+        }
+    }
+#endif
     if (!ps || !light)
         return;
     key = light + LT_F8;
     p = pslot(s, ps, kind == 0);
     if (kind == 0) {
         r = slot(s, key);
+#ifdef LT_PROBE
+        if (pr->armed)
+            pr->c[r->m != key ? 5 : !r->fresh ? 6 : 4]++;
+#endif
         if (r->m != key || !r->fresh)
             return;
         r->fresh = 0;
@@ -331,8 +538,29 @@ void lt_entry(Lt *s, u32 esp, g2h_t g2h, u32 kind)
             p->dm[i] = r->dm[i];
         return;
     }
-    if (!p || p->light != light)
+#ifdef LT_PROBE
+    if (pr->armed) {
+        pr->c[!p ? 9 : p->light != light ? 10 : 8]++;
+        pr->stale = !p || p->light != light;
+        if (e) {
+            if (!p) e->nopart = (u8)pr_sat(e->nopart);
+            else if (p->light != light) e->mism = (u8)pr_sat(e->mism);
+            else e->hit = (u8)pr_sat(e->hit);
+        }
+    }
+#endif
+    if (!p || p->light != light) {
+#ifdef LT_PROBE
+        if (pr->armed && e == &pr->e[0]) {
+            u8 *v = pr->ev[pr->head & 31];
+            pr->head++;
+            pr->open = 1;
+            v[0] = (u8)(kind | 8);
+            v[7] = (u8)pr->c[1];
+        }
+#endif
         return;
+    }
     C = (const float *)g2h(light + LT_C);
     for (i = 0; i < 9; i++)
         s->dm[i] = p->dm[i];
@@ -341,4 +569,95 @@ void lt_entry(Lt *s, u32 esp, g2h_t g2h, u32 kind)
             s->c[3 * i + c] = C[4 * i + c];
     s->light = light;
     s->m = (*(const u32 *)g2h(light + LT_FLAGS) & 3) == 1 ? key : 0;
+#ifdef LT_PROBE
+    if (pr->armed && e == &pr->e[0]) {
+        u8 *v = pr->ev[pr->head & 31];
+        u32 h = pr_hash(s->dm, 9), ch;
+        pr->head++;
+        pr->open = 1;
+        v[0] = (u8)kind;
+        v[7] = (u8)pr->c[1];
+        for (ch = 0; ch < 3; ch++)
+            v[8 + ch] = (u8)pr_f2b((s->c[3 * ch] + s->c[3 * ch + 1] + s->c[3 * ch + 2]) * K(0x3F000000u));
+        v[12] = (u8)h; v[13] = (u8)(h >> 8);
+        h = pr_hash(s->c, 9);
+        v[14] = (u8)h; v[15] = (u8)(h >> 8);
+    }
+#endif
 }
+
+#ifdef LT_PROBE
+/* the flip hook (every presented frame): L3 clicked once arms the probe
+ * (clears it, counts from here), clicked again a second or more later dumps
+ * it into the crash report and stops the game (svcBreak).
+ *   x0..x7 (16 words): c[0..15]; x29, x30: the first four lights
+ *   TLS dump (256): e[0..20], stack dump (256): e[21..41], 12 bytes each:
+ *   ps; hit nopart mism bits; big small maxd seen */
+#define BTN_L3 (1ull << 4)
+static __attribute__((noinline, section(".text.lt"))) u8 *input_obj(u8 **got)
+{
+    u8 *p;
+    if (!got || !(p = *got)) return 0;
+    if (!(p = *(u8 **)(void *)(p + 0))) return 0;
+    if (!(p = *(u8 **)(void *)(p + 8))) return 0;
+    if (!(p = *(u8 **)(void *)(p + 0))) return 0;
+    return *(u8 **)(void *)(p + 0x88);
+}
+
+static __attribute__((noinline, noreturn, section(".text.lt"))) void pr_dump(Probe *pr)
+{
+    unsigned long long regs[10];
+    u32 out[64];
+    u32 *tls, *w;
+    u32 i;
+    __asm__ volatile("mrs %0, tpidrro_el0" : "=r"(tls));
+    for (i = 0; i < 64; i++) { tls[i] = 0; out[i] = 0; }
+    for (i = 0; i < 32; i++) {          /* oldest first */
+        const u32 *v = (const u32 *)(void *)pr->ev[(pr->head + i) & 31];
+        w = (i < 16 ? tls : out) + 4 * (i & 15);
+        w[0] = v[0]; w[1] = v[1]; w[2] = v[2]; w[3] = v[3];
+    }
+    pr->c[0] = 0x3250544Cu;             /* 'LTP2' */
+    for (i = 0; i < 8; i++)
+        regs[i] = pr->c[2 * i] | (unsigned long long)pr->c[2 * i + 1] << 32;
+    regs[8] = pr->lights[0] | (unsigned long long)pr->lights[1] << 32;
+    regs[9] = pr->e[0].ps | (unsigned long long)pr->head << 32;
+    __asm__ volatile(
+        "mov x16, %0\n"
+        "mov x17, %1\n"
+        "ldp x0, x1, [x16, #0]\n"
+        "ldp x2, x3, [x16, #16]\n"
+        "ldp x4, x5, [x16, #32]\n"
+        "ldp x6, x7, [x16, #48]\n"
+        "ldp x29, x30, [x16, #64]\n"
+        "mov sp, x17\n"
+        "svc #0x26\n"
+        "udf #0\n"
+        : : "r"(regs), "r"(out) : "memory");
+    __builtin_unreachable();
+}
+
+__attribute__((section(".text.lt")))
+void lp_frame(Lt *s, u8 **got)
+{
+    Probe *pr = PR(s);
+    u8 *p = input_obj(got);
+    u32 down = p && (*(unsigned long long *)(void *)(p + 0x20) & BTN_L3);
+    u32 edge = down && !pr->prev;
+    u32 i, *z;
+    pr->prev = down;
+    if (pr->armed)
+        pr->c[1]++;
+    if (!edge)
+        return;
+    if (pr->armed && pr->c[1] >= 60)
+        pr_dump(pr);
+    if (pr->armed)
+        return;
+    z = (u32 *)pr;
+    for (i = 0; i < sizeof(Probe) / 4; i++)
+        z[i] = 0;
+    pr->prev = 1;
+    pr->armed = 1;
+}
+#endif

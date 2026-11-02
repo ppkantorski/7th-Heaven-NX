@@ -398,3 +398,205 @@ FNS[0x71aaa3]['pokes'] = FNS[0x71aaa3]['pokes'] + [
     {0x92565c: s, 0xdc130c: 0, 0xdd4734: 1, 0xdd4724: 0, 0xdd6bb0: 0, 0xdd6b94: 0, 0xdd6ba4: 0,
      0xdd6b84: r, 0xdd6bbc: r, 0xdd6bf4: r, 0xdd6b48: r % 3, 0xdd6c98: r % 4, 0xdd4710: 0x925660}
     for s in (0, 1, 2, 3, 6) for r in (0, 2, 4, 6)]
+
+# ---------------------------------------------------------------- BUILD 877 every battle option
+# The battle cursor's hand edits were written with one layout's numbers (Battle View
+# v2, names, transparent boxes): every other battle option left the whole battle
+# screen stock. They now read their numbers from THIS variant's x86 (NEW_FULL), and
+# its two ESUI caves are translated from the variant's own cave code.
+def _xnew(va):
+    import esui_port as _P
+    o = _ep.va_to_offset(_PE, va)
+    return next(_cs.Cs(_cs.CS_ARCH_X86, _cs.CS_MODE_32).disasm(bytes(_P.NEW_FULL[o:o + 16]), va))
+
+
+def _ximm(va):
+    """the instruction's last operand as an int (an immediate or a signed displacement)."""
+    i = _xnew(va)
+    s = i.op_str.replace(' ', '')
+    m = _re.search(r'([+-])0x([0-9a-f]+)\]$', s) or _re.search(r'([+-])(\d+)\]$', s)
+    if m:
+        v = int(m.group(2), 16 if '0x' in s[m.start():] else 10)
+        return -v if m.group(1) == '-' else v
+    t = s.split(',')[-1]
+    return int(t, 16) if t.startswith('0x') else int(t)
+
+
+def _xcave(start):
+    """[(va, mnemonic, op_str)] of an ESUI cave in this variant, up to its ret."""
+    import esui_port as _P
+    md = _cs.Cs(_cs.CS_ARCH_X86, _cs.CS_MODE_32)
+    o = _ep.va_to_offset(_PE, start)
+    out = []
+    for i in md.disasm(bytes(_P.NEW_FULL[o:o + 0x200]), start):
+        out.append((i.address, i.mnemonic, i.op_str))
+        if i.mnemonic == 'ret':
+            break
+    return out
+
+
+def _cave_ops(start, skip_first=True):
+    """a straight-line ESUI cave as hook ops: byte/word/dword stores of constants and
+    dword copies through ecx. The cave's first store ([edx + 4]) is the displaced
+    instruction, carried by store_const."""
+    ops, held = [], None
+    cave = _xcave(start)
+    tail = min((va for va, mn, _op in cave if mn in ('pop', 'ret')
+                and all(m2 in ('pop', 'ret') for a2, m2, _o in cave if a2 >= va)), default=None)
+    vals, cmp_at = [], None
+    for va, mn, op in cave:
+        if mn in ('push', 'pop', 'ret', 'nop'):
+            continue
+        # `cmp byte [m], a ; je L ; cmp byte [m], b ; jne <tail>` -> the rest runs only for a or b
+        m = _re.match(r'byte ptr \[(0x[0-9a-f]+)\], (0x[0-9a-f]+|\d+)$', op)
+        if mn == 'cmp' and m:
+            if cmp_at not in (None, int(m.group(1), 16)):
+                raise ValueError('cave %X: two compared bytes' % va)
+            cmp_at = int(m.group(1), 16)
+            vals.append(int(m.group(2), 0))
+            continue
+        if mn == 'je' and cmp_at is not None:
+            continue
+        if mn == 'jne' and cmp_at is not None and int(op, 16) == tail:
+            ops.append(('skip_unless8', cmp_at, tuple(vals)))
+            continue
+        if mn == 'mov' and skip_first and not ops and held is None and op.startswith(('word ptr [edx', 'dword ptr [edx')):
+            continue                                  # the displaced store (arm_struct / store_const carry it)
+        m = _re.match(r'(byte|word|dword) ptr \[(0x[0-9a-f]+)\], (0x[0-9a-f]+|\d+)$', op)
+        if mn == 'mov' and m:
+            ops.append(({'byte': 'st8', 'word': 'st16', 'dword': 'st32'}[m.group(1)],
+                        int(m.group(2), 16), int(m.group(3), 0)))
+            continue
+        m = _re.match(r'ecx, dword ptr \[(0x[0-9a-f]+)\]$', op)
+        if mn == 'mov' and m:
+            held = int(m.group(1), 16)
+            continue
+        m = _re.match(r'dword ptr \[(0x[0-9a-f]+)\], ecx$', op)
+        if mn == 'mov' and m and held is not None:
+            ops.append(('cp32', held, int(m.group(1), 16)))
+            continue
+        if mn == 'mov' and skip_first and not ops and _re.match(r'(word|dword) ptr \[edx \+ 0x[0-9a-f]+\]|dword ptr \[edx \+ 4\]', op):
+            continue                                  # the displaced store
+        raise ValueError('cave %X: %s %s not translated' % (va, mn, op))
+    return ops
+
+
+def _tables_ops(start):
+    """ESUI's cursor-table caves (0x914529 and its smaller forms): the [91C3DB] part is
+    always there; the second part writes [91C6D3] and/or [91C63B]."""
+    cave = _xcave(start)
+    second = [int(m, 16) for _va, mn, op in cave if mn == 'mov'
+              for m in _re.findall(r'byte ptr \[(0x[0-9a-f]+)\], dl', op) if int(m, 16) != 0x91c3db]
+    return [('cursor_tables', tuple(second))]
+
+
+def _cursor_variant():
+    c = FNS[0x6cf5c5]
+    s = c['arm_struct']
+    s[0xd1b23c] = A.movz(9, _ximm(0x6cf90c))            # imul eax, eax, N (row step)
+    s[0xd1b400] = A.movz(9, _ximm(0x6cf79a))            # imul eax, eax, N (column step)
+    s[0xd1b45c] = A.sub_imm(24, 8, -_ximm(0x6cf7ba))    # lea ecx, [ecx + eax - N]
+    s[0xd1b51c] = A.movz(8, _ximm(0x6cf955) & 0xffff)   # mov word [0xdc3c68], N
+    s[0xd1b680] = A.sub_imm(23, 8, _ximm(0x6cf875))     # sub eax, N
+    s[0xd1b714] = A.movz(8, _ximm(0x6cf8b6) & 0xffff)   # mov word [0xdc3c68], N
+    rep = [r for r in c['replace'] if r[0] != 0xd1b5dc]
+    if _xnew(0x6cf9ac).mnemonic == 'imul':              # x = v * N - M (stock: v ? 0xf0 : 0)
+        m = _xnew(0x6cf9b2)
+        sub = [A.sub_imm(23, 23, _ximm(0x6cf9b2))] if m.mnemonic == 'sub' else []
+        rep.append((0xd1b5dc, [A.movz(9, _ximm(0x6cf9ac)), A.mul(23, 8, 9)] + sub + [A.cmp_imm(8, 0)]))
+    else:
+        s.pop(0xd1b5ec, None)                           # the stock csel stays: x = v ? 0xf0 : 0
+    c['replace'] = rep
+    hooks, native = [], []
+    a = _xnew(0x6cf6c6)
+    if a.mnemonic == 'call':
+        t = int(a.op_str, 16)
+        hooks.append((0xd1ac2c, _cave_ops(t)))
+        native.append((t, _xcave(t)[-1][0] + 1))
+    b = _xnew(0x6cf756)
+    if b.mnemonic == 'call':
+        t = int(b.op_str, 16)
+        hooks.append((0xd1ae44, _tables_ops(t)))
+        native.append((t, _xcave(t)[-1][0] + 1))
+    c['hooks'] = hooks
+    c['native_extra'] = native
+
+
+def _guard(f, fns):
+    try:
+        f()
+    except Exception as e:                          # only these functions' variants fail
+        for fn in fns:
+            FNS[fn]['broken'] = repr(e)
+
+
+_guard(_cursor_variant, (0x6cf5c5,))
+
+
+def _others_variant():
+    # battle text start (5BCF9D): ESUI either calls a cave or stores 0 directly
+    c = FNS[0x5bcf9d]
+    a = _xnew(0x5bcfd0)
+    if a.mnemonic == 'call':
+        t = int(a.op_str, 16)
+        c['hooks'] = [(0x7cba98, _cave_ops(t))]
+        c['native_extra'] = [(t, _xcave(t)[-1][0] + 1)]
+    else:
+        c['hooks'] = []
+        c['native_extra'] = []
+        c['arm_struct'] = {0x7cba94: A.movz(8, _ximm(0x5bcfd0) & 0xffff)}
+    # defend/change box (6D0AF9): each nop of ESUI's has its own ARM store
+    c = FNS[0x6d0af9]
+    c['gate'] = {0xd20468: (0x6d0b2d, 4), 0xd204b8: (0x6d0b45, 5)}
+    # viewing area y (6DAC2D): ESUI's `add ecx, N` over the rounding -> (h - 2N) >> 1
+    c = FNS[0x6dac2d]
+    i = _xnew(0x6daed2)
+    if i.mnemonic == 'add':
+        c['arm_struct'] = {0xd6b654: A.sub_imm(8, 8, 2 * _ximm(0x6daed2))}
+    else:
+        c['arm_struct'] = {}
+        c['struct_x86'] = []
+
+
+_guard(_others_variant, (0x5bcf9d, 0x6d0af9, 0x6dac2d))
+
+
+# BUILD 878: Expanded Icons OFF (ESUI's default). The icon sets force 6E1308's
+# sub-view switch to the status case; without them the barrier (case 0) and
+# m.barrier (case 1) rows run too. ARM shares one register per row x between the
+# two 6F9739 calls and the 6F638C struct, and one `mov w8, #0x19e` between the
+# two bottom labels -- ESUI's x differs by a pixel between those uses, so no
+# single add fits. Each is set from this variant's HEXT.
+def _icons_off_variant():
+    c = FNS[0x6e1308]
+    if _xnew(0x6e1412).mnemonic != 'cmp':          # an icon set: the status case only
+        return
+    s = c['arm_struct']
+    rep = list(c['replace'])
+    x0, sx0 = _ximm(0x6e1491), _ximm(0x6e1547)     # case 0: call x (both calls), struct x
+    x0b = _ximm(0x6e14c6)
+    x1, sx1 = _ximm(0x6e1630), _ximm(0x6e16e6)     # case 1
+    x1b = _ximm(0x6e1665)
+    assert x0 == x0b and x1 == x1b, 'per-call x differs within a case'
+    s[0xd47620] = A.movz(24, x0 & 0xffff)                        # mov w24, #x (case 0)
+    if sx0 != x0:
+        rep.append((0xd47870, [A.movz(9, sx0 & 0xffff), A.strh(9, 0)]))
+    s[0xd47a94] = A.movz(24, x1 & 0xffff)                        # case 1
+    if sx1 != x1:
+        rep.append((0xd47ce4, [A.movz(9, sx1 & 0xffff), A.strh(9, 0)]))
+    # bottom label x: case 0 / case 1 share D481E8; w25 = [DC2088] (0 or 1 here)
+    b0, b1 = _ximm(0x6e18d8), _ximm(0x6e18ff)
+    d = b0 - b1
+    sub = 0x4B000000 | (9 << 16) | (8 << 5) | 8                  # sub w8, w8, w9
+    rep.append((0xd481e8, [A.movz(8, b0 & 0xffff), A.movz(9, abs(d)),
+                           0x1B007C00 | (25 << 16) | (9 << 5) | 9,   # mul w9, w9, w25
+                           sub if d >= 0 else A.add_reg(8, 8, 9)]))
+    c['replace'] = rep
+    # both row states of each case ([9A8896] bit per row: status drawn or not)
+    c['pokes'] = c['pokes'] + [{0xdc2088: v, 0x9a8896: m} for v in (0, 1) for m in (0xffff, 0x5)]
+    c['struct_x86'] = c['struct_x86'] + [(0x6e1491, 5), (0x6e14c6, 5), (0x6e1547, 6),
+                                         (0x6e1630, 5), (0x6e1665, 5), (0x6e16e6, 6),
+                                         (0x6e18d8, 5), (0x6e18ff, 5)]
+
+
+_guard(_icons_off_variant, (0x6e1308,))

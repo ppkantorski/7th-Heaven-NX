@@ -46,7 +46,7 @@ HERE = nxpaths.ROOT
 
 # Shown in the header, nearest the title. Single source of truth --
 # anything else that needs it should import this rather than repeat it.
-VERSION = '1.0.5'
+VERSION = '1.0.6'
 sys.path.insert(0, HERE)
 
 import build  # noqa: E402
@@ -3325,6 +3325,7 @@ def launch_ui():
     fps_var = tk.BooleanVar(value=bool(global_saved.get('fps_60', False)))
     m30_var = tk.BooleanVar(value=bool(global_saved.get('movie_30fps', False)))
     a360_var = tk.BooleanVar(value=bool(global_saved.get('analog_360', False)))
+    # BUILD 869: Controls > Stick moves relative to the screen, on by default
     norun_var = tk.BooleanVar(value=bool(global_saved.get('no_autorun', False)))
     import ff7nx_texcache as _texcache
     _tc_saved = str(global_saved.get('texture_cache', _texcache.MODE))
@@ -3572,7 +3573,9 @@ def launch_ui():
         ('Controls', [
             ('check', '360° movement', a360_var, None,
              'Walk in the exact direction of the stick instead of eight '
-             'fixed directions.', True),
+             'fixed directions. On every field, up on the stick walks up the '
+             'screen and left walks left, even where the room is drawn at an '
+             'angle. The D-pad keeps the game\'s own directions.', True),
             ('check', 'Disable auto-run', norun_var, None,
              'Pushing the stick all the way no longer makes you run. Hold '
              'the run button instead.', True),
@@ -5804,6 +5807,19 @@ def launch_ui():
                 # BUILD 641: shown at the value the build applies
                 current = build.ff7nx_nitpick.locked_value(mod, opt.id, clb=_clb)
                 var.set(_opt_label(opt.label_for(current)))
+            # BUILD 877. ESUI battle options: only the values whose battle
+            # ports are verified. One value: greyed out at it; several: the
+            # dropdown lists only those.
+            _allowed = ff7nx_esui.allowed_values(mod, opt.id)
+            if _allowed is not None:
+                if current not in _allowed:
+                    current = _allowed[0]
+                    var.set(_opt_label(opt.label_for(current)))
+                    settings_by_mod.setdefault(mod.filename, {})[opt.id] = current
+                store[opt.id] = current
+                if len(_allowed) > 1:
+                    labels = [_opt_label(label) for v, label in opt.values
+                              if v in _allowed]
             # BUILD 864. PC x86 code options (PS3Tweaks): greyed out at their default,
             # which is what the build does with them (ff7nx_pccode).
             if not locked:

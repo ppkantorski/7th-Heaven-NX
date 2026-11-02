@@ -69,6 +69,10 @@ class Asm:
         self.fix.append((len(self.w), name, cond))
         self.w.append(0)
 
+    def bl(self, name):
+        self.fix.append((len(self.w), name, 'bl'))
+        self.w.append(0)
+
     def cbz(self, rt, name, wide=False):
         self.fix.append((len(self.w), name, ('cbz64' if wide else 'cbz', rt)))
         self.w.append(0)
@@ -79,6 +83,8 @@ class Asm:
             tgt = self.lab[name]
             if kind == 'b':
                 self.w[idx] = A.b(here, tgt)
+            elif kind == 'bl':
+                self.w[idx] = A.bl(here, tgt)
             elif isinstance(kind, tuple) and kind[0] == 'cbz':
                 self.w[idx] = A.cbz(kind[1], here, tgt)
             elif isinstance(kind, tuple) and kind[0] == 'cbz64':
@@ -116,7 +122,17 @@ COND_EQ, COND_NE, COND_GE, COND_LT, COND_LE = 0, 1, 10, 11, 13
 FRAME = 0x30
 
 
-def build_field_cave(cave, snap_va, atan_va, addr=None, diag=False):
+def build_field_cave(cave, snap_va, atan_va, addr=None, diag=False,
+                     rot360=True, screen=False):
+    """The field cave. `screen` (BUILD 869, Settings > Controls > "Stick
+    moves relative to the screen") selects the second form below; without it
+    the words are exactly the 360-only cave's, which hardware has tested."""
+    if screen and not diag:
+        return build_screen_cave(cave, snap_va, atan_va, addr, rot360)
+    return _build_field_cave_360(cave, snap_va, atan_va, addr, diag)
+
+
+def _build_field_cave_360(cave, snap_va, atan_va, addr=None, diag=False):
     """
     `snap_va` and `atan_va` are the module addresses of the two lookup tables.
     They live in .rodata, not in the cave: a chained cave is cut into two- and
@@ -279,4 +295,233 @@ def build_field_cave(cave, snap_va, atan_va, addr=None, diag=False):
     a.emit(A.ldp64_post(29, 30, SP, FRAME))
     a.emit(AN.FIELD_ORIG)
     a.emit(A.b(a.pc(), AN.FIELD_HOOK + 4))
+    return a.resolve()
+
+
+# ==========================================================================
+# BUILD 869: STICK MOVEMENT RELATIVE TO THE SCREEN
+# ==========================================================================
+# A field's control direction (triggers +9) decides which world direction the
+# eight input directions map to. Most fields set it so "up" goes up the
+# screen; angled fields often set it along a walkway instead, so pushing the
+# stick up walks diagonally on screen. With this on, while the STICK is what
+# is held (any half-axis past the port's 0.4 deadzone, the same threshold
+# that turned it into the direction keys), the base is the camera's: the
+# ground direction that is screen-up. The D-pad keeps the field's own value.
+#
+# The camera's screen-up on the ground, in the control direction's units:
+#
+#     base = dir256(vx.x, vx.y) + 128          (camera section +0, +2)
+#
+# vx is the camera's RIGHT axis (its z is 0 in every field: no roll), and the
+# + 128 was measured across all 711 fields of flevel.lgp: on 382 of them the
+# designers' own value is within 4 units of it, and on 160 of the 361 fields
+# whose camera is not axis-aligned within 8 (ff7nx_analog.SCREEN_OFFSET). The
+# rest are the angled fields this exists for.
+#
+# The camera section is found the way the game's own get_field_section
+# (0x6308CA) finds it: [0xCFF594] + [0xCFF570 + 4*1] + 4, in guest space. Its
+# offset in the file has any alignment (measured: 2/3/0/1 mod 4), so the four
+# bytes are read through four translator calls -- one page each, never a
+# pointer indexed across a page boundary. Computed once per field, with the
+# field's own value, and kept at scratch +0x0C.
+FRAME2 = 0x50
+STICK_ACTIVE = 1638                      # 0.4 in the cave's 1/4096 fixed point
+SECTIONS_GUEST = 0xCFF570                # get_field_section's offset table
+CAMERA_SECTION = 1
+
+
+def csel_(rd, rn, rm, cond):
+    return csel(rd, rn, rm, cond)
+
+
+def sxth(rd, rn):   return 0x13003C00 | (rn << 5) | rd
+def sxtb(rd, rn):   return 0x13001C00 | (rn << 5) | rd
+
+
+COND_GT = 12
+
+
+def _emit_dir(a):
+    """Subroutine `dir`: w10 = ix, w11 = iy -> w4 = 0..255 (ff7nx_analog.
+    dir256) and w5 = 1, or w5 = 0 for a zero vector. Uses x0..x9 only, makes
+    no calls, returns with `ret`."""
+    a.label('dir')
+    a.emit(A.asr(2, 10, 31))
+    a.emit(eor_reg(0, 10, 2))
+    a.emit(sub_reg(0, 0, 2))            # w0 = ax
+    a.emit(A.asr(3, 11, 31))
+    a.emit(eor_reg(1, 11, 3))
+    a.emit(sub_reg(1, 1, 3))            # w1 = ay
+    a.emit(orr_reg(5, 0, 1))
+    a.cbz(5, 'dir_ret')
+    a.emit(A.cmp_reg(0, 1))
+    a.emit(csel(6, 0, 1, COND_GE))      # hi
+    a.emit(csel(7, 1, 0, COND_GE))      # lo
+    a.emit(A.lsl(4, 7, 7))
+    a.emit(A.add_reg(4, 4, 6))
+    a.emit(A.lsl(5, 6, 1))
+    a.emit(sdiv(4, 4, 5))
+    a.emit(A.adrp(9, a.pc(), a.atan_va & ~0xFFF))
+    a.emit(A.add_imm64(9, 9, a.atan_va & 0xFFF))
+    a.emit(A.add_reg64(9, 9, 4))
+    a.emit(A.ldrb(4, 9, 0))
+    a.emit(A.movz(5, 64))
+    a.emit(sub_reg(5, 5, 4))
+    a.emit(csel(4, 4, 5, COND_GE))
+    a.emit(A.movz(5, 128))
+    a.emit(sub_reg(5, 5, 4))
+    a.emit(A.cmp_imm(10, 0))
+    a.emit(csel(4, 5, 4, COND_LT))
+    a.emit(sub_reg(5, WZR, 4))
+    a.emit(A.cmp_imm(11, 0))
+    a.emit(csel(4, 5, 4, COND_LT))
+    a.emit(A.and_mask(4, 4, 8))
+    a.emit(A.movz(5, 1))
+    a.label('dir_ret')
+    a.emit(A.ret())
+
+
+def build_screen_cave(cave, snap_va, atan_va, addr=None, rot360=True):
+    """The field cave with the screen-relative base (BUILD 869). `rot360`
+    adds the 360 degree offset exactly as the 360-only cave computes it, but
+    only while the stick is the input (a D-pad press is never rotated).
+
+    Callee-saved registers it keeps across the translator calls: x19
+    scratch, x20 &control_direction (host), x21 the camera bytes, x22 the
+    offset, x23 "the stick is held", x24 level / camera guest address, x28
+    the field id."""
+    a = Asm(cave, addr)
+    a.atan_va = atan_va
+    a.emit(A.stp64_pre(29, 30, SP, -FRAME2))
+    a.emit(0xA9000000 | ((16 // 8) << 15) | (20 << 10) | (SP << 5) | 19)
+    a.emit(0xA9000000 | ((32 // 8) << 15) | (22 << 10) | (SP << 5) | 21)
+    a.emit(0xA9000000 | ((48 // 8) << 15) | (24 << 10) | (SP << 5) | 23)
+    a.emit(A.str64(28, SP, 64))
+    a.emit(A.adrp(19, a.pc(), AN.ANALOG_BASE & ~0xFFF))
+    a.emit(A.add_imm64(19, 19, AN.ANALOG_BASE & 0xFFF))
+    # ---- the input object, exactly as the 360 cave resolves it ---------
+    a.emit(A.adrp(9, a.pc(), AN.INPUT_GOT & ~0xFFF))
+    a.emit(A.ldr64(9, 9, AN.INPUT_GOT & 0xFFF))
+    a.cbz(9, 'out', wide=True)
+    for off in AN.INPUT_CHAIN:
+        a.emit(A.ldr64(9, 9, off))
+        a.cbz(9, 'out', wide=True)
+    a.emit(ldr_s(0, 9, AN.OBJ_UP))
+    a.emit(ldr_s(1, 9, AN.OBJ_DOWN))
+    a.emit(ldr_s(2, 9, AN.OBJ_RIGHT))
+    a.emit(ldr_s(3, 9, AN.OBJ_LEFT))
+    a.emit(fsub_s(0, 0, 1))
+    a.emit(fsub_s(2, 2, 3))
+    a.emit(fcvtzs_fix(11, 0, 12))       # w11 = iy
+    a.emit(fcvtzs_fix(10, 2, 12))       # w10 = ix
+    # ---- w23 = the stick is held past the port's deadzone --------------
+    a.emit(A.asr(2, 10, 31))
+    a.emit(eor_reg(0, 10, 2))
+    a.emit(sub_reg(0, 0, 2))
+    a.emit(A.asr(3, 11, 31))
+    a.emit(eor_reg(1, 11, 3))
+    a.emit(sub_reg(1, 1, 3))
+    a.emit(A.cmp_reg(0, 1))
+    a.emit(csel(2, 0, 1, COND_GE))      # max(ax, ay)
+    a.emit(A.movz(3, 1))
+    a.emit(A.cmp_imm(2, STICK_ACTIVE))
+    a.emit(csel(23, 3, WZR, COND_GT))
+    a.emit(A.mov_reg(22, WZR))
+    if rot360:
+        a.cbz(23, 'write')
+        a.emit(A.adrp(9, a.pc(), AN.KEYBUF & ~0xFFF))
+        a.emit(A.add_imm64(9, 9, AN.KEYBUF & 0xFFF))
+        a.emit(A.ldrb(12, 9, AN.DIK_RIGHT))
+        a.emit(A.ldrb(14, 9, AN.DIK_UP))
+        a.emit(A.ldrb(15, 9, AN.DIK_LEFT))
+        a.emit(A.ldrb(16, 9, AN.DIK_DOWN))
+        for r in (12, 14, 15, 16):
+            a.emit(A.lsr(r, r, 7))
+        a.emit(add_shifted(12, 12, 14, 1))
+        a.emit(add_shifted(12, 12, 15, 2))
+        a.emit(add_shifted(12, 12, 16, 3))
+        a.emit(A.adrp(9, a.pc(), snap_va & ~0xFFF))
+        a.emit(A.add_imm64(9, 9, snap_va & 0xFFF))
+        a.emit(A.add_reg64(9, 9, 12))
+        a.emit(A.ldrb(13, 9, 0))
+        a.emit(A.cmp_imm(13, 0xFF))
+        a.bcond('write', COND_EQ)
+        a.bl('dir')
+        a.cbz(5, 'write')
+        a.emit(sub_reg(22, 4, 13))
+        a.emit(A.and_mask(22, 22, 8))
+        a.emit(A.cmp_imm(22, 128))
+        a.bcond('write', COND_LE)
+        a.emit(sub_imm(22, 22, 256))
+    # ---- the control direction byte ------------------------------------
+    a.label('write')
+    a.emit(A.movz(0, AN.FIELD_ID_GUEST & 0xFFFF))
+    a.emit(A.movk_hi(0, AN.FIELD_ID_GUEST >> 16))
+    a.emit(A.bl(a.pc(), AN.TRANSLATE))
+    a.emit(A.ldrh(28, 0, 0))                    # w28 = field_id
+    a.emit(A.movz(0, AN.LEVEL_PTR_GUEST & 0xFFFF))
+    a.emit(A.movk_hi(0, AN.LEVEL_PTR_GUEST >> 16))
+    a.emit(A.bl(a.pc(), AN.TRANSLATE))
+    a.emit(A.ldr(24, 0, 0))                     # w24 = level data (guest)
+    a.cbz(24, 'out')
+    a.emit(A.movz(0, AN.TRIGGERS_PTR_GUEST & 0xFFFF))
+    a.emit(A.movk_hi(0, AN.TRIGGERS_PTR_GUEST >> 16))
+    a.emit(A.bl(a.pc(), AN.TRANSLATE))
+    a.emit(A.ldr(0, 0, 0))
+    a.cbz(0, 'out')
+    a.emit(A.add_imm(0, 0, AN.CONTROL_DIR_OFF))
+    a.emit(A.bl(a.pc(), AN.TRANSLATE))
+    a.emit(A.mov_reg64(20, 0))                  # x20 = host &control_direction
+    a.emit(A.ldr(3, 19, 0))
+    a.emit(A.ldr(4, 19, 4))
+    a.cbz(4, 'capture')
+    a.emit(A.cmp_reg(28, 3))
+    a.bcond('have_base', COND_EQ)
+    a.label('capture')
+    a.emit(ldrsb_w(5, 20, 0))                   # the field's own value
+    a.emit(A.str_(5, 19, 8))
+    a.emit(A.str_(5, 19, 12))                   # camera base, until measured
+    a.emit(A.str_(28, 19, 0))
+    a.emit(A.movz(6, 1))
+    a.emit(A.str_(6, 19, 4))
+    # camera section = level + [0xCFF570 + 4] + 4, in guest space
+    va = SECTIONS_GUEST + 4 * CAMERA_SECTION
+    a.emit(A.movz(0, va & 0xFFFF))
+    a.emit(A.movk_hi(0, va >> 16))
+    a.emit(A.bl(a.pc(), AN.TRANSLATE))
+    a.emit(A.ldr(0, 0, 0))
+    a.emit(A.add_reg(24, 24, 0))
+    a.emit(A.add_imm(24, 24, 4))                # w24 = camera section (guest)
+    a.emit(A.mov_reg(21, WZR))
+    for k in range(4):                          # vx.x, vx.y: one page each
+        a.emit(A.add_imm(0, 24, k))
+        a.emit(A.bl(a.pc(), AN.TRANSLATE))
+        a.emit(A.ldrb(1, 0, 0))
+        if k:
+            a.emit(A.lsl(1, 1, 8 * k))
+        a.emit(orr_reg(21, 21, 1))
+    a.emit(sxth(10, 21))                        # ix = vx.x
+    a.emit(A.asr(11, 21, 16))                   # iy = vx.y
+    a.bl('dir')
+    a.cbz(5, 'have_base')                       # no camera: the field's own
+    a.emit(A.add_imm(4, 4, AN.SCREEN_OFFSET))
+    a.emit(sxtb(4, 4))
+    a.emit(A.str_(4, 19, 12))
+    a.label('have_base')
+    a.emit(A.ldr(5, 19, 8))                     # D-pad: the field's own
+    a.emit(A.ldr(6, 19, 12))                    # stick: the camera's
+    a.emit(A.cmp_imm(23, 0))
+    a.emit(csel(5, 6, 5, COND_NE))
+    a.emit(A.add_reg(5, 5, 22))
+    a.emit(A.strb(5, 20, 0))
+    a.label('out')
+    a.emit(0xA9400000 | ((16 // 8) << 15) | (20 << 10) | (SP << 5) | 19)
+    a.emit(0xA9400000 | ((32 // 8) << 15) | (22 << 10) | (SP << 5) | 21)
+    a.emit(0xA9400000 | ((48 // 8) << 15) | (24 << 10) | (SP << 5) | 23)
+    a.emit(A.ldr64(28, SP, 64))
+    a.emit(A.ldp64_post(29, 30, SP, FRAME2))
+    a.emit(AN.FIELD_ORIG)
+    a.emit(A.b(a.pc(), AN.FIELD_HOOK + 4))
+    _emit_dir(a)
     return a.resolve()

@@ -19,6 +19,8 @@ import esui_port as P, fns
 if os.environ.get('TRACK_STACK'): P.D.TRACK_STACK[0] = True
 fn = int(sys.argv[1], 16); h = sys.argv[2]
 cfg = P.cfg_for(fn)
+if cfg.get('broken'):
+    raise SystemExit('%x %s: config %s' % (fn, h, cfg['broken']))
 pokes = [None] + P.party_pokes() + cfg.get('pokes', []) + ([] if cfg.get('no_random') else P.random_pokes(fn, n=12, extra=cfg.get('poke_extra', ()))[1:])
 args = cfg.get('argsets', P.ARGSETS[:4])
 pairs, tgt, st = P.sample(fn, cfg, seeds=range(2), argsets=args, pokes=pokes)

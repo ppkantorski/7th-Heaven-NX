@@ -83,7 +83,7 @@ class CacheGC(unittest.TestCase):
         self.build()
         G.sweep(self.mods, False)
         self.assertTrue(self.exists('stale'))
-        self.assertTrue(self.exists('mov_old'))
+        self.assertFalse(self.exists('mov_old'))      # BUILD 875: replaced by mov_used
         self.assertFalse(os.path.exists(os.path.join(self.root, 'Gone')))
 
     def test_report_and_off_delete_nothing(self):
@@ -147,19 +147,20 @@ class CacheGC(unittest.TestCase):
     # ---- BUILD 848 ---------------------------------------------------
     def test_fieldlzs_is_swept_when_flevel_was_rebuilt(self):
         """Another archive kept no longer blocks _fieldlzs; movies (no
-        archive listed) keep the old all-archives rule."""
+        archive listed) keep the old all-archives rule, except for versions
+        a newer one replaced (BUILD 875)."""
         self.build()
         G.sweep(self.mods, {'battle.lgp'})
         self.assertTrue(self.exists('used'))
         self.assertFalse(self.exists('stale'))
-        self.assertTrue(self.exists('mov_old'))
+        self.assertFalse(self.exists('mov_old'))      # BUILD 875: replaced by mov_used
 
     def test_a_kept_flevel_keeps_fieldlzs(self):
         self.build()
         logs = []
         G.sweep(self.mods, {'flevel.lgp'}, logs.append)
         self.assertTrue(self.exists('stale'))
-        self.assertTrue(any('_fieldlzs' in l and 'not swept' in l
+        self.assertTrue(any('_fieldlzs' in l and 'not fully swept' in l
                             for l in logs))
 
     def test_spell_dds_follows_magic(self):
@@ -213,6 +214,51 @@ class CacheGC(unittest.TestCase):
         touch(os.path.join(self.root, 'Lone', G.COMPACT_MARK))
         G.sweep_orphans(self.mods)          # its .iro is gone: an orphan
         self.assertFalse(os.path.exists(os.path.join(self.root, 'Lone')))
+
+    # ---- BUILD 875 ---------------------------------------------------
+    def test_held_directories_lose_replaced_versions_only(self):
+        """A kept archive no longer keeps an old generation forever: an
+        unused entry goes when this build used another version of the same
+        thing. Entries for things this build never reached stay, so no
+        later rebuild has to re-make them."""
+        tc = lambda n: os.path.join(self.root, '_texconv', n)
+        files = {
+            'tc_new': tc('battle.lgp.qjaf.' + 'a' * 16),
+            'tc_old': tc('battle.lgp.qjaf.' + 'b' * 16),
+            'tc_kept': tc('magic.lgp.fire.' + 'c' * 16),   # a kept archive's
+            'sfx_new': os.path.join(self.root, 'sfx',
+                                    '1.ogg-10-7-44100-1024-plain.wav'),
+            'sfx_old': os.path.join(self.root, 'sfx',
+                                    '1.ogg-10-5-44100-1024-plain.wav'),
+            'sfx_other': os.path.join(self.root, 'sfx',
+                                      '2.ogg-10-5-44100-1024-plain.wav'),
+        }
+        for p in files.values():
+            touch(p)
+        os.remove(self.f['idle'])
+        self.build()
+        for k in ('tc_new', 'sfx_new'):
+            open(files[k], 'rb').read()
+        logs = []
+        G.sweep(self.mods, {'magic.lgp'}, logs.append)
+        ex = lambda k: os.path.exists(files[k])
+        self.assertTrue(ex('tc_new') and ex('sfx_new'))
+        self.assertFalse(ex('tc_old'))
+        self.assertFalse(ex('sfx_old'))
+        self.assertTrue(ex('tc_kept'))           # nothing replaced it
+        self.assertTrue(ex('sfx_other'))
+        self.assertFalse(self.exists('mov_old'))  # opening.<new> was used
+        self.assertTrue(self.exists('mov_used'))
+        self.assertTrue(any('replaced entr' in l for l in logs))
+
+    def test_report_mode_keeps_replaced_versions(self):
+        os.environ[G.ENV] = 'report'
+        try:
+            self.build()
+            G.sweep(self.mods, {'magic.lgp'})
+            self.assertTrue(self.exists('mov_old'))
+        finally:
+            os.environ.pop(G.ENV)
 
     def test_compact_toggle(self):
         os.environ.pop(G.COMPACT_ENV, None)

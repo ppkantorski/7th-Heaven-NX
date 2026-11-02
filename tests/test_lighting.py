@@ -35,7 +35,7 @@ def test_stock_sites():
 def test_blob_has_four_entries():
     e = L.entries()
     assert set(e) == {'lt_setup', 'lt_vtx', 'lt_mvfix', 'lt_entry'}    # 679
-    assert os.path.getsize(L.BLOB) < 0x780
+    assert os.path.getsize(L.BLOB) <= 0x840     # 876: the whole 'light' part
 
 
 def test_apply():
@@ -45,6 +45,9 @@ def test_apply():
         m = nxmap.Main(out)
         lo, hi = DS.part(DUMP, 'light')
         assert lo <= rep['code'] and rep['code'] + rep['bytes'] <= hi
+        # 876: the stubs are in 'light2'
+        slo, shi = DS.part(DUMP, 'light2')
+        assert all(slo <= a < shi for a in rep['stubs'].values())
         blob = open(L.BLOB, 'rb').read()
         assert m.text[rep['code']:rep['code'] + len(blob)] == blob
         st = rep['stubs']
@@ -74,11 +77,11 @@ def test_apply():
             assert ws[5] == A.b(st_ + 20, site + 4)
             assert ws[2] == A.bl(st_ + 8, st['ecommon'])
         assert has_branch(st['ecommon'], rep['entries']['lt_entry'])
-        # nothing else in .text changed outside the part and the four sites
+        # nothing else in .text changed outside the two parts and the sites
         a, b = nxmap.Main(DUMP).text, m.text
         diff = [i for i in range(0, len(a), 4) if a[i:i + 4] != b[i:i + 4]]
         sites = {L.SETUP_CALL, L.VTX_CALL} | set(L.MV_CALLS) | {x[0] for x in L.ENTRY_SITES}
-        assert all(lo <= i < hi or i in sites for i in diff)
+        assert all(lo <= i < hi or slo <= i < shi or i in sites for i in diff)
 
 
 def test_sfxpre_part_is_empty_now():

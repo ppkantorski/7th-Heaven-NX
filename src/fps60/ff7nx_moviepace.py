@@ -297,3 +297,91 @@ def apply(main, log=print):
         'by the clock (BSS +%#x). %s=0 disables, %s sets the rate.' % (
             movie_fps(), bss, ENV, FPS_ENV))
     return 0
+
+
+# BUILD 877: THE CUTSCENE MOVIE WAIT SLEEPS INSTEAD OF SPINNING.
+#
+# During a cutscene movie no frame limiter runs (the field limiter skips
+# itself, above), so the frame's pace is fw_movie_update's wait for the
+# decoder's next frame: the stock loop +0x10F161C..+0x10F1648 asks
+# movie_is_finished, pumps the player (vtable +0x78) and calls present()
+# (+0x10F9080), round and round until the frame is ready. Measured on
+# hardware (tools/probes/movieprobe.py, 11-02): 10.1 s of FMV, 304 movie
+# frames (30/s), 135,097 passes of that loop (13,300/s), every present
+# back in under 1 ms (12 us at most). present does not wait for vsync: the
+# main thread spun a core flat out for the whole movie.
+#
+# The loop's present call now goes through a cave: present() as before,
+# then nn::os::SleepThread(WAIT_SLEEP_US). A ready frame is noticed at most
+# one quantum late (0.25 ms of a 33 ms frame); the loop otherwise runs as
+# stock. Only callee-saved registers are live across the call (x19, x21,
+# x23), and SleepThread keeps them. A background-movie field (above) never
+# reaches this loop. SEVENTH_NX_LIMITER_SLEEP=off restores the spin.
+WAIT_SLEEP_CALL = 0x10F1640    # bl present, inside the wait loop
+PRESENT = 0x10F9080
+WAIT_SLEEP_US = 250
+
+
+def wait_sleep_cave(sleep_fn):
+    def build(_entry, addr):
+        w = []
+        pc = lambda: addr(len(w))
+        w.append(A.stp64_pre(29, 30, 31, -0x10))
+        w.append(A.bl(pc(), PRESENT))
+        ns = WAIT_SLEEP_US * 1000
+        w.append(A.movz(0, ns & 0xFFFF))
+        w.append(A.movk_hi(0, ns >> 16))           # w0 -> x0, zero-extended
+        w.append(A.bl(pc(), sleep_fn))             # SleepThread(TimeSpan ns)
+        w.append(A.ldp64_post(29, 30, 31, 0x10))
+        w.append(0xD65F03C0)                       # ret
+        return w
+    return build
+
+
+def apply_wait_sleep(main, log=print):
+    """Install the movie-wait sleep on `main` in place. 0 = installed or
+    already there; 1 = the call site is not stock (left spinning)."""
+    import ff7nx_audio_cave as AC
+    import ff7nx_cave
+    import ff7nx_fieldpace
+    import nsosyms
+    import nxmap
+    main = Path(main)
+    m = nxmap.Main(str(main))
+    got = w32(m.text, WAIT_SLEEP_CALL)
+    if got != A.bl(WAIT_SLEEP_CALL, PRESENT):
+        if got >> 26 == 0x25:
+            log('  movie wait sleep: already installed')
+            return 0
+        log('  ! movie wait sleep: +%#x is %08X, not bl present -- left '
+            'spinning' % (WAIT_SLEEP_CALL, got))
+        return 1
+    _m, plt = nsosyms.imports(str(main))
+    sleep_fn = next((va for va, name in plt.items()
+                     if name == ff7nx_fieldpace.SLEEP_SYMBOL), None)
+    if sleep_fn is None:
+        log('  ! movie wait sleep: SleepThread not imported -- left spinning')
+        return 1
+    pool = ff7nx_cave.HolePool(bytearray(m.img), starts=set(m.arm_starts))
+    entry, words = ff7nx_cave.emit_laid_out(pool, wait_sleep_cave(sleep_fn),
+                                            span=0x80000)
+    words = dict(words)
+    words[WAIT_SLEEP_CALL] = A.bl(WAIT_SLEEP_CALL, entry)
+    blob = main.read_bytes()
+    segs, raw = AC.segments(blob)
+    text = bytearray(raw[0])
+    for va, word in words.items():
+        struct.pack_into('<I', text, va, word)
+    out = AC.pack(blob, [bytes(text), raw[1], raw[2]], 0)
+    fd, tmp = tempfile.mkstemp(dir=str(main.parent), prefix='.moviesleep-')
+    os.close(fd)
+    try:
+        Path(tmp).write_bytes(out)
+        shutil.move(tmp, str(main))
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+    log('  movie wait sleep (BUILD 877): the cutscene movie wait sleeps %d us '
+        'a pass instead of spinning (cave +%#x, SleepThread +%#x)'
+        % (WAIT_SLEEP_US, entry, sleep_fn))
+    return 0

@@ -22,7 +22,7 @@ def movz(rd, i, hw): return 0xD2800000 | (hw << 21) | (i << 5) | rd
 def movk(rd, i, hw): return 0xF2800000 | (hw << 21) | (i << 5) | rd
 g2h = [movz(1, H & 0xFFFF, 0), movk(1, (H >> 16) & 0xFFFF, 1), 0x8B204020, 0xD65F03C0]
 orig = [movz(0, 0x77, 0), 0xD65F03C0]
-SB = 0x20000
+SB = 0x30000   # 876: LtAll is 150 KB (vertex colours)
 guest = bytearray(0x10000); state = [bytes(SB)]
 def run(fn, args):
     mu = U.Uc(U.UC_ARCH_ARM64, U.UC_MODE_ARM)

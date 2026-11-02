@@ -148,6 +148,7 @@ import ff7nx_underfill
 import ff7nx_fxtrial
 import ff7nx_fxsmooth
 import ff7nx_fxcomplete
+import ff7nx_fxddssync
 import ff7nx_shakepad
 import ff7nx_trainlower
 import ff7nx_texpatch
@@ -286,6 +287,9 @@ HERE = nxpaths.ROOT
 PYFF7_DIR = nxpaths.pyff7_root()          # BUILD 817: common/PyFF7
 VANILLA_CACHE = os.path.join(HERE, 'cache', '_vanilla')
 
+
+# BUILD 878: fx complete's per-field memory cap (see its use below)
+FX_COMPLETE_MB_DEFAULT = 44.5
 
 def ensure_pyff7(log=lambda *_: None):
     """
@@ -1690,6 +1694,18 @@ def build_plan(mods, settings_by_mod, catalogs, log=lambda *_: None,
             log('! double-input fix: its HEXT files are not the ones this '
                 'build knows (%s); left to the exe path, which skips code '
                 'patches' % exc)
+    # BUILD 878: BUILT IN. The game's own input repeats any held button, so a
+    # held A in battle keeps confirming (Attack, then a target) with or
+    # without the mod. The held-face-button fix (ff7nx_difix.face_no_repeat)
+    # builds on the double-input fix's once-per-press word, so both go in on
+    # every build; the mod now only adds its repeat rate / delay choices.
+    # SEVENTH_NX_NO_DIFIX=1 still leaves input stock.
+    if not ff7nx_difix.disabled():
+        if ff7nx_difix.CURRENT is None:
+            ff7nx_difix.CURRENT = {'difix': True, 'rate': None, 'delay': None,
+                                   'files': []}
+        else:
+            ff7nx_difix.CURRENT['difix'] = True
     # BUILD 866. Code HEXT that only changes constants (PS3Tweaks' status
     # speed, morph damage, EXP share...) is translated to ARM64 words by
     # ff7nx_hextarm and leaves the exe list; apply_hextarm writes it.
@@ -10592,14 +10608,47 @@ def _build_flevel(archive_path, chunks, field_files, romfs, log,
     # median Cosmos frame, multi-sheet composite, single sheet), field by
     # field inside the memory cap; fades, palette permutations, cycles and
     # confirmed fields are left alone. See ff7nx_fxcomplete.
+    # BUILD 871: TRIAL. las0_2 ships at 44.19 MB (its fx trial is not
+    # capped), so SEVENTH_NX_FX_COMPLETE_MB=44.5 lets this pass go that far
+    # too: at 44.5 the FX pages 35 leaves paletted in clsin2_1, corel3 and
+    # gaia_1/2/31 all fit. BUILD 878: the default (hardware 11-01: gaia_1,
+    # gaia_31, corel3 and clsin2_1 all fine at 44.5). SEVENTH_NX_FX_COMPLETE_MB
+    # sets another cap; =0 (or anything at or under FIELD_MB_CAP) is the old
+    # FIELD_MB_CAP behaviour.
+    _fc_env = os.environ.get('SEVENTH_NX_FX_COMPLETE_MB')
+    try:
+        FX_COMPLETE_MB_CAP = (FX_COMPLETE_MB_DEFAULT if _fc_env is None
+                              or not _fc_env.strip() else float(_fc_env))
+    except ValueError:
+        FX_COMPLETE_MB_CAP = FX_COMPLETE_MB_DEFAULT
+    if FX_COMPLETE_MB_CAP > field_bg_dense.FIELD_MB_CAP:
+        log('  fx complete: memory cap %.1f MB (SEVENTH_NX_FX_COMPLETE_MB=0 '
+            'for the general %.1f)'
+            % (FX_COMPLETE_MB_CAP, field_bg_dense.FIELD_MB_CAP))
+    # The same trial lifts the raw (decompressed field) ceiling to 4/5 of a
+    # 32 MB field buffer, as ff7nx_fxtrial does for las0_2: gaia_1 at 44.19 MB
+    # decompresses to 15.5 MB, past the 12.8 MB cap. Without that its 16:9
+    # and letterbox FX pages -- which Cosmos adds and which are EMPTY on the
+    # paletted path -- stay empty (hardware 11-01, gaia_1 / gaia_31).
+    _fc_trial = FX_COMPLETE_MB_CAP > field_bg_dense.FIELD_MB_CAP
     fc_stats = ff7nx_fxcomplete.apply_to_flevel(
         archive, payloads, _bc_art,
         encode=lambda raw: _encode_field_cached(archive, raw),
-        mb_cap=field_bg_dense.FIELD_MB_CAP, raw_cap=FIELD_BG_RAW_CAP,
+        mb_cap=max(field_bg_dense.FIELD_MB_CAP, FX_COMPLETE_MB_CAP),
+        raw_cap=(32 * 1024 * 1024 * 4 // 5 if _fc_trial
+                 else FIELD_BG_RAW_CAP),
         log=log)
     fc_line = ff7nx_fxcomplete.summarise(fc_stats)
     if fc_line:
         log(fc_line)
+    global FIELD_BG_MAX_RAW
+    if fc_stats.get('max_raw', 0) > FIELD_BG_MAX_RAW:
+        FIELD_BG_MAX_RAW = fc_stats['max_raw']
+        log('  fx complete: largest field is now %s bytes -- the field buffer '
+            'patch grows to %s bytes' % (
+                format(FIELD_BG_MAX_RAW, ','),
+                format(ff7nx_fieldbg.field_buffer_bytes(FIELD_BG_MAX_RAW),
+                       ',')))
 
     # BUILD 618w. Palette-animated effects (junbin5's lamps, eals_1's
     # waterfall and spray) made truecolor with their animation kept: one set
@@ -10742,7 +10791,6 @@ def _build_flevel(archive_path, chunks, field_files, romfs, log,
         log(ft_line)
     # BUILD 618z7: las0_2's trial grows the field past the old 12.8 MB raw
     # cap; the field decompression buffer must be sized from it.
-    global FIELD_BG_MAX_RAW
     if ft_stats.get('max_raw', 0) > FIELD_BG_MAX_RAW:
         FIELD_BG_MAX_RAW = ft_stats['max_raw']
         log('  fx trial: largest field is now %s bytes -- the field buffer '
@@ -11177,6 +11225,22 @@ def _build_flevel(archive_path, chunks, field_files, romfs, log,
     # where it used to run). No-op unless SEVENTH_NX_FIELD_BG_D1_PX=512.
     _lift_depth1_payloads(archive, payloads, log)
 
+    # BUILD 871b: additive FX cells on truecolor pages redrawn from Cosmos's
+    # DDS where the promotion took the 1x paletted art instead (corel3's
+    # stray fire squares, hardware 11-01). See ff7nx_fxddssync. LAST among
+    # the page passes: placed right after fxcomplete (871) the 19 cells came
+    # out of the build unchanged, so nothing after this may touch FX pages.
+    fds_stats = ff7nx_fxddssync.apply_to_flevel(
+        archive, payloads, _bc_art,
+        encode=lambda raw: _encode_field_cached(archive, raw), log=log)
+    fds_line = ff7nx_fxddssync.summarise(fds_stats)
+    if fds_line:
+        log(fds_line)
+    else:
+        log('  fx dds sync: nothing changed (%s)' % (
+            ', '.join('%s: %s' % r for r in fds_stats.get('refused', ()))
+            or 'no cell differs from the DDS'))
+
     # BUILD 618 / 618i. DEBUG ONLY, off unless SEVENTH_NX_DEBUG_WARP=src=dst
     # is set: entering `src` shows `dst` (for fields with no normal way in,
     # such as cosmo2). 618i: this USED to run before texpatch, stackorder,
@@ -11311,6 +11375,11 @@ def _build_flevel(archive_path, chunks, field_files, romfs, log,
 MOVIE_CACHE_ENV = 'SEVENTH_NX_MOVIE_CACHE'
 MOVIE_30FPS_ENV = 'SEVENTH_NX_MOVIE_30FPS'
 ANALOG_360_ENV = 'SEVENTH_NX_ANALOG_360'
+# BUILD 869: Controls > Stick moves relative to the screen (ff7nx_analog_cave
+# build_screen_cave), on by default. Carried by the same field cave as 360
+# movement; ANALOG_ROT tells the patcher whether that cave also rotates.
+STICK_SCREEN_ENV = 'SEVENTH_NX_STICK_SCREEN'
+ANALOG_ROT_ENV = 'SEVENTH_NX_ANALOG_ROT'
 NO_AUTORUN_ENV = 'SEVENTH_NX_NO_AUTORUN'
 NO_CHEATS_ENV = 'SEVENTH_NX_NO_CHEATS'
 # BUILD 859: the GUI's W-Item bug fix and Advanced facial animations toggles
@@ -11331,6 +11400,18 @@ def analog_360():
     """Is 360 degree field movement on?"""
     return os.environ.get(ANALOG_360_ENV, '').strip().lower() in (
         '1', 'true', 'yes', 'on')
+
+
+def stick_screen():
+    """Does the stick move relative to the screen on fields?
+
+    BUILD 872: part of 360 degree movement, not a setting of its own (the
+    GUI row is gone). SEVENTH_NX_STICK_SCREEN=0 still builds 360 movement
+    without it, for comparison."""
+    if not analog_360():
+        return False
+    return os.environ.get(STICK_SCREEN_ENV, '').strip().lower() not in (
+        '0', 'false', 'no', 'off')
 
 
 def no_autorun():
@@ -13948,6 +14029,10 @@ ARCHIVE_SCOPED_ENV = {
     # groups (exefs/main + ff7_en). The patcher's battle.lgp wait scaling is
     # decided by the rate alone (_fps_archive_key).
     ANALOG_360_ENV: (),
+    # stick_screen() and the ANALOG_ROT it sets (BUILD 869): the same
+    # analog-360 cave group in exefs/main, nothing else.
+    STICK_SCREEN_ENV: (),
+    ANALOG_ROT_ENV: (),
     # limiter_fps(): the patcher's --limiter-fps, ff7nx_minipace (ff7_en) and
     # the footstep tick rates (exefs/main).
     LIMITER_FPS_ENV: (),
@@ -15464,8 +15549,8 @@ def apply_fps_patches(sdout, dump, log=lambda *_: None, produced=()):
     movies were rebuilt at the doubled rate, or every movie desyncs.
     """
     rate = {60: '60', 30: '30'}.get(fps_mode(), 'stock')
-    if rate == 'stock' and not (analog_360() or no_autorun() or no_cheats()
-                                or movie_30fps()):
+    if rate == 'stock' and not (analog_360() or no_autorun()
+                                or no_cheats() or movie_30fps()):
         return []
     what = {'60': '60 FPS', '30': 'Full 30 FPS',
             'stock': 'input and FMV tweak'}[rate]
@@ -15545,6 +15630,11 @@ def apply_fps_patches(sdout, dump, log=lambda *_: None, produced=()):
     # SEVENTH_NX_ANALOG_DIAG=1 alongside this builds a diagnostic variant that
     # ignores the stick and rotates a flat 45 degrees, so a build that appears
     # to do nothing can be told apart from a cave that is not running.
+    # BUILD 869: the same cave carries the screen-relative stick. BUILD 872:
+    # that is part of 360 movement now, not its own setting, so the group
+    # follows analog_360() alone and the patcher's analog_parts() turns the
+    # screen-relative half on unless SEVENTH_NX_STICK_SCREEN=0.
+    os.environ[ANALOG_ROT_ENV] = '1' if analog_360() else '0'
     if analog_360():
         argv = [x + ',analog-360' if k and argv[k - 1] == '--enable' else x
                 for k, x in enumerate(argv)]
@@ -16619,8 +16709,9 @@ def apply_difix(sdout, dump, log=lambda *_: None, produced=()):
     """
     BUILD 620. Double Input Bugfix (Dig / potus-barret): the mod's x86 HEXT
     patches as ARM64 words in exefs/main -- see ff7nx_difix. Two words for
-    the fix, one each for a non-default repeat rate / delay. Only when the
-    mod is enabled; SEVENTH_NX_NO_DIFIX=1 leaves input stock.
+    the fix, one each for a non-default repeat rate / delay. BUILD 878: the
+    fix (and the held-face-button one) on every build, the rate / delay only
+    with the mod; SEVENTH_NX_NO_DIFIX=1 leaves input stock.
     """
     cur = ff7nx_difix.CURRENT
     if cur is None or ff7nx_difix.disabled():
@@ -16654,7 +16745,7 @@ def apply_difix(sdout, dump, log=lambda *_: None, produced=()):
     log(f'  base main   {src}'
         + ('   (previous patch output)' if built else '   (from dump)'))
     tmp = dest + '.difix-tmp'
-    if not ff7nx_difix.apply_to_nso(src, tmp, cur, log):
+    if not ff7nx_difix.apply_to_nso(src, tmp, cur, log, stock=dump.nso):
         if os.path.exists(tmp):
             os.remove(tmp)
         return []
@@ -16870,6 +16961,12 @@ def apply_limiter_sleep(sdout, dump, plan, log=lambda *_: None, produced=()):
         log('! limiter sleep: %s: %s -- NOT INSTALLED, the limiters spin as '
             'stock' % (type(exc).__name__, exc))
         return []
+    # BUILD 877: and the cutscene movie's frame wait (ff7nx_moviepace)
+    try:
+        ff7nx_moviepace.apply_wait_sleep(tmp, log=log)
+    except Exception as exc:                                   # noqa: BLE001
+        log('! movie wait sleep: %s: %s -- NOT INSTALLED, the movie wait '
+            'spins as stock' % (type(exc).__name__, exc))
     os.replace(tmp, dest)
     log('  %s: the wait sleeps %d us at a time while more than %.1f ms is '
         'left, then spins to the deadline as before (routine +0x%X, '

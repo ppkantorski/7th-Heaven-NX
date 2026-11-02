@@ -215,6 +215,15 @@ def sites(module):
             imm = (w >> 5) & 0x7FFFF
             cbz = (pc, pc + (imm - (1 << 19) if imm & 0x40000 else imm) * 4)
             break
+        if w >> 26 == 0x05:                    # BUILD 875b: the face cave
+            imm = w & 0x3FFFFFF
+            cave = pc + (imm - (1 << 26) if imm & 0x2000000 else imm) * 4
+            c0, c1 = _w(img, cave), _w(img, cave + 4)
+            if c0 >> 24 == 0x35 and c0 & 31 == reg and c1 >> 26 == 0x05:
+                imm = c1 & 0x3FFFFFF
+                cbz = (pc, cave + 4 + (imm - (1 << 26) if imm & 0x2000000
+                                       else imm) * 4)
+                break
     if cbz is None:
         raise ValueError('check(): no cbz on the compared value')
     t = cbz[1]
@@ -268,6 +277,97 @@ def sites(module):
     return out
 
 
+# BUILD 874: HELD FACE BUTTONS NO LONGER AUTO-REPEAT.
+#
+# Hardware 11-01: "if i hold A ... it rapidly clicks select when it hits my
+# turn, making it auto click an attack and select an enemy." check()
+# (0x41B099) is the menus' input-with-repeat; 0x6F53F1 calls it with 0x20
+# (confirm) 15 times and 0x40 (cancel) 8 times, so once the repeat starts
+# (delay, then every `rate`) a held A confirms on every pulse -- the battle
+# menu picks Attack and a target on its own. The game's design repeats ANY
+# key; what the player expects is repeating cursor movement. So the repeat
+# branch is taken only for a mask with no face/Select/Start bit
+# (0xFF0: triangle 0x10, circle 0x20, cross 0x40, square 0x80, Select 0x100,
+# 0x200, 0x400, Start 0x800); those read `pressed` -- once per press, the
+# no-repeat branch the fix already uses -- however long they are held. The
+# d-pad (0xF000) and L1/R1/L2/R2 (0x000F, list paging) keep their repeat.
+#
+# The site is check()'s `cbz w22, <no-repeat>` (w22 = [0x9A8734], "a repeat
+# has fired", w21 = the mask); a 4-word cave in a padding hole:
+#     cbz  w22, no_repeat
+#     tst  w21, #0xFF0
+#     b.ne no_repeat
+#     b    <the repeat branch>
+# SEVENTH_NX_DIFIX_REPEAT_ALL=1 keeps the old repeat-everything behaviour.
+REPEAT_ALL_ENV = 'SEVENTH_NX_DIFIX_REPEAT_ALL'
+TST_W21_FACE = 0x721C1EBF            # tst w21, #0xff0
+CBZ_W22 = (0xFF00001F, 0x34000016)   # cbz w22, <imm19>
+
+
+def repeat_all():
+    return os.environ.get(REPEAT_ALL_ENV, '').strip().lower() in (
+        '1', 'true', 'yes', 'on')
+
+
+def _cbz_site(module):
+    """(va, no_repeat_target) of check()'s cbz on the repeat flag."""
+    lo, hi = module.extent(X86_CHECK)
+    img = module.img
+    hits = [va for va in range(lo, hi, 4)
+            if _w(img, va) & CBZ_W22[0] == CBZ_W22[1]]
+    if len(hits) != 1:
+        raise ValueError('check(): %d `cbz w22` words, expected 1' % len(hits))
+    va = hits[0]
+    imm = (_w(img, va) >> 5) & 0x7FFFF
+    if imm & 0x40000:
+        imm -= 0x80000
+    return va, va + 4 * imm
+
+
+def face_no_repeat(module, src, stock=None):
+    """{va: (expect, new)} for the cave, or {} when already in place.
+
+    BUILD 875b: the cave lives in ff7nx_deadspace's 'difix' part. The
+    padding near check() is spent by the time this pass runs on a full build
+    (hardware log 11-01: "no 524288-byte window holds 4 usable word(s)"),
+    and that refusal took the whole double-input fix down with it. The
+    dead-space part is far from check(), so the conditional branches stay
+    inside the cave and only unconditional `b` (+/-128 MB) leaves it:
+        cbnz w22, 1f          ; no repeat fired:
+        b    no_repeat        ;   once per press, as before
+    1:  tst  w21, #0xFF0      ; a face/Select/Start bit in the mask:
+        b.eq 2f
+        b    no_repeat        ;   once per press, however long it is held
+    2:  b    <check()+4>      ; d-pad / L / R: the repeat branch
+    """
+    import a64 as A
+    import ff7nx_deadspace as DS
+    a, e = module.extent(X86_CHECK)
+    for pc in range(a, e, 4):                    # already our branch
+        w = _w(module.img, pc)
+        if w >> 26 == 0x05:
+            imm = w & 0x3FFFFFF
+            cave = pc + (imm - (1 << 26) if imm & 0x2000000 else imm) * 4
+            if _w(module.img, cave + 8) == TST_W21_FACE:
+                return {}
+    va, target = _cbz_site(module)
+    have = _w(module.img, va)
+    lo, hi = DS.part(src, 'difix', stock)
+
+    def build(entry, addr):
+        return [A.cbnz(22, addr(0), addr(2)),
+                A.b(addr(1), target),
+                TST_W21_FACE,
+                A.bcond(addr(3), addr(5), 0),         # EQ
+                A.b(addr(4), target),
+                A.b(addr(5), va + 4)]
+    bump = DS.Bump(lo, hi)
+    entry = bump.put(build)
+    words = {a: (_w(module.img, a), w) for a, w in bump.placed.items()}
+    words[va] = (have, A.b(va, entry))
+    return words
+
+
 def build_patches(module, cur):
     """{va: (expect stock word, new word)} for `cur`."""
     s = sites(module)
@@ -283,8 +383,9 @@ def build_patches(module, cur):
     return words
 
 
-def apply_to_nso(src, dest, cur, log=lambda *_: None):
-    """Write `dest` from `src`. False when nothing was written."""
+def apply_to_nso(src, dest, cur, log=lambda *_: None, stock=None):
+    """Write `dest` from `src`. False when nothing was written. `stock`: the
+    dump's exefs/main, to prove the dead-space part unwritten."""
     from pathlib import Path as _P
     import nxmap
     import nso_patcher
@@ -294,6 +395,14 @@ def apply_to_nso(src, dest, cur, log=lambda *_: None):
     except Exception as exc:                                  # noqa: BLE001
         log('! double-input fix: %s -- nothing was written' % exc)
         return False
+    # BUILD 875b: the face-button cave is its own step. If it cannot be
+    # placed, the double-input fix itself still goes in.
+    if cur.get('difix') and not repeat_all():
+        try:
+            words.update(face_no_repeat(module, str(src), stock))
+        except Exception as exc:                              # noqa: BLE001
+            log('! held face buttons: %s -- they keep the game\'s repeat '
+                '(the double-input fix is still applied)' % exc)
     if not words:
         return False
     todo = {}
@@ -331,6 +440,8 @@ def describe(cur):
     bits = []
     if cur.get('difix'):
         bits.append('double-input fix ON')
+        if not repeat_all():
+            bits.append('held face buttons do not repeat (d-pad and L/R do)')
     if cur.get('rate') is not None:
         bits.append('repeat rate %s' % ms(cur['rate']))
     if cur.get('delay') is not None:

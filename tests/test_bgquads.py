@@ -262,6 +262,47 @@ class BgQuads(unittest.TestCase):
         self.assertTrue(all(va in arms or lo <= va < hi for va in diff))
 
 
+class InsetGuard(BgQuads):
+    """BUILD 874b: a positive guard (ff7nx_fieldbg 'inset') reaches the
+    near-edge slots as is and the far-edge slots negated; stock leaves them 0.
+    BUILD 875b: whatever the state's +0xA90/+0xA98 test says (it is false on
+    the Switch, so 874b's inset never ran)."""
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        t = bytearray(cls.raw[0])
+        hi = 0x39AA                                  # +0.25/768, truncated
+        struct.pack_into('<I', t, B.BLEED_SITE, 0x52A00016 | (hi << 5))
+        lo, hi_ = B.dead_region(DUMP_MAIN, None)
+        code = B.bleed_blob(open(B.BLOB, 'rb').read(), bytes(t))
+        B.patch_text(t, lo, hi_, code, B.entries())
+        cls.text_inset = bytes(t)
+
+    def guard_slots(self, text, seed):
+        mu_seed = seed
+        out = self.run_one(text, mu_seed)
+        page = out['pages'][0xD00]
+        return {o: struct.unpack_from('<I', page, o)[0]
+                for o in range(0x10, 0x50, 4)}, out
+
+    def test_far_edge_is_the_negation(self):
+        seen = False
+        for seed in range(1, 40):
+            st, out = self.guard_slots(self.text_inset, seed)
+            if out['pc'] != SENTINEL:
+                continue
+            # BUILD 875c: u by column (left +, right -), v by ROW (top +,
+            # bottom -): u 0x10 TL 0x14 BL 0x18 TR 0x1C BR, v 0x34 TL 0x30 BL
+            # 0x3C TR 0x38 BR; blend u 0x20/24/28/2C, v 0x40 TL 0x48 BL
+            # 0x44 TR 0x4C BR (bgquads.c tile())
+            near = [st[o] for o in (0x10, 0x14, 0x34, 0x3C, 0x20, 0x24, 0x40, 0x44)]
+            far = [st[o] for o in (0x18, 0x1C, 0x30, 0x38, 0x28, 0x2C, 0x48, 0x4C)]
+            seen = True
+            self.assertEqual(set(near), {0x39AA0000})
+            self.assertEqual(set(far), {0xB9AA0000})
+        self.assertTrue(seen, 'no seed ran to the end')
+
+
 class TilePass(BgQuads):
     """BUILD 793: 0x64085C (depth 1) and 0x640C49 (depth 2), each tile
     tested against the view, flagged, and handed to the inlined

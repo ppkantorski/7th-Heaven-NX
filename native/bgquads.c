@@ -219,7 +219,7 @@ void bg_6465fb(u8 *ctx, u8 *const *const *tabp, u8 *const *dummyp, u8 *x87,
                fn_t get_state, fn_t alloc, fn_t tick)
 {
     G gg, *g = &gg;
-    u32 esp, ebp, st, v, L, o, cnt, zf;
+    u32 esp, ebp, st, v, f, vt, vb, ft, fb, near, far, on, L, o, cnt, zf;
     u32 eax, ecx, edx;
     g->ctx = ctx;
     g->tabp = tabp;
@@ -235,16 +235,45 @@ void bg_6465fb(u8 *ctx, u8 *const *const *tabp, u8 *const *dummyp, u8 *x87,
     call(g, get_state, esp);                    /* 0x676578 */
     st = *CR(g, C_EAX);
     W32(g, ebp - 0xC, st);
-    v = (R32(g, R32(g, ebp - 0xC) + 0xA90) != 0
-         && R32(g, R32(g, ebp - 0xC) + 0xA98) == 0) ? 0xBAE00000u : 0;
+    /* BUILD 874: `near` is the stock bleed guard, 0xBAE00000 compiled in;
+       ff7nx_bgquads.bleed_blob rewrites its high half to what
+       ff7nx_fieldbg chose. A POSITIVE value is an inset: the far edge then
+       gets its negation, so bilinear filtering never reaches the next atlas
+       cell from either side (corel3's lines). Stock and zero leave the far
+       edge 0, exactly as the x86 does. */
+    /* opaque to the compiler: the one word bleed_blob patches */
+    __asm__ volatile("movz %w0, #0xBAE0, lsl #16" : "=r"(near));
+    far = (near != 0 && !(near >> 31)) ? (near ^ 0x80000000u) : 0;
+    /* BUILD 875b: the stock test (state +0xA90 set, +0xA98 clear) is
+       false on the Switch -- had the 1997 guard ever run there, every HD
+       tile would show its neighbour's column -- so 874b's inset never
+       reached a quad. An inset now applies whatever the test says; stock
+       and zero keep the x86 behaviour exactly. */
+    on = (far != 0)
+         || (R32(g, R32(g, ebp - 0xC) + 0xA90) != 0
+             && R32(g, R32(g, ebp - 0xC) + 0xA98) == 0);
+    v = on ? near : 0;
+    f = on ? far : 0;
+    /* Which corner each slot feeds (tile() below): u 0x10 top-left, 0x14
+       bottom-left, 0x18 top-right, 0x1C bottom-right; v 0x34 top-left,
+       0x30 bottom-left, 0x3C top-right, 0x38 bottom-right (blend: u
+       0x20/0x24/0x28/0x2C, v 0x40/0x48/0x44/0x4C in the same order).
+       The x86 gives the guard to the LEFT corners for u AND v. An inset
+       must split v by row instead: top + , bottom - . BUILD 875b split it
+       by column, which tilted every tile's v (horizontal lines along tile
+       rows); BUILD 875c splits it by row. Stock and zero keep the x86. */
+    vt = v;                             /* v slot, top-left */
+    vb = (far != 0) ? f : v;            /* v slot, bottom-left */
+    ft = (far != 0) ? v : f;            /* v slot, top-right */
+    fb = f;                             /* v slot, bottom-right */
     W32(g, BASE + 0x10, v); W32(g, BASE + 0x14, v);
-    W32(g, BASE + 0x18, 0); W32(g, BASE + 0x1C, 0);
-    W32(g, BASE + 0x34, v); W32(g, BASE + 0x30, v);
-    W32(g, BASE + 0x3C, 0); W32(g, BASE + 0x38, 0);
+    W32(g, BASE + 0x18, f); W32(g, BASE + 0x1C, f);
+    W32(g, BASE + 0x34, vt); W32(g, BASE + 0x30, vb);
+    W32(g, BASE + 0x3C, ft); W32(g, BASE + 0x38, fb);
     W32(g, BASE + 0x20, v); W32(g, BASE + 0x24, v);
-    W32(g, BASE + 0x28, 0); W32(g, BASE + 0x2C, 0);
-    W32(g, BASE + 0x40, v); W32(g, BASE + 0x48, v);
-    W32(g, BASE + 0x44, 0); W32(g, BASE + 0x4C, 0);
+    W32(g, BASE + 0x28, f); W32(g, BASE + 0x2C, f);
+    W32(g, BASE + 0x40, vt); W32(g, BASE + 0x48, vb);
+    W32(g, BASE + 0x44, ft); W32(g, BASE + 0x4C, fb);
     eax = *CR(g, C_EAX);
     ecx = *CR(g, C_ECX);
     edx = *CR(g, C_EDX);

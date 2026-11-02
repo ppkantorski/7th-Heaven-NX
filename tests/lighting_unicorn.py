@@ -22,7 +22,7 @@ g2h = [enc_movz(1, H & 0xFFFF, 0), enc_movk(1, (H >> 16) & 0xFFFF, 1), 0x8B20402
 orig = [enc_movz(0, 0x77, 0), 0xD65F03C0]
 def run(fn, args):
     mu = U.Uc(U.UC_ARCH_ARM64, U.UC_MODE_ARM)
-    for base, size in ((CODE, 0x10000), (G2H, 0x1000), (ST, 0x4000), (STK - 0x10000, 0x10000), (H, 0x20000), (H + 0xCBF000, 0x1000)):  # 783: the mode word
+    for base, size in ((CODE, 0x10000), (G2H, 0x1000), (ST, 0x30000), (STK - 0x10000, 0x10000), (H, 0x20000), (H + 0xCBF000, 0x1000)):  # 783: the mode word
         mu.mem_map(base, size)
     mu.mem_write(CODE, blob)
     mu.mem_write(G2H, struct.pack('<4I', *g2h)); mu.mem_write(ORIG, struct.pack('<2I', *orig))
@@ -33,10 +33,10 @@ def run(fn, args):
     # enable FP
     mu.reg_write(UC_ARM64_REG_CPACR_EL1, 0x300000)
     mu.emu_start(CODE + ent[fn], 0xDEAD0, count=100000)
-    state[0] = bytes(mu.mem_read(ST, 0x4000)); guest[:] = mu.mem_read(H, 0x20000)
+    state[0] = bytes(mu.mem_read(ST, 0x30000)); guest[:] = mu.mem_read(H, 0x20000)
     return mu.reg_read(UC_ARM64_REG_X0)
 rng = np.random.default_rng(7)
-guest = bytearray(0x20000); state = [bytes(0x4000)]
+guest = bytearray(0x20000); state = [bytes(0x30000)]
 LIGHT, BONE, ESP, N, VC, AL, OUT, ESP2, OUTF = 0x1000, 0x2000, 0x8000, 0x3000, 0x3100, 0x3200, 0x3300, 0x9000, 0x3400
 def w32(a, v): struct.pack_into('<I', guest, a, v)
 def wf(a, vals): struct.pack_into('<%df' % len(vals), guest, a, *vals)

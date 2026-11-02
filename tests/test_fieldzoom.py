@@ -155,7 +155,7 @@ def test_bss_grows_by_the_flag_block():
 def test_maplist_and_env():
     if os.path.exists(FLEVEL):
         assert Z.maplist_index(FLEVEL, ['convil_2']) == {'convil_2': 356}
-    assert Z.fields({}) == ('convil_2', 'ztruck')
+    assert Z.fields({}) == ('convil_2', 'ztruck', 'corel3')
     assert Z.fields({Z.ENV: 'a:1.5,b'}) == ('a', 'b')
     assert Z.factor('a', {Z.ENV: 'a:1.5,b'}) == 1.5
     assert Z.factor('b', {Z.ENV: 'a:1.5,b'}) == 4.0 / 3.0

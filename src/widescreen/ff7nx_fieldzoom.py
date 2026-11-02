@@ -89,8 +89,8 @@ import a64 as A
 from ff7nx_analog_cave import Asm
 
 ENV = 'SEVENTH_NX_FIELD_ZOOM'
-DEFAULT = ('convil_2', 'ztruck')
-VERSION = 'fieldzoom-618z11'
+DEFAULT = ('convil_2', 'ztruck', 'corel3')
+VERSION = 'fieldzoom-871'
 # BUILD 618z11. Per-field factor. FFNx's WM_ZOOM shows 2 x (right - left)
 # game px of the field's config range across the 16:9 width; the port's
 # unzoomed 16:9 view is 320 / 0.75 = 426.67 units, so the factor is
@@ -99,7 +99,15 @@ VERSION = 'fieldzoom-618z11'
 # -175, right 175): 350 units across, as FFNx shows it -- the art is 352
 # wide, so the unzoomed 427-unit view runs off it (hardware 10-06).
 VIEW_W = 320.0 / 0.75
-FACTORS = {'ztruck': VIEW_W / 350.0}
+# BUILD 871. corel3 (the Corel flashback; hardware 11-01, "a black bar at
+# the bottom"): its camera range is exactly 240 tall, so the camera is pinned
+# at y = 0 and the 240-unit view is -120..120, but Cosmos's art stops at
+# y = 104 -- 16 units of nothing under the town. ff7nx_camfit will not move a
+# pinned camera, and moving it would also slide the town out from under the
+# fire overlay (layer 4 does not scroll). A zoom scales both together:
+# 120 / 1.16 = 103.4, inside the art, and the sides still have art to spare
+# (half-width 184 against a range of -376..314).
+FACTORS = {'ztruck': VIEW_W / 350.0, 'corel3': 1.16}
 
 TRANSLATE = 0x10FC3A0
 FIELD_ID = 0xCFF468                 # u16, the field the models belong to

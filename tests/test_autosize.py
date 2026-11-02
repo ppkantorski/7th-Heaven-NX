@@ -147,7 +147,7 @@ def ffnx(text, table, names):
         else:
             w += adv(c)
         i += 1
-    return (max(mw, w) + 32) // 2, (max(mh, h) + 50) // 2
+    return (max(mw, w) + 40) // 2, (max(mh, h) + 50) // 2
 
 
 def expect(x, y, w, h, text, table, names):
@@ -157,6 +157,8 @@ def expect(x, y, w, h, text, table, names):
     nw, nh = r
     nh = min(nh, h)
     nw, nh = max(0, min(nw, 320)), max(0, min(nh, 224))
+    if abs(2 * x + w - 320) <= 8:        # 876: a centred box stays centred
+        x = (320 - nw) // 2
     x = max(0, min(x, 320 - nw))
     y = max(0, min(y, 224 - nh))
     return (x, y, nw, nh)
@@ -178,6 +180,26 @@ def test_short_line_shrinks_width_and_height():
     assert b.open(0) == 1
     assert b.geom(0) == expect(8, 8, 304, 57, t, b.table, b.names)
     assert b.geom(0)[3] == 25                              # one line
+
+
+@pytest.mark.parametrize('x,w', [(71, 177), (18, 283), (8, 308), (28, 263)])
+def test_876_a_centred_box_stays_centred(x, w):
+    """Echo-S's new-game notes (blackbgh) are authored centred."""
+    b = Box()
+    b.window(0, x, 0x2B, w, 0x89)
+    t = bytes((0x28, 0x45, 0x4C, 0x4C, 0x4F, 0xFF))       # "Hello"
+    b.text(0, t)
+    assert b.open(0) == 1
+    gx, gy, gw, gh = b.geom(0)
+    assert abs(2 * gx + gw - 320) <= 1 and gw < w
+
+
+def test_876_an_off_centre_box_keeps_its_left_edge():
+    b = Box()
+    b.window(0, 8, 8, 200, 57)
+    b.text(0, bytes((0x28, 0x45, 0x4C, 0x4C, 0x4F, 0xFF)))
+    b.open(0)
+    assert b.geom(0)[0] == 8
 
 
 def test_only_the_first_opening_frame():
@@ -210,7 +232,7 @@ def test_never_taller_than_authored_and_long_lines_clamp():
     b.text(2, t)
     assert b.open(2) == 1
     x, y, w, h = b.geom(2)
-    assert w == 320 and x == 0                  # (1200 + 32) / 2 -> 320
+    assert w == 320 and x == 0                  # (1200 + 40) / 2 -> 320
     assert h == 41 and y == 224 - 41
 
 
@@ -221,7 +243,9 @@ def test_pages_take_the_largest():
     b.window(0, 8, 8, 300, 73)
     b.text(0, t)
     b.open(0)
-    assert b.geom(0) == (8, 8, (9 * 20 + 32) // 2, (32 + 50) // 2)
+    nw = (9 * 20 + 40) // 2
+    # 876: x 8 w 300 is centred (centre 158), so it stays centred
+    assert b.geom(0) == ((320 - nw) // 2, 8, nw, (32 + 50) // 2)
 
 
 def test_world_reads_the_world_string_table():

@@ -307,16 +307,38 @@ def test_difix_620_arm64_words(tmp_path):
                  0x89730: (0xB9400016, 0x12800016)}   # rate: mov w22,#-1
     # x19 really is 0x9A85D4 there, and +0x160 is the repeat flag 0x9A8734
     assert struct.unpack_from('<I', m.img, 0x8C37C)[0] == 0x5290BA93
+    cur = {'difix': True, 'rate': None, 'delay': None}
     out = tmp_path / 'main'
-    assert D.apply_to_nso(_DUMP_MAIN, str(out), {'difix': True, 'rate': None,
-                                                 'delay': None})
+    os.environ[D.REPEAT_ALL_ENV] = '1'
+    try:
+        assert D.apply_to_nso(_DUMP_MAIN, str(out), cur)
+    finally:
+        os.environ.pop(D.REPEAT_ALL_ENV)
     mm = nxmap.Main(str(out))
     changed = [i for i in range(0, len(m.img), 4)
                if m.img[i:i + 4] != mm.img[i:i + 4]]
     assert changed == [0x8C39C, 0x8C520]
+    # BUILD 875b: held face buttons -- check()'s cbz becomes a branch to a
+    # six-word cave in the dead-space 'difix' part, which the padding pool
+    # (spent on a full build) no longer has to supply
+    import ff7nx_deadspace as DS
+    lo, hi = DS.part(_DUMP_MAIN, 'difix')
+    face = tmp_path / 'face'
+    assert D.apply_to_nso(_DUMP_MAIN, str(face), cur, stock=_DUMP_MAIN)
+    mf = nxmap.Main(str(face))
+    changed = [i for i in range(0, len(m.img), 4)
+               if m.img[i:i + 4] != mf.img[i:i + 4]]
+    assert changed[:3] == [0x8C39C, 0x8C3C8, 0x8C520]
+    assert changed[3:] == list(range(lo, lo + 24, 4)) and lo + 24 <= hi
+    assert struct.unpack_from('<I', mf.img, lo + 8)[0] == D.TST_W21_FACE
     # already applied -> nothing written
-    assert not D.apply_to_nso(str(out), str(tmp_path / 'again'),
-                              {'difix': True, 'rate': None, 'delay': None})
+    for done in (out, face):
+        if done is out:
+            os.environ[D.REPEAT_ALL_ENV] = '1'
+        try:
+            assert not D.apply_to_nso(str(done), str(tmp_path / 'again'), cur)
+        finally:
+            os.environ.pop(D.REPEAT_ALL_ENV, None)
 
 
 def test_difix_620_plan_from_folder_mod():
@@ -337,7 +359,12 @@ def test_difix_620_plan_from_folder_mod():
     assert (D.CURRENT['rate'], D.CURRENT['delay']) == (D.INF, 1000)
     st.update(difix=0, rate=50, delay=200)
     build.build_plan([m], {m.filename: st}, {})
-    assert D.CURRENT is None
+    # BUILD 878: the fix is built in -- on with the mod's own toggle off,
+    # and with no mod at all
+    assert D.CURRENT == {'difix': True, 'rate': None, 'delay': None,
+                         'files': []}
+    build.build_plan([], {}, {})
+    assert D.CURRENT['difix'] and D.CURRENT['rate'] is None
 
 
 def test_artpatch_620_nvmkin_stairs(tmp_path):

@@ -45,7 +45,7 @@ def _movk(rd, imm, hw):
 class Rig:
     def __init__(self, mode):
         self.mu = mu = U.Uc(U.UC_ARCH_ARM64, U.UC_MODE_ARM)
-        for base, size in ((CODE, 0x10000), (G2H, 0x1000), (ST, 0x4000),
+        for base, size in ((CODE, 0x10000), (G2H, 0x1000), (ST, 0x30000),   # 876: the whole state (vertex colours at +55 KB)
                            (STK - 0x10000, 0x10000), (H, 0x20000),
                            (H + (MODE & ~0xFFF), 0x1000), (0xDE000, 0x1000)):
             mu.mem_map(base, size)

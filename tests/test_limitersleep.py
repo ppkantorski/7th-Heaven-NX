@@ -76,7 +76,21 @@ def test_sleeps_only_when_far_and_restores():
 
 def test_sites_and_toggle(monkeypatch):
     assert len(FP.SLEEP_SITES) == 4
+    assert len(FP.MENU_SLEEP_SITES) == 2       # BUILD 875
     monkeypatch.setenv(FP.SLEEP_ENV, 'off')
     assert not FP.sleep_enabled()
     monkeypatch.delenv(FP.SLEEP_ENV)
     assert FP.sleep_enabled()
+
+
+def test_menu_sites_encode_their_loops():
+    """BUILD 875: each menu site's stock word is its own branch back to the
+    loop head, the exit is the next word, and none is swapped (the battle
+    routine's sense: time left = d0 - d8)."""
+    import a64 as A2
+    for va, word, kind, reg, loop, leave, _w, swap in FP.MENU_SLEEP_SITES:
+        enc = A2.cbz if kind == 'cbz' else A2.cbnz
+        assert word == enc(reg, va, loop) and leave == va + 4 and not swap
+    # the same words, kinds and registers as the battle limiter it copies
+    assert [s[1:4] for s in FP.MENU_SLEEP_SITES] == \
+        [s[1:4] for s in FP.SLEEP_SITES[2:4]]

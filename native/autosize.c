@@ -14,7 +14,7 @@
  *   width   the widest line of every page, measured in the game's own
  *           glyph metrics (the byte table the field text draw reads,
  *           [0xDB958C]: advance 2 * (pad + width) half-pixels, 26 in the
- *           FE E9 fixed-width mode), + 32, halved;
+ *           FE E9 fixed-width mode), + PAD_W (40), halved;
  *   height  the most lines on any page, 32 half-pixels a line, + 50,
  *           halved -- and never taller than the script made it;
  *   then    width <= 320, height <= 224, and the box moved inside the
@@ -61,6 +61,7 @@ typedef void *(*g2h_t)(u32);
 #define MAX_W          320
 #define MAX_H          224
 #define LINE_STEP      32          /* half-pixels */
+#define ICON_W         34          /* half-pixels: a button icon, 16 px + 1 */
 
 #define S __attribute__((noinline, section(".text.as")))
 
@@ -156,6 +157,20 @@ static S s32 measure(g2h_t g2h, u32 text, u32 table, s32 *ow, s32 *oh)
             i += 1;
             continue;
         }
+        /* BUILD 874: the port's button icons -- F6 xx (A, L, ZL, R, ZR, +,
+           -, d-pad), F7 (X), F8 (Y), F9 (B) -- are drawn as a sprite about
+           16 px wide, not from the glyph table, so measuring F6 and its
+           index byte as two letters undercounted every prompt by ~9 px and
+           "(B) Access the menu" wrapped its last word (hardware 11-01). */
+        if (c == 0xF6) {
+            w += ICON_W;
+            i += 1;
+            continue;
+        }
+        if (c >= 0xF7 && c <= 0xF9) {
+            w += ICON_W;
+            continue;
+        }
         if (c >= 0xE0 && c <= 0xE4) {
             w += expansion(g2h, table, c, fixed);
             continue;
@@ -189,6 +204,18 @@ static S s32 measure(g2h_t g2h, u32 text, u32 table, s32 *ow, s32 *oh)
     return 1;
 }
 
+/*
+ * BUILD 872: the horizontal padding, in half-pixels, 32 -> 40. At 32 the gap
+ * between the widest line and the right border was a pinch narrower than the
+ * gap between the border and the first character on the left (hardware
+ * 11-01). FFNx's current auto_resize_text_box (japanese_text.cpp) uses the
+ * same 40: "make calculated length bigger, but not height". +4 px of width.
+ */
+#define PAD_W 40
+
+/* twice the box's centre within 8 (4 px) of twice the screen's (320) */
+#define CENTRED(x, w) (2 * (x) + (w) >= MAX_W - 8 && 2 * (x) + (w) <= MAX_W + 8)
+
 static inline __attribute__((always_inline)) s32 quarter(s32 v)
 {
     s32 q = v / 4;                          /* C truncation, as FFNx's int16 */
@@ -220,7 +247,7 @@ S s32 as_open(u32 esp, g2h_t g2h, u32 world)
         return 0;
     if (!measure(g2h, text, table, &tw, &th))
         return 0;
-    nw = (tw + 32) / 2;
+    nw = (tw + PAD_W) / 2;
     nh = (th + 50) / 2;
     if (nh > wh)
         nh = wh;                            /* never taller than authored */
@@ -230,6 +257,14 @@ S s32 as_open(u32 esp, g2h_t g2h, u32 world)
     if (nh < 0) nh = 0;
     x = (s16)rd16(g2h, wa + W_POS_X);
     y = (s16)rd16(g2h, wa + W_POS_Y);
+    /* BUILD 876: a window the script centred stays centred. Echo-S's new-game
+     * notes (field blackbgh: "Welcome to Project Echo-S", ..., "If you find
+     * ANY bugs at all") are authored centred -- x 71 w 177, x 18 w 283, x 8
+     * w 308, x 28 w 263: centres 159.5..162 -- and kept their left edge, so
+     * the narrower box sat left of centre (hardware 11-01). A box whose
+     * centre is within 4 px of the screen's keeps that centre. */
+    if (CENTRED(x, ww))
+        x = (MAX_W - nw) / 2;
     if (x > MAX_W - nw) x = MAX_W - nw;
     if (x < 0) x = 0;
     if (y > MAX_H - nh) y = MAX_H - nh;

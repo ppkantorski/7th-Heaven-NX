@@ -34,6 +34,8 @@ USER_KEYS = frozenset((
     'video_shader',
     'movie_quality',
     'analog_360',
+    'witem_fix',                    # BUILD 859: Controls > W-Item bug fix
+    'advanced_facial',              # BUILD 859: Voice > Advanced facial animations
     'no_autorun',
     'no_cheats',
     'compact_cache',                # BUILD 848: Storage > Compact cache after build

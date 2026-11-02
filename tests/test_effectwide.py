@@ -59,7 +59,7 @@ def patched(tmp_path_factory):
 ALL_SITES = ({EW.ULT_A_LEFT, EW.ULT_A_RIGHT, EW.ULT_B_BASE,
               EW.ULT_STEP_A, EW.ULT_STEP_B, EW.KOTR_X_START,
               EW.KOTR_ROW2_HEIGHT, EW.KOTR_EXTRA_HOOK,
-              EW.POL_W, EW.POL_H, EW.POL_DOT_X, EW.POL_BG_X}
+              EW.POL_W, EW.POL_H, EW.POL_DOT_X, EW.POL_BG_SCALE}
              | set(EW.ULT_B_SPAN))
 
 
@@ -363,12 +363,13 @@ def test_cold_breath_dot_field_is_the_whole_frame(patched):
     assert xs == [EW.WIDE_X, EW.WIDE_X + EW.WIDE_W - 1]
 
 
-def test_cold_breath_billboard_takes_ffnx_x_and_keeps_its_y(patched, stock_img):
+def test_cold_breath_billboard_keeps_its_place_and_grows(patched, stock_img):
+    """BUILD 874: x stays stock (-100), the sprite's scale 0.75 -> 1.125."""
     img = nxmap.Main(str(patched)).img
-    body = _cave_body(img, EW.POL_BG_X)
-    v = _exec(body[:1]).get(8, w=True)
-    assert v - (1 << 32) == EW.WIDE_X - 200 == -307
-    assert body[1] == EW.STRH_W8_X0
+    assert word(img, EW.POL_BG_X) == word(stock_img, EW.POL_BG_X) == EW.POL_BG_X_STOCK
+    assert word(stock_img, EW.POL_BG_SCALE) == EW.POL_BG_SCALE_STOCK
+    assert _exec([word(stock_img, EW.POL_BG_SCALE)]).get(8, w=True) == 0xC00
+    assert _exec([word(img, EW.POL_BG_SCALE)]).get(8, w=True) == 0x1200
     # y still stores the shared -100 in w19
     assert word(img, 0x005A9960) == word(stock_img, 0x005A9960) == 0x529FF393
     assert word(img, 0x005A9984) == 0x79000013

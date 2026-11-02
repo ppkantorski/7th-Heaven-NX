@@ -23,10 +23,10 @@ def movz(rd, i, hw): return 0xD2800000 | (hw << 21) | (i << 5) | rd
 def movk(rd, i, hw): return 0xF2800000 | (hw << 21) | (i << 5) | rd
 g2h = [movz(1, H & 0xFFFF, 0), movk(1, (H >> 16) & 0xFFFF, 1), 0x8B204020, 0xD65F03C0]
 orig = [movz(0, 0x77, 0), 0xD65F03C0]
-guest = bytearray(0x10000); state = [bytes(0x4000)]; mode = [2]
+guest = bytearray(0x10000); state = [bytes(0x30000)]; mode = [2]
 def run(fn, args):
     mu = U.Uc(U.UC_ARCH_ARM64, U.UC_MODE_ARM)
-    for b, n in ((CODE, 0x10000), (G2H, 0x1000), (ST, 0x4000), (STK - 0x10000, 0x10000), (H, 0x10000), (MODEP, 0x1000), (0xDE000, 0x1000)):
+    for b, n in ((CODE, 0x10000), (G2H, 0x1000), (ST, 0x30000), (STK - 0x10000, 0x10000), (H, 0x10000), (MODEP, 0x1000), (0xDE000, 0x1000)):
         mu.mem_map(b, n)
     mu.mem_write(CODE, blob); mu.mem_write(G2H, struct.pack('<4I', *g2h)); mu.mem_write(ORIG, struct.pack('<2I', *orig))
     mu.mem_write(ST, state[0]); mu.mem_write(H, bytes(guest)); mu.mem_write(MODEP, struct.pack('<I', mode[0]))
@@ -34,7 +34,7 @@ def run(fn, args):
     mu.reg_write(UC_ARM64_REG_SP, STK - 0x100); mu.reg_write(UC_ARM64_REG_X30, 0xDEAD0)
     for i, a in enumerate(args): mu.reg_write(UC_ARM64_REG_X0 + i, a)
     mu.emu_start(CODE + ent[fn], 0xDEAD0, count=100000)
-    state[0] = bytes(mu.mem_read(ST, 0x4000)); guest[:] = mu.mem_read(H, 0x10000)
+    state[0] = bytes(mu.mem_read(ST, 0x30000)); guest[:] = mu.mem_read(H, 0x10000)
     return mu.reg_read(UC_ARM64_REG_X0)
 LIGHT, BONE, ESP, N, VC, AL, OUT, ESP2, OUTF = 0x1000, 0x2000, 0x8000, 0x3000, 0x3100, 0x3200, 0x3300, 0x9000, 0x3400
 def w32(a, v): struct.pack_into('<I', guest, a, v)

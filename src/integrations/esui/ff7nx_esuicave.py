@@ -353,10 +353,12 @@ def store_cave(at, site, old, f, x86_to_arm=None):
     return w
 
 
-def _cursor_tables(w, pc):
+def _cursor_tables(w, pc, second=(0x91C6D3, 0x91C63B)):
     """ESUI's 0x914529 (battle cursor, Transparency2): from the case byte
     [0x6D0005 + [0x91EF9C]]: >2 -> [91C3DB]=2, ==1 -> [91C3DB]=1; then
-    [91C6D3] = [91C63B] = 2 if [91CFC5] == 1 else 1. Uses w11/w12."""
+    [91C6D3] = [91C63B] = 2 if [91CFC5] == 1 else 1. Uses w11/w12.
+    BUILD 877: `second` is what the variant's cave writes in its second part
+    (0x914417: [91C6D3] only; 0x913A25: no second part)."""
     w += _mov32(0, 0x91EF9C)
     w.append(A.bl(pc(), TRANSLATE))
     w.append(A.ldrsh(11, 0, 0))
@@ -380,6 +382,8 @@ def _cursor_tables(w, pc):
     w.append(A.bl(pc(), TRANSLATE))
     w.append(A.strb(12, 0, 0))
     skip = len(w)
+    if not second:
+        return {j_big: (big, 8), j_skip: (skip, 1), j_st: (store, None)}
     w += _mov32(0, 0x91CFC5)
     w.append(A.bl(pc(), TRANSLATE))
     w.append(A.ldrb(11, 0, 0))
@@ -389,7 +393,7 @@ def _cursor_tables(w, pc):
     w.append(0)                                         # b.ne keep 1
     w.append(A.movz(12, 2))
     keep = len(w)
-    for addr in (0x91C6D3, 0x91C63B):
+    for addr in second:
         w += _mov32(0, addr)
         w.append(A.bl(pc(), TRANSLATE))
         w.append(A.strb(12, 0, 0))
@@ -404,7 +408,7 @@ def hook_cave(at, site, displaced, ops):
     w.append(A.stp64_off(10, 30, 31, 32))
     w.append(A.stp64_off(11, 12, 31, 48))
     w.append(A.mrs_nzcv(1))
-    skips = []
+    skips, always = [], []
     for op in ops:
         kind = op[0]
         if kind == 'skip_lt8':                   # the ops after it run only when byte [addr] >= val
@@ -415,15 +419,34 @@ def hook_cave(at, site, displaced, ops):
             w.append(A.cmp_imm(8, val))
             skips.append(len(w))
             w.append(0)                                   # b.lo the end of the ops
-        elif kind in ('st8', 'st32'):
+        elif kind == 'skip_unless8':             # BUILD 877: the ops after it run only when byte [addr] is one of vals
+            _, addr, vals = op
+            w += _mov32(0, addr)
+            w.append(A.bl(pc(), TRANSLATE))
+            w.append(A.ldrb(8, 0, 0))
+            for i, v in enumerate(vals):
+                w.append(A.cmp_imm(8, v))
+                w.append(A.bcond(pc(), pc() + 8 + 8 * (len(vals) - 1 - i), 0))   # b.eq past the rest
+            always.append(len(w))
+            w.append(0)                                   # b the end of the ops (patched below)
+        elif kind in ('st8', 'st16', 'st32'):
             _, addr, val = op
             w += _mov32(0, addr)
             w.append(A.bl(pc(), TRANSLATE))
             w += _mov32(8, val)
-            w.append(A.strb(8, 0, 0) if kind == 'st8' else A.str_(8, 0, 0))
+            w.append({'st8': A.strb, 'st16': A.strh, 'st32': A.str_}[kind](8, 0, 0))
+        elif kind == 'cp32':                     # BUILD 877: dword [dst] = dword [src]
+            _, frm, dst = op
+            w += _mov32(0, frm)
+            w.append(A.bl(pc(), TRANSLATE))
+            w.append(A.ldr(8, 0, 0))
+            w.append(A.mov_reg(11, 8))
+            w += _mov32(0, dst)
+            w.append(A.bl(pc(), TRANSLATE))
+            w.append(A.str_(11, 0, 0))
         elif kind == 'cursor_tables':
             base = len(w)
-            fix = _cursor_tables(w, pc)
+            fix = _cursor_tables(w, pc, op[1] if len(op) > 1 else (0x91C6D3, 0x91C63B))
             for k, (t, cond) in fix.items():
                 frm, to = at + 4 * k, at + 4 * t
                 w[k] = A.b(frm, to) if cond is None else A.bcond(frm, to, cond)
@@ -432,6 +455,8 @@ def hook_cave(at, site, displaced, ops):
             raise ValueError('hook op %r' % (op,))
     for k in skips:
         w[k] = A.bcond(at + 4 * k, at + 4 * len(w), 3)    # lo
+    for k in always:                                      # skip_unless8: none matched
+        w[k] = A.b(at + 4 * k, at + 4 * len(w))
     w.append(A.msr_nzcv(1))
     w.append(A.ldp64_off(11, 12, 31, 48))
     w.append(A.ldp64_off(10, 30, 31, 32))

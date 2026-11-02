@@ -265,6 +265,21 @@ POL_BG_X = 0x005A9964            # strh w19, [x0]   [eax+4] = -100 (x only)
 POL_BG_X_STOCK = 0x79000013
 POL_BG_X_VALUE = WIDE_X - 200    # -307, FFNx's
 STRH_W8_X0 = 0x79000008
+# BUILD 874: the billboard's SIZE, not its x. Hardware 11-01: at -307 the
+# cloud layer ended about 3/4 across the wide frame and black space showed on
+# the right for the whole attack. FFNx's -307 goes with a second change we
+# never ported: its renderer multiplies that texture's quad width and height
+# by (16:9)/(4:3) = 1.33, growing it to the RIGHT of x_left. Here the
+# billboard is a 3D sprite drawn about its own origin (0x547B94: scale
+# matrix 0.75, then the translation x, y, z = -100, -100, 2000), and both x
+# and y scroll +4 a tick for 45 ticks. Measured on the hardware video, the
+# stock sprite covers the 4:3 screen through the whole scroll with little to
+# spare, so the wide frame needs it >= 1.3x larger about the SAME origin.
+# Stock x (-100) and scale 0.75 -> 1.125 (1.5x) cover -107..747 at both ends
+# of the scroll with margin; y and z are untouched.
+POL_BG_SCALE = 0x005AAA8C        # mov w8, #0xc00  [ebp-8] = 0.75 (x, y, z)
+POL_BG_SCALE_STOCK = 0x321607E8
+POL_BG_SCALE_WIDE = 0x52800000 | (0x1200 << 5) | 8   # movz w8, #0x1200
 
 POL_ANCHORS = {
     0x005A8BF0: 0x7100091F,      # cmp w8, #2       the graphics mode arm
@@ -753,13 +768,17 @@ def pollensalta_plan(m, revert=False):
                 'cold breath dot height', revert, ps, notes, problems)
     _cave_site(m, POL_DOT_X, POL_DOT_X_STOCK, _pol_dot_body(),
                'cold breath dot x', revert, ps, notes, problems, pool)
-    _cave_site(m, POL_BG_X, POL_BG_X_STOCK, _pol_bg_body(),
-               'cold breath billboard x', revert, ps, notes, problems, pool)
+    if revert:
+        # BUILD 874 no longer moves the billboard; undo an older build's cave
+        _cave_site(m, POL_BG_X, POL_BG_X_STOCK, _pol_bg_body(),
+                   'cold breath billboard x', revert, ps, notes, problems, pool)
+    _plain_swap(img, POL_BG_SCALE, POL_BG_SCALE_STOCK, POL_BG_SCALE_WIDE,
+                'cold breath billboard scale', revert, ps, notes, problems)
     if not problems and ps and not revert:
         notes.append('      dots: 640 x 320 -> 854 x 480, drawn at x - 107 '
                      '(FFNx wraps them in -107..747)')
-        notes.append('      billboard x: -100 -> %d (FFNx: wide_viewport_x - 200)'
-                     % POL_BG_X_VALUE)
+        notes.append('      billboard: stock x -100, scale 0.75 -> 1.125 '
+                     '(covers the wide frame through the whole scroll)')
     return ps, notes, problems
 
 
@@ -837,6 +856,8 @@ def _verify(main, log=print) -> int:
         'cold breath dot width is stock 640 or wide 854')
     chk(_word(img, POL_H) in (POL_H_STOCK, POL_H_WIDE),
         'cold breath dot height is stock 320 or wide 480')
+    chk(_word(img, POL_BG_SCALE) in (POL_BG_SCALE_STOCK, POL_BG_SCALE_WIDE),
+        'cold breath billboard scale is stock 0.75 or wide 1.125')
     for hook, stock, body, name in (
             (POL_DOT_X, POL_DOT_X_STOCK, _pol_dot_body(), 'cold breath dot x'),
             (POL_BG_X, POL_BG_X_STOCK, _pol_bg_body(), 'cold breath billboard x')):

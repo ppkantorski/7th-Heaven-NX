@@ -15,7 +15,7 @@ It is split so a shipping pass and the diagnostic probe can never collide:
                                 until BUILD 739, 704 until BUILD 842)
     [lo + 0x200,   lo + 0x300)  'sleep': ff7nx_fieldpace's limiter sleep
                                 (BUILD 842) -- one shared routine and four
-                                4-word stubs, 184 bytes; 'pace' has 108 left
+                                4-word stubs, 240 bytes (the menu's two, BUILD 875, live in the world part)
     [lo + 0x300,   lo + 0x800)  'amb': ff7nx_ambient (BUILD 739) -- the
                                 ambience fade and rotation runtime, which the
                                 spent padding pool has no room for
@@ -59,7 +59,10 @@ It is split so a shipping pass and the diagnostic probe can never collide:
     [lo + 0x2E00,  lo + 0x3200) 'calendar': ff7nx_calendar (BUILD 596) --
                                 the menu date row and clock caves, when the
                                 padding pool has no room left for them (1 KB
-                                since BUILD 693: they take 540 bytes)
+                                since BUILD 693: they take 540 bytes; 544
+                                since BUILD 876)
+    [lo + 0x3020,  lo + 0x3200) 'light2': ff7nx_lighting's stubs (BUILD 876:
+                                its code fills 'light')
     [lo + 0x3200,  lo + 0x3500) 'follow': ff7nx_subfollow (BUILD 693) -- the
                                 player camera's float position (528 bytes)
     [lo + 0x3500,  lo + 0x3600) 'winrep': ff7nx_winrepeat (BUILD 694) -- the
@@ -99,7 +102,10 @@ It is split so a shipping pass and the diagnostic probe can never collide:
                                 steps
     [lo + 0xAEA0,  lo + 0xB000) 'blank': ff7nx_blankhold (BUILD 665) -- a
                                 frame with nothing drawn shows the last one
-    [lo + 0xA000,  hi - FAR)    ff7nx_drawprobe, diagnostic builds only --
+    [lo + 0xB000,  hi - FAR)    'difix': ff7nx_difix (BUILD 875b) -- the
+                                held-face-button cave (24 of 32 bytes); the
+                                padding near check() is spent on a full build
+    [lo + 0xA000,  lo + 0xB000) ff7nx_drawprobe, diagnostic builds only --
                                 the SAME space as 'light' + 'subcam' +
                                 'blank': a draw-probe build
                                 (SEVENTH_NX_FRAME_PROBE=draw) leaves those out
@@ -142,6 +148,7 @@ ZOOM_AT = 0x2400
 PAD_AT = 0x2600
 CANIM_AT = 0x2A00
 CALENDAR_AT = 0x2E00
+LIGHT2_AT = 0x3020                    # BUILD 876: the top 480 B of 'calendar'
 FOLLOW_AT = 0x3200                    # BUILD 693: the upper KB of 'calendar'
 WINREP_AT = 0x3500                    # BUILD 694: the top of 'follow'
 CAMPOS_AT = 0x3600
@@ -168,6 +175,8 @@ BLANK_AT = 0xAEA0                     # BUILD 812: was 0xAF00 (665); blankhold's
                                       # of the 1,632 left below it
 PROBE_AT = 0xB000                     # BUILD 665: end of 'blank' (the probe now
                                       # reuses SFXPRE_AT..far, see part())
+DIFIX_AT = 0xB000                     # BUILD 875b: the 32 B above 'blank' (probe
+                                      # builds took it; they now end here)
 FAR_BYTES = 0x6A00                     # BUILD 665: was 0x6C00 (662), 0x7400 (661), 0x7800 (655);
                                        # worldfar uses 27,048 of 27,136
 
@@ -222,7 +231,9 @@ def part(src, which, stock=None):
     elif which == 'canim':
         p = (lo + CANIM_AT, lo + CALENDAR_AT)
     elif which == 'calendar':
-        p = (lo + CALENDAR_AT, lo + FOLLOW_AT)
+        p = (lo + CALENDAR_AT, lo + LIGHT2_AT)
+    elif which == 'light2':
+        p = (lo + LIGHT2_AT, lo + FOLLOW_AT)
     elif which == 'follow':
         p = (lo + FOLLOW_AT, lo + WINREP_AT)
     elif which == 'winrep':
@@ -252,7 +263,9 @@ def part(src, which, stock=None):
         p = (lo + BLANK_AT, lo + PROBE_AT)
     elif which == 'probe':
         # BUILD 665: shares the sfxpre/blank parts (a probe build skips them)
-        p = (lo + SFXPRE_AT, (hi - FAR_BYTES) & ~15)
+        p = (lo + SFXPRE_AT, lo + DIFIX_AT)
+    elif which == 'difix':
+        p = (lo + DIFIX_AT, (hi - FAR_BYTES) & ~15)
     elif which == 'far':
         p = ((hi - FAR_BYTES) & ~15, hi)
     else:

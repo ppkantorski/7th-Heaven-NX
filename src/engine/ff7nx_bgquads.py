@@ -298,6 +298,41 @@ def patch_text(text, lo, hi, code, ent, rows=HOOKS):
     return entry, stubs, end
 
 
+BLEED_SITE = 0xA09680        # ff7nx_fieldbg.SITE_BLEED: movz w22, #hi, lsl 16
+BLEED_STOCK_HI = 0xBAE0      # -0.4375/256
+
+
+def bleed_blob(code, text, log=lambda *_: None):
+    """BUILD 874: the blob with the tile bleed guard ff7nx_fieldbg chose.
+
+    bgquads.c compiles the stock guard in (`? 0xBAE00000u : 0`, one
+    `movz wN, #0xBAE0, lsl 16`). This pass REPLACES the function, so the
+    word fieldbg writes at +0xA09680 never runs -- BUILD 873's corel3 fix
+    reached the module and changed nothing on screen. The guard's high half
+    is now read from that word and written into the blob's one movz.
+    874b: bgquads.c gives the far edge the negation of a POSITIVE guard (an
+    inset); the stock negative guard and zero leave the far edge 0."""
+    w = struct.unpack_from('<I', text, BLEED_SITE)[0]
+    if w & 0xFFE0001F != 0x52A00016:
+        raise ValueError('bg quads: +0x%X holds %08X, not movz w22, #imm, '
+                         'lsl 16' % (BLEED_SITE, w))
+    hi = (w >> 5) & 0xFFFF
+    at = [k for k in range(0, len(code), 4)
+          if struct.unpack_from('<I', code, k)[0] & 0xFFFFFFE0
+          == 0x52A00000 | (BLEED_STOCK_HI << 5)]
+    if len(at) != 1:
+        raise ValueError('bg quads: expected one movz #0x%X, lsl 16 in the '
+                         'blob, found %d' % (BLEED_STOCK_HI, len(at)))
+    if hi == BLEED_STOCK_HI:
+        return code
+    out = bytearray(code)
+    k = at[0]
+    old = struct.unpack_from('<I', out, k)[0]
+    struct.pack_into('<I', out, k, (old & ~(0xFFFF << 5)) | (hi << 5))
+    log('  bg quads: tile bleed guard 0x%04X0000 (from +0x%X)' % (hi, BLEED_SITE))
+    return bytes(out)
+
+
 def apply_to_nso(src, dest, stock=None, exe=None, log=lambda *_: None, rows=None):
     rows = hooks() if rows is None else rows
     blob = open(src, 'rb').read()
@@ -320,11 +355,15 @@ def apply_to_nso(src, dest, stock=None, exe=None, log=lambda *_: None, rows=None
             if x86 in WS_SITES:
                 ws_params(text, x86)
             ok = set(WS_SITES.get(x86, ()))
+            # BUILD 873: ff7nx_fieldbg sizes the bleed guard to the page by
+            # default now; this pass replaces the function, so that word is
+            # never executed once it has run
+            ok.add(0xA09680)
             if any(st[va:va + 4] != bytes(text[va:va + 4]) and va not in ok
                    and st[va:va + 4] != bytes(4) for va in range(flo, fhi, 4)):
                 raise ValueError('x86 0x%X\'s translation is not stock here '
                                  '(patched by an earlier step)' % x86)
-    code = open(BLOB, 'rb').read()
+    code = bleed_blob(open(BLOB, 'rb').read(), text, log)
     if len(code) % 4 or any(struct.unpack_from('<I', code, k)[0] == 0
                             for k in range(0, len(code), 4)):
         raise ValueError('bg quads: the blob holds a zero word (the padding '

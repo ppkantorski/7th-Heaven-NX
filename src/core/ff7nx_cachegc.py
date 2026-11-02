@@ -47,6 +47,19 @@ from and every file's (size, mtime_ns). build.Mod.ensure_extracted restores
 those mtimes when the .iro is unchanged, so a compacted mod costs only the
 extraction time. Folder mods are never touched.
 
+BUILD 875: SUPERSEDED ENTRIES GO EVEN WHEN HELD. A held cache (an archive
+it feeds was kept) was never swept at all, and most builds keep some archive,
+so the caches without an ARCHIVE_DEPS entry (movies, _texconv, _texcap,
+_pfix, _debleed, the sfx encodes) grew by a generation on every key change,
+for good (a user reported 113 GB). Their entry names carry the thing they
+were made for ahead of the key -- `battle.lgp.qjaf.<key>`, `junsea.<key>.mp4`,
+`6661.ogg-<size>-<mtime>-...wav` -- and SLOT says how to read it. In a held
+directory, an entry this build did not use is deleted when another entry for
+the SAME thing was used: this build made or read a newer version, so the old
+one is only a past setting's. Entries for things the build did not get to
+(a kept archive's) are left alone, so a later rebuild never has to re-make
+anything it would have found before.
+
 Deleting a cache entry can only cost time (it is rebuilt when needed),
 never correctness. SEVENTH_NX_CACHE_GC=0 turns the sweep off;
 SEVENTH_NX_CACHE_GC=report lists what would go without deleting.
@@ -105,6 +118,25 @@ SWEEP = {
 ARCHIVE_DEPS = {
     '_fieldlzs': frozenset(('flevel.lgp',)),
     '_spell_dds': frozenset(('magic.lgp',)),
+}
+
+# BUILD 875: {directory: regex whose group 1 names what an entry was made
+# for (its key stripped)}. Two entries with the same group 1 are versions of
+# one thing. Pure-hash caches (_fieldlzs, _spell_dds) have none: their
+# ARCHIVE_DEPS sweep covers them.
+_KEYED = re.compile(r'^(.+)\.[0-9a-f]{16}$')
+_SFX = re.compile(r'^(.+?\.(?:ogg|wav))-\d+-\d+-.*\.wav$')
+SLOT = {
+    'movies': re.compile(r'^(.+)\.[0-9a-f]{20}\.mp4$'),
+    '_texconv': _KEYED,
+    '_texcap': _KEYED,
+    '_pfix': _KEYED,
+    '_debleed': _KEYED,
+    'sfx': _SFX,
+    'sfx-battle': _SFX,
+    'sfx-fieldsteps': _SFX,
+    'sfx-rotations': _SFX,
+    'sfx-worldsteps': _SFX,
 }
 
 COMPACT_ENV = 'SEVENTH_NX_COMPACT_CACHE'
@@ -359,6 +391,69 @@ def stale_entries():
     return out
 
 
+def _entries(d):
+    """[(path, rel)] of the sweepable entries of SWEEP directory `d`."""
+    pat = SWEEP[d]
+    root = os.path.join(ROOT, d)
+    out = []
+    if not os.path.isdir(root):
+        return out
+    if d == 'movies':
+        walk = [(root, [f for f in os.listdir(root)
+                        if os.path.isfile(os.path.join(root, f))])]
+    else:
+        walk = [(b, n) for b, _dirs, n in os.walk(root)]
+    for base, names in walk:
+        for f in names:
+            p = os.path.join(base, f)
+            rel = os.path.relpath(p, root).replace(os.sep, '/')
+            if rel.startswith('.') or f.startswith('.'):
+                continue
+            if pat is None or pat.match(rel):
+                out.append((p, rel))
+    return out
+
+
+def superseded(held):
+    """{dir: [(path, bytes)]}: in each `held` directory with a SLOT rule,
+    the entries this build did not use whose thing it DID use another
+    version of."""
+    out = {}
+    for d in sorted(held):
+        pat = SLOT.get(d)
+        if pat is None or d not in SWEEP:
+            continue
+        files = _entries(d)
+        used, idle = set(), []
+        for p, rel in files:
+            m = pat.match(rel)
+            if not m:
+                continue
+            if p in _TOUCHED:
+                used.add(m.group(1))
+            else:
+                idle.append((p, m.group(1)))
+        old = [(p, _size(p)) for p, slot in idle if slot in used]
+        if old:
+            out[d] = old
+    return out
+
+
+def _remove(d, entries):
+    for p, _b in entries:
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+    root = os.path.join(ROOT, d)
+    for base, dirs, files in os.walk(root, topdown=False):
+        if base != root and not dirs and not files:
+            try:
+                os.rmdir(base)
+            except OSError:
+                pass
+
+
 def sweep_orphans(mods_dir, log=lambda *_: None):
     """BUILD 756: at launch, clear the extractions of mods that are no longer
     installed. Needs no build: whether mods/<stem>.iro exists is the whole
@@ -409,22 +504,20 @@ def sweep(mods_dir, kept, log=lambda *_: None, compact=False):
             % ('removed' if act else 'would remove', len(stale),
                'y' if len(stale) == 1 else 'ies', d, _fmt(n)))
         if act:
-            for p, _b in stale:
-                try:
-                    os.remove(p)
-                except OSError:
-                    pass
-            root = os.path.join(ROOT, d)
-            for base, dirs, files in os.walk(root, topdown=False):
-                if base != root and not dirs and not files:
-                    try:
-                        os.rmdir(base)
-                    except OSError:
-                        pass
+            _remove(d, stale)
+        freed += n
+    # BUILD 875: held directories still lose what a newer version replaced.
+    for d, old in sorted(superseded(held).items()):
+        n = sum(b for _p, b in old)
+        log('  cache: %s %d replaced entr%s in %s (%s)'
+            % ('removed' if act else 'would remove', len(old),
+               'y' if len(old) == 1 else 'ies', d, _fmt(n)))
+        if act:
+            _remove(d, old)
         freed += n
     if held:
-        log('  cache: %s not swept -- an archive they feed was kept from an '
-            'earlier run, so their entries were not all read'
+        log('  cache: %s not fully swept -- an archive they feed was kept '
+            'from an earlier run, so only entries a newer version replaced go'
             % ', '.join(held))
     if compact:
         freed += compact_mod_caches(mods_dir, log, act)

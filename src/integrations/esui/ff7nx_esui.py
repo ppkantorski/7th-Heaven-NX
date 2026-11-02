@@ -91,6 +91,10 @@ LOCKED_OPTIONS = {
     'controllerorder': 'Switch: its own button icons',
     'controllerxinput': 'Switch: its own button icons',
     'pos': 'Switch: its own world-map patch',
+    # BUILD 878: ESUI's field-text folders (forcenoaddon\\*, flevel chunks for
+    # vanilla / NT / SAC text with button codes) are not carried. Echo-S's own
+    # field text has the icons whatever this says, drawn with the Switch glyphs.
+    'forcenoaddon': 'Switch: field icons come with Echo-S',
 }
 
 
@@ -134,7 +138,63 @@ def locked_option(mod, option_id):
     why = pc_only(mod)
     if why:
         return why[0]
-    return LOCKED_OPTIONS.get(option_id) if handles(mod) else None
+    if not handles(mod):
+        return None
+    if option_id in LOCKED_OPTIONS:
+        return LOCKED_OPTIONS[option_id]
+    vals = BATTLE_VERIFIED.get(option_id)
+    if vals is not None and len(vals) == 1:
+        return BATTLE_LOCK_REASON
+    return None
+
+
+# BUILD 877. THE BATTLE SCREEN IS PORTED FOR THESE VALUES ONLY.
+# Every battle function is ported per ESUI variant of its code, and a variant
+# with no verified port leaves the WHOLE battle screen's code stock -- while
+# ESUI's art and data still apply, so stock code draws over ESUI's layout:
+# misplaced and missing battle text (user reports, 11-02). An audit of every
+# option one at a time found these the only values whose battle ports exist
+# (ESUI's own defaults, icons = 0, among the broken ones). Until the rest are
+# ported, the GUI offers only these, and the build applies them whatever an
+# old settings.json says. A tuple of one is shown greyed out; the first value
+# is what an unverified choice falls back to. Unlock a value by adding it
+# once its ports pass tools/esui/port (genvar.py, 0 runs differ).
+BATTLE_VERIFIED = {
+    'battleview': (3, 1),          # Optimized UI v2 (Recommended) or v1 (BUILD 878)
+    'ba': (0, 2),                  # Battle Avatars: Show Names, or 2 (BUILD 878)
+    'tbb': (1, 0),                 # Transparent Battle Boxes: on or off (BUILD 878)
+    'nbb': (0,),                   # No Battle Boxes: off
+    'bars': (2, 0, 1),             # UI Border Thickness: every choice (BUILD 878)
+    'icons': (2, 1, 0),            # Expanded Icons: Set 2, Set 1, or Off (BUILD 878)
+}
+# BUILD 878: every combination of the values above (72) has a ported battle
+# screen (tests/test_esui877.py checks them all). Icons Off: 6E1308's barrier
+# rows, hand-fitted in tools/esui/port/fns.py (_icons_off_variant). Still
+# unported: nbb = 1 and ba = 1 outside battleview 1, battleview 2/4/5.
+BATTLE_LOCK_REASON = 'Switch: the other choices are not ported to battle yet'
+
+
+def allowed_values(mod, option_id):
+    """The values of an ESUI option the Switch build supports, or None (all)."""
+    if not handles(mod) or pc_only(mod):
+        return None
+    return BATTLE_VERIFIED.get(option_id)
+
+
+def enforce_verified(settings, log=lambda *_: None):
+    """`settings` with every battle option on a verified value (a copy)."""
+    out = dict(settings)
+    for k, vals in BATTLE_VERIFIED.items():
+        try:
+            cur = int(out.get(k, vals[0]))
+        except (TypeError, ValueError):
+            cur = None
+        if cur not in vals:
+            if k in out:
+                log('Enhanced Stock UI: %s = %s is not ported to battle yet -- '
+                    'built as %s' % (k, out.get(k), vals[0]))
+            out[k] = vals[0]
+    return out
 
 
 # BUILD 752. ESUI releases newer than the one every port here was generated
@@ -255,7 +315,7 @@ def plan_for(mod, settings, read=None, log=lambda *_: None):
     # an ESUI option. The Switch draws the game 4:3 (pillarboxed): FFNx's 0.
     # Unset, every "(ffnx_aspect_ratio = 0 OR ... OR force43 = 1)" folder is
     # off with Force 4:3 off, and so is every widescreen one -- no battle view.
-    settings = dict(settings)
+    settings = enforce_verified(settings, log)            # BUILD 877
     settings.setdefault('ffnx_aspect_ratio', 0)
     folders = iro.active_folders(mod.manifest, settings, read=read)
     return {'mod': mod, 'folders': [f.replace('\\', '/') for f in folders],
@@ -507,6 +567,18 @@ CODE_MAIN = [
     (0xDC5328, 0x528002E8, 0x52800308, 0x703176, 'OK'),  # mov w8, #0x17 -> mov w8, #0x18
     (0xDC53DC, 0x52800A38, 0x52800A18, 0x703176, 'GROUP'),  # mov w24, #0x51 -> mov w24, #0x50
 ]
+
+# BUILD 877: "EXP Bar Toggle" = Exp Bars Disabled (folder EXP). ESUI moves the
+# main menu's EXP bar, its border and the next-level text 0x400 to the right,
+# off the screen (HEXT 6CAC62 / 6CAD81 / 6CADD5: 0x14B -> 0x54B, 0x147 -> 0x547,
+# 0x148 -> 0x548). The post-battle, PHS and Status bars are in the ported
+# menus; the main menu's three were not carried, so its bars stayed.
+CODE_EXP = [
+    (0xD033FC, 0x11055D1A, 0x11152D1A, 0x6CA346, 'EXP 6cac62'),  # add w26, w8, #0x157 -> add w26, w8, #0x54b
+    (0xD03784, 0x1105551A, 0x11151D1A, 0x6CA346, 'EXP 6cad81'),  # add w26, w8, #0x155 -> add w26, w8, #0x547
+    (0xD03954, 0x11051D1A, 0x1115211A, 0x6CA346, 'EXP 6cadd5'),  # add w26, w8, #0x147 -> add w26, w8, #0x548
+]
+
 
 CODE_FULLMENU = [
     (0xCA5BC4, 0x321E1BF8, 0x528042B8, 0x6C98A6, 'm:6c9b44 (Fullmenu text X, loop)'),  # mov w24, #0x1fc -> mov w24, #0x215
@@ -776,6 +848,8 @@ def _sets():
         code = {r[0]: r for r in CODE_MAIN}
         if has_folder('Fullmenu'):
             code.update({r[0]: r for r in CODE_FULLMENU})
+        if has_folder('EXP'):
+            code.update({r[0]: r for r in CODE_EXP})
         if CURRENT is not None:
             code.update({r[0]: r for r in CODE_GLYPHW})
         if os.environ.get(CENTER_ENV, '1').strip().lower() not in ('0', 'off', 'no', 'false'):
@@ -2367,6 +2441,7 @@ MAIN_FUNCTIONS = ((0x6C62A2, 0x6C66C8), (0x6C98A6, 0x6C9D07),
                   (0x70212A, 0x703344))
 CARRIED = {('enhancedstock', '00-main.txt'), ('enhancedstock', '00-spacing.txt'),
            ('enhancedstock', '03-battle.txt'), ('fullmenu', 'all.txt'),
+           ('exp', 'all.txt'),
            ('echos/main', '05 - esui theme.txt')}
 
 

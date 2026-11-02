@@ -74,6 +74,17 @@ the fresh setup to its polygon set (a 1,024-slot part table), and the
 relight routines' entries make the set's own record the cache, so each
 part is relit with its own bone (FFNx's intensity, as 675d).
 
+876 (hardware probes 876p/876p2, gaia_1, Cloud standing still: arms, hair
+and shoulders flicker): the field's relight (0x64CA65) lights each vertex
+IN PLACE -- it reads the colour at the vertex record's +0x10 and 0x68DD1E
+writes the lit colour back there. Cloud was relit twice a frame with the
+same light, ambient and bone; one pass started from his real colour
+(255 -> 214), the other from the already-lit one (214 -> 180), and the
+frame showed whichever ran last. lt_vtx now keeps, per lit vertex (8,192
+slots keyed by the output address), the unlit colour and the colour it
+wrote: an input that is exactly its last output is lit from the unlit
+colour, so lighting twice gives what lighting once does. +96 KB BSS.
+
 Code: 'light' dead-space part (2 KB; one .text.lt section, entries from the
 symbols; stubs packed). State: Lt header 96 B + 128 records
 x 80 B = 10,336 B BSS.
@@ -93,7 +104,7 @@ import a64 as A
 import ff7nx_audio_cave as AC
 import ff7nx_deadspace as DS
 
-VERSION = 6790   # 679: each part relit with its own bone
+VERSION = 8760   # 876: a vertex lit twice is lit from its unlit colour (gaia flicker)
 ENV = 'SEVENTH_NX_LIGHTING'
 HERE = nxpaths.ROOT
 BLOB = os.path.join(nxpaths.APP, 'native', 'lighting.bin')
@@ -103,7 +114,7 @@ X86_CTX_GOT, X86_ESP, GUEST_TO_HOST = 0x12CE2B0, 0x10, 0x10FC3A0
 SETUP_CALL, SETUP_TARGET = 0xB5D5D4, 0xBC7280      # x86 0x69C69F -> 0x69C3D7
 VTX_CALL, VTX_TARGET = 0xB8E0B4, 0x10F23C0         # x86 0x68DD1E -> native vertex
 MV_CALLS, MV_TARGET = (0xB8E1F0, 0xB8D214, 0xB8C404), 0x7E40  # 0x68DE75 / 0x68DBF4 / 0x68DAE1 -> 0x66CFE8
-STATE_BYTES = 96 + 128 * 80 + 1024 * 44   # 675c: Lt header + per-light records; 679: + per-part records
+STATE_BYTES = 96 + 128 * 80 + 1024 * 44 + 8192 * 12   # 675c: Lt header + per-light records; 679: + per-part records; 876: + per-vertex colours
 # 679: entries hooked (first word displaced): x86 0x68E92D light_polygon_set
 # (kind 0: bind the fresh setup to the set), 0x64CA65 / 0x64C382 the field's
 # relight (kind 1: the set's own record)
@@ -224,6 +235,9 @@ def apply_to_nso(src, dest, stock=None, log=lambda *_: None, region=None):
     text = bytearray(raw[0])
     check(text)
     lo, hi = region if region else DS.part(src, 'light', stock)
+    # 876: the code fills 'light'; the stubs go in 'light2' (a region given
+    # by a test holds both)
+    slo, shi = (None, None) if region else DS.part(src, 'light2', stock)
     code = open(BLOB, 'rb').read()
     base = AC.scratch_base(blob, segs)
     state = (base + 15) & ~15
@@ -231,6 +245,12 @@ def apply_to_nso(src, dest, stock=None, log=lambda *_: None, region=None):
     entry = (lo + 15) & ~15
     fn = {k: entry + v for k, v in entries().items()}
     at = (entry + len(code) + 15) & ~15
+    if slo is not None:
+        if at > hi:
+            raise ValueError('lighting: %d code bytes do not fit the %d-byte part'
+                             % (at - lo, hi - lo))
+        code_lo, code_end, lo, hi = lo, at, slo, shi
+        at = (slo + 15) & ~15
     stubs, words = {}, {}
 
     def put(name, ws):
@@ -265,7 +285,12 @@ def apply_to_nso(src, dest, stock=None, log=lambda *_: None, region=None):
     with open(dest, 'wb') as f:
         f.write(AC.pack(blob, raw, growth))
     log('  model lighting: FFNx per-vertex (each light clamped, squared, plus the '
-        'ambient); code +0x%X (%d bytes of the light part), state +0x%X'
-        % (entry, at - lo, state))
-    return {'code': entry, 'bytes': at - lo, 'stubs': stubs, 'state': state,
+        'ambient; a vertex lit twice is lit from its unlit colour); code +0x%X '
+        '(%d bytes of the light part%s), state +0x%X'
+        % (entry, (code_end - code_lo) if slo is not None else at - lo,
+           ', stubs in light2' if slo is not None else '', state))
+    return {'code': entry,
+            'bytes': (code_end - code_lo) if slo is not None else at - lo,
+            'stub_bytes': (at - lo) if slo is not None else 0,
+            'stubs': stubs, 'state': state,
             'bss': growth, 'entries': fn}

@@ -645,7 +645,9 @@ def apply_to_flevel(archive, payloads, art, encode=None, mb_cap=35.0,
             if not msg.startswith('nothing convertible'):
                 total['refused'].append((name, msg[:80]))
             continue
-        payloads[name] = encode(lgp.join_sections(parts))
+        new_raw = lgp.join_sections(parts)
+        payloads[name] = encode(new_raw)
+        total['max_raw'] = max(total.get('max_raw', 0), len(new_raw))
         total['pages'] += len(done)
         total['names'].append('%s %s (%.1f MB%s)' % (
             name, ','.join(map(str, sorted(done))), mb, blank_note))

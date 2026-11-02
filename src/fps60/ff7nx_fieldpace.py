@@ -278,6 +278,23 @@ WORLD_SLEEP_SITES = (
 )
 
 
+# BUILD 875: the menu's limiter (x86 0x6CD91A, ARM +0xD0D060, called by
+# menu_loop_sub_6CC623) is a third copy of the battle one: the same x86 waits
+# (0x6CD983 elapsed < frame; 0x6CDA17 frame - debt > elapsed), translated to
+# the same branch words and register use as battle's two, so the plain
+# routine serves both (no swap). Until now the whole menu, ESUI included,
+# spun a core through the idle part of every frame. The 'sleep' part is full
+# (one routine and four stubs, 240 of its 256 bytes), so these two stubs go
+# in the world part next to the world's, which has room for them.
+# (branch VA, stock word, kind, register, loop head, exit, what, swap)
+MENU_SLEEP_SITES = (
+    (0xD0D3F0, 0x34FFEFEA, 'cbz', 10, 0xD0D1EC, 0xD0D3F4, 'menu wait',
+     False),
+    (0xD0D864, 0x35FFF148, 'cbnz', 8, 0xD0D68C, 0xD0D868,
+     'menu catch-up wait', False),
+)
+
+
 def sleep_enabled():
     return os.environ.get(SLEEP_ENV, '').strip().lower() not in (
         '0', 'off', 'no', 'false')
@@ -357,7 +374,7 @@ def apply_sleep_to_nso(src, dest, stock=None):
     for site in SLEEP_SITES:
         got = struct.unpack_from('<I', text, site[0])[0]
         (sites if got == site[1] else skipped).append(site)
-    wstock = [w for w in WORLD_SLEEP_SITES
+    wstock = [w for w in WORLD_SLEEP_SITES + MENU_SLEEP_SITES
               if struct.unpack_from('<I', text, w[0])[0] == w[1]]
     if not sites and not wstock:
         raise ValueError('no wait loop holds its stock branch')
@@ -376,10 +393,16 @@ def apply_sleep_to_nso(src, dest, stock=None):
                         build_sleep_stub(e, ad, k, r, lp, lv, routine))
         placed[va] = A.b(va, stub)
     placed.update(dead.placed)
-    # BUILD 855: the world map's two waits
-    wsites = [w for w in WORLD_SLEEP_SITES
+    # BUILD 855: the world map's two waits; BUILD 875: and the menu's
+    wsites = [w for w in WORLD_SLEEP_SITES + MENU_SLEEP_SITES
               if struct.unpack_from('<I', text, w[0])[0] == w[1]]
-    skipped += [w for w in WORLD_SLEEP_SITES if w not in wsites]
+    skipped += [w for w in WORLD_SLEEP_SITES + MENU_SLEEP_SITES
+                if w not in wsites]
+    if routine is None and any(w in MENU_SLEEP_SITES for w in wsites):
+        # the plain routine would have to live here too: 2 routines and 4
+        # stubs do not fit WORLD_SLEEP_BYTES, so the menu keeps its spin
+        skipped += [w for w in wsites if w in MENU_SLEEP_SITES]
+        wsites = [w for w in wsites if w not in MENU_SLEEP_SITES]
     if wsites:
         try:
             wlo, whi = world_dead_part(src, stock, 'sleep')

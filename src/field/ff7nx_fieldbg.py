@@ -766,9 +766,52 @@ def patches_module(px=None, max_raw=None):
     return bool(words(px, None, max_raw))
 
 
+INSET_TEXELS = 0.25                   # BUILD 875b (874b: 0.5)
+
+
+def bleed_mode():
+    """BUILD 874b: 'inset' by default (=zero: no guard at all); HALVE_BLEED_ENV=0 restores the 1997
+    constant ('stock'), =scale gives BUILD 873's -0.4375/px ('scale').
+
+    Hardware 11-01, corel3: thin vertical lines on the fire layer, fixed on
+    screen and in step with the flame cycle. The guard is added to the u AND
+    v of each tile's LEFT edge only (the right edge gets 0), so it pulls the
+    left edge's sampling OUTWARD (and up) by 0.4375/256 of the page; the
+    vertex positions do not move. On a 768px page that is 1.31 texels, so
+    every HD tile's first column samples the NEIGHBOURING atlas cell -- on an
+    FX page, the next flame frame -- a one-pixel vertical line.
+
+    873 scaled it to 0.4375 texel and it changed nothing on hardware, for two
+    reasons: ff7nx_bgquads runs this function as native code with the
+    constant compiled in, so the word at SITE_BLEED was never executed
+    (bgquads now copies it into its blob); and even 0.44 texel outward is
+    still outside the cell for the first screen pixel at 1080p (a pixel is
+    0.67 of a 768 texel there: -0.44 + 0.33 = -0.10). Zero keeps the first
+    pixel inside at every page size and output resolution, and moves no
+    geometry, so it cannot open a seam.
+
+    874b (hardware 11-01 12:29, corel3 still showed a line now and then):
+    the remaining line is the FAR edge -- tile x -224 y -120 ends on cell
+    (8,5) of page 28 whose right-hand neighbour is the bright horizon (mean
+    193 against the sky's 47), and bilinear filtering reaches it from the
+    last pixel (0.29 texel short of the edge at 1080p: ~20% of the
+    neighbour). 'inset' pulls BOTH edges half a texel in: near +0.5/px, far
+    -0.5/px (bgquads gives the far edge the negation of a positive guard).
+    The tile's 48 texels are drawn across 47 -- a 2% stretch -- and no
+    filter tap can leave the cell. Positions are untouched."""
+    v = os.environ.get(HALVE_BLEED_ENV, '').strip().lower()
+    if v in ('0', 'false', 'no', 'off', 'stock'):
+        return 'stock'
+    if v in ('scale', 'page'):
+        return 'scale'
+    if v == 'zero':
+        return 'zero'
+    return 'inset'
+
+
 def halve_bleed():
-    return os.environ.get(HALVE_BLEED_ENV, '').strip().lower() in (
-        '1', 'true', 'yes', 'on')
+    """Kept for callers: True unless the stock constant is selected."""
+    return bleed_mode() != 'stock'
 
 
 def page_bytes(depth, px=None):
@@ -880,17 +923,39 @@ def words(px=None, bleed=None, max_raw=None):
     out.update(_load_slots_word())
     out.update(_d1_words())
     out.update(_fx_blend_words())
-    if bleed if bleed is not None else halve_bleed():
+    if bleed is None:
+        mode = bleed_mode()
+    elif isinstance(bleed, str):
+        mode = bleed
+    else:
+        mode = 'scale' if bleed else 'stock'
+    if mode == 'inset':
+        # BUILD 874b: an inset at the near edge; ff7nx_bgquads writes the
+        # negation at the far edge. BUILD 875b: a quarter texel (truncated
+        # to one movz). It now really runs (bgquads applied it only when the
+        # stock test passed, which it never does on the Switch), on every
+        # HD tile of every field, so it is the least that keeps the edge
+        # pixel's filter footprint inside the cell at 1080p up to the 4/3
+        # field zoom (that needs 0.25; 1.16x needs 0.21, 1x 0.17): the art
+        # gives up a quarter texel at each tile edge instead of a half.
+        hi = _f32_bits(INSET_TEXELS / px) >> 16
+        put(SITE_BLEED, _movz_hi16(ORIG[SITE_BLEED], hi),
+            'tile bleed guard -0.4375/256 -> inset +-%g/%d '
+            '(0x%04X0000; no filter tap leaves the cell at 1080p)'
+            % (INSET_TEXELS, px, hi))
+    elif mode == 'zero':
+        # BUILD 874: no outward pull at all -- see bleed_mode().
+        put(SITE_BLEED, _movz_hi16(ORIG[SITE_BLEED], 0),
+            'tile bleed guard -0.4375/256 -> 0 (left-edge u/v no longer '
+            'sample the neighbouring atlas cell)')
+    elif mode == 'scale':
         # -0.4375/256 -> -0.4375/px, so the tile-edge bleed guard stays the
-        # same fraction of a TEXEL. Costs correctness on the depth-1 pages
-        # that stay 256, which is why it is off by default.
+        # same fraction of a TEXEL.
         #
         # DERIVED rather than tabulated. The site is `movz w22, #imm, lsl 16`,
         # so the float32 has to have a zero low half -- true for 128,256,512
         # and 1024 (all powers of two: dividing by one only walks the
-        # exponent) and FALSE for 768, where -0.4375/768 is 0xBA155555. The
-        # old {512: 0xBA60, 1024: 0xB9E0} table encoded that fact by omission
-        # and would KeyError on 768 or 128; now it is stated and checked.
+        # exponent) and FALSE for 768, where -0.4375/768 is 0xBA155555.
         hi = _bleed_hi16(px)
         if hi is None:
             raise ValueError(
@@ -900,7 +965,8 @@ def words(px=None, bleed=None, max_raw=None):
                 % (px, px, _f32_bits(-0.4375 / px), SITE_BLEED,
                    HALVE_BLEED_ENV))
         put(SITE_BLEED, _movz_hi16(ORIG[SITE_BLEED], hi),
-            'tile bleed guard -0.4375/256 -> -0.4375/%d' % px)
+            'tile bleed guard -0.4375/256 -> -0.4375/%d (0x%04X0000)'
+            % (px, hi))
     return out
 
 
@@ -1038,6 +1104,11 @@ def _bleed_hi16(px):
     and the constant therefore needs two instructions.
     """
     bits = _f32_bits(-0.4375 / px)
+    if px == 768:
+        # BUILD 873: 0xBA155555 has a non-zero low half. Dropping it rounds
+        # the magnitude DOWN by 0.2% (0.4366 texel instead of 0.4375), which
+        # keeps the guard inside the tile's own texel; one movz still does it.
+        return bits >> 16
     return None if bits & 0xFFFF else bits >> 16
 
 
