@@ -25,7 +25,7 @@ MOD = os.path.join(ROOT, 'mods', 'Enhanced Stock UI-rel2')
 
 
 def test_877_unverified_battle_values_fall_back():
-    s = E.enforce_verified({'battleview': 2, 'ba': 1, 'tbb': 0, 'nbb': 1,
+    s = E.enforce_verified({'battleview': 2, 'ba': 7, 'tbb': 0, 'nbb': 1,
                             'bars': 0, 'icons': 0, 'fonts': 2})
     assert E.enforce_verified({'icons': 3}) == {'icons': 2}
     assert s == {'battleview': 3, 'ba': 0, 'tbb': 0, 'nbb': 0, 'bars': 0,
@@ -51,7 +51,7 @@ def test_877_exp_bar_toggle_moves_the_main_menu_bars(monkeypatch):
 
 @pytest.mark.skipif(not os.path.isdir(MOD), reason='ESUI mod not present')
 @pytest.mark.parametrize('opts', [{}, {'battleview': 2}, {'icons': 0, 'bars': 0},
-                                  {'ba': 1, 'tbb': 0, 'nbb': 1}])
+                                  {'ba': 1, 'tbb': 0, 'nbb': 1}, {'battleview': 5, 'ba': 1}])
 def test_877_every_battle_choice_builds_a_ported_battle(opts):
     import build
     m = build.Mod(MOD, tempfile.mkdtemp())

@@ -160,17 +160,18 @@ def locked_option(mod, option_id):
 # is what an unverified choice falls back to. Unlock a value by adding it
 # once its ports pass tools/esui/port (genvar.py, 0 runs differ).
 BATTLE_VERIFIED = {
-    'battleview': (3, 1),          # Optimized UI v2 (Recommended) or v1 (BUILD 878)
-    'ba': (0, 2),                  # Battle Avatars: Show Names, or 2 (BUILD 878)
+    'battleview': (3, 1, 5),       # Optimized UI v2 (Recommended), v1, Minimal UI v2 (BUILD 878)
+    'ba': (0, 2, 1),               # Battle Avatars: Show Names, Show Both, Show Mini Avatars (BUILD 878)
     'tbb': (1, 0),                 # Transparent Battle Boxes: on or off (BUILD 878)
     'nbb': (0,),                   # No Battle Boxes: off
     'bars': (2, 0, 1),             # UI Border Thickness: every choice (BUILD 878)
     'icons': (2, 1, 0),            # Expanded Icons: Set 2, Set 1, or Off (BUILD 878)
 }
-# BUILD 878: every combination of the values above (72) has a ported battle
+# BUILD 878: every combination of the values above (162) has a ported battle
 # screen (tests/test_esui877.py checks them all). Icons Off: 6E1308's barrier
-# rows, hand-fitted in tools/esui/port/fns.py (_icons_off_variant). Still
-# unported: nbb = 1 and ba = 1 outside battleview 1, battleview 2/4/5.
+# rows, hand-fitted in tools/esui/port/fns.py (_icons_off_variant). Mini
+# avatars: 6DD041's name-draw caves (_mini_avatars_variant). Still unported:
+# nbb = 1 (some combinations) and battleview 2/4 (single column menus).
 BATTLE_LOCK_REASON = 'Switch: the other choices are not ported to battle yet'
 
 

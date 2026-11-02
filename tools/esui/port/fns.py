@@ -600,3 +600,41 @@ def _icons_off_variant():
 
 
 _guard(_icons_off_variant, (0x6e1308,))
+
+
+# BUILD 878: Battle Avatars "Show Mini Avatars" (BattleView\BA*). The name
+# draws (two `call 0x6F5B03` in 6DD041) become `jmp` into ESUI caves that push
+# the new x (0x16a, too big for the push imm8 they replace), call the same
+# routine and jump back. The caves run as part of the function.
+def _x86_jmp_caves(fn, lo=0x913000, hi=0x915000):
+    import esui_port as _P
+    a0, a1 = _M.containing(fn)
+    md = _cs.Cs(_cs.CS_ARCH_X86, _cs.CS_MODE_32)
+    o = _ep.va_to_offset(_PE, a0)
+    out = []
+    for i in md.disasm(bytes(_P.NEW_FULL[o:o + (a1 - a0)]), a0):
+        if i.mnemonic == 'jmp' and i.op_str.startswith('0x'):
+            t = int(i.op_str, 16)
+            if lo <= t < hi:
+                oc = _ep.va_to_offset(_PE, t)
+                for j in md.disasm(bytes(_P.NEW_FULL[oc:oc + 0x40]), t):
+                    if j.mnemonic == 'jmp' and j.op_str.startswith('0x') \
+                            and a0 <= int(j.op_str, 16) < a1:
+                        out.append((t, j.address + j.size))
+                        break
+    return out
+
+
+def _mini_avatars_variant():
+    c = FNS[0x6dd041]
+    caves = _x86_jmp_caves(0x6dd041)
+    # the 7777 row's name x ([ebp-0x3c]; 0xe stock, 0x14 ESUI, 0x149 with
+    # mini avatars) is one movz in the ARM
+    c['arm_struct'][0xd3fa34] = A.movz(8, _ximm(0x6dd31b) & 0xffff)
+    if caves:
+        c['native_extra'] = list(c.get('native_extra', [])) + [x for x in caves if x not in c.get('native_extra', [])]
+        # cover the 7777 row (a member at 7777 HP: [DBA4A8 + 0x440 n] = 0x1E61)
+        c['pokes'] = list(c['pokes']) + [{**p, 0xdba4a8: 0x1e61} for p in c["pokes"][:2]]
+
+
+_guard(_mini_avatars_variant, (0x6dd041,))
