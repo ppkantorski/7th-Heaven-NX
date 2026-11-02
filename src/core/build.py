@@ -138,6 +138,7 @@ import ff7nx_strayfront
 import ff7nx_ventcrop
 import ff7nx_deadarrow
 import ff7nx_bandguard
+import ff7nx_voidmask
 import ff7nx_chunkparallax
 import ff7nx_trnad1fx
 import ff7nx_l4offset
@@ -11219,6 +11220,15 @@ def _build_flevel(archive_path, chunks, field_files, romfs, log,
     bg_line = ff7nx_bandguard.summarise(bg_stats)
     if bg_line:
         log(bg_line)
+    # BUILD 879. holu_1: a body walking out through the right-hand door was
+    # drawn over the empty black 16:9 margin. Front-most near-black squares
+    # mask every margin texel no tile paints. See ff7nx_voidmask.
+    vm_stats = ff7nx_voidmask.apply_to_flevel(
+        archive, payloads,
+        encode=lambda raw: _encode_field_cached(archive, raw), log=log)
+    vm_line = ff7nx_voidmask.summarise(vm_stats)
+    if vm_line:
+        log(vm_line)
 
     # ------------------------------------------ DEPTH-1 RESOLUTION LIFT
     # BUILD 618v: now really dead last among the page passes (see the note
