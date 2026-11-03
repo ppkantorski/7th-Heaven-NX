@@ -11,7 +11,7 @@
 
 **7th Heaven NX** brings PC 7th Heaven mods to **Final Fantasy VII on Nintendo Switch**. You point it at your own game dump, pick your mods, and it builds an Atmosphère LayeredFS folder you copy straight onto your SD card.
 
-[![7th Heaven NX game window](.pics/game_screenshot.png)](https://github.com/ppkantorski/7th-Heaven-NX#screenshots)
+[![7th Heaven NX game window](.pics/game_screenshot.png)](https://github.com/ppkantorski/7th-Heaven-NX#7th-heaven-nx)
 
 On PC, mods like Cosmo Memory, Echo-S and Enhanced Stock UI depend on FFNx, a replacement graphics driver for the game. The Switch has no FFNx, so 7th Heaven NX does that work itself: it repacks the mods into the formats the Switch port reads, and patches the game's own ARM64 module for everything a data file alone can't do (60 FPS, widescreen, HD shaders, voice acting, model shadows and more).
 
