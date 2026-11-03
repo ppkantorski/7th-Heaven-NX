@@ -46,7 +46,7 @@ HERE = nxpaths.ROOT
 
 # Shown in the header, nearest the title. Single source of truth --
 # anything else that needs it should import this rather than repeat it.
-VERSION = '1.0.6'
+VERSION = '1.0.7'
 sys.path.insert(0, HERE)
 
 import build  # noqa: E402
@@ -1770,9 +1770,49 @@ class _BuildClock:
                 self._log('  ! %s' % exc)
 
 
+# BUILD 880. A tester's fresh install built for two hours with no FFmpeg:
+# the launch-time download had failed with nothing on screen, and the build
+# then finished "done" without movies, sound effects, ambient audio or
+# Echo-S voice. Before a build, a missing FFmpeg is fetched again; if that
+# fails too, the build stops with the reason. SEVENTH_NX_ALLOW_NO_FFMPEG=1
+# builds anyway (the old behaviour).
+ALLOW_NO_FFMPEG_ENV = 'SEVENTH_NX_ALLOW_NO_FFMPEG'
+FFMPEG_BLOCK = [None]
+
+
+def _ffmpeg_gate(log):
+    try:
+        ok, why = ff7nx_deps.retry_ffmpeg(nxpaths.ROOT)
+    except Exception as exc:                                   # noqa: BLE001
+        ok, why = False, '%s: %s' % (type(exc).__name__, exc)
+    if ok:
+        return True
+    if os.environ.get(ALLOW_NO_FFMPEG_ENV, '').strip() == '1':
+        log('! FFmpeg is missing (%s). %s=1: building WITHOUT movies, sound '
+            'effects, ambient audio and Echo-S voice.'
+            % (why, ALLOW_NO_FFMPEG_ENV))
+        return True
+    FFMPEG_BLOCK[0] = why
+    for line in (
+            '!! BUILD STOPPED: FFmpeg is missing, and downloading it again '
+            'failed (%s).' % why,
+            '   Without it the build would skip every movie, the sound '
+            'effects, ambient audio and Echo-S voice.',
+            '   Check your internet connection, firewall or antivirus and '
+            'build again (the download comes from GitHub),',
+            '   or install FFmpeg yourself so ffmpeg and ffprobe are on PATH.',
+            '   To build without them anyway, set %s=1.'
+            % ALLOW_NO_FFMPEG_ENV):
+        log(line)
+    return False
+
+
 def run_build(mods, enabled, settings_by_mod, log, progress,
               fps_60=False):
     """The build, timed (BUILD 835): see _BuildClock."""
+    FFMPEG_BLOCK[0] = None
+    if not _ffmpeg_gate(log):
+        return False
     clock = _BuildClock(log)
     clock.header()
     try:
@@ -5786,6 +5826,7 @@ def launch_ui():
                      justify='left').grid(
                 row=row, column=0, sticky='w', pady=3, padx=(0, 12))
             labels = [_opt_label(label) for _, label in opt.values]
+            shown = [v for v, _ in opt.values]   # value behind each entry
             current = store.get(opt.id, opt.default)
 
             # A List with no <Option> at all -- Enhanced Stock UI's
@@ -5820,6 +5861,7 @@ def launch_ui():
                 if len(_allowed) > 1:
                     labels = [_opt_label(label) for v, label in opt.values
                               if v in _allowed]
+                    shown = [v for v, _ in opt.values if v in _allowed]
             # BUILD 864. PC x86 code options (PS3Tweaks): greyed out at their default,
             # which is what the build does with them (ff7nx_pccode).
             if not locked:
@@ -5846,16 +5888,29 @@ def launch_ui():
                 wraplength=MODIFIES_COL - 10,
                 row=row, column=2, sticky='w', padx=(14, 0))
 
-            def on_pick(_evt, o=opt, v=var, mf=mod.filename):
-                for value, label in o.values:
-                    if _opt_label(label) == v.get():
-                        settings_by_mod.setdefault(mf, {})[o.id] = value
-                        break
+            # BUILD 881: pick by POSITION, not by label. Two entries with the
+            # same label (Ninostyle Chibi's two "NinoStyle" Chocobos) made
+            # the label lookup always land on the first one, so the second
+            # could never be chosen. iro._dedupe_labels now keeps labels
+            # unique too; this keeps a future collision from biting again.
+            def on_pick(_evt, o=opt, v=var, mf=mod.filename, c=None,
+                        sv=tuple(shown)):
+                idx = c.current() if c is not None else -1
+                if 0 <= idx < len(sv):
+                    settings_by_mod.setdefault(mf, {})[o.id] = sv[idx]
+                else:
+                    for value, label in o.values:
+                        if _opt_label(label) == v.get():
+                            settings_by_mod.setdefault(mf, {})[o.id] = value
+                            break
                 save_settings_now()
                 refresh_summary()
                 _sync_dflt()
 
-            combo.bind('<<ComboboxSelected>>', on_pick)
+            combo.bind('<<ComboboxSelected>>',
+                       lambda e, f=on_pick, c=combo: f(e, c=c))
+            if current in shown:
+                combo.current(shown.index(current))
             store.setdefault(opt.id, current)
 
     rows = {}  # filename -> (row, indicator, checkbutton, label)
@@ -6713,6 +6768,15 @@ def launch_ui():
                     build_btn.state(['!disabled'])
                     bar['value'] = bar['maximum'] if payload else 0
                     statuslabel.configure(text='done' if payload else 'failed')
+                    if not payload and FFMPEG_BLOCK[0] is not None:
+                        messagebox.showerror(
+                            '7th Heaven NX',
+                            'FFmpeg is missing, so the build was stopped.\n\n'
+                            'Downloading it again failed:\n%s\n\n'
+                            'Check your internet connection, firewall or '
+                            'antivirus and build again, or install FFmpeg '
+                            'so ffmpeg and ffprobe are on PATH.'
+                            % FFMPEG_BLOCK[0])
                     # anything installed while the build ran
                     reload_mods()
                     if payload:

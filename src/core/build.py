@@ -19896,6 +19896,19 @@ def apply_echo_tutorial(sdout, dump, plan, log=lambda *_: None, produced=()):
         log('! Echo-S tutorial redirect: %s: %s'
             % (type(exc).__name__, exc))
         return []
+    # The redirect is only half of this. Slot 1 carries no file in the stock
+    # game -- that is exactly why it was safe to claim -- so if the movie pass
+    # did not produce one, the module would send mds7pb_1 at a movie that is
+    # not there. BUILD 880 (a tester's build with no FFmpeg): the redirect is
+    # now NOT installed in that case, so mds7pb_1 keeps the stock movie.
+    movie = os.path.join(sdout, 'atmosphere', 'contents', TITLE_ID, ROMFS,
+                         'data', 'movies', report['redirect'] + '.mp4')
+    if not os.path.exists(movie):
+        os.remove(tmp)
+        log('! Echo-S tutorial movie: NOT installed -- %s.mp4 is not in the '
+            'output (the movie pass did not run: is FFmpeg missing?), so '
+            'mds7pb_1 keeps the stock movie.' % report['redirect'])
+        return []
     os.replace(tmp, dest)
     log('Echo-S tutorial movie: PMVIE slot %d (%s) -> slot %d (%s) only in '
         '%s (field id 0x%03X), cave +0x%X (%d words)'
@@ -19906,20 +19919,6 @@ def apply_echo_tutorial(sdout, dump, plan, log=lambda *_: None, produced=()):
         log('  the tutorial movie keeps its full height: ff7nx_moviealign and '
             'ff7nx_moviebars stand aside for a 4:3 movie in mds7pb_1 only '
             '(%s=off restores the field framing)' % echo_s_tutorial.FULLVIEW_ENV)
-    # The redirect is only half of this. Slot 1 carries no file in the stock
-    # game -- that is exactly why it was safe to claim -- so if the movie pass
-    # did not produce one, the module now sends mds7pb_1 at a movie that is
-    # not there. That is silent in the build log and confusing on hardware,
-    # and it has already cost one test cycle.
-    movie = os.path.join(sdout, 'atmosphere', 'contents', TITLE_ID, ROMFS,
-                         'data', 'movies', report['redirect'] + '.mp4')
-    if not os.path.exists(movie):
-        log('! Echo-S tutorial movie: the redirect is installed but '
-            '%s.mp4 is NOT in the output. Slot %d has no file in the stock '
-            'game, so mds7pb_1 will now ask for a movie that does not exist. '
-            'Either the movie pass did not run (ffmpeg missing?) or the '
-            'movies directory was not copied to the SD card.'
-            % (report['redirect'], report['redirect_index']))
     return [dest] if not built else []
 
 

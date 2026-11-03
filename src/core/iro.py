@@ -278,6 +278,41 @@ def extract(src, dest, progress=None, skip=None):
 
 _TAG = r'<{0}\b[^>]*/?>'
 _FIELD = re.compile(r'<(\w+)>([^<]*)</\1>')
+def _dedupe_labels(values, previews):
+    """Make repeated option labels distinguishable.
+
+    Some manifests give two choices the same Name -- Ninostyle Chibi labels
+    both world-map Chocobo options (and both Highwinds) just "NinoStyle" and
+    expects the user to tell them apart by the preview picture, which our
+    launcher does not show. Settings are stored by Value, so relabelling is
+    display-only. A repeat gets a suffix taken from the words its PreviewFile
+    has that the first one's lacks (NinoStyle_chocobo_alt.png -> "alt",
+    NinoStyle_highwind2.png -> "2"), falling back to the option's Value.
+    """
+    first = {}
+    for i, (_v, label) in enumerate(values):
+        first.setdefault(label.lower(), i)
+    out = []
+    for i, (value, label) in enumerate(values):
+        j = first[label.lower()]
+        if j == i or sum(1 for _x, l in values if l.lower() == label.lower()) < 2:
+            out.append((value, label))
+            continue
+        def words(name):
+            stem = os.path.splitext(os.path.basename(name or ''))[0].lower()
+            return [w for w in re.split(r'[^a-z0-9]+|(?<=[a-z])(?=[0-9])', stem) if w]
+        base = set(words(previews[j] if j < len(previews) else ''))
+        extra = [w for w in words(previews[i] if i < len(previews) else '')
+                 if w not in base]
+        tag = ' '.join(extra) if extra else 'option %d' % value
+        if tag == 'alt':
+            tag = 'alternate'
+        elif tag.isdigit():
+            tag = 'version %s' % tag
+        out.append((value, '%s (%s)' % (label, tag)))
+    return out
+
+
 _CONFIG = re.compile(r'<ConfigOption>(.*?)</ConfigOption>', re.S)
 _OPTION = re.compile(r'<Option\s+([^>]*?)/?>')
 _ATTRS = re.compile(r'(\w+)\s*=\s*"([^"]*)"')
@@ -566,6 +601,7 @@ class Manifest:
             # Bool, which is why their dropdowns came up with two blank rows.
             kind = fields.get('Type', '').strip().lower()
             values = []
+            previews = []
             for attrs in _OPTION.findall(block):
                 a = dict(_ATTRS.findall(attrs))
                 if 'Value' not in a:
@@ -576,6 +612,8 @@ class Manifest:
                     label = {0: 'Off', 1: 'On'}.get(value, str(value)) \
                         if kind == 'bool' else str(value)
                 values.append((value, label))
+                previews.append(a.get('PreviewFile', ''))
+            values = _dedupe_labels(values, previews)
             try:
                 default = int(fields.get('Default', '0').strip())
             except ValueError:

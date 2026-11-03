@@ -1364,6 +1364,112 @@ def build_battle_move_caves(text, ro_base, verify_only, log, shift):
             % (hook, cave, len(words), label))
 
 
+# --------------------------------------------------------------------------
+# BUILD 880. The battle GUN EFFECT toggle at the battle multiplier's rate.
+#
+# Hardware 11-02 (Patrick and a tester, the first fight of a new game): the
+# MPs fire, but SOMETIMES with no muzzle flash and no bullets.
+#
+# FFNx, src/ff7/battle/animations.cpp:
+#
+#     // Gun effect uses a variable that is toggle true and false each frame
+#     // in 15 FPS. With greater FPS, this should change less frequently
+#     void battle_sub_6CE81E() {
+#         if (frame_counter % battle_frame_multiplier == 0)
+#             ff7_externals.battle_sub_6CE81E();
+#     }
+#     replace_call_function(battle_sub_42D808 + 0x117, battle_sub_6CE81E);
+#
+# x86 0x6CE81E swaps a double-buffer pointer ([0xBE1128] between 0xBF2FB0
+# and 0xBF70A4) and flips [0xBF2848] ^= 1, once per battle frame. At 60 FPS
+# that happens four times per 15 Hz effect step, so whether the gun effect
+# sees the buffer it drew into depends on which of the four frames its
+# (interpolated, once-per-four) step lands on -- sometimes it does,
+# sometimes the flash and bullets are never shown.
+#
+# THE CAVES DO NOT SKIP THE CALL (HANDOFF 5b: a skipped translated call
+# leaves its guest return address on the guest stack). The function runs on
+# every frame as before; only its two guest STORES are made conditional,
+# so on the other frames it changes nothing, which is exactly what FFNx's
+# skipped call does. Both stores sit right after `bl 0x10FC3A0`, so x16/x17
+# (IP0/IP1) are dead there, as at every other hook in this file.
+#
+#   +0xD13960  str w22, [x0]   ; [0xBE1128] = the other buffer   (hook A)
+#   +0xD13980  str w19, [x0]   ; [0xBF2848] = toggle ^ 1         (hook B)
+#
+# Hook A advances a per-call phase counter (BSS) and stores on phase 0;
+# hook B stores on the same phase. SEVENTH_NX_NO_GUN_TOGGLE=1 disables.
+# --------------------------------------------------------------------------
+GUN_TOGGLE_FN = 0x00D138C0                 # translated x86 0x6CE81E
+GUN_TOGGLE_A_HOOK = 0x00D13960
+GUN_TOGGLE_A_ORIG = 0xB9000016             # str w22, [x0]
+GUN_TOGGLE_B_HOOK = 0x00D13980
+GUN_TOGGLE_B_ORIG = 0xB9000013             # str w19, [x0]
+GUN_TOGGLE_OFF_ENV = 'SEVENTH_NX_NO_GUN_TOGGLE'
+
+
+def gun_toggle_disabled():
+    return os.environ.get(GUN_TOGGLE_OFF_ENV, '').strip().lower() in (
+        '1', 'true', 'yes', 'on')
+
+
+def _gun_toggle_caves(cave_a, cave_b, counter, bits):
+    """(words A, words B). A: phase = (phase + 1) & mask; store on phase 0.
+    B: store on phase 0. Both return to their hook + 4."""
+    import a64 as A
+    page, off = counter & ~0xFFF, counter & 0xFFF
+    a = [A.adrp(16, cave_a, page),
+         A.ldr(17, 16, off),
+         A.add_imm(17, 17, 1),
+         A.and_mask(17, 17, bits),
+         A.str_(17, 16, off),
+         0,                                  # cbnz w17, skip
+         GUN_TOGGLE_A_ORIG,
+         0]                                  # skip: b hook A + 4
+    a[5] = A.cbnz(17, cave_a + 4 * 5, cave_a + 4 * 7)
+    a[7] = A.b(cave_a + 4 * 7, GUN_TOGGLE_A_HOOK + 4)
+    b = [A.adrp(16, cave_b, page),
+         A.ldr(17, 16, off),
+         0,                                  # cbnz w17, skip
+         GUN_TOGGLE_B_ORIG,
+         0]                                  # skip: b hook B + 4
+    b[2] = A.cbnz(17, cave_b + 4 * 2, cave_b + 4 * 4)
+    b[4] = A.b(cave_b + 4 * 4, GUN_TOGGLE_B_HOOK + 4)
+    return a, b
+
+
+def build_gun_toggle_caves(text, ro_base, counter, verify_only, log, bits):
+    for hook, orig in ((GUN_TOGGLE_A_HOOK, GUN_TOGGLE_A_ORIG),
+                       (GUN_TOGGLE_B_HOOK, GUN_TOGGLE_B_ORIG)):
+        cur, = struct.unpack('<I', text[hook:hook + 4])
+        if cur != orig:
+            raise SystemExit('ABORT  gun effect toggle hook +0x%X: expected '
+                             '%08X, found %08X -- input is not stock?'
+                             % (hook, orig, cur))
+    if verify_only:
+        log('  ok  +0x%06X/+0x%06X  gun effect toggle hooks'
+            % (GUN_TOGGLE_A_HOOK, GUN_TOGGLE_B_HOOK))
+        return
+    cave_a = len(text)
+    wa, _ = _gun_toggle_caves(cave_a, cave_a + 4 * 8, counter, bits)
+    cave_b = cave_a + 4 * len(wa)
+    wa, wb = _gun_toggle_caves(cave_a, cave_b, counter, bits)
+    text.extend(struct.pack('<%dI' % len(wa), *wa))
+    text.extend(struct.pack('<%dI' % len(wb), *wb))
+    if len(text) > ro_base:
+        raise SystemExit('ABORT  gun toggle cave overflows .rodata')
+    struct.pack_into('<I', text, GUN_TOGGLE_A_HOOK,
+                     0x14000000 | (((cave_a - GUN_TOGGLE_A_HOOK) >> 2)
+                                   & 0x3FFFFFF))
+    struct.pack_into('<I', text, GUN_TOGGLE_B_HOOK,
+                     0x14000000 | (((cave_b - GUN_TOGGLE_B_HOOK) >> 2)
+                                   & 0x3FFFFFF))
+    log('  ok  +0x%06X/+0x%06X  -> caves 0x%06X/0x%06X ctr 0x%X  gun effect '
+        'toggle once per %d frames (FFNx battle_sub_6CE81E)'
+        % (GUN_TOGGLE_A_HOOK, GUN_TOGGLE_B_HOOK, cave_a, cave_b, counter,
+           1 << bits))
+
+
 # Raw pre-bias product recovery, specific to each hook's register state at
 # the moment the cave takes over (both re-confirmed against the real
 # disassembly this session):
@@ -5289,6 +5395,20 @@ def patch_nso(data, patches, verify_only=False, log=print, extra=(),
             log('  ok  +0x%06X  -> cave 0x%06X ctr 0x%X  camera %s 1-in-%d'
                 % (hook, cave, counter, label, throttle))
         _BSS_GROW = 4 * len(CAM_FNS) + 4
+    # --- BUILD 880: gun effect toggle (see comment block above) ----------
+    # LAST, so its 8 BSS bytes go after every other group's allocation.
+    if (any(c.get('tag') == 'effect10' for c in dispatch)
+            and not gun_toggle_disabled()):
+        gbits = {2: 1, 4: 2, 8: 3}.get(batt_mult)
+        if gbits is None:
+            raise SystemExit('ABORT  battle multiplier must be 2, 4 or 8')
+        gbss = struct.unpack('<I', data[0x3C:0x40])[0]
+        gdata_end = (segs[2][1] + segs[2][2] + 0xFFF) & ~0xFFF
+        goff = (_BSS_GROW + 7) & ~7
+        build_gun_toggle_caves(text, ro_base, gdata_end + gbss + goff,
+                               verify_only, log, gbits)
+        if not verify_only:
+            _BSS_GROW = goff + 8
     if verify_only:
         return None
     log('  .text %d bytes, %d free before .rodata' % (len(text), ro_base - len(text)))
@@ -6176,7 +6296,8 @@ def main():
                   | {WALK_TICK_HOOK, WALK_X_HOOK, WALK_Y_HOOK,
                      WALK_PFLAG_SET_HOOK, WALK_PFLAG_CLR_HOOK,
                      BATTLE_MOVE_X_HOOK, BATTLE_MOVE_Z_HOOK,
-                     BATTLE_MOVE_Y_HOOK, BATTLE_MOVE_YIDX_HOOK})
+                     BATTLE_MOVE_Y_HOOK, BATTLE_MOVE_YIDX_HOOK,
+                     GUN_TOGGLE_A_HOOK, GUN_TOGGLE_B_HOOK})
         # Caves chained through reclaimed padding change words all over .text
         # rather than appending to the tail, so each one is listed explicitly
         # -- the audit still accounts for every changed word, it just has more

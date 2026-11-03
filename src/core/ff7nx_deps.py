@@ -282,8 +282,10 @@ def _ensure_ffmpeg(download_root=None):
     `download_root` (release builds) puts the download, and static-ffmpeg's
     lock file, there instead of inside its own package folder, which in a
     release build is part of the read-only bundle."""
-    if _ffmpeg_on_system() or not _have('static_ffmpeg'):
-        return
+    if _ffmpeg_on_system():
+        return None
+    if not _have('static_ffmpeg'):
+        return 'the static-ffmpeg package is not installed'
     try:
         from static_ffmpeg import run
         _say('Checking FFmpeg (downloaded once on first run) ...')
@@ -299,9 +301,28 @@ def _ensure_ffmpeg(download_root=None):
     except Exception as exc:                                    # noqa: BLE001
         _say('FFmpeg is not available (%s). Movies and voice will be skipped '
              'until it is installed and on PATH.' % exc)
-        return
+        return '%s: %s' % (type(exc).__name__, exc)
     os.environ[FFMPEG_ENV] = ffmpeg
     os.environ[FFPROBE_ENV] = ffprobe
+    return None
+
+
+def retry_ffmpeg(root):
+    """BUILD 880. (ok, why): FFmpeg on PATH, or fetched again now.
+
+    The download normally happens once, at launch. When it fails there (no
+    network, a firewall, antivirus) the only trace is one line in a log a
+    windowed release never shows, and the build then ran without movies,
+    sound or voice. A build calls this first, so a failed download gets a
+    second chance and, if it fails again, a reason the person can read."""
+    if _ffmpeg_on_system():
+        return True, ''
+    dest = (os.path.join(root, 'modules', 'ffmpeg')
+            if getattr(sys, 'frozen', False) else None)
+    why = _ensure_ffmpeg(dest)
+    if _ffmpeg_on_system():
+        return True, ''
+    return False, why or 'ffmpeg and ffprobe were not found on PATH'
 
 
 def _ssl_context():

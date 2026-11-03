@@ -361,10 +361,17 @@ def read_state(img) -> str:
 def plan(m, revert=False):
     import cave_space
     img = m.img
+    want = -1 if (revert or not enabled()) else size_shift()
+    # BUILD 880. Off (the default) and not installed: nothing to undo. The
+    # anchors below are stock words, and ff7nx_gpucap, which runs first,
+    # rewrites two of them (+0x10D7264, +0x10D72F4) -- so checking them here
+    # only printed "refusing to change the capture path" in every default
+    # build, for a revert that had nothing to do.
+    if want == -1 and installed(img) == -1:
+        return [], [], []
     problems = verify(img)
     if problems:
         return [], [], problems
-    want = -1 if (revert or not enabled()) else size_shift()
     have = installed(img)
     if have == want:
         return [], [], []
