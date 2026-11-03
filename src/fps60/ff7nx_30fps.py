@@ -199,6 +199,10 @@ NSO_X2 = {
     },
 }
 
+# BUILD 882: battle text queue wait / explicit n_frames at x2.
+import ff7nx_textqueue as _textqueue  # noqa: E402
+NSO_X2['battle-text'].update(_textqueue.x2_table())
+
 # Resolver output (ff7nx_resolve.py --battle-mult 2 --common-mult 1) for the
 # battle groups the 60 FPS preset ships, at their x4 offsets. Labels are
 # FFNx's own patch sites. battle_menu_closing_window_box_6DAEF0 is absent on

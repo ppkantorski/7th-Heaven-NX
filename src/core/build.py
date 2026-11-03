@@ -139,6 +139,7 @@ import ff7nx_ventcrop
 import ff7nx_deadarrow
 import ff7nx_bandguard
 import ff7nx_voidmask
+import ff7nx_gatewall
 import ff7nx_chunkparallax
 import ff7nx_trnad1fx
 import ff7nx_l4offset
@@ -11229,6 +11230,16 @@ def _build_flevel(archive_path, chunks, field_files, romfs, log,
     vm_line = ff7nx_voidmask.summarise(vm_stats)
     if vm_line:
         log(vm_line)
+    # BUILD 883b. mds6_2: the Wall Market gate's door edge showed on the
+    # wall right of the stripe pillar (1997 left a gap there that Cosmos
+    # paints over). One wall square takes its row's front depth. See
+    # ff7nx_gatewall.
+    gw_stats = ff7nx_gatewall.apply_to_flevel(
+        archive, payloads,
+        encode=lambda raw: _encode_field_cached(archive, raw), log=log)
+    gw_line = ff7nx_gatewall.summarise(gw_stats)
+    if gw_line:
+        log(gw_line)
 
     # ------------------------------------------ DEPTH-1 RESOLUTION LIFT
     # BUILD 618v: now really dead last among the page passes (see the note

@@ -2549,6 +2549,13 @@ NSO_GATED['battle-text'] = [
      0x007CF18C, 0x11001108, 0x11004108),
 ]
 
+# BUILD 882: the explicit-duration branch and the wait of the same function.
+# Sense (and every action event that sets its own n_frames) flashed each line
+# for a quarter of its time, and started before the camera reached the enemy.
+# See ff7nx_textqueue.py.
+import ff7nx_textqueue as _textqueue  # noqa: E402
+NSO_GATED['battle-text'] += _textqueue.patches(4)
+
 
 # --------------------------------------------------------------------------
 # `boss-death` -- the boss vanquish effect
