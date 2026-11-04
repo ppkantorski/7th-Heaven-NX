@@ -3166,6 +3166,91 @@ def _build_message_stub_cave(cave, addr, scratch, save=False, reads=False,
     a.emit(A.b(a.pc(), resume_address))
     return a.resolve()
 
+# BUILD 887: WHEN THE PADDING POOL HAS NO WINDOW LEFT.
+# ====================================================
+# Hardware 11-03 (log 17-22-00): with Echo-S's `Auto` on the runtime is ~266
+# words larger (the auto-OK paths in the field/world services, the input
+# cave) and the build stopped with
+#     NoRoom: no 983040-byte window holds 377 usable word(s)
+# so NO voice was installed at all -- silent dialogue, no auto advance. With
+# Auto off the same pool just fits, which is why only Auto broke.
+#
+# A cave that finds no window now goes, whole and contiguous, into the
+# translated body of an x86 function that nothing can reach, the way the
+# calendar, day/night and facial runtimes already do. These three were found
+# by a scan of every translated function over 1.6 KB in the shipped module:
+# no ARM b/bl targets their entry, no relocation names it except the
+# recompilation map's own record, no x86 call/jmp reaches it and its address
+# appears nowhere in ff7_en. No pass in this project names them. All four
+# facts, and that the bytes are still the dump's, are re-proved on every
+# build before a word is written; a body that fails any of them is skipped.
+#
+# The pool is always tried first, so a build that fits (Auto off) lays out
+# exactly as it always has -- nothing hardware-proven moves.
+SPILL_X86 = (0x67D8B0, 0x673547, 0x663DE3)
+SPILL_GUARD = 0x40          # never at a body's entry (the liveness proof)
+SPILL_TAIL = 0x40
+_SPILL = None               # the active allocator during one install
+
+
+class _Spill:
+    def __init__(self, src, stock, exe_bytes):
+        self.src, self.stock, self.exe = src, stock, exe_bytes
+        self.bodies = None
+        self.used = []              # (x86, entry, words)
+        self.skipped = []           # (x86, why)
+
+    def _prove(self):
+        import ff7nx_fieldbg
+        import ff7nx_fxinterp
+        m = nxmap.Main(self.src)
+        st = nxmap.Main(self.stock)
+        self.bodies = []
+        for x86 in SPILL_X86:
+            why = ff7nx_fieldbg._liveness(m, x86)
+            if not why:
+                why = ff7nx_fxinterp._x86_unreferenced(self.exe, x86)
+            if not why:
+                lo, hi = m.extent(x86)
+                lo, hi = (lo + SPILL_GUARD + 15) & ~15, hi - SPILL_TAIL
+                if m.text[lo:hi] != st.text[lo:hi]:
+                    why = 'its body was already written by another pass'
+            if why:
+                self.skipped.append((x86, why))
+                continue
+            self.bodies.append([x86, lo, hi])
+
+    def put(self, build):
+        if self.bodies is None:
+            self._prove()
+        n = len(build(0, lambda i: 4 * i))
+        for body in self.bodies:
+            x86, at, hi = body
+            if at + 4 * n > hi:
+                continue
+            words = build(at, lambda i: at + 4 * i)
+            if len(words) != n:
+                raise ValueError('spilled cave changed length on its layout')
+            body[1] = (at + 4 * n + 15) & ~15
+            self.used.append((x86, at, n))
+            return at, {at + 4 * i: w for i, w in enumerate(words)}
+        raise ff7nx_cave.NoRoom(
+            'no window in the padding pool and no proven-dead body has %d '
+            'free word(s) (skipped: %s)' % (n, self.skipped or 'none'))
+
+
+def _emit_laid_out(pool, build, span=None):
+    """ff7nx_cave.emit_laid_out, then a proven-dead body (BUILD 887)."""
+    try:
+        if span is None:
+            return ff7nx_cave.emit_laid_out(pool, build)
+        return ff7nx_cave.emit_laid_out(pool, build, span=span)
+    except ff7nx_cave.NoRoom:
+        if _SPILL is None:
+            raise
+        return _SPILL.put(build)
+
+
 def patch_main_clocked_dialogue(src, dest, forced_name=None,
                                 defer_foreign_play=True,
                                 allow_foreign_field_replace=False,
@@ -3362,17 +3447,17 @@ def patch_main_clocked_dialogue(src, dest, forced_name=None,
     pause_entry, pause_placed = (None, {})
     resume_entry, resume_placed = (None, {})
     if hook_field:
-        mapjump_entry, mapjump_placed = ff7nx_cave.emit_laid_out(
+        mapjump_entry, mapjump_placed = _emit_laid_out(
             pool, lambda cave, address: _build_mapjump_voice_latch(
                 cave, address, scratch))
         transition_worker_entry, transition_worker_placed = \
-            ff7nx_cave.emit_laid_out(
+            _emit_laid_out(
                 pool, lambda cave, address: _build_mapjump_worker_stop(
                     cave, address, scratch))
-        pause_entry, pause_placed = ff7nx_cave.emit_laid_out(
+        pause_entry, pause_placed = _emit_laid_out(
             pool, lambda cave, address: _build_worker_pause(
                 cave, address, scratch))
-        resume_entry, resume_placed = ff7nx_cave.emit_laid_out(
+        resume_entry, resume_placed = _emit_laid_out(
             pool, lambda cave, address: _build_service_resume(
                 cave, address, scratch))
     message_entry, message_placed = (None, {})
@@ -3416,7 +3501,7 @@ def patch_main_clocked_dialogue(src, dest, forced_name=None,
             resume_call_target=message_call_target)
 
     if hook_message and message_stub in publication_masks:
-        message_entry, message_placed = ff7nx_cave.emit_laid_out(
+        message_entry, message_placed = _emit_laid_out(
             pool, build_message_publication)
     elif hook_message and message_stub:
         footprint_words = None
@@ -3425,7 +3510,7 @@ def patch_main_clocked_dialogue(src, dest, forced_name=None,
             # chosen runs are a pure function of this count, so an equal-size
             # NOP body receives the same entry and every same padding run.
             footprint_words = len(build_message(0, lambda i: i * 4))
-        message_entry, message_placed = ff7nx_cave.emit_laid_out(
+        message_entry, message_placed = _emit_laid_out(
             pool, lambda cave, address: _build_message_stub_cave(
                 cave, address, scratch,
                 save=(message_stub == 'saveonly'),
@@ -3437,14 +3522,14 @@ def patch_main_clocked_dialogue(src, dest, forced_name=None,
                 resume_address=message_resume,
                 resume_call_target=message_call_target))
     elif hook_message:
-        message_entry, message_placed = ff7nx_cave.emit_laid_out(
+        message_entry, message_placed = _emit_laid_out(
             pool, build_message)
     ask_entry = None
     ask_placed = {}
     if hook_ask:
         route_ask_choices = (key_mode == 'folder' and forced_name is None and
                              folder_forced_suffix is None)
-        ask_entry, ask_placed = ff7nx_cave.emit_laid_out(
+        ask_entry, ask_placed = _emit_laid_out(
             pool, lambda cave, address: _build_message_command_cave(
                 cave, address, scratch, forced_name=forced_name,
                 forced_alt_name=forced_alt_name,
@@ -3469,12 +3554,12 @@ def patch_main_clocked_dialogue(src, dest, forced_name=None,
     name_entry = None
     name_placed = {}
     if disable_name_change:
-        name_entry, name_placed = ff7nx_cave.emit_laid_out(
+        name_entry, name_placed = _emit_laid_out(
             pool, lambda cave, address: _build_disable_name_change_cave(
                 cave, address, scratch))
     field_entry, field_placed = (None, {})
     if hook_field:
-        field_entry, field_placed = ff7nx_cave.emit_laid_out(
+        field_entry, field_placed = _emit_laid_out(
             pool, lambda cave, address: _build_field_clocked_voice_service(
                 cave, address, scratch, resume_entry=resume_entry, retain_completed=retain_completed,
                 voice_gain=voice_gain,
@@ -3498,15 +3583,15 @@ def patch_main_clocked_dialogue(src, dest, forced_name=None,
     battle_service_entry = None
     battle_service_placed = {}
     if battle_probability:
-        battle_action_entry, battle_action_placed = ff7nx_cave.emit_laid_out(
+        battle_action_entry, battle_action_placed = _emit_laid_out(
             pool, lambda cave, address: _build_battle_action_command_cave(
                 cave, address, scratch, battle_probability))
     if battle_text:
-        battle_text_entry, battle_text_placed = ff7nx_cave.emit_laid_out(
+        battle_text_entry, battle_text_placed = _emit_laid_out(
             pool, lambda cave, address: _build_battle_text_command_cave(
                 cave, address, scratch))
     if battle_probability or battle_text:
-        battle_service_entry, battle_service_placed = ff7nx_cave.emit_laid_out(
+        battle_service_entry, battle_service_placed = _emit_laid_out(
             pool, lambda cave, address: _build_field_clocked_voice_service(
                 cave, address, scratch, resume_entry=resume_entry, retain_completed=retain_completed,
                 voice_gain=voice_gain,
@@ -3523,16 +3608,16 @@ def patch_main_clocked_dialogue(src, dest, forced_name=None,
     world_service_entry = None
     world_service_placed = {}
     if hook_world:
-        world_message_entry, world_message_placed = ff7nx_cave.emit_laid_out(
+        world_message_entry, world_message_placed = _emit_laid_out(
             pool, lambda cave, address: _build_world_command_cave(
                 cave, address, scratch, WORLD_MESSAGE_HOOKS[0][2],
                 is_ask=False, auto_advance=auto_advance))
-        world_ask_entry, world_ask_placed = ff7nx_cave.emit_laid_out(
+        world_ask_entry, world_ask_placed = _emit_laid_out(
             pool, lambda cave, address: _build_world_command_cave(
                 cave, address, scratch, WORLD_ASK_HOOKS[0][2],
                 is_ask=True, auto_advance=auto_advance))
         world_service_entry, world_service_placed = \
-            ff7nx_cave.emit_laid_out(
+            _emit_laid_out(
                 pool, lambda cave, address: _build_field_clocked_voice_service(
                     cave, address, scratch, resume_entry=resume_entry, retain_completed=retain_completed,
                     voice_gain=voice_gain,
@@ -3547,7 +3632,7 @@ def patch_main_clocked_dialogue(src, dest, forced_name=None,
     input_entry = None
     input_placed = {}
     if auto_advance:
-        input_entry, input_placed = ff7nx_cave.emit_laid_out(
+        input_entry, input_placed = _emit_laid_out(
             pool, lambda cave, address: _build_auto_ok_input_cave(
                 cave, address, scratch))
     placed = {}
@@ -3780,7 +3865,8 @@ def apply_to_nso(src, dest, auto_advance=True, voice_gain=VOICE_GAIN_DEFAULT,
                  stop_on_close=True, publish_on_dialog_change=True,
                  first_in_burst_wins=True,
                  replay_guard=False,
-                 stream_once=True):
+                 stream_once=True,
+                 spill_stock=None, spill_exe=None):
     """
     Install the production dialogue runtime, `src` -> `dest`, in this
     project's idiom.
@@ -3838,22 +3924,31 @@ def apply_to_nso(src, dest, auto_advance=True, voice_gain=VOICE_GAIN_DEFAULT,
     # walking a guest string altogether. Nothing useful plays, but it splits
     # the producer in half for a bisect -- everything up to and including the
     # MESSAGE state read stays, and only the key construction goes.
-    report = patch_main_clocked_dialogue(
-        src, dest, music_thread_name='music stream', key_mode='folder',
-        message_phase=message_phase, forced_name=forced_name,
-        message_stub=message_stub,
-        voice_gain=voice_gain,
-        duck_percent=duck_percent, duck_attack_frames=duck_attack_frames,
-        duck_release_frames=duck_release_frames,
-        battle_probability=battle_probability, battle_text=battle_text,
-        defer_foreign_play=defer_foreign_play,
-        stop_on_close=stop_on_close,
-        allow_foreign_field_replace=allow_foreign_field_replace,
-        publish_on_dialog_change=publish_on_dialog_change,
-        first_in_burst_wins=first_in_burst_wins,
-        replay_guard=replay_guard,
-        stream_once=stream_once,
-        **flags)
+    global _SPILL
+    _SPILL = (_Spill(src, spill_stock, spill_exe)
+              if spill_stock and spill_exe else None)
+    spill = _SPILL
+    try:
+        report = patch_main_clocked_dialogue(
+            src, dest, music_thread_name='music stream', key_mode='folder',
+            message_phase=message_phase, forced_name=forced_name,
+            message_stub=message_stub,
+            voice_gain=voice_gain,
+            duck_percent=duck_percent, duck_attack_frames=duck_attack_frames,
+            duck_release_frames=duck_release_frames,
+            battle_probability=battle_probability, battle_text=battle_text,
+            defer_foreign_play=defer_foreign_play,
+            stop_on_close=stop_on_close,
+            allow_foreign_field_replace=allow_foreign_field_replace,
+            publish_on_dialog_change=publish_on_dialog_change,
+            first_in_burst_wins=first_in_burst_wins,
+            replay_guard=replay_guard,
+            stream_once=stream_once,
+            **flags)
+    finally:
+        _SPILL = None
+    report['spilled'] = list(spill.used) if spill else []
+    report['spill_skipped'] = list(spill.skipped) if spill else []
     report['level'] = level
     report['defer_foreign_play'] = (defer_foreign_play
                                     and not allow_foreign_field_replace)

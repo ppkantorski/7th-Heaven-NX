@@ -140,6 +140,9 @@ import ff7nx_deadarrow
 import ff7nx_bandguard
 import ff7nx_voidmask
 import ff7nx_gatewall
+import ff7nx_cargowait
+import ff7nx_winwait
+import ff7nx_lighttile
 import ff7nx_chunkparallax
 import ff7nx_trnad1fx
 import ff7nx_l4offset
@@ -8261,6 +8264,13 @@ MODEL_SOURCE_DIR = {
     'char.lgp': 'char', 'world_us.lgp': 'world', 'high-us.lgp': 'high',
     'battle.lgp': 'battle', 'magic.lgp': 'magic', 'menu_us.lgp': 'menu',
 }
+# BUILD 888: where a field-model texture missing from its own source folder
+# may also be found (same TEX format, exact filename only).
+MODEL_TEX_FALLBACK_DIRS = {
+    'char.lgp': ('high', 'world'),
+    'high-us.lgp': ('char', 'world'),
+    'world_us.lgp': ('char', 'high'),
+}
 
 # Distinct from `_RE_RSD_TEX` further down (which this once shadowed): that
 # one is used by the model-assembly pass and accepts only [A-Za-z0-9_] stems,
@@ -8331,6 +8341,21 @@ def _rescue_dangling_model_textures(plan, catalogs, mods, log):
         if not missing:
             continue
         found_all = _find_in_mod_trees(mods, set(missing), source_dir)
+        # BUILD 888. Ninostyle HD's HTJF1.rsd names AAAA1.TIM, but the mod's
+        # field-model folder ships that art only as AAA1.TEX; its High and
+        # world folders carry AAAA1.TEX, byte-identical (tester log 11-03:
+        # "aaaa1.tex ... in no mod folder at all"). A name still missing is
+        # looked for, by exact filename, in the other FIELD-model source
+        # folders (same TEX format); a hit is reported as such.
+        for alt in MODEL_TEX_FALLBACK_DIRS.get(target, ()):
+            rest = {t for t in missing if t not in found_all}
+            if not rest:
+                break
+            for low, (path, where) in _find_in_mod_trees(
+                    mods, rest, alt).items():
+                found_all[low] = (path, where + '  (from the mod\'s %s/ '
+                                  'folder: its %s/ folder lacks it)'
+                                  % (alt, source_dir))
         for low in missing:
             found = found_all.get(low)
             if not found:
@@ -11073,7 +11098,8 @@ def _build_flevel(archive_path, chunks, field_files, romfs, log,
     # field half: model loaders repointed, eye textures copied.
     sm_stats = ff7nx_scenemodel.apply_to_flevel(
         archive, payloads,
-        encode=lambda raw: _encode_field_cached(archive, raw), log=log)
+        encode=lambda raw: _encode_field_cached(archive, raw), log=log,
+        char_path=os.path.join(romfs, ARCHIVES['char.lgp']))
     sm_line = ff7nx_scenemodel.summarise(sm_stats)
     if sm_line:
         log(sm_line)
@@ -11240,6 +11266,31 @@ def _build_flevel(archive_path, chunks, field_files, romfs, log,
     gw_line = ff7nx_gatewall.summarise(gw_stats)
     if gw_line:
         log(gw_line)
+    # BUILD 884. cargoin: Echo-S starts Biggs's "Cloud!!" without waiting and
+    # then resizes the same window for Cloud's reply -- an empty box when Auto
+    # Text Advance is off. Cloud now waits for Biggs. See ff7nx_cargowait.
+    cw_stats = ff7nx_cargowait.apply_to_flevel(
+        archive, payloads,
+        encode=lambda raw: _encode_field_cached(archive, raw), log=log)
+    cw_line = ff7nx_cargowait.summarise(cw_stats)
+    if cw_line:
+        log(cw_line)
+    # BUILD 885. The other provable Echo-S window reuses (junin1a, nivgate):
+    # the speaker waits for the box still holding its window. See
+    # ff7nx_winwait. And cargoin's frame-0 light tile whose HD art does not
+    # match is no longer drawn (1997 adds no light there). See ff7nx_lighttile.
+    ww_stats = ff7nx_winwait.apply_to_flevel(
+        archive, payloads,
+        encode=lambda raw: _encode_field_cached(archive, raw), log=log)
+    ww_line = ff7nx_winwait.summarise(ww_stats)
+    if ww_line:
+        log(ww_line)
+    lt_stats = ff7nx_lighttile.apply_to_flevel(
+        archive, payloads,
+        encode=lambda raw: _encode_field_cached(archive, raw), log=log)
+    lt_line = ff7nx_lighttile.summarise(lt_stats)
+    if lt_line:
+        log(lt_line)
 
     # ------------------------------------------ DEPTH-1 RESOLUTION LIFT
     # BUILD 618v: now really dead last among the page passes (see the note
@@ -13647,6 +13698,7 @@ FPS_MULT_TAG = 'fpsmult='
 # field file. Adding a name here is only safe under that rule.
 MAIN_ONLY_ENV = frozenset((
     'SEVENTH_NX_TEXT_AUTOSIZE',       # BUILD 860: exefs/main only
+    'SEVENTH_NX_TEXT_CLOSE',          # BUILD 886: exefs/main only
     'SEVENTH_NX_DEPTH_COPY_FIX',      # BUILD 860h: ff7nx_depthcopy.ENV
     'SEVENTH_NX_LIMITER_SLEEP', 'SEVENTH_NX_BOOST_TICKS',
     'SEVENTH_NX_BOOST_TICKS_MS',      # BUILD 847: exefs/main only
@@ -13934,6 +13986,8 @@ MAIN_ONLY_MODULES = frozenset((
     'ff7nx_autosize.py',
     # BUILD 860h. Field depth copy without a colour target: one word.
     'ff7nx_depthcopy.py',
+    # BUILD 886. Shrinking dialogue boxes draw no text: two 12-word caves.
+    'ff7nx_textclose.py',
 ))
 
 # The shader half of the same rule.
@@ -18041,6 +18095,40 @@ def apply_text_autosize(sdout, dump, log=lambda *_: None, produced=()):
     return [dest] if not built else []
 
 
+def apply_text_close(sdout, dump, log=lambda *_: None, produced=()):
+    """
+    BUILD 886. A shrinking dialogue box draws no text, so none shows past its
+    border while it closes (the window rect clips text at its edge, but the
+    visible border sits inside the rect). Two 12-word caves in verified
+    padding, refused unless both hooks are stock. See ff7nx_textclose.
+    """
+    import ff7nx_textclose
+    if not ff7nx_textclose.enabled():
+        return []
+    src, built = _audio_bridge_base(sdout, dump, log, produced,
+                                    'text close')
+    if src is None:
+        return []
+    dest = os.path.join(sdout, 'atmosphere', 'contents', TITLE_ID, 'exefs',
+                        'main')
+    log('')
+    log('dialogue text while a box closes ...')
+    tmp = dest + '.textclose-tmp'
+    try:
+        shutil.copyfile(src, tmp)
+        rc = ff7nx_textclose.apply(tmp, log=log)
+    except Exception as exc:                                   # noqa: BLE001
+        rc = 1
+        log('! text close: %s: %s -- not installed'
+            % (type(exc).__name__, exc))
+    if rc:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        return []
+    os.replace(tmp, dest)
+    return [dest] if not built else []
+
+
 def apply_ui_top(sdout, dump, log=lambda *_: None, produced=()):
     """
     BUILD 684. Attacks never draw over the battle UI: the menu is drawn last
@@ -19071,6 +19159,14 @@ def apply_echo_voice(sdout, dump, plan, log=lambda *_: None, produced=()):
                     'footprint'):
         stub = None
     tmp = dest + '.echovoice-tmp'
+    # BUILD 887: a cave the padding pool has no window for goes into a
+    # proven-dead translated body (ff7nx_voice.SPILL_X86). That proof needs
+    # the stock module and ff7_en; without them the pool is the only option.
+    spill_exe = None
+    exe = getattr(dump, 'exe', None)
+    if exe and os.path.isfile(str(exe)):
+        with open(str(exe), 'rb') as handle:
+            spill_exe = handle.read()
     try:
         report = ff7nx_voice.apply_to_nso(
             src, tmp, auto_advance=auto_advance, level=level,
@@ -19090,7 +19186,8 @@ def apply_echo_voice(sdout, dump, plan, log=lambda *_: None, produced=()):
             voice_gain=_echo_voice_gain(log),
             duck_percent=_echo_duck_percent(log),
             duck_attack_frames=ECHO_DUCK_ATTACK_FRAMES,
-            duck_release_frames=ECHO_DUCK_RELEASE_FRAMES)
+            duck_release_frames=ECHO_DUCK_RELEASE_FRAMES,
+            spill_stock=dump.nso, spill_exe=spill_exe)
     except Exception as exc:                                   # noqa: BLE001
         report = None
         log('! Echo-S voice runtime: %s: %s' % (type(exc).__name__, exc))
@@ -19133,6 +19230,11 @@ def apply_echo_voice(sdout, dump, plan, log=lambda *_: None, produced=()):
                if report['message_stub'] not in
                ('pubowner', 'pubauto', 'pubcmd', 'publication')
                else 'No key and no playback.'))
+    for x86, entry, n in report.get('spilled', ()):
+        log('  BUILD 887: %d-word cave had no window in the padding pool -- '
+            'placed in the dead x86 0x%X body at +0x%X' % (n, x86, entry))
+    for x86, why in report.get('spill_skipped', ()):
+        log('  (dead body x86 0x%X not used: %s)' % (x86, why))
     log('  MESSAGE hooked %s the native window updater (phase %s)'
         % ('before' if report.get('message_phase') == 'pre' else 'after',
            report.get('message_phase')))

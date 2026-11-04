@@ -59,9 +59,12 @@ OFF_ENV = 'SEVENTH_NX_NO_SCENE_MODEL'
 PREFIX = 'zn'
 # variant hrc -> (source hrc, bone, op, part, replacement)
 #   op 'drop': remove `part`; 'add': append `part`; 'swap': part -> repl
+#   op 'graft': add the attachments (parts after the first) the SAME bone
+#   of model `part` carries and this model's bone lacks (BUILD 888: Zack's back sword is EJDF1 in Chibi Fixes,
+#   IBBA1 in Ninostyle HD -- EJDC's chest minus IBAD's chest is both)
 VARIANTS = {
     'ZNAA': ('AAAA', 'chest', 'drop', 'AAAD1', None),
-    'ZNIB': ('IBAD', 'chest', 'add', 'EJDF1', None),
+    'ZNIB': ('IBAD', 'chest', 'graft', 'EJDC', None),
     'ZNBH': ('BHFF', 'r_hand', 'swap', 'BHJB1', 'ZNBS'),
 }
 # new rsd -> (source rsd, PLY/MAT/GRP stem to name instead)
@@ -153,33 +156,81 @@ def variant_rsd(src, stem):
     return text.encode('latin1')
 
 
-def plan_char(get):
+def bone_parts(src, bone):
+    """The parts list of one bone of an .hrc (bytes)."""
+    _l, bones = _bones(src.decode('latin1').replace('\r\n', '\n'))
+    hit = [b for b in bones if b[0] == bone]
+    if len(hit) != 1:
+        raise ValueError('no single bone %r' % bone)
+    return hit[0][3]
+
+
+def plan_char(get, notes=None):
     """{new lower name: payload} for char.lgp; `get(lower name)` -> bytes or
-    None. Raises when a source is not as measured."""
+    None.
+
+    BUILD 888: EVERY variant .hrc the field half names is always produced.
+    A variant whose source is not as measured (another model mod, e.g.
+    Ninostyle HD) becomes an unchanged copy of its source model, so the
+    scene keeps the general model -- before this a single refusal dropped
+    the whole char.lgp half while flevel still pointed ztruck/midgal at
+    ZNAA/ZNIB/ZNBH (tester log 11-03), i.e. at models that did not exist.
+    `notes` (a list) receives (variant, why) for each fallback. Raises only
+    when a SOURCE model itself is missing."""
+    notes = [] if notes is None else notes
     out = {}
     for new, (stem_src, stem) in RSDS.items():
-        src = get(stem_src.lower() + '.rsd')
-        if src is None:
-            raise ValueError('%s.rsd missing' % stem_src)
-        if get(stem.lower() + '.p') is None:
-            raise ValueError('%s.p missing' % stem)
-        out[new.lower() + '.rsd'] = variant_rsd(src, stem)
+        try:
+            src = get(stem_src.lower() + '.rsd')
+            if src is None:
+                raise ValueError('%s.rsd missing' % stem_src)
+            if get(stem.lower() + '.p') is None:
+                raise ValueError('%s.p missing' % stem)
+            out[new.lower() + '.rsd'] = variant_rsd(src, stem)
+        except ValueError as exc:
+            notes.append((new, str(exc)))
     for new, (srcname, bone, op, part, repl) in VARIANTS.items():
         src = get(srcname.lower() + '.hrc')
         if src is None:
             raise ValueError('%s.hrc missing' % srcname)
-        need = repl if op == 'swap' else (part if op == 'add' else None)
-        if need and get(need.lower() + '.rsd') is None and \
-                need.lower() + '.rsd' not in out:
-            raise ValueError('%s.rsd missing' % need)
-        out[new.lower() + '.hrc'] = variant_hrc(src, bone, op, part, repl)
+        try:
+            if op == 'graft':
+                other = get(part.lower() + '.hrc')
+                if other is None:
+                    raise ValueError('%s.hrc missing' % part)
+                have = {p.upper() for p in bone_parts(src, bone)}
+                # the bone's ATTACHMENTS: everything after its own body
+                # part (EJDC chest: EJDF + EJDF1 in Chibi Fixes, IBBA +
+                # IBBA1 in Ninostyle HD -- the sword is the second)
+                extra = [p for p in bone_parts(other, bone)[1:]
+                         if p.upper() not in have]
+                if not extra:
+                    raise ValueError('%s %s adds nothing to %s'
+                                     % (part, bone, srcname))
+                data = src
+                for p in extra:
+                    if get(p.lower() + '.rsd') is None:
+                        raise ValueError('%s.rsd missing' % p)
+                    data = variant_hrc(data, bone, 'add', p, None)
+            else:
+                need = repl if op == 'swap' else (
+                    part if op == 'add' else None)
+                if need and get(need.lower() + '.rsd') is None and \
+                        need.lower() + '.rsd' not in out:
+                    raise ValueError('%s.rsd missing' % need)
+                data = variant_hrc(src, bone, op, part, repl)
+        except ValueError as exc:
+            notes.append((new, str(exc)))
+            data = src                  # the general model, unchanged
+        out[new.lower() + '.hrc'] = data
     return out
 
 
 def apply_to_char(path, log=lambda *_: None):
     """Add the variants to a finished char.lgp in place. Idempotent."""
     import lgp
-    st = {'written': False, 'added': [], 'same': 0, 'refused': None}
+    st = {'written': False, 'added': [], 'same': 0, 'refused': None,
+          'general': []}
     if disabled():
         return st
     try:
@@ -188,7 +239,7 @@ def apply_to_char(path, log=lambda *_: None):
         def get(n):
             e = a.index.get(n)
             return e['payload'] if e else None
-        want = plan_char(get)
+        want = plan_char(get, st['general'])
         for name, data in sorted(want.items()):
             have = get(name)
             if have == data:
@@ -213,13 +264,17 @@ def summarise_char(st):
     if st.get('refused'):
         return ('  ! scene models (BUILD 618z11): char.lgp not changed -- %s'
                 % st['refused'])
+    gen = ''
+    if st.get('general'):
+        gen = ('\n  scene models: kept the general model for %s'
+               % '; '.join('%s (%s)' % g for g in st['general']))
     if st.get('added') or st.get('same'):
         return ('  SCENE MODELS (BUILD 618z11): char.lgp %s (%s). %s=1 '
                 'disables.' % ('variants added' if st.get('added')
                                else 'variants already present',
                                ', '.join(st.get('added') or ()) or
-                               '%d entries' % st['same'], OFF_ENV))
-    return ''
+                               '%d entries' % st['same'], OFF_ENV)) + gen
+    return gen.lstrip('\n')
 
 
 # ------------------------------------------------------------- the fields
@@ -264,11 +319,37 @@ def plan_field(name, sec3):
     return bytes(s3), done
 
 
-def apply_to_flevel(archive, payloads, encode=None, log=lambda *_: None):
+def char_entry_names(path):
+    """Lower-case entry names of an LGP, read from its table of contents
+    only (no payloads)."""
+    with open(path, 'rb') as f:
+        f.read(12)
+        n = struct.unpack('<i', f.read(4))[0]
+        toc = f.read(27 * n)
+    return {toc[27 * i:27 * i + 20].split(b'\0')[0].decode(
+        'ascii', 'replace').lower() for i in range(n)}
+
+
+def apply_to_flevel(archive, payloads, encode=None, log=lambda *_: None,
+                    char_path=None):
     import lgp
     st = {'names': [], 'refused': [], 'faces': 0}
     if disabled():
         return st
+    # BUILD 888: never point a field at a variant char.lgp does not carry.
+    # `char_path` is the char.lgp this build ships (None = not checked);
+    # when it is absent -- no model mod, so the dump's char.lgp is used --
+    # or lacks a variant, the scene keeps the general model.
+    if char_path is not None:
+        have = (char_entry_names(char_path) if os.path.exists(char_path)
+                else set())
+        need = {v.lower() + '.hrc' for sc in SCENES.values()
+                for v in sc.values()}
+        lack = sorted(need - have)
+        if lack:
+            st['refused'].append(('ztruck/midgal', 'char.lgp has no %s'
+                                  % ', '.join(lack)))
+            return st
     encode = encode or archive.encode_field
     renamed = {}
     for name in SCENES:

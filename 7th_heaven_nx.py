@@ -46,7 +46,7 @@ HERE = nxpaths.ROOT
 
 # Shown in the header, nearest the title. Single source of truth --
 # anything else that needs it should import this rather than repeat it.
-VERSION = '1.0.8'
+VERSION = '1.0.9'
 sys.path.insert(0, HERE)
 
 import build  # noqa: E402
@@ -2386,6 +2386,9 @@ def _run_build_steps(mods, enabled, settings_by_mod, log, progress,
     # BUILD 860. Autosize dialogue boxes (FFNx's option), off by default.
     # Its own dead translated body, no BSS. See ff7nx_autosize.
     produced += build.apply_text_autosize(SDOUT_DIR, DUMP, log, produced)
+    # BUILD 886. A shrinking dialogue box draws no text, so none shows
+    # past its border as it closes. See ff7nx_textclose.
+    produced += build.apply_text_close(SDOUT_DIR, DUMP, log, produced)
     # BUILD 860h. The field depth copy draws with no colour target, not the
     # screen's (mogu_1's water cut at 3/4 width). See ff7nx_depthcopy.
     produced += build.apply_depth_copy(SDOUT_DIR, DUMP, log, produced)
