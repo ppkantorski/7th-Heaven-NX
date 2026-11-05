@@ -220,6 +220,10 @@ def exempt(mod):
     if (getattr(getattr(mod, 'manifest', None), 'mod_id', '') or '').lower() \
             == ECHO_S_MOD_ID:
         return True
+    # BUILD 889: New Threat 2.0's hext is split by ff7nx_newthreat
+    import ff7nx_newthreat
+    if ff7nx_newthreat.handles(mod):
+        return True
     for m in (ff7nx_esui, ff7nx_difix, ff7nx_nitpick, ff7nx_idleanim):
         try:
             if m.handles(mod):

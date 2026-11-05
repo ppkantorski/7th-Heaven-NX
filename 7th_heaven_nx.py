@@ -46,7 +46,7 @@ HERE = nxpaths.ROOT
 
 # Shown in the header, nearest the title. Single source of truth --
 # anything else that needs it should import this rather than repeat it.
-VERSION = '1.0.9'
+VERSION = '1.1.0'
 sys.path.insert(0, HERE)
 
 import build  # noqa: E402
@@ -1518,6 +1518,12 @@ def _compatibility_profile(mods, enabled, settings_by_mod, log):
                 if pair not in {p[0] for p in bad if isinstance(p, tuple)}:
                     bad.append((pair, '%s forbids %s'
                                 % (mod.display_name, target.display_name)))
+    # BUILD 889: New Threat 2.0's <Setting> rules that FORBID a value
+    # (7th Heaven enforces them; the rule engine below reads Require only).
+    try:
+        bad.extend(build.ff7nx_newthreat.setting_conflicts(active, effective))
+    except Exception as exc:                                    # noqa: BLE001
+        log('note: New Threat setting rules not checked (%s)' % exc)
     if bad:
         log('ERROR: declared IRO compatibility conflict(s); no output was built:')
         for item in bad:
@@ -1988,6 +1994,15 @@ def _run_build_steps(mods, enabled, settings_by_mod, log, progress,
         except Exception as exc:                               # noqa: BLE001
             log(f'note: RuntimeVar gates not evaluated ({exc}); every '
                 'conditional folder is kept')
+    # BUILD 889: with New Threat 2.0 on, the gates other mods key on its exe
+    # flag (Byte:0x914B1A) are answered with its data patches applied. The
+    # same reader object is returned when it is off.
+    try:
+        runtime_read = build.ff7nx_newthreat.reader(
+            runtime_read, active, effective_settings, log)
+    except Exception as exc:                                    # noqa: BLE001
+        log('! New Threat: RuntimeVar gates read from the stock exe (%s)'
+            % exc)
     progress(0, 0, 'Planning which mod files go where')
     plan = build.build_plan(list(reversed(active)),
                             effective_settings, catalogs, log,
@@ -3408,6 +3423,11 @@ def launch_ui():
     compact_var = tk.BooleanVar(value=bool(global_saved.get('compact_cache', False)))
     # BUILD 869: Storage > Write a changes folder (build.sdout_changes); off by default.
     changes_var = tk.BooleanVar(value=bool(global_saved.get('changes_folder', False)))
+    # BUILD 890: GUI > Check for updates automatically (ff7nx_update), on by
+    # default; update_skip is the release the user said to skip.
+    update_var = tk.BooleanVar(value=bool(global_saved.get('update_check',
+                                                          True)))
+    update_skip = [str(global_saved.get('update_skip', '') or '')]
 
     lim_label_by_value = {v: l for v, l in LIMITER_FPS_CHOICES}
     lim_value_by_label = {l: v for v, l in LIMITER_FPS_CHOICES}
@@ -3572,6 +3592,10 @@ def launch_ui():
              'Shows every setting. Turning it off only hides them: the '
              'build keeps using them as set. The note on the right says '
              'whether they are at their tested defaults.', False),
+            ('check', 'Check for updates automatically', update_var, None,
+             'Looks for a new 7th Heaven NX release when the program opens '
+             'and every few hours while it stays open, and offers to '
+             'install it. Check for Updates below asks right away.', False),
         ]),
         ('Display', [
             ('combo', 'Aspect ratio', ws_var,
@@ -3899,6 +3923,10 @@ def launch_ui():
         # same left edge as the settings above it.
         ttk.Button(footer, text='About Dev',
                    command=lambda: open_about(win)).pack(side='left')
+        # BUILD 890: right next to About Dev
+        ttk.Button(footer, text='Check for Updates',
+                   command=lambda: check_updates(manual=True, parent=win)
+                   ).pack(side='left', padx=(8, 0))
 
         def restore_defaults():
             """Every setting, developer ones included, back to
@@ -4942,6 +4970,7 @@ def launch_ui():
     # the first mod's option vars), so a half-built UI can never overwrite a
     # good settings file.
     _ui_ready = [False]
+    _build_busy = [False]           # BUILD 890: no update install mid-build
 
     def snapshot_settings(raw=False):
         persist = {}
@@ -5086,7 +5115,10 @@ def launch_ui():
                                  'developer_settings':
                                      bool(devset_var.get()),
                                  # BUILD 814: Install Mods' check boxes
-                                 'install_selection': dict(install_sel)}
+                                 'install_selection': dict(install_sel),
+                                 # BUILD 890: update checks
+                                 'update_check': bool(update_var.get()),
+                                 'update_skip': update_skip[0]}
         # BUILD 804: saved as the vars hold them, developer mode or not.
         return persist
 
@@ -5140,6 +5172,7 @@ def launch_ui():
     autosize_var.trace_add('write', save_settings_now)
     compact_var.trace_add('write', save_settings_now)
     changes_var.trace_add('write', save_settings_now)
+    update_var.trace_add('write', save_settings_now)
     lim_var.trace_add('write', save_settings_now)
     # The four added with the field-buffer work. Without these they are
     # only written on Build and on window close, which is enough to be
@@ -6766,6 +6799,7 @@ def launch_ui():
                     else:
                         set_stage(label or '')
                 elif kind == 'done':
+                    _build_busy[0] = False
                     bar.stop()
                     bar.configure(mode='determinate')
                     build_btn.state(['!disabled'])
@@ -6800,6 +6834,7 @@ def launch_ui():
         root.after(80, pump)
 
     def start():
+        _build_busy[0] = True
         log_clear()
         build_btn.state(['disabled'])
         open_btn.state(['disabled'])
@@ -7148,6 +7183,277 @@ def launch_ui():
                   'then Build SD Output.')
         if DEV_MODE:
             log_write('Developer mode: every setting is shown.')
+
+    # ---------- BUILD 890: updates of 7th Heaven NX itself ----------
+    # ff7nx_update does the network and the files; this is only the GUI.
+    # Network work runs on a thread and hands its answer back through
+    # _upd_jobs, which the Tk thread polls -- Tk is never touched off it.
+    import ff7nx_update
+    _upd_jobs = queue.Queue()
+    _upd = {'polling': False, 'prompted': set(), 'win': None, 'timer': None}
+
+    def _upd_poll():
+        try:
+            while True:
+                done, value = _upd_jobs.get_nowait()
+                try:
+                    done(value)
+                except Exception as exc:                    # noqa: BLE001
+                    print('update: %s' % exc, file=sys.stderr)
+        except queue.Empty:
+            pass
+        root.after(150, _upd_poll)
+
+    def _upd_bg(work, done):
+        if not _upd['polling']:
+            _upd['polling'] = True
+            root.after(150, _upd_poll)
+
+        def run():
+            try:
+                value = work()
+            except Exception as exc:                        # noqa: BLE001
+                value = exc
+            _upd_jobs.put((done, value))
+        threading.Thread(target=run, daemon=True).start()
+
+    def _v(ver):
+        """'1.1.0' -> 'v1.1.0', as the header shows it."""
+        ver = str(ver or '')
+        return ver if ver[:1] in 'vV' else 'v' + ver
+
+    def _plain_notes(text):
+        out = []
+        for line in (text or '').splitlines():
+            line = re.sub(r'^\s{0,3}#{1,6}\s*', '', line)
+            line = line.replace('**', '')
+            line = re.sub(r'\[([^\]]+)\]\(([^)]+)\)', r'\1', line)
+            out.append(line)
+        return '\n'.join(out).strip() or 'No release notes.'
+
+    def check_updates(manual=False, parent=None):
+        """manual: the Settings button (always asks GitHub, always answers).
+        Otherwise the automatic check: silent unless there is something new
+        that was not skipped."""
+        def done(result):
+            if isinstance(result, Exception):
+                if manual:
+                    messagebox.showerror(
+                        'Check for Updates',
+                        'Could not check for updates:\n%s' % result,
+                        parent=parent or root)
+                else:
+                    print('update check: %s' % result, file=sys.stderr)
+                return
+            if result is None:
+                if manual:
+                    messagebox.showinfo(
+                        'Check for Updates',
+                        'You have the latest version of 7th Heaven NX '
+                        '(%s).' % _v(VERSION), parent=parent or root)
+                return
+            if not manual:
+                if result.version == update_skip[0] \
+                        or result.version in _upd['prompted']:
+                    return
+                if _build_busy[0]:
+                    # not now: ask again once the build has finished
+                    root.after(60000, lambda: done(result))
+                    return
+                log_write('7th Heaven NX %s is available (you have %s).'
+                          % (_v(result.version), _v(VERSION)))
+            _upd['prompted'].add(result.version)
+            show_update(result, parent)
+        _upd_bg(lambda: ff7nx_update.check(VERSION, force=manual), done)
+
+    def _schedule_auto_check(delay_ms):
+        if _upd['timer'] is not None:
+            try:
+                root.after_cancel(_upd['timer'])
+            except tk.TclError:
+                pass
+
+        def tick():
+            _upd['timer'] = None
+            if update_var.get():
+                check_updates(manual=False)
+            _schedule_auto_check(ff7nx_update.CHECK_INTERVAL * 1000)
+        _upd['timer'] = root.after(delay_ms, tick)
+
+    def show_update(rel, parent=None):
+        import webbrowser
+        if _upd['win'] is not None and _upd['win'].winfo_exists():
+            _upd['win'].destroy()
+        owner = parent if parent is not None and parent.winfo_exists() \
+            else root
+        win = tk.Toplevel(owner)
+        _upd['win'] = win
+        win.withdraw()
+        win.title('Update Available')
+        win.configure(bg=BG_APP)
+        win.transient(owner)
+        win.resizable(False, False)
+        mode, why = ff7nx_update.install_mode()
+        asset = rel.asset()
+        body = ttk.Frame(win, padding=(20, 18, 20, 14))
+        body.pack(fill='both', expand=True)
+        ttk.Label(body, text='7th Heaven NX %s is available' % _v(rel.version),
+                  font=(UI_FONT, 15, 'bold')).pack(anchor='w')
+        sub = 'You have %s.' % _v(VERSION)
+        if asset:
+            sub += '  Download: %s (%.1f MB).' % (asset['name'],
+                                                  asset['size'] / 1e6)
+        ttk.Label(body, text=sub, style='Sub.TLabel').pack(anchor='w',
+                                                          pady=(2, 10))
+        box = ttk.Frame(body)
+        box.pack(fill='both', expand=True)
+        notes = tk.Text(box, width=78, height=16, wrap='word', bd=0,
+                        bg=BG_ROW, fg=TEXT_PRIMARY, insertbackground=BG_ROW,
+                        highlightthickness=1, highlightbackground=BORDER,
+                        font=(UI_FONT, 11), padx=10, pady=8)
+        sb = ttk.Scrollbar(box, orient='vertical', command=notes.yview)
+        notes.configure(yscrollcommand=sb.set)
+        notes.insert('1.0', _plain_notes(rel.notes))
+        notes.configure(state='disabled')
+        notes.pack(side='left', fill='both', expand=True)
+        sb.pack(side='right', fill='y')
+        status = ttk.Label(body, text='', style='Sub.TLabel', wraplength=600,
+                           justify='left')
+        status.pack(anchor='w', pady=(10, 0))
+        bar = ttk.Progressbar(body, mode='determinate', length=600)
+        if mode != 'auto':
+            status.configure(text=why + ' Download it from the release page '
+                             'instead.')
+        elif not asset:
+            status.configure(text='This release has no download for %s %s '
+                             'yet; see the release page.'
+                             % ff7nx_update.target())
+        else:
+            status.configure(text='Your mods, dump, settings and builds are '
+                             'kept: only the program is replaced. 7th Heaven '
+                             'NX closes, installs the update and reopens.')
+        foot = ttk.Frame(win, padding=(20, 0, 20, 16))
+        foot.pack(fill='x')
+        state = {'cancel': False, 'done': 0, 'total': 0, 'staged': None,
+                 'busy': False}
+
+        def close():
+            state['cancel'] = True
+            if state['staged'] and not state['busy']:
+                ff7nx_update.discard()
+            win.destroy()
+        win.protocol('WM_DELETE_WINDOW', close)
+
+        def skip():
+            update_skip[0] = rel.version
+            save_settings_now()
+            close()
+
+        def tick_progress():
+            if not state['busy'] or not win.winfo_exists():
+                return
+            if state['total']:
+                bar['value'] = 100.0 * state['done'] / state['total']
+                status.configure(text='Downloading… %.1f of %.1f MB'
+                                 % (state['done'] / 1e6, state['total'] / 1e6))
+            win.after(200, tick_progress)
+
+        def install_now():
+            if _build_busy[0]:
+                messagebox.showinfo('Update', 'A build is running. Update '
+                                    'once it has finished.', parent=win)
+                return
+            save_settings_now()
+            try:
+                argv = ff7nx_update.write_script(state['staged'], rel.version)
+                ff7nx_update.launch_installer(argv)
+            except Exception as exc:                        # noqa: BLE001
+                messagebox.showerror('Update', 'The installer could not be '
+                                     'started:\n%s' % exc, parent=win)
+                return
+            root.destroy()
+
+        def downloaded(result):
+            state['busy'] = False
+            if not win.winfo_exists():
+                if not isinstance(result, Exception):
+                    ff7nx_update.discard()
+                return
+            bar.pack_forget()
+            if isinstance(result, Exception):
+                if isinstance(result, ff7nx_update.Cancelled):
+                    return
+                ff7nx_update.discard()
+                status.configure(text='The update was not installed: %s'
+                                 % result)
+                update_btn.configure(text='Try Again', command=start)
+                update_btn.state(['!disabled'])
+                return
+            state['staged'] = result
+            status.configure(text='Downloaded and verified (SHA-256). '
+                             '7th Heaven NX will close, install %s and '
+                             'reopen. Your mods, dump, settings and builds '
+                             'are not touched.' % _v(rel.version))
+            update_btn.configure(text='Restart and Update',
+                                 command=install_now)
+            update_btn.state(['!disabled'])
+
+        def start():
+            if _build_busy[0]:
+                messagebox.showinfo('Update', 'A build is running. Update '
+                                    'once it has finished.', parent=win)
+                return
+            update_btn.state(['disabled'])
+            state.update(cancel=False, done=0, total=asset['size'],
+                         busy=True)
+            bar['value'] = 0
+            bar.pack(anchor='w', pady=(6, 0))
+            status.configure(text='Downloading…')
+            win.after(200, tick_progress)
+
+            def prog(done, total):
+                state['done'], state['total'] = done, total or state['total']
+
+            def work():
+                z = ff7nx_update.download(asset, prog,
+                                          lambda: state['cancel'])
+                return ff7nx_update.stage(z, rel.version)
+            _upd_bg(work, downloaded)
+
+        ttk.Button(foot, text='Later', command=close).pack(side='right')
+        ttk.Button(foot, text='Release Page',
+                   command=lambda: webbrowser.open(rel.url)
+                   ).pack(side='right', padx=(0, 8))
+        update_btn = ttk.Button(foot, text='Update Now', style='Accent.TButton',
+                                command=start)
+        if mode == 'auto' and asset:
+            update_btn.pack(side='right', padx=(0, 8))
+        ttk.Button(foot, text='Skip This Version', command=skip
+                   ).pack(side='left')
+        win.update_idletasks()
+        x = owner.winfo_rootx() + (owner.winfo_width()
+                                   - win.winfo_reqwidth()) // 2
+        y = owner.winfo_rooty() + (owner.winfo_height()
+                                   - win.winfo_reqheight()) // 3
+        win.geometry('+%d+%d' % (max(0, x), max(0, y)))
+        win.deiconify()
+        win.lift()
+
+    # What the previous run's installer did, then the first automatic check
+    # a few seconds after the window is up (and every CHECK_INTERVAL after).
+    try:
+        _last = ff7nx_update.last_result(VERSION)
+    except Exception:                                       # noqa: BLE001
+        _last = None
+    if _last and _last[0] == 'ok':
+        log_write('Updated to 7th Heaven NX %s.' % _v(_last[1]))
+    elif _last:
+        root.after(800, lambda: messagebox.showwarning(
+            'Update', 'The last update could not be installed, so this is '
+            'still %s:\n\n%s\n\nNothing else was changed. Try '
+            'again from Settings > Check for Updates, or download it from '
+            'the release page.' % (_v(VERSION), _last[1]), parent=root))
+    _schedule_auto_check(4000)
 
     root.mainloop()
 

@@ -47,6 +47,7 @@ import ff7nx_echomusic
 import ff7nx_calendar
 import ff7nx_esui
 import ff7nx_pccode
+import ff7nx_newthreat
 import ff7nx_titlemusic
 import ff7nx_sqlogo
 import ff7nx_nitpick
@@ -1057,7 +1058,8 @@ class Mod:
         if folders:
             kept = []
             for f in folders:
-                why = ff7nx_pccode.dropped(self, f)
+                why = ff7nx_pccode.dropped(self, f) \
+                    or ff7nx_newthreat.dropped(self, f)
                 if why is None:
                     kept.append(f)
                 elif log:
@@ -1385,6 +1387,10 @@ def build_plan(mods, settings_by_mod, catalogs, log=lambda *_: None,
     plan.mod_rank = {mod.filename: i for i, mod in enumerate(mods)}
     # BUILD 641: Nitpick's greyed-out options are forced and its folders
     # resolved for the Switch (4:3 title art). See ff7nx_nitpick.
+    # BUILD 889: New Threat 2.0 (None unless it is on). See ff7nx_newthreat.
+    ff7nx_newthreat.CURRENT = ff7nx_newthreat.plan_for(mods, settings_by_mod,
+                                                       log)
+    ff7nx_newthreat.STATS.clear()
     ff7nx_nitpick.CURRENT = None
     for mod in mods:
         if ff7nx_nitpick.handles(mod) and mod.manifest is not None:
@@ -1660,6 +1666,38 @@ def build_plan(mods, settings_by_mod, catalogs, log=lambda *_: None,
             if ff7nx_nitpick.handles(mod) and ff7nx_nitpick.carried_hext(full):
                 continue        # BUILD 641: carried as module words
             plan.hext_files.append((full, mod))
+    # BUILD 889. New Threat 2.0's hext: its .data/.rdata features go to the
+    # exe as one data-only file, its immediate-only code features to
+    # ff7nx_hextarm, the rest is PC-only and named. See ff7nx_newthreat.
+    if ff7nx_newthreat.CURRENT is not None:
+        _nt_files = []
+        for f, m in plan.hext_files:
+            if not ff7nx_newthreat.handles(m):
+                _nt_files.append((f, m))
+                continue
+            try:
+                res = ff7nx_newthreat.split_hext(f)
+            except Exception as exc:                           # noqa: BLE001
+                log('! %s: %s not split (%s) -- left to the exe path, which '
+                    'skips a file with code patches whole'
+                    % (m.display_name, os.path.basename(f), exc))
+                _nt_files.append((f, m))
+                continue
+            if res['data_path']:
+                _nt_files.append((res['data_path'], m))
+            for feat, words in res['arm']:
+                plan.hextarm.append(('%s#%s' % (f, feat['name'][:40]), m,
+                                     words))
+            log('%s: %s -- %d data feature(s) (%d patches) to ff7_en, %d '
+                'code constant(s) to ARM64 (%s), %d PC-only x86 feature(s) '
+                'not carried: %s'
+                % (m.display_name, os.path.basename(f), len(res['data']),
+                   sum(len(x['patches']) for x in res['data']),
+                   len(res['arm']),
+                   ', '.join(x['name'][:28] for x, _w in res['arm'])
+                   or 'none', len(res['pc_only']),
+                   '; '.join(n[:40] for n in res['pc_only']) or 'none'))
+        plan.hext_files = _nt_files
     # BUILD 621. Enhanced Stock UI: what its options select, for ff7nx_esui.
     # Its HEXT files leave the exe list -- the screens it carries are applied
     # as ARM64 words and data by apply_esui, the rest is not carried yet.
@@ -9836,11 +9874,20 @@ def _build_flevel(archive_path, chunks, field_files, romfs, log,
             # to what we already have" keeps the payload already recorded.
             parts = lgp.split_sections(base_raw)
             van_raw = base_raw
-        for idx, (src, _) in sorted(sections.items()):
+        _nt = {}
+        for idx, (src, _cmod) in sorted(sections.items()):
             if not 1 <= idx <= 9:
                 continue
             with open(src, 'rb') as f:
                 parts[idx - 1] = f.read()
+            # BUILD 889: New Threat's PC script / loader, ported below
+            if idx in (1, 3) and ff7nx_newthreat.handles(_cmod):
+                _nt[idx] = parts[idx - 1]
+        if _nt:
+            _stock = lgp.split_sections(archive.decompressed(entry))
+            for idx, data in ff7nx_newthreat.port_field(field, _nt,
+                                                        _stock).items():
+                parts[idx - 1] = data
         raw = lgp.join_sections(parts)
         if raw == van_raw:
             identical += 1
@@ -9854,6 +9901,8 @@ def _build_flevel(archive_path, chunks, field_files, romfs, log,
         log(f'  {patched} fields patched'
             + (f', {identical} identical to vanilla and left untouched'
                if identical else ''))
+        for _line in ff7nx_newthreat.flevel_summary():
+            log(_line)
 
     # BUILD 803. The port's own button hints that no longer match the
     # controls (Kalm: the world map view toggle is ZL+ZR now). On whatever

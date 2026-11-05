@@ -47,6 +47,8 @@ USER_KEYS = frozenset((
     'install_selection',            # BUILD 814: Install Mods' check boxes; not a build input
     'developer_settings',           # Settings > GUI toggle: same as SEVENTH_NX_DEV
     'text_autosize',                # BUILD 860: Display > Autosize dialogue boxes
+    'update_check',                 # BUILD 890: GUI > Check for updates automatically
+    'update_skip',                  # BUILD 890: the release "Skip This Version" chose; not a build input
 ))
 
 # The shipped configuration: the developer settings' defaults, and what
