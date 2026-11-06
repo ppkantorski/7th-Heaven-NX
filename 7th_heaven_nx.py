@@ -2432,7 +2432,8 @@ def _run_build_steps(mods, enabled, settings_by_mod, log, progress,
     produced += build.apply_hextarm(SDOUT_DIR, DUMP, plan, log, produced)
     produced += build.apply_frame_probe(SDOUT_DIR, DUMP, plan, log, produced)
 
-    # BUILD 894: sdout/build.txt -- the 7th Heaven NX version and every mod
+    # BUILD 894: build.txt in the title folder (sdout/atmosphere/contents/
+    # 0100A5B00BDC6000/) -- the 7th Heaven NX version and every mod
     # (version, options as built) this build was made with. Before
     # prune_stale, which keeps only what `produced` names.
     if produced:

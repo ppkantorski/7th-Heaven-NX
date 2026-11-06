@@ -69,11 +69,18 @@ def test_render_is_neat_and_exact():
 def test_write_replaces_the_file(tmp_path):
     mods, settings, installed = _sample()
     p = B.write(str(tmp_path), '1.1.0', mods, settings, installed)
-    assert os.path.basename(p) == 'build.txt'
+    assert p == os.path.join(str(tmp_path), 'atmosphere', 'contents',
+                             '0100A5B00BDC6000', 'build.txt')
     first = open(p).read()
     B.write(str(tmp_path), '1.1.1', mods, settings, installed)
     assert 'v1.1.1.' in open(p).read() and first != open(p).read()
-    assert os.listdir(str(tmp_path)) == ['build.txt']
+    assert os.listdir(os.path.dirname(p)) == ['build.txt']
+    assert os.listdir(str(tmp_path)) == ['atmosphere']
+
+
+def test_title_id_matches_the_build():
+    import build
+    assert B.TITLE_ID == build.TITLE_ID
 
 
 def test_build_registers_it_before_prune():

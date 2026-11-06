@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""ff7nx_buildinfo.py -- sdout/build.txt, what a build was made with.
+"""ff7nx_buildinfo.py -- build.txt, what a build was made with.
 BUILD 894.
 
-Written at the end of every build that produced output, at the top of
-sdout/ (so it goes onto the SD card root with everything else): the
+Written at the end of every build that produced output, in the title's
+own folder, sdout/atmosphere/contents/0100A5B00BDC6000/ -- beside exefs/
+and romfs/, where Atmosphere ignores it, and removed with the rest when
+that folder is deleted. It says: the
 7th Heaven NX version, when the build ran, and every enabled mod in
 priority order with its version and the options it was built with -- the
 EFFECTIVE options, after 7th Heaven compatibility rules, i.e. exactly what
@@ -18,6 +20,12 @@ import os
 import time
 
 FILE_NAME = 'build.txt'
+TITLE_ID = '0100A5B00BDC6000'
+
+
+def path_for(sdout):
+    """sdout/atmosphere/contents/<title>/build.txt"""
+    return os.path.join(sdout, 'atmosphere', 'contents', TITLE_ID, FILE_NAME)
 WIDTH = 72
 
 _MONTHS = ('January', 'February', 'March', 'April', 'May', 'June', 'July',
@@ -134,10 +142,10 @@ def render(version, mods, settings_by_mod, installed=(), when=None):
 
 
 def write(sdout, version, mods, settings_by_mod, installed=(), when=None):
-    """Write sdout/build.txt; returns its path."""
-    path = os.path.join(sdout, FILE_NAME)
+    """Write build.txt into the title folder (path_for); returns its path."""
+    path = path_for(sdout)
     text = render(version, mods, settings_by_mod, installed, when)
-    os.makedirs(sdout, exist_ok=True)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = path + '.tmp'
     with open(tmp, 'w', encoding='ascii', newline='\n') as f:
         f.write(text)
