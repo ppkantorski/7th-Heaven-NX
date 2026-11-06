@@ -622,6 +622,18 @@ RIM_D = 6                 # texels at 768 re-shaped next to the cut (2 native px
 RIM_REF = (7, 10)         # texels: the glow just behind the rim
 RIM_TAPER = (0.55, 0.7, 0.82, 0.9, 0.96, 1.0)  # of the reference, d=1..6
 RIM_SMOOTH = 0           # texels (768): Gaussian over the lit glow (off)
+# BUILD 893: LOCAL SPIKES. The reference above is the glow 7-10 texels from
+# the cut, and between these bars no lit texel is that deep -- so the pass
+# had no reference anywhere on the grate and lowered nothing. One spot was
+# visible for it: the third bar's right end, where the glow ends in a 2x2
+# tip at 180-213 against 130-148 just behind it, a bright square against
+# the dark post (hardware report, 11-06). An edge texel (within RIM_D of the
+# cut, visibly bright) that is over SPIKE_RATIO x the glow BEHIND it (the
+# median of the deeper lit texels within SPIKE_R) is brought to RIM_TAPER of
+# that glow, so the tip fades into the cut instead of flaring. Only lowers.
+SPIKE_R = 4              # texels: the window the glow behind is read from
+SPIKE_RATIO = 1.4
+SPIKE_MIN = 64           # brightness: dimmer specks are invisible either way
 GLOW_CLOSE = 5           # texels (768): dark streaks narrower than this fill
 
 
@@ -718,6 +730,20 @@ def plan_rim_despike(name, sec9):
         target = ref * taper
         m &= lum > target.max(-1) * 1.05
         rgb[m] = np.minimum(rgb[m], target[m])
+    # LOCAL SPIKES (BUILD 893): see SPIKE_R.
+    for d, taper in zip(range(1, RIM_D + 1), RIM_TAPER):
+        for yy, xx in zip(*np.nonzero((dist == d) & lit
+                                      & (rgb.max(-1) >= SPIKE_MIN))):
+            ys, xs = max(0, yy - SPIKE_R), max(0, xx - SPIKE_R)
+            ye, xe = yy + SPIKE_R + 1, xx + SPIKE_R + 1
+            behind = lit[ys:ye, xs:xe] & (dist[ys:ye, xs:xe] > d)
+            if behind.sum() < 6:
+                continue
+            ref_l = float(np.median(rgb[ys:ye, xs:xe].max(-1)[behind]))
+            val = float(rgb[yy, xx].max())
+            if val > SPIKE_RATIO * ref_l:
+                rgb[yy, xx] = rgb[yy, xx] * (taper * ref_l / val)
+                st['spikes'] = st.get('spikes', 0) + 1
     # DARK FRINGES. The Cosmos glow carries thin dark streaks (one or two
     # texels) running along the bars inside the light, which read as dirty
     # aliasing. A grey-scale closing (GLOW_CLOSE x GLOW_CLOSE) fills valleys
