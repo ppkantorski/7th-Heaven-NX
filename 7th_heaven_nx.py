@@ -7295,12 +7295,18 @@ def launch_ui():
         win.resizable(False, False)
         mode, why = ff7nx_update.install_mode()
         asset = rel.asset()
+        # BUILD 892: an unpacked source archive updates from the release's
+        # own source archive; a release build from its zip
+        source = mode == 'source'
+        can_install = source or (mode == 'auto' and asset)
         body = ttk.Frame(win, padding=(20, 18, 20, 14))
         body.pack(fill='both', expand=True)
         ttk.Label(body, text='7th Heaven NX %s is available' % _v(rel.version),
                   font=(UI_FONT, 15, 'bold')).pack(anchor='w')
         sub = 'You have %s.' % _v(VERSION)
-        if asset:
+        if source:
+            sub += '  Download: the release\'s source code.'
+        elif asset:
             sub += '  Download: %s (%.1f MB).' % (asset['name'],
                                                   asset['size'] / 1e6)
         ttk.Label(body, text=sub, style='Sub.TLabel').pack(anchor='w',
@@ -7321,7 +7327,15 @@ def launch_ui():
                            justify='left')
         status.pack(anchor='w', pady=(10, 0))
         bar = ttk.Progressbar(body, mode='determinate', length=600)
-        if mode != 'auto':
+        if source:
+            status.configure(text='Replaces this folder\'s program files '
+                             '(7th_heaven_nx.py, src/, assets/ ...) with '
+                             '%s\'s. Your mods, dump, settings, builds and '
+                             '.venv are kept, and any program file you '
+                             'changed yourself is saved in .nx_update/'
+                             'previous/ first. 7th Heaven NX closes, updates '
+                             'and reopens.' % _v(rel.version))
+        elif mode != 'auto':
             status.configure(text=why + ' Download it from the release page '
                              'instead.')
         elif not asset:
@@ -7356,6 +7370,11 @@ def launch_ui():
                 bar['value'] = 100.0 * state['done'] / state['total']
                 status.configure(text='Downloading… %.1f of %.1f MB'
                                  % (state['done'] / 1e6, state['total'] / 1e6))
+            else:                       # a source archive has no size
+                bar.configure(mode='indeterminate')
+                bar.step(4)
+                status.configure(text='Downloading… %.1f MB'
+                                 % (state['done'] / 1e6))
             win.after(200, tick_progress)
 
         def install_now():
@@ -7365,7 +7384,11 @@ def launch_ui():
                 return
             save_settings_now()
             try:
-                argv = ff7nx_update.write_script(state['staged'], rel.version)
+                argv = (ff7nx_update.write_source_script(state['staged'],
+                                                         rel.version)
+                        if source else
+                        ff7nx_update.write_script(state['staged'],
+                                                  rel.version))
                 ff7nx_update.launch_installer(argv)
             except Exception as exc:                        # noqa: BLE001
                 messagebox.showerror('Update', 'The installer could not be '
@@ -7390,10 +7413,12 @@ def launch_ui():
                 update_btn.state(['!disabled'])
                 return
             state['staged'] = result
-            status.configure(text='Downloaded and verified (SHA-256). '
+            status.configure(text='Downloaded and verified (%s). '
                              '7th Heaven NX will close, install %s and '
                              'reopen. Your mods, dump, settings and builds '
-                             'are not touched.' % _v(rel.version))
+                             'are not touched.'
+                             % ('the tagged commit' if source else 'SHA-256',
+                                _v(rel.version)))
             update_btn.configure(text='Restart and Update',
                                  command=install_now)
             update_btn.state(['!disabled'])
@@ -7404,8 +7429,9 @@ def launch_ui():
                                     'once it has finished.', parent=win)
                 return
             update_btn.state(['disabled'])
-            state.update(cancel=False, done=0, total=asset['size'],
-                         busy=True)
+            state.update(cancel=False, done=0,
+                         total=0 if source else asset['size'], busy=True)
+            bar.configure(mode='determinate')
             bar['value'] = 0
             bar.pack(anchor='w', pady=(6, 0))
             status.configure(text='Downloading…')
@@ -7415,6 +7441,10 @@ def launch_ui():
                 state['done'], state['total'] = done, total or state['total']
 
             def work():
+                if source:
+                    z = ff7nx_update.download_source(
+                        rel, prog, lambda: state['cancel'])
+                    return ff7nx_update.stage_source(z, rel.version)
                 z = ff7nx_update.download(asset, prog,
                                           lambda: state['cancel'])
                 return ff7nx_update.stage(z, rel.version)
@@ -7426,7 +7456,7 @@ def launch_ui():
                    ).pack(side='right', padx=(0, 8))
         update_btn = ttk.Button(foot, text='Update Now', style='Accent.TButton',
                                 command=start)
-        if mode == 'auto' and asset:
+        if can_install:
             update_btn.pack(side='right', padx=(0, 8))
         ttk.Button(foot, text='Skip This Version', command=skip
                    ).pack(side='left')

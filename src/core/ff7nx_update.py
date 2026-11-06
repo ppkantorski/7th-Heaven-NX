@@ -45,10 +45,26 @@ HOW IT IS INSTALLED
   the updated app opens without the Gatekeeper prompt a browser download
   gets. A translocated app is replaced at its ORIGINAL location (nxpaths).
 
+RUN FROM SOURCE (BUILD 892)
+  A folder unpacked from a release's "Source code (zip)" updates from that
+  same archive, github.com/<repo>/archive/refs/tags/<tag>.zip. GitHub
+  publishes no checksum for it, but it writes the commit the archive was
+  made from into the zip's comment; that must equal the commit the API says
+  the tag points to, and the archive's 7th_heaven_nx.py must say the
+  release's VERSION. The new files are copied over the program's own; local
+  data (mods/, dump/, cache/, sdout/, settings.json, .venv/, attic/,
+  data/ff7_en_switch ... -- the repository's .gitignore) is never written,
+  and .py files the new version no longer has are removed from src/ only
+  (a stale module there could shadow a moved one). Every file replaced or
+  removed is kept in .nx_update/previous/ until the next update, so a local
+  edit is never lost. The copy runs in a standalone Python script after the
+  program has exited, with the same interpreter, which then restarts it.
+  A git clone (.git/) is left to `git pull`.
+
 WHEN IT CANNOT INSTALL
-  Run from source (git clone): it says so and offers the release page --
-  `git pull` is the update there. A release whose folder is not writable,
-  or that was started with SEVENTH_NX_HOME pointing elsewhere: the same.
+  A git clone: it says so and offers the release page. A release whose
+  folder is not writable, or that was started with SEVENTH_NX_HOME pointing
+  elsewhere: the same.
 
 Licensed under GPLv3
 Copyright (c) 2026 ppkantorski
@@ -248,11 +264,19 @@ def _required_items(system=None):
 
 
 def install_mode():
-    """('auto', None) when this copy can update itself, otherwise
-    ('source' | 'manual', why)."""
+    """How this copy updates: ('auto', None) for a release build, ('source',
+    None) for an unpacked source archive, otherwise ('git' | 'manual', why)
+    -- those cannot update themselves."""
     if not nxpaths.FROZEN:
-        return ('source', 'This copy runs from the source code. Update it '
-                'with `git pull`, or download the release.')
+        root = nxpaths.ROOT
+        if os.path.exists(os.path.join(root, '.git')):
+            return ('git', 'This copy is a git clone. Update it with '
+                    '`git pull`.')
+        if not os.path.isfile(os.path.join(root, '7th_heaven_nx.py')):
+            return ('manual', '7th_heaven_nx.py is not in %s.' % root)
+        if not os.access(root, os.W_OK):
+            return ('manual', '%s cannot be written to.' % root)
+        return ('source', None)
     if os.environ.get('SEVENTH_NX_HOME'):
         return ('manual', 'SEVENTH_NX_HOME puts your folder somewhere other '
                 'than next to the program, so the program cannot be found '
@@ -568,7 +592,8 @@ def launch_installer(argv):
 
 def discard():
     """Throw away a staged update that was not installed."""
-    for p in (os.path.join(WORK, 'new'), os.path.join(WORK, 'old')):
+    for p in (os.path.join(WORK, 'new'), os.path.join(WORK, 'old'),
+              os.path.join(WORK, 'new_src')):
         _remove(p)
     try:
         for n in os.listdir(WORK):
@@ -596,8 +621,277 @@ def last_result(current):
     # an installer may still be cleaning up for a second or two; whatever it
     # leaves is removed by the next launch instead
     if out is None or out[0] == 'ok':
-        _remove(WORK)
+        # everything but previous/ (a source update's replaced files, kept
+        # until the next update)
+        try:
+            for n in os.listdir(WORK):
+                if n != 'previous':
+                    _remove(os.path.join(WORK, n))
+        except OSError:
+            pass
+        try:
+            os.rmdir(WORK)          # only when nothing (no previous/) is left
+        except OSError:
+            pass
     else:
         _remove(RESULT)
         discard()
     return out
+
+
+# ------------------------------------------------- source archives (892)
+
+ARCHIVE_URL = 'https://github.com/%s/archive/refs/tags/%%s.zip' % REPO
+COMMIT_API = 'https://api.github.com/repos/%s/commits/%%s' % REPO
+
+# Never written by a source update: the user's data and per-machine files
+# (the repository's own .gitignore says the same).
+SOURCE_KEEP = ('dump/', 'mods/', 'cache/', 'sdout/', 'sdout_changes/',
+               'game_data_files/', 'repos/', 'attic/', 'release/',
+               'modules/', 'ffmpeg/', '.venv/', '.nx_update/', '.git/',
+               'shaders/stock/', 'settings.json', 'sdout_changes.txt',
+               '7th_heaven_nx.log', 'data/ff7_en_switch',
+               'data/build_counters.json', '.deps_skipped')
+# Folders whose .py files are removed when the new version no longer has
+# them (src/ is on sys.path module by module: a leftover could shadow a
+# module that moved).
+SOURCE_PRUNE = ('src/',)
+
+
+def source_kept(rel):
+    rel = rel.replace('\\', '/')
+    return any(rel == k.rstrip('/') or (k.endswith('/') and
+                                        rel.startswith(k))
+               for k in SOURCE_KEEP)
+
+
+def tag_commit(tag):
+    """The commit SHA `tag` points to, from the GitHub API."""
+    try:
+        resp = _open(COMMIT_API % tag, headers={
+            'Accept': 'application/vnd.github.sha',
+            'User-Agent': '7th-Heaven-NX'})
+        with resp:
+            sha = resp.read().decode('ascii', 'replace').strip()
+    except Exception as exc:                                   # noqa: BLE001
+        raise UpdateError('could not ask GitHub which commit %s is (%s)'
+                          % (tag, getattr(exc, 'reason', None) or exc))
+    if not re.fullmatch(r'[0-9a-f]{40}', sha):
+        raise UpdateError('GitHub did not name the commit of %s' % tag)
+    return sha
+
+
+def download_source(rel, progress=lambda done, total: None,
+                    cancelled=lambda: False):
+    """Download the release's source archive into WORK and check that it is
+    the tagged commit. Returns its path."""
+    sha = tag_commit(rel.tag)
+    os.makedirs(WORK, exist_ok=True)
+    dest = os.path.join(WORK, 'source-%s.zip' % rel.version)
+    part = dest + '.part'
+    last = None
+    for attempt in range(3):
+        if cancelled():
+            raise Cancelled('cancelled')
+        done = 0
+        try:
+            resp = _open(ARCHIVE_URL % rel.tag, timeout=60)
+            with resp, open(part, 'wb') as f:
+                total = int(resp.headers.get('Content-Length') or 0)
+                while True:
+                    if cancelled():
+                        raise Cancelled('cancelled')
+                    block = resp.read(1 << 18)
+                    if not block:
+                        break
+                    f.write(block)
+                    done += len(block)
+                    progress(done, total)
+            break
+        except Cancelled:
+            _remove(part)
+            raise
+        except Exception as exc:                               # noqa: BLE001
+            last = exc
+            time.sleep(2 * (attempt + 1))
+    else:
+        _remove(part)
+        raise UpdateError('the download failed (%s)'
+                          % (getattr(last, 'reason', None) or last))
+    try:
+        with zipfile.ZipFile(part) as zf:
+            comment = zf.comment.decode('ascii', 'replace').strip()
+    except zipfile.BadZipFile:
+        _remove(part)
+        raise UpdateError('the download is not a zip archive')
+    if comment != sha:
+        _remove(part)
+        raise UpdateError('the archive is not the commit %s points to, so '
+                          'it was thrown away' % rel.tag)
+    os.replace(part, dest)
+    return dest
+
+
+def stage_source(zip_path, version):
+    """Extract a verified source archive into WORK/new_src and check it.
+    Returns the folder holding the new tree."""
+    new = os.path.join(WORK, 'new_src')
+    _remove(new)
+    os.makedirs(new)
+    _extract_zip(zip_path, new)
+    tops = [d for d in os.listdir(new)
+            if os.path.isdir(os.path.join(new, d))]
+    if len(tops) != 1:
+        raise UpdateError('the archive does not hold one top folder')
+    folder = os.path.join(new, tops[0])
+    entry = os.path.join(folder, '7th_heaven_nx.py')
+    if not os.path.isfile(entry) or not os.path.isdir(
+            os.path.join(folder, 'src')):
+        raise UpdateError('the archive is not a 7th Heaven NX source tree')
+    with open(entry, encoding='utf-8', errors='replace') as f:
+        m = re.search(r"^VERSION = '([^']+)'", f.read(), re.M)
+    if not m or m.group(1) != version:
+        raise UpdateError('the archive says it is version %s, not %s'
+                          % (m.group(1) if m else '?', version))
+    _remove(zip_path)
+    return folder
+
+
+def source_plan(folder, root=None):
+    """(files to copy [rel], stale .py files to remove [rel]) for putting the
+    tree at `folder` over `root`."""
+    root = root or nxpaths.ROOT
+    copy = []
+    for d, subs, files in os.walk(folder):
+        subs[:] = [s for s in subs if s != '__pycache__']
+        for f in files:
+            rel = os.path.relpath(os.path.join(d, f), folder).replace(
+                os.sep, '/')
+            if not source_kept(rel):
+                copy.append(rel)
+    new = set(copy)
+    stale = []
+    for top in SOURCE_PRUNE:
+        base = os.path.join(root, top)
+        for d, subs, files in os.walk(base):
+            subs[:] = [s for s in subs if s != '__pycache__']
+            for f in files:
+                if not f.endswith('.py'):
+                    continue
+                rel = os.path.relpath(os.path.join(d, f), root).replace(
+                    os.sep, '/')
+                if rel not in new:
+                    stale.append(rel)
+    return sorted(copy), sorted(stale)
+
+
+# The installer for a source update: standalone (no project imports), run by
+# the same interpreter as the program once the program has exited.
+_SOURCE_APPLY = r"""
+import json, os, shutil, subprocess, sys, time
+plan = json.load(open(sys.argv[1], encoding='utf-8'))
+root, new, prev, result = plan['root'], plan['new'], plan['prev'], plan['result']
+
+def alive(pid):
+    if os.name == 'nt':
+        import ctypes
+        k = ctypes.windll.kernel32
+        h = k.OpenProcess(0x00100000, False, pid)        # SYNCHRONIZE
+        if not h:
+            return False
+        try:
+            return k.WaitForSingleObject(h, 0) == 0x102  # WAIT_TIMEOUT
+        finally:
+            k.CloseHandle(h)
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+for _ in range(720):
+    if not alive(plan['pid']):
+        break
+    time.sleep(0.25)
+time.sleep(0.5)
+
+def write(path, text):
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write(text)
+
+backed, added = [], []
+try:
+    if os.path.isdir(prev):
+        shutil.rmtree(prev)
+    os.makedirs(prev)
+    for rel in plan['remove']:
+        src = os.path.join(root, rel)
+        if os.path.isfile(src):
+            dst = os.path.join(prev, rel)
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.move(src, dst)
+            backed.append(rel)
+    for rel in plan['copy']:
+        dst = os.path.join(root, rel)
+        if os.path.isfile(dst):
+            keep = os.path.join(prev, rel)
+            os.makedirs(os.path.dirname(keep), exist_ok=True)
+            shutil.copy2(dst, keep)
+            backed.append(rel)
+        else:
+            added.append(rel)
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        tmp = dst + '.nxupd'
+        shutil.copy2(os.path.join(new, rel), tmp)
+        os.replace(tmp, dst)
+    write(result, 'OK %s\n' % plan['version'])
+    ok = True
+except Exception as exc:
+    ok = False
+    for rel in added:
+        try:
+            os.remove(os.path.join(root, rel))
+        except OSError:
+            pass
+    for rel in backed:
+        try:
+            dst = os.path.join(root, rel)
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.copy2(os.path.join(prev, rel), dst)
+        except OSError:
+            pass
+    write(result, 'FAILED %s\n' % exc)
+if plan.get('relaunch', True):
+    kw = {'cwd': root, 'stdin': subprocess.DEVNULL,
+          'stdout': subprocess.DEVNULL, 'stderr': subprocess.DEVNULL}
+    if os.name == 'nt':
+        kw['creationflags'] = 0x00000008 | 0x00000200     # detached
+    else:
+        kw['start_new_session'] = True
+    subprocess.Popen([plan['python'], os.path.join(root, '7th_heaven_nx.py')]
+                     + plan.get('args', []), **kw)
+if ok:
+    shutil.rmtree(os.path.dirname(new), ignore_errors=True)
+"""
+
+
+def write_source_script(folder, version, pid=None, python=None,
+                        relaunch=None):
+    """The detached installer for a source update. Returns its argv."""
+    root = nxpaths.ROOT
+    os.makedirs(WORK, exist_ok=True)
+    copy, stale = source_plan(folder, root)
+    if relaunch is None:
+        relaunch = not os.environ.get('SEVENTH_NX_UPDATE_NO_RELAUNCH')
+    python = python or sys.executable
+    plan = {'root': root, 'new': folder, 'prev': os.path.join(WORK, 'previous'),
+            'result': RESULT, 'version': version, 'pid': pid or os.getpid(),
+            'copy': copy, 'remove': stale, 'python': python,
+            'relaunch': relaunch}
+    plan_path = os.path.join(WORK, 'apply_source.json')
+    with open(plan_path, 'w', encoding='utf-8') as f:
+        json.dump(plan, f)
+    script = os.path.join(WORK, 'apply_source.py')
+    with open(script, 'w', encoding='utf-8') as f:
+        f.write(_SOURCE_APPLY)
+    return [python, '-I', script, plan_path]

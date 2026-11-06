@@ -234,6 +234,111 @@ def test_powershell_script_quotes_paths(sandbox, monkeypatch):
     assert 'Wait-Process -Id 42' in text and "'OK 1.2.0'" in text
 
 
-def test_source_checkout_does_not_self_update():
-    if not nxpaths.FROZEN:
-        assert U.install_mode()[0] == 'source'
+# ---------------------------------------------- BUILD 892: source archives
+
+def test_install_mode_from_source(sandbox):
+    root = str(sandbox)
+    open(os.path.join(root, '7th_heaven_nx.py'), 'w').close()
+    assert U.install_mode() == ('source', None)
+    os.makedirs(os.path.join(root, '.git'))
+    assert U.install_mode()[0] == 'git'
+
+
+def test_source_kept_paths():
+    for rel in ('mods/a.iro', 'settings.json', 'data/ff7_en_switch',
+                '.venv/bin/python', 'shaders/stock/x.glsl', 'cache/x'):
+        assert U.source_kept(rel), rel
+    for rel in ('src/core/build.py', 'data/mod_sources.json',
+                'shaders/hd.glsl', '7th_heaven_nx.py', 'settings.json.bak'):
+        assert not U.source_kept(rel), rel
+
+
+def _source_zip(path, version, commit, extra=None):
+    with zipfile.ZipFile(path, 'w') as zf:
+        top = '7th-Heaven-NX-%s/' % version
+        zf.writestr(top + '7th_heaven_nx.py',
+                    "VERSION = '%s'\nopen('launched', 'w').write('%s')\n"
+                    % (version, version))
+        zf.writestr(top + 'src/core/mod.py', 'NEW = 1\n')
+        zf.writestr(top + 'data/mod_sources.json', '{}')
+        zf.writestr(top + 'settings.json', 'must not be copied')
+        for name, data in (extra or {}).items():
+            zf.writestr(top + name, data)
+        zf.comment = commit.encode()
+
+
+def test_download_source_checks_the_commit(sandbox, monkeypatch):
+    rel = U.Release(_release())
+    good, bad = 'a' * 40, 'b' * 40
+    z = str(sandbox / 'src.zip')
+    _source_zip(z, '1.2.0', good)
+    blob = open(z, 'rb').read()
+
+    def fake_open(url, headers=None, timeout=None):
+        if 'commits' in url:
+            return _Resp(good.encode())
+        return _Resp(blob)
+    monkeypatch.setattr(U, '_open', fake_open)
+    path = U.download_source(rel)
+    folder = U.stage_source(path, '1.2.0')
+    assert os.path.isfile(os.path.join(folder, 'src', 'core', 'mod.py'))
+    _source_zip(z, '1.2.0', bad)
+    blob = open(z, 'rb').read()
+    with pytest.raises(U.UpdateError, match='not the commit'):
+        U.download_source(rel)
+
+
+def _old_source_tree(root):
+    os.makedirs(os.path.join(root, 'src', 'core'))
+    open(os.path.join(root, '7th_heaven_nx.py'), 'w').write(
+        "VERSION = '1.1.0'\nopen('launched', 'w').write('1.1.0')\n")
+    open(os.path.join(root, 'src', 'core', 'mod.py'), 'w').write('EDIT = 1\n')
+    open(os.path.join(root, 'src', 'core', 'gone.py'), 'w').write('OLD\n')
+    os.makedirs(os.path.join(root, 'mods'))
+    open(os.path.join(root, 'mods', 'm.iro'), 'w').write('mod')
+    open(os.path.join(root, 'settings.json'), 'w').write('{"k": 1}')
+
+
+def _stage_new(root, extra=None):
+    os.makedirs(U.WORK, exist_ok=True)
+    z = os.path.join(U.WORK, 's.zip')
+    _source_zip(z, '1.2.0', 'c' * 40, extra)
+    return U.stage_source(z, '1.2.0')
+
+
+@pytest.mark.parametrize('broken', [False, True])
+def test_source_installer(sandbox, broken):
+    root = str(sandbox)
+    _old_source_tree(root)
+    folder = _stage_new(root, {'src/core/newmod.py': 'X = 1\n'})
+    if broken:
+        # a folder where the update wants a file: that copy fails
+        os.makedirs(os.path.join(root, 'data', 'mod_sources.json'))
+    p = subprocess.Popen([sys.executable, '-c', 'pass'])
+    p.wait()
+    argv = U.write_source_script(folder, '1.2.0', pid=p.pid, relaunch=True)
+    subprocess.run(argv, timeout=60)
+    for _ in range(100):
+        if os.path.exists(os.path.join(root, 'launched')):
+            break
+        time.sleep(0.1)
+    launched = open(os.path.join(root, 'launched')).read()
+    src = open(os.path.join(root, 'src', 'core', 'mod.py')).read()
+    if broken:
+        assert launched == '1.1.0', 'the old version is started again'
+        assert U.last_result('1.1.0')[0] == 'failed'
+        assert src == 'EDIT = 1\n'
+        assert os.path.exists(os.path.join(root, 'src', 'core', 'gone.py'))
+        assert not os.path.exists(os.path.join(root, 'src', 'core',
+                                               'newmod.py'))
+    else:
+        assert launched == '1.2.0'
+        assert src == 'NEW = 1\n'
+        assert not os.path.exists(os.path.join(root, 'src', 'core', 'gone.py'))
+        prev = os.path.join(U.WORK, 'previous', 'src', 'core')
+        assert open(os.path.join(prev, 'mod.py')).read() == 'EDIT = 1\n'
+        assert os.path.exists(os.path.join(prev, 'gone.py'))
+        assert U.last_result('1.2.0') == ('ok', '1.2.0')
+        assert os.listdir(U.WORK) == ['previous']
+    assert open(os.path.join(root, 'settings.json')).read() == '{"k": 1}'
+    assert os.listdir(os.path.join(root, 'mods')) == ['m.iro']

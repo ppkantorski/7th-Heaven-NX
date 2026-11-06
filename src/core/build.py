@@ -215,6 +215,7 @@ import ff7nx_easteregg
 import ff7nx_idleanim
 import ff7nx_onnafix
 import ff7nx_catshades
+import ff7nx_decallift
 import ff7nx_poseunblock
 import ff7nx_destrobe
 import ff7nx_floordepth
@@ -15475,6 +15476,16 @@ def apply_plan(plan, archive_paths, sdout, log=lambda *_: None,
             _cs_line = ff7nx_catshades.summarise_char(_cs)
             if _cs_line:
                 log(_cs_line)
+            # BUILD 891. Eye/mouth decals lifted off the face so the port's
+            # depth test stops tying them with the skin (mds5_m's merchant
+            # flickering). Idempotent, same-size .p payloads.
+            _dl = ff7nx_decallift.apply_to_char(_cdest, log)
+            if _dl.get('written'):
+                _archive_restat('char.lgp', _cdest, log,
+                                'the decal-lift pass')
+            _dl_line = ff7nx_decallift.summarise_char(_dl)
+            if _dl_line:
+                log(_dl_line)
 
     if do_flevel and not reuse_flevel:
         progress(step, total, 'Building flevel.lgp')
