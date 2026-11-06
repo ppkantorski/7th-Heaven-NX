@@ -2432,6 +2432,18 @@ def _run_build_steps(mods, enabled, settings_by_mod, log, progress,
     produced += build.apply_hextarm(SDOUT_DIR, DUMP, plan, log, produced)
     produced += build.apply_frame_probe(SDOUT_DIR, DUMP, plan, log, produced)
 
+    # BUILD 894: sdout/build.txt -- the 7th Heaven NX version and every mod
+    # (version, options as built) this build was made with. Before
+    # prune_stale, which keeps only what `produced` names.
+    if produced:
+        try:
+            import ff7nx_buildinfo
+            produced.append(ff7nx_buildinfo.write(
+                SDOUT_DIR, VERSION, active, effective_settings,
+                installed=mods))
+        except Exception as exc:                                # noqa: BLE001
+            log('  ! build.txt not written: %s' % exc)
+
     # Everything the build produces is known now, so anything a PREVIOUS
     # build left here that this one does not produce is stale -- a feature
     # toggled off since. Only ever removes files this packer itself wrote.
