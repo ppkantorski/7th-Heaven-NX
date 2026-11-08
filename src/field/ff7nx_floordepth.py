@@ -238,6 +238,17 @@ HOLE_FIELDS = {
                  # lip texels over the planks. That corner is left as it was.
                  'keep': [((48.0, 16.0), (96.0, 16.0), (96.0, 32.0),
                            (48.0, 32.0))]},
+    # BUILD 896 (hardware 11-07): in mds6_1, standing on the low road (z 4)
+    # beside the perforated plate, Cloud's shadow showed as a sliver on the
+    # upper road (walkmesh z 130..135) left of him, field ~(-53..-48, 120).
+    # That patch of upper road is layer-1 art (no depth, ID 4095) at tiles
+    # (-64, 120) and its neighbours, so a low-road shadow cast under it was
+    # drawn over it. The 1997 layer-2 squares beside it (IDs 944..976) hide
+    # the same shadow, some by only a few IDs. Same treatment as games_2 /
+    # mds7pb_1, around this ledge: the main floor is the low road (plane 4);
+    # the rows sit at y = 8 mod 16 (grid).
+    'mds6_1': {'plane': 4.0, 'box': (-96, 16, 72, 168), 'grid': (0, 8),
+               'ffnx_bias': True, 'pad': 28.0},
 }
 
 
@@ -1046,7 +1057,7 @@ def _floor_dist(tris, x, y):
     return best
 
 
-def _texels(R, o, zoom, tris, gx, gy):
+def _texels(R, o, zoom, tris, gx, gy, plane=0.0):
     """per screen point: (class 0 floor / 1 object / 2 raised, the depth
     a main-floor shadow there must be behind (inf: none), the depth feet on
     raised walkmesh need in front (-inf: none))"""
@@ -1073,16 +1084,18 @@ def _texels(R, o, zoom, tris, gx, gy):
         hit = ok & (u >= -1e-3) & (w >= -1e-3) & (u + w <= 1.001) & (t > 0) & (t < first)
         first = np.where(hit, t, first)
         fz = np.where(hit, tris[i, :, 2].mean(), fz)
-    main = tris[np.abs(tris[:, :, 2]).max(1) <= 3]
-    # the main floor's plane (z 0) and its shadow plane (z -11)
-    t0 = (0.0 - b[2]) / D[:, 2]
-    ts = (-11.0 - b[2]) / D[:, 2]
+    # BUILD 896: the main floor need not be at z 0 (mds6_1's lower road is
+    # at z 4, its upper roads at 130..182); `plane` is cfg['plane']
+    main = tris[np.abs(tris[:, :, 2] - plane).max(1) <= 3]
+    # the main floor's plane and its shadow plane (11 under it)
+    t0 = (plane - b[2]) / D[:, 2]
+    ts = (plane - 11.0 - b[2]) / D[:, 2]
     X = b + t0[:, None] * D
     dist = _floor_dist(main, X[:, 0], X[:, 1])
     cls = np.zeros(len(D), int)
     hole = ~np.isfinite(first)
     cls[hole & (dist >= EDGE_KEEP)] = 1
-    raised = np.isfinite(first) & (fz >= 16)
+    raised = np.isfinite(first) & (fz >= plane + 16)
     cls[raised] = 2
     hi = np.where((cls > 0) & (dist <= RECEIVER_REACH) & (t0 > 0)
                   & (ts > np.where(raised, first, 0) + 8.0), ts - HOLE_BIAS, np.inf)
@@ -1092,15 +1105,15 @@ def _texels(R, o, zoom, tris, gx, gy):
     return cls.reshape(sh), hi.reshape(sh), lo.reshape(sh)
 
 
-def _texels_cons(R, o, zoom, tris, gx, gy, half):
+def _texels_cons(R, o, zoom, tris, gx, gy, half, plane=0.0):
     """_texels, with `hi` the NEAREST shadow depth anywhere in the texel
     (centre and four corners, +-half units), not only at its centre.
     BUILD 771c: a copy solved from texel centres left a sub-texel sliver
     of the floor shadow showing along one band edge (the user's red line,
     games_2 tile 128,176) -- the shadow's depth changes across a texel."""
-    cls, hi, lo = _texels(R, o, zoom, tris, gx, gy)
+    cls, hi, lo = _texels(R, o, zoom, tris, gx, gy, plane)
     for dx, dy in ((-half, -half), (half, -half), (-half, half), (half, half)):
-        _c, h2, _l = _texels(R, o, zoom, tris, gx + dx, gy + dy)
+        _c, h2, _l = _texels(R, o, zoom, tris, gx + dx, gy + dy, plane)
         hi = np.where(np.isfinite(hi), np.minimum(hi, h2), hi)
     return cls, hi, lo
 
@@ -1266,7 +1279,8 @@ def _plan_holes_once(name, sec1, sec5, sec9):
         n = k if tc else 16
         t = (np.arange(n) + 0.5) * 16.0 / n
         gx, gy = np.meshgrid(x + t, y + t)
-        cls, hi, lo = _texels_cons(R, o, zoom, tris, gx, gy, 8.0 / n)
+        cls, hi, lo = _texels_cons(R, o, zoom, tris, gx, gy, 8.0 / n,
+                                   cfg.get('plane', 0.0))
         cls, hi, lo, solid[(x, y)] = _solid(cfg, R, o, zoom, gx, gy, cls, hi, lo)
         hi = _ffnx_shift(cfg, A, B, _deep(cfg, gx, gy, hi))
         obj = cls > 0
@@ -1456,7 +1470,10 @@ def _plan_holes_once(name, sec1, sec5, sec9):
                 continue
             fr[xy].append(rr)
         for (x, y), lst in sorted(fr.items()):
-            if x % 16 or y % 16:
+            # BUILD 896: the field's own tile grid (mds6_1's rows are at
+            # y = 8 mod 16)
+            gox, goy = cfg.get('grid', (0, 0))
+            if (x - gox) % 16 or (y - goy) % 16:
                 continue
             plain = [rr for rr in lst if not (rr[26] or rr[28])]
             if not plain or any(
@@ -1467,7 +1484,8 @@ def _plan_holes_once(name, sec1, sec5, sec9):
             n = k
             t = (np.arange(n) + 0.5) * 16.0 / n
             gx, gy = np.meshgrid(x + t, y + t)
-            cls, hi, lo = _texels_cons(R, o, zoom, tris, gx, gy, 8.0 / n)
+            cls, hi, lo = _texels_cons(R, o, zoom, tris, gx, gy, 8.0 / n,
+                                       cfg.get('plane', 0.0))
             cls, hi, lo, solid[(x, y)] = _solid(cfg, R, o, zoom, gx, gy, cls,
                                                 hi, lo)
             hi = _ffnx_shift(cfg, A, B, _deep(cfg, gx, gy, hi))

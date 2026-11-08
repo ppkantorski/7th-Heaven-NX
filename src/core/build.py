@@ -222,6 +222,7 @@ import ff7nx_floordepth
 import ff7nx_laserhd
 import ff7nx_halohd
 import ff7nx_hillfix
+import ff7nx_edgeaa
 import ff7nx_difix
 import ff7nx_bgmoviefield
 import ff7nx_moviepace
@@ -11256,6 +11257,15 @@ def _build_flevel(archive_path, chunks, field_files, romfs, log,
     hf_line = ff7nx_hillfix.summarise(hf_stats)
     if hf_line:
         log(hf_line)
+    # BUILD 896. mds6_1: the stakes' painted dark edges (Cosmos's upscale of
+    # the 1997 one-pixel outline) smoothed and anti-aliased where they step;
+    # every shadow and outline is kept. See ff7nx_edgeaa.
+    ea_stats = ff7nx_edgeaa.apply_to_flevel(
+        archive, payloads,
+        encode=lambda raw: _encode_field_cached(archive, raw), log=log)
+    ea_line = ff7nx_edgeaa.summarise(ea_stats)
+    if ea_line:
+        log(ea_line)
     # BUILD 776/778/860c. mogu_1's stream held frames; since 860c one frame
     # is on at a time, each of the 16 for 5 ticks. See ff7nx_waterloop.
     wl_stats = ff7nx_waterloop.apply_to_flevel(

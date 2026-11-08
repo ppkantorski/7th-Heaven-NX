@@ -9,8 +9,10 @@ that folder is deleted. It says: the
 7th Heaven NX version, when the build ran, and every enabled mod in
 priority order with its version and the options it was built with -- the
 EFFECTIVE options, after 7th Heaven compatibility rules, i.e. exactly what
-went into the build. Mods that are installed but were off are named at the
-end. Plain ASCII text, so any editor on any system shows it the same.
+went into the build. Mods that are installed but off are NOT listed (11-07:
+they contribute nothing to the build, so naming them only adds noise). The
+time carries the local time zone ("8:50 AM PST"). Plain ASCII text, so any
+editor on any system shows it the same.
 
 Licensed under GPLv3
 Copyright (c) 2026 ppkantorski
@@ -26,7 +28,9 @@ TITLE_ID = '0100A5B00BDC6000'
 def path_for(sdout):
     """sdout/atmosphere/contents/<title>/build.txt"""
     return os.path.join(sdout, 'atmosphere', 'contents', TITLE_ID, FILE_NAME)
-WIDTH = 72
+WIDTH = 72        # narrowest the file gets
+MAX_WIDTH = 120   # 11-07: the file widens so every option line fits in full
+                  # ("Upscaled + Extended Backgrounds (Recommended)"), up to this
 
 _MONTHS = ('January', 'February', 'March', 'April', 'May', 'June', 'July',
            'August', 'September', 'October', 'November', 'December')
@@ -39,12 +43,35 @@ def _v(text):
     return text if not text or text[:1] in 'vV' else 'v' + text
 
 
+def _zone(lt):
+    """Short name of the local time zone in effect at `lt`: 'PST', 'CET'...
+
+    macOS / Linux give the abbreviation directly. Windows gives the long
+    name ('Pacific Standard Time'), which is shortened to its initials. If
+    neither yields a plain short word, the UTC offset is used ('UTC-08:00')."""
+    name = (getattr(lt, 'tm_zone', None) or '').strip()
+    if name and not (name.isalpha() and name.isupper() and len(name) <= 5):
+        words = [w for w in name.replace('(', ' ').replace(')', ' ').split()
+                 if w[:1].isalpha()]
+        initials = ''.join(w[0] for w in words).upper()
+        name = initials if 2 <= len(initials) <= 5 and len(words) > 1 else ''
+    if name and name.isalpha():
+        return name
+    off = getattr(lt, 'tm_gmtoff', None)
+    if off is None:
+        off = -(time.altzone if lt.tm_isdst > 0 and time.daylight
+                else time.timezone)
+    sign = '+' if off >= 0 else '-'
+    off = abs(int(off)) // 60
+    return 'UTC%s%02d:%02d' % (sign, off // 60, off % 60)
+
+
 def _when(t):
     lt = time.localtime(t)
     hour = lt.tm_hour % 12 or 12
-    return '%s, %s %d, %d at %d:%02d %s' % (
+    return '%s, %s %d, %d at %d:%02d %s %s' % (
         _DAYS[lt.tm_wday], _MONTHS[lt.tm_mon - 1], lt.tm_mday, lt.tm_year,
-        hour, lt.tm_min, 'AM' if lt.tm_hour < 12 else 'PM')
+        hour, lt.tm_min, 'AM' if lt.tm_hour < 12 else 'PM', _zone(lt))
 
 
 def _ascii(text):
@@ -70,25 +97,21 @@ def _is_heading(opt):
                                      or not bare)
 
 
-def _dots(name, value, indent=4):
+def _dots(name, value, indent=4, width=WIDTH):
     name = _ascii(name).strip() or '?'
     value = _ascii(value).strip()
-    room = WIDTH - indent - len(value) - 2
+    room = width - indent - len(value) - 2
     if len(name) > room - 2:
         name = name[:max(8, room - 5)].rstrip() + '...'
     return ' ' * indent + name + ' ' + '.' * max(2, room - len(name)) + \
         ' ' + value
 
 
-def render(version, mods, settings_by_mod, installed=(), when=None):
-    """The text of build.txt.
-
-    mods             the enabled mods, highest priority first (build.Mod)
-    settings_by_mod  {mod.filename: {option id: value}} as built
-    installed        every installed mod, for the "not enabled" list"""
-    when = time.time() if when is None else when
-    rule = '=' * WIDTH
-    out = [rule, '7th Heaven NX - Build'.center(WIDTH).rstrip(), rule, '',
+def _render(version, mods, settings_by_mod, when, W, need):
+    """build.txt laid out at width W; appends to `need` the width each
+    option / title line wants to be shown in full."""
+    rule = '=' * W
+    out = [rule, '7th Heaven NX - Build'.center(W).rstrip(), rule, '',
            'Built with 7th Heaven NX %s.' % _v(version),
            'Built on %s.' % _when(when), '']
     n = len(mods)
@@ -102,11 +125,12 @@ def render(version, mods, settings_by_mod, installed=(), when=None):
         ver = _v(getattr(man, 'version', '') if man else '')
         head = '%*d. %s' % (num_w, i, name)
         if ver:
-            gap = WIDTH - len(head) - len(ver)
+            need.append(len(head) + 2 + len(ver))
+            gap = W - len(head) - len(ver)
             head = head + ' ' * max(2, gap) + ver
-        out.append('-' * WIDTH)
+        out.append('-' * W)
         out.append(head)
-        out.append('-' * WIDTH)
+        out.append('-' * W)
         opts = list(getattr(man, 'options', ()) if man else ())
         chosen = settings_by_mod.get(mod.filename, {}) or {}
         lines, pending = [], None
@@ -126,19 +150,35 @@ def render(version, mods, settings_by_mod, installed=(), when=None):
                     lines.append('')
                 lines.append('    [%s]' % _ascii(pending))
                 pending = None
-            lines.append(_dots(opt.name or opt.id, _label(opt, value)))
+            nm, lab = _ascii(opt.name or opt.id).strip() or '?', _ascii(_label(opt, value)).strip()
+            need.append(4 + len(nm) + 4 + len(lab))
+            lines.append(_dots(opt.name or opt.id, _label(opt, value), width=W))
         out.extend(lines or ['    (no options)'])
-        out.append('')
-    off = sorted((_ascii(m.display_name) for m in installed
-                  if m not in mods), key=str.casefold)
-    if off:
-        out.append('-' * WIDTH)
-        out.append('Installed but not enabled:')
-        out.append('-' * WIDTH)
-        out.extend('    ' + name for name in off)
         out.append('')
     out.append(rule)
     return '\n'.join(out) + '\n'
+
+
+def render(version, mods, settings_by_mod, installed=(), when=None):
+    """The text of build.txt.
+
+    mods             the enabled mods, highest priority first (build.Mod)
+    settings_by_mod  {mod.filename: {option id: value}} as built
+    installed        accepted for compatibility; installed-but-disabled mods
+                     are not listed (they add nothing to the build)
+
+    The width is WIDTH, or wider (up to MAX_WIDTH) when an option's name and
+    value need more room to be shown in full."""
+    when = time.time() if when is None else when
+    need = []
+    _render(version, mods, settings_by_mod, when, MAX_WIDTH, need)
+    width = max(WIDTH, min(MAX_WIDTH, max(need, default=0)))
+    return _render(version, mods, settings_by_mod, when, width, [])
+
+
+def width_of(text):
+    """The width a rendered build.txt was laid out at (its rule length)."""
+    return len(text.split('\n', 1)[0])
 
 
 def write(sdout, version, mods, settings_by_mod, installed=(), when=None):

@@ -47,12 +47,17 @@ def test_render_is_neat_and_exact():
     text = B.render('1.1.0', mods, settings, installed, when)
     lines = text.splitlines()
     assert 'Built with 7th Heaven NX v1.1.0.' in lines
-    assert 'Built on Friday, November 6, 2026 at 2:05 PM.' in lines
+    on = next(l for l in lines if l.startswith('Built on '))
+    zone = B._zone(time.localtime(when))
+    assert on == 'Built on Friday, November 6, 2026 at 2:05 PM %s.' % zone
+    assert zone and ' ' not in zone
     assert '2 mods enabled, highest priority first.' in lines
-    assert all(len(l) <= B.WIDTH for l in lines)
+    W = B.width_of(text)
+    assert B.WIDTH <= W <= B.MAX_WIDTH
+    assert all(len(l) <= W for l in lines)
     text.encode('ascii')
     head = next(l for l in lines if l.startswith('1. '))
-    assert head.endswith('v1.24') and len(head) == B.WIDTH
+    assert head.endswith('v1.24') and len(head) == W
     assert any(l.startswith('2. Cosmos Gaia') and l.endswith('v1.02')
                for l in lines)
     auto = next(l for l in lines if 'Auto Text Advance' in l)
@@ -61,9 +66,38 @@ def test_render_is_neat_and_exact():
     assert next(l for l in lines if 'Battle Grunts' in l).endswith(' On')
     assert next(l for l in lines if l.strip().startswith('An option')
                 ).endswith(' On')
-    i = lines.index('Installed but not enabled:')
-    assert '    New Threat 2.0' in lines[i:]
-    assert '    Cosmos Gaia' not in lines[i:]
+    # 11-07: installed-but-disabled mods are not listed at all
+    assert 'Installed but not enabled:' not in lines
+    assert not any('New Threat' in l for l in lines)
+
+
+def test_widens_so_long_options_fit():
+    """11-07: 'Cosmos Limit Bre... .. Upscaled + Extended Backgrounds
+    (Recommended)' -- the file widens instead of cutting the name."""
+    m = _mod('Cosmos Gaia', 'v1.02', [
+        iro.Option('BG', 'Cosmos Limit Break Backgrounds',
+                   [(0, 'Off'), (1, 'Upscaled + Extended Backgrounds '
+                                    '(Recommended)')], 1)], 'CosmosGaia.iro')
+    text = B.render('1.1.1', [m], {}, [m], time.time())
+    line = next(l for l in text.splitlines() if 'Limit Break' in l)
+    assert 'Cosmos Limit Break Backgrounds ..' in line
+    assert line.endswith('Upscaled + Extended Backgrounds (Recommended)')
+    assert B.width_of(text) == len(line) > B.WIDTH
+    # a short file stays at the usual width
+    s = _mod('Cosmos Gaia', 'v1.02', [], 'CosmosGaia.iro')
+    assert B.width_of(B.render('1.1.1', [s], {}, [s])) == B.WIDTH
+
+
+def test_zone_names():
+    class LT:
+        tm_isdst = 0
+        def __init__(self, zone, off):
+            self.tm_zone, self.tm_gmtoff = zone, off
+    assert B._zone(LT('PST', -8 * 3600)) == 'PST'
+    assert B._zone(LT('Pacific Standard Time', -8 * 3600)) == 'PST'
+    assert B._zone(LT('W. Europe Standard Time', 3600)) == 'WEST'
+    assert B._zone(LT('+0530', 5 * 3600 + 1800)) == 'UTC+05:30'
+    assert B._zone(LT('', -3 * 3600)) == 'UTC-03:00'
 
 
 def test_write_replaces_the_file(tmp_path):
