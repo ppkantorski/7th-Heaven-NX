@@ -23,6 +23,17 @@ Copyright (c) 2026 ppkantorski
 import os as _os
 import sys as _sys
 _sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), 'src'))
+# BUILD 900. Started by the previous version as the update installer: do that
+# and nothing else -- before nxpaths, the dependency check or any window, all
+# of which would act on this staged copy's folder. See ff7nx_selfupdate.
+if '--nx-apply-update' in _sys.argv:
+    try:
+        import ff7nx_selfupdate
+    except ImportError:                       # from source: src/ is per area
+        _sys.path.insert(0, _os.path.join(_os.path.dirname(
+            _os.path.abspath(__file__)), 'src', 'core'))
+        import ff7nx_selfupdate
+    _sys.exit(ff7nx_selfupdate.main())
 import nxpaths  # noqa: E402  BUILD 755: the code lives in src/<area>/
 nxpaths.install()
 import ff7nx_deps  # noqa: E402
@@ -46,7 +57,7 @@ HERE = nxpaths.ROOT
 
 # Shown in the header, nearest the title. Single source of truth --
 # anything else that needs it should import this rather than repeat it.
-VERSION = '1.1.1'
+VERSION = '1.1.2'
 sys.path.insert(0, HERE)
 
 import build  # noqa: E402
@@ -2289,6 +2300,9 @@ def _run_build_steps(mods, enabled, settings_by_mod, log, progress,
     # BUILD 629. FFNx's title-screen music (Echo-S's main_menu.ogg): two
     # caves in the title screen's frame function. See ff7nx_titlemusic.
     produced += build.apply_titlemusic(SDOUT_DIR, DUMP, plan, log, produced)
+    # BUILD 899. Echo-S's scene cues, battle themes and shuffled variants
+    # (off while Arranged Soundtrack is on). See ff7nx_echooverride.
+    produced += build.apply_echo_music(SDOUT_DIR, DUMP, plan, log, produced)
     # BUILD 640. The startup logo movie (Echo-S: _sqlogo with SYW mods,
     # else _eidoslogo; none without Echo-S). See ff7nx_sqlogo.
     produced += build.apply_sqlogo(SDOUT_DIR, DUMP, plan, log, produced)
@@ -7397,17 +7411,38 @@ def launch_ui():
                 return
             save_settings_now()
             try:
-                argv = (ff7nx_update.write_source_script(state['staged'],
-                                                         rel.version)
-                        if source else
-                        ff7nx_update.write_script(state['staged'],
-                                                  rel.version))
-                ff7nx_update.launch_installer(argv)
+                argvs = ([ff7nx_update.write_source_script(state['staged'],
+                                                           rel.version)]
+                         if source else
+                         ff7nx_update.write_scripts(state['staged'],
+                                                    rel.version))
             except Exception as exc:                        # noqa: BLE001
                 messagebox.showerror('Update', 'The installer could not be '
                                      'started:\n%s' % exc, parent=win)
                 return
-            root.destroy()
+            # BUILD 898: quit only once the installer has shown it is
+            # running. Before, the window closed the moment it had been
+            # asked to start, so an installer that was blocked looked like
+            # "the app closes and never comes back, not updated".
+            state['busy'] = True
+            update_btn.state(['disabled'])
+            status.configure(text='Starting the installer…')
+
+            def started(result):
+                state['busy'] = False
+                if isinstance(result, Exception):
+                    if win.winfo_exists():
+                        update_btn.state(['!disabled'])
+                        status.configure(text='The update was not installed.')
+                    messagebox.showerror('Update', 'The update could not be '
+                                         'installed:\n\n%s' % result,
+                                         parent=win if win.winfo_exists()
+                                         else root)
+                    return
+                _upd['exit_now'] = True
+                root.destroy()
+            _upd_bg(lambda: ff7nx_update.start_installer(argvs, rel.version),
+                    started)
 
         def downloaded(result):
             state['busy'] = False
@@ -7490,6 +7525,13 @@ def launch_ui():
         _last = None
     if _last and _last[0] == 'ok':
         log_write('Updated to 7th Heaven NX %s.' % _v(_last[1]))
+    elif _last and _last[0] == 'busy':
+        # BUILD 898: opened by hand while the installer is still waiting to
+        # replace this very program; it will finish once this window closes
+        root.after(800, lambda: messagebox.showinfo(
+            'Update', 'The update to %s is still being installed. Close '
+            'this window: 7th Heaven NX will reopen updated.'
+            % _v(_last[1]), parent=root))
     elif _last:
         root.after(800, lambda: messagebox.showwarning(
             'Update', 'The last update could not be installed, so this is '
@@ -7499,6 +7541,21 @@ def launch_ui():
     _schedule_auto_check(4000)
 
     root.mainloop()
+    if _upd.get('exit_now'):
+        # BUILD 898: the installer is waiting for THIS process to end before
+        # it can replace the program. Nothing may keep it alive now (a worker
+        # thread, a pool joined at shutdown, a child process): end it here.
+        for stream in (sys.stdout, sys.stderr):
+            try:
+                stream.flush()
+            except Exception:                               # noqa: BLE001
+                pass
+        try:
+            import logging
+            logging.shutdown()
+        except Exception:                                   # noqa: BLE001
+            pass
+        os._exit(0)
 
 
 def selftest():

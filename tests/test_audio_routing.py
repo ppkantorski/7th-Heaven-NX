@@ -70,6 +70,11 @@ def plan_for(tree, manifest_body, music_names=None):
 
     iro_path = os.path.join(root, 'TestMod.iro')
     open(iro_path, 'wb').write(b'')
+    # BUILD 751 trusts a cached mod.xml only when the cache is stamped for
+    # this exact .iro; without the stamp the fixture's manifest was thrown
+    # away and every option here was silently ignored (BUILD 897).
+    with open(os.path.join(moddir, '.iro-signature'), 'w') as f:
+        f.write(build._sig(iro_path) + '\n')
     mod = build.Mod(iro_path, cache)
     mod._load_manifest()
     settings = mod.manifest.defaults() if mod.manifest else {}
@@ -271,6 +276,65 @@ check(plan.music == {},
 check('wind.ogg' not in plan.music,
       'the `wind` music track is not overwritten by an ambient sound')
 
+# --------------------------------------------- BUILD 897: Echo-S's own music
+# Echo-S's "Music" option (Echoes of the Planet) ships its soundtrack under
+# `EchoeS Of The Planet/vgmstream/` and `Arranged/vgmstream/`, inside a mod
+# that is otherwise tens of thousands of voice/ and sfx/ files. The
+# soundtrack-or-alias verdict used to be one per MOD, so the voice lines
+# outvoted the music and every track was dropped: with Arranged Soundtrack
+# off, a build with Echo-S Music on played vanilla music. The verdict is now
+# per option folder.
+print('\na voice mod whose separate option folder is a soundtrack (Echo-S)\n')
+ECHO_TREE = (['VO/voice/nvmkin21/%d.ogg' % i for i in range(40)]
+             + ['Sound/sfx/%d.ogg' % i for i in range(20)]
+             + ['EchoeS Of The Planet/vgmstream/%s.ogg' % n for n in
+                ('TIFA', 'ASERI2', 'CEPHIROS', 'KETC', 'YUME')]
+             + ['EchoeS Of The Planet/vgmstream/field_canon_2_1.ogg',
+                'Arranged/vgmstream/ti.ogg', 'Arranged/vgmstream/oa.ogg'])
+ECHO_XML = '\n'.join('<ModFolder Folder="%s"/>' % f for f in
+                      ('VO', 'Sound', 'EchoeS Of The Planet', 'Arranged'))
+plan = plan_for(ECHO_TREE, ECHO_XML, music_names=TRACKS | {'tifa.ogg',
+                                                           'ketc.ogg',
+                                                           'yume.ogg'})
+check(sorted(plan.music) == ['aseri2.ogg', 'cephiros.ogg', 'ketc.ogg',
+                             'oa.ogg', 'ti.ogg', 'tifa.ogg', 'yume.ogg'],
+      '60 voice/sfx files elsewhere in the mod no longer outvote the 8 '
+      'soundtrack files in their own folders (got %s)' % sorted(plan.music))
+check(plan.skipped_ffnx_audio.get('vgmstream') == 1,
+      'and the one FFNx-only per-field name is still filtered by name '
+      '(got %s)' % plan.skipped_ffnx_audio)
+
+# Cosmo Memory's alias, one folder over from its sfx, stays an alias even
+# when the mod also carries a genuine soundtrack folder.
+plan = plan_for(['Base/sfx/%d.ogg' % i for i in range(5)]
+                + ['Base/vgmstream/Wind.ogg']
+                + ['Music/vgmstream/oa.ogg', 'Music/vgmstream/ti.ogg'],
+                '<ModFolder Folder="Base"/><ModFolder Folder="Music"/>',
+                music_names=TRACKS)
+check(sorted(plan.music) == ['oa.ogg', 'ti.ogg'],
+      'Base/vgmstream/Wind.ogg is still outvoted inside Base/, while '
+      'Music/ is taken (got %s)' % sorted(plan.music))
+
+# BUILD 897: with Echo-S's Music option OFF, main_menu.ogg is not in the
+# plan, so apply_titlemusic writes no title-screen caves -- the title screen
+# never asks the player for a track the SD card does not have.
+print('\nEcho-S Music off: no main_menu.ogg, so no title-music patch\n')
+MM_TREE = ['VO/voice/nvmkin21/1.ogg',
+           'EchoeS Of The Planet/vgmstream/main_menu.ogg',
+           'EchoeS Of The Planet/vgmstream/TIFA.ogg']
+MM_XML = ('<ModFolder Folder="VO"/>'
+          '<ModFolder Folder="EchoeS Of The Planet" ActiveWhen="Music = 1"/>'
+          '<ConfigOption><Type>Bool</Type><Default>0</Default>'
+          '<ID>Music</ID><Name>Music</Name>'
+          '<Option Value="0" Name="Off"/><Option Value="1" Name="On"/>'
+          '</ConfigOption>')
+plan = plan_for(MM_TREE, MM_XML, music_names=TRACKS | {'tifa.ogg'})
+check(build.ff7nx_titlemusic.TRACK not in plan.music,
+      'main_menu.ogg is not planned with Music off (got %s)'
+      % sorted(plan.music))
+check(build.apply_titlemusic(tempfile.mkdtemp(), None, plan) == [],
+      'and apply_titlemusic returns before touching exefs/main or the exe')
+
 # --------------------------------------------- the synthesized toggle, 505
 print('\na folder the mod ships with no ActiveWhen\n')
 SYNTH_TREE = ['Base/sfx/1.ogg', 'Base/sfx/config.toml', 'WM/sfx/2.ogg']
@@ -295,6 +359,11 @@ def _synth_mod():
                 + SYNTH_XML + '\n</ModInfo>\n')
     iro_path = os.path.join(root, 'TestMod.iro')
     open(iro_path, 'wb').write(b'')
+    # BUILD 751 trusts a cached mod.xml only when the cache is stamped for
+    # this exact .iro; without the stamp the fixture's manifest was thrown
+    # away and every option here was silently ignored (BUILD 897).
+    with open(os.path.join(moddir, '.iro-signature'), 'w') as f:
+        f.write(build._sig(iro_path) + '\n')
     mod = build.Mod(iro_path, cache)
     mod._load_manifest()
     return mod

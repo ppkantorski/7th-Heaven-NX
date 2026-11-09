@@ -25,6 +25,11 @@ import os
 import sys
 
 FROZEN = bool(getattr(sys, 'frozen', False))
+# BUILD 898: the variables the program was STARTED with, before anything in
+# it sets its own (the GUI exports settings as SEVENTH_NX_* for the build).
+# The self-updater starts the next copy from this, so a value the old copy
+# set for itself never overrides the new copy's saved settings.
+LAUNCH_ENV_KEYS = frozenset(os.environ)
 
 #: BUILD 817. Third-party code the program vendors, out of the project root.
 COMMON_DIR = 'common'

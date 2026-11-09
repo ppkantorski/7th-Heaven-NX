@@ -41,6 +41,11 @@ def sandbox(tmp_path, monkeypatch):
     monkeypatch.setattr(U, 'STATE_FILE', str(tmp_path / 'state' / 's.json'))
     monkeypatch.setattr(U, 'WORK', str(root / '.nx_update'))
     monkeypatch.setattr(U, 'RESULT', str(root / '.nx_update' / 'result.txt'))
+    # BUILD 898's installer handshake and its log
+    monkeypatch.setattr(U, 'STARTED', str(root / '.nx_update' / 'started'))
+    monkeypatch.setattr(U, 'PENDING', str(root / '.nx_update' / 'pending.json'))
+    monkeypatch.setattr(U, 'APPLY_LOG', str(root / '.nx_update' / 'apply.log'))
+    monkeypatch.setattr(U, 'LAST_LOG', str(tmp_path / 'state' / 'last.log'))
     return root
 
 

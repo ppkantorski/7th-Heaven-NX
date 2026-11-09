@@ -41,6 +41,27 @@ HOW IT IS INSTALLED
   Only program items move. mods/, dump/, cache/, sdout/, modules/ and
   settings.json are never touched.
 
+  BUILD 898: the program quits only after the installer has PROVED it is
+  running (its first act is to create .nx_update/started; the program waits
+  up to HANDSHAKE seconds). An installer that does not show itself is
+  stopped and the next one is tried -- on Windows a plain-ASCII batch file
+  run by cmd.exe, for machines where PowerShell is blocked by policy or by
+  security software. If none starts, the program stays open and says so.
+  Every installer logs to .nx_update/apply.log, refuses to touch anything
+  if the old program has not exited within WAIT_EXIT seconds, and starts
+  the next copy with a clean environment (installer_env). A launch that
+  finds a started installer with no result reports it (with the log), or,
+  if that installer is still waiting, leaves its files alone.
+  After a confirmed start the GUI ends the process with os._exit, so no
+  leftover thread or pool can keep the installer waiting.
+
+  BUILD 900: the first installer tried on Windows and Linux is the NEW
+  program itself (ff7nx_selfupdate, `--nx-apply-update`): it copies its own
+  files into .nx_update/incoming/, renames each installed item aside and the
+  copy into place, rolls back on any failure, and starts the result. No
+  script interpreter is involved. The scripts above are its fallback (and
+  first on macOS; see write_scripts).
+
   macOS: a file downloaded by this program carries no quarantine flag, so
   the updated app opens without the Gatekeeper prompt a browser download
   gets. A translocated app is replaced at its ORIGINAL location (nxpaths).
@@ -466,8 +487,56 @@ def _ps_quote(s):
     return "'" + s.replace("'", "''") + "'"
 
 
+# BUILD 898. Every installer proves it is running before the program quits:
+# its first act is to create STARTED. The program waits for that (up to
+# HANDSHAKE seconds), and only then exits. Before 898 the program quit the
+# moment the installer had been *asked* to start, so an installer that never
+# ran -- PowerShell blocked by policy or by security software, say -- looked
+# exactly like a user report: "the app closes, does not reopen, and is not
+# updated". And the next launch said nothing, because no result.txt meant
+# "no update happened" to last_result.
+STARTED = os.path.join(WORK, 'started')
+PENDING = os.path.join(WORK, 'pending.json')
+APPLY_LOG = os.path.join(WORK, 'apply.log')
+LAST_LOG = os.path.join(STATE_DIR, 'last_install.log')
+HANDSHAKE = 25                  # s; PowerShell's cold start can take ~10 s
+WAIT_EXIT = 180                 # s the installer waits for this program
+MOVE_TRIES = 120                # x 0.5 s: antivirus may hold a new file
+
+
+def installer_env(base=None):
+    """The environment for the installer and the program it starts.
+
+    A PyInstaller program exports its own bookkeeping (_PYI_*, _MEIPASS2)
+    and, on Linux, points LD_LIBRARY_PATH at its _internal/. A frozen
+    program started with those inherited believes it is a sub-process of
+    the old one; PyInstaller's documented remedy is
+    PYINSTALLER_RESET_ENVIRONMENT=1. The library paths go back to what the
+    user had (PyInstaller keeps them as *_ORIG), and SEVENTH_NX_* values the
+    old copy set for itself are dropped, so they cannot override the new
+    copy's saved settings."""
+    env = dict(os.environ if base is None else base)
+    launch = getattr(nxpaths, 'LAUNCH_ENV_KEYS', None)
+    for k in list(env):
+        if k.startswith('_PYI_') or k in ('_MEIPASS2', '_MEIPASS'):
+            del env[k]
+        elif (k.startswith('SEVENTH_NX_') and launch is not None
+              and k not in launch):
+            del env[k]
+    for var in ('LD_LIBRARY_PATH', 'DYLD_LIBRARY_PATH', 'DYLD_FRAMEWORK_PATH',
+                'LIBPATH'):
+        orig = env.pop(var + '_ORIG', None)
+        if orig is not None:
+            env[var] = orig
+        elif nxpaths.FROZEN and var in env:
+            del env[var]
+    env['PYINSTALLER_RESET_ENVIRONMENT'] = '1'
+    return env
+
+
 def write_script(staged, version, pid=None, system=None):
-    """The detached installer for this platform. Returns its argv."""
+    """The detached installer for this platform (PowerShell on Windows, sh
+    elsewhere). Returns its argv."""
     system = system or target()[0]
     pid = pid or os.getpid()
     root = nxpaths.ROOT
@@ -479,46 +548,67 @@ def write_script(staged, version, pid=None, system=None):
         script = os.path.join(WORK, 'apply.ps1')
         body = '''$ErrorActionPreference = 'Stop'
 $root = %(root)s; $new = %(new)s; $old = %(old)s; $result = %(result)s
+$log = %(log)s
+Set-Content -LiteralPath %(started)s -Value 'powershell'
+function Log($t) { try { Add-Content -LiteralPath $log -Value ((Get-Date -Format 'HH:mm:ss') + ' [ps] ' + $t) } catch {} }
 $items = @(%(items)s)
-try { Wait-Process -Id %(pid)d -Timeout 180 -ErrorAction SilentlyContinue } catch {}
+Log 'waiting for process %(pid)d to exit'
+try { Wait-Process -Id %(pid)d -Timeout %(wait)d -ErrorAction SilentlyContinue } catch {}
+if (Get-Process -Id %(pid)d -ErrorAction SilentlyContinue) {
+  Log 'it did not exit; nothing was changed'
+  Set-Content -LiteralPath $result -Value 'FAILED the old program did not close within %(wait)d seconds, so nothing was changed'
+  exit 1
+}
 Start-Sleep -Milliseconds 700
 function Move-Retry($src, $dst) {
-  for ($i = 0; $i -lt 20; $i++) {
+  for ($i = 0; $i -lt %(tries)d; $i++) {
     try { Move-Item -LiteralPath $src -Destination $dst; return }
-    catch { Start-Sleep -Milliseconds 500 }
+    catch { if ($i -eq 0) { Log ('retrying a move: ' + $_.Exception.Message) }; Start-Sleep -Milliseconds 500 }
   }
   Move-Item -LiteralPath $src -Destination $dst
+}
+function Start-Program {
+  $si = New-Object System.Diagnostics.ProcessStartInfo
+  $si.FileName = Join-Path $root %(exe)s
+  $si.WorkingDirectory = $root
+  $si.UseShellExecute = $true
+  try { [System.Diagnostics.Process]::Start($si) | Out-Null; Log 'program started' }
+  catch { Log ('could not start the program: ' + $_.Exception.Message) }
 }
 $moved = @(); $ok = $true; $why = ''
 try {
   if (Test-Path -LiteralPath $old) { Remove-Item -LiteralPath $old -Recurse -Force }
-  New-Item -ItemType Directory -Path $old | Out-Null
+  [System.IO.Directory]::CreateDirectory($old) | Out-Null
   foreach ($i in $items) {
     $dst = Join-Path $root $i
     if (Test-Path -LiteralPath $dst) { Move-Retry $dst (Join-Path $old $i) }
     $moved += $i
     Move-Retry (Join-Path $new $i) $dst
+    Log ('installed ' + $i)
   }
 } catch {
   $ok = $false; $why = $_.Exception.Message
+  Log ('failed: ' + $why)
   foreach ($i in $moved) {
     $dst = Join-Path $root $i
     try {
       if (Test-Path -LiteralPath $dst) { Remove-Item -LiteralPath $dst -Recurse -Force }
       if (Test-Path -LiteralPath (Join-Path $old $i)) { Move-Item -LiteralPath (Join-Path $old $i) -Destination $dst }
-    } catch {}
+    } catch { Log ('could not restore ' + $i + ': ' + $_.Exception.Message) }
   }
 }
 if ($ok) { Set-Content -LiteralPath $result -Value 'OK %(version)s' }
 else { Set-Content -LiteralPath $result -Value ('FAILED ' + $why) }
-Start-Process -FilePath (Join-Path $root %(exe)s) -WorkingDirectory $root
+Start-Program
 if ($ok) {
   Remove-Item -LiteralPath $old -Recurse -Force -ErrorAction SilentlyContinue
   Remove-Item -LiteralPath $new -Recurse -Force -ErrorAction SilentlyContinue
 }
 ''' % {'root': _ps_quote(root), 'new': _ps_quote(staged),
        'old': _ps_quote(old), 'result': _ps_quote(RESULT),
+       'log': _ps_quote(APPLY_LOG), 'started': _ps_quote(STARTED),
        'items': ', '.join(_ps_quote(i) for i in items), 'pid': pid,
+       'wait': WAIT_EXIT, 'tries': MOVE_TRIES,
        'version': version.replace("'", ''), 'exe': _ps_quote(NAME + '.exe')}
         with open(script, 'w', encoding='utf-8-sig') as f:
             f.write(body)
@@ -527,7 +617,11 @@ if ($ok) {
                 '-File', script]
     script = os.path.join(WORK, 'apply.sh')
     if system == 'macos':
-        launch = 'open %s' % _sh_quote(os.path.join(root, NAME + '.app'))
+        app = os.path.join(root, NAME + '.app')
+        # LaunchServices first; the bundle's own executable if it refuses
+        launch = ('open %s 2>>"$LOG" || (%s >/dev/null 2>&1 &)'
+                  % (_sh_quote(app), _sh_quote(os.path.join(
+                      app, 'Contents', 'MacOS', NAME))))
     else:
         launch = ('(cd %s && nohup %s >/dev/null 2>&1 &)'
                   % (_sh_quote(root), _sh_quote(os.path.join(root, NAME))))
@@ -536,14 +630,24 @@ ROOT=%(root)s
 NEW=%(new)s
 OLD=%(old)s
 RESULT=%(result)s
+LOG=%(log)s
+echo sh > %(started)s
+log() { printf '%%s [sh] %%s\\n' "$(date +%%H:%%M:%%S)" "$*" >> "$LOG" 2>/dev/null; }
+log "waiting for process %(pid)d to exit"
 n=0
 while kill -0 %(pid)d 2>/dev/null; do
-  sleep 0.5; n=$((n+1)); [ $n -gt 360 ] && break
+  sleep 0.5; n=$((n+1))
+  if [ $n -gt %(polls)d ]; then
+    log "it did not exit; nothing was changed"
+    printf 'FAILED the old program did not close within %(wait)d seconds, so nothing was changed\\n' > "$RESULT"
+    exit 1
+  fi
 done
 sleep 0.5
 rm -rf "$OLD"; mkdir -p "$OLD"
 MOVED=""
 fail() {
+  log "failed: $1"
   for i in $MOVED; do
     i=$(printf '%%s' "$i" | tr '\\001' ' ')
     rm -rf "$ROOT/$i"
@@ -555,16 +659,20 @@ fail() {
 }
 for i in %(items)s; do
   if [ -e "$ROOT/$i" ] || [ -L "$ROOT/$i" ]; then
-    mv "$ROOT/$i" "$OLD/$i" || fail "could not move $i aside"
+    mv "$ROOT/$i" "$OLD/$i" 2>>"$LOG" || fail "could not move $i aside"
   fi
   MOVED="$MOVED $(printf '%%s' "$i" | tr ' ' '\\001')"
-  mv "$NEW/$i" "$ROOT/$i" || fail "could not move the new $i in"
+  mv "$NEW/$i" "$ROOT/$i" 2>>"$LOG" || fail "could not move the new $i in"
+  log "installed $i"
 done
 printf 'OK %(version)s\\n' > "$RESULT"
 %(launch)s
+log "program started"
 rm -rf "$OLD" "$NEW"
 ''' % {'root': _sh_quote(root), 'new': _sh_quote(staged),
-       'old': _sh_quote(old), 'result': _sh_quote(RESULT), 'pid': pid,
+       'old': _sh_quote(old), 'result': _sh_quote(RESULT),
+       'log': _sh_quote(APPLY_LOG), 'started': _sh_quote(STARTED),
+       'pid': pid, 'polls': WAIT_EXIT * 2, 'wait': WAIT_EXIT,
        'items': ' '.join(_sh_quote(i) for i in items),
        'version': re.sub(r'[^0-9A-Za-z.\-]', '', version), 'launch': launch}
     with open(script, 'w', encoding='utf-8') as f:
@@ -573,27 +681,303 @@ rm -rf "$OLD" "$NEW"
     return ['/bin/sh', script]
 
 
-def launch_installer(argv):
-    """Start the installer detached; the caller then quits the program."""
-    if os.path.exists(RESULT):
-        _remove(RESULT)
-    if sys.platform == 'win32':
-        flags = (getattr(subprocess, 'DETACHED_PROCESS', 0x8)
-                 | getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0x200)
-                 | getattr(subprocess, 'CREATE_NO_WINDOW', 0x8000000))
-        subprocess.Popen(argv, creationflags=flags, close_fds=True,
-                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                         stderr=subprocess.DEVNULL)
+def write_cmd_script(staged, version, pid=None):
+    """BUILD 898. The Windows installer as a batch file, for when PowerShell
+    does not start (execution policy set by Group Policy, PowerShell
+    removed, or security software stopping a hidden PowerShell script).
+
+    cmd.exe has no execution policy. The script is pure ASCII: every path is
+    built from its own location (%~dp0 is <ROOT>\\.nx_update\\), which cmd
+    keeps in UTF-16, so a non-English user name in the path cannot be
+    mangled by the console code page. Returns its argv, which is relative:
+    launch_installer runs it with WORK as the working folder."""
+    pid = pid or os.getpid()
+    os.makedirs(WORK, exist_ok=True)
+    rel = os.path.relpath(staged, WORK).replace('/', '\\')
+    if rel.startswith('..') or not rel.isascii() or re.search(r'[%!^&|<>()"]',
+                                                              rel):
+        raise UpdateError('the staged copy is not where the batch installer '
+                          'can name it')
+    items = [i for i in program_items('windows')
+             if os.path.exists(os.path.join(staged, i))]
+    dirs = {i for i in items if os.path.isdir(os.path.join(staged, i))}
+    ver = re.sub(r'[^0-9A-Za-z.\-]', '', version)
+    L = ['@echo off',
+         'setlocal EnableExtensions DisableDelayedExpansion',
+         'set "W=%~dp0"',
+         'for %%I in ("%W%..") do set "ROOT=%%~fI"',
+         'set "NEW=%%W%%%s"' % rel,
+         'set "OLD=%W%old"',
+         'set "RESULT=%W%result.txt"',
+         'set "LOG=%W%apply.log"',
+         '>"%W%started" echo cmd',
+         '>>"%LOG%" echo [cmd] waiting for process {pid} to exit',
+         'set /a N=0',
+         ':wait',
+         'tasklist /FI "PID eq {pid}" /FO CSV /NH 2>nul | findstr /C:"\\"{pid}\\"" >nul',
+         'if errorlevel 1 goto gone',
+         'set /a N+=1',
+         'if %N% GEQ {wait} goto stuck',
+         'ping -n 2 127.0.0.1 >nul',
+         'goto wait',
+         ':stuck',
+         '>>"%LOG%" echo [cmd] it did not exit; nothing was changed',
+         '>"%RESULT%" echo FAILED the old program did not close within {wait} seconds, so nothing was changed',
+         'exit /b 1',
+         ':gone',
+         'ping -n 2 127.0.0.1 >nul',
+         'if exist "%OLD%" rmdir /s /q "%OLD%"',
+         'mkdir "%OLD%"',
+         'if not exist "%OLD%" (set "WHY=could not create the backup folder" & goto fail)']
+    # :mv takes its paths in S and D, never as arguments: CALL expands %
+    # a second time, which would corrupt a folder name holding one
+    for k, i in enumerate(items):
+        L += ['set "S=%%ROOT%%\\%s"' % i,
+              'set "D=%%OLD%%\\%s"' % i,
+              'if exist "%%S%%" call :mv '
+              '|| (set "WHY=could not move %s aside" & goto fail)' % i,
+              'set "M%d=1"' % k,
+              'set "S=%%NEW%%\\%s"' % i,
+              'set "D=%%ROOT%%\\%s"' % i,
+              'call :mv || (set "WHY=could not move the new %s in" & goto fail)'
+              % i,
+              '>>"%%LOG%%" echo [cmd] installed %s' % i]
+    L += ['>"%RESULT%" echo OK ' + ver,
+          'call :launch',
+          'rmdir /s /q "%OLD%" 2>nul',
+          'rmdir /s /q "%NEW%" 2>nul',
+          'exit /b 0',
+          ':fail',
+          '>>"%LOG%" echo [cmd] failed: %WHY%']
+    for k, i in reversed(list(enumerate(items))):
+        remove = ('rmdir /s /q "%%ROOT%%\\%s"' if i in dirs
+                  else 'del /f /q "%%ROOT%%\\%s"') % i
+        L += ['if defined M%d if exist "%%ROOT%%\\%s" %s' % (k, i, remove),
+              'if defined M%d if exist "%%OLD%%\\%s" move /Y "%%OLD%%\\%s" '
+              '"%%ROOT%%\\%s" >nul' % (k, i, i, i)]
+    L += ['>"%RESULT%" echo FAILED %WHY%',
+          'call :launch',
+          'exit /b 1',
+          ':mv',
+          'set /a T=0',
+          ':mvloop',
+          'move /Y "%S%" "%D%" >nul 2>>"%LOG%" && exit /b 0',
+          'set /a T+=1',
+          'if %T% GEQ {tries} exit /b 1',
+          'ping -n 2 127.0.0.1 >nul',
+          'goto mvloop',
+          ':launch',
+          'start "" /D "%ROOT%" "%ROOT%\\{exe}"',
+          '>>"%LOG%" echo [cmd] program started',
+          'exit /b 0']
+    body = '\r\n'.join(L).replace('{pid}', str(int(pid))).replace(
+        '{wait}', str(WAIT_EXIT)).replace('{tries}', str(MOVE_TRIES // 2)
+                                          ).replace('{exe}', NAME + '.exe')
+    body += '\r\n'
+    if not body.isascii():
+        raise UpdateError('the batch installer would not be plain ASCII')
+    script = os.path.join(WORK, 'apply.cmd')
+    with open(script, 'w', encoding='ascii', newline='') as f:
+        f.write(body)
+    return ['cmd.exe', '/d', '/c', 'apply.cmd']
+
+
+# BUILD 900. The first release whose program can install ITSELF
+# (ff7nx_selfupdate, `--nx-apply-update`). The helper is the NEW version, so
+# this is checked against the release being installed, not this copy.
+HELPER_SINCE = (1, 1, 2)
+HELPER_FLAG = '--nx-apply-update'
+
+
+def _staged_executable(staged, system):
+    if system == 'macos':
+        return os.path.join(staged, NAME + '.app', 'Contents', 'MacOS', NAME)
+    return os.path.join(staged, NAME + ('.exe' if system == 'windows'
+                                        else ''))
+
+
+def write_helper(staged, version, pid=None, system=None, frozen=None):
+    """BUILD 900. argv that starts the downloaded program as its own
+    installer, or None where that cannot be used (running from source, a
+    release older than HELPER_SINCE, no executable in the staged copy)."""
+    system = system or target()[0]
+    frozen = nxpaths.FROZEN if frozen is None else frozen
+    ver = parse_version(version)
+    exe = _staged_executable(staged, system)
+    if not frozen or ver is None or ver < HELPER_SINCE or \
+            not os.path.isfile(exe):
+        return None
+    root = nxpaths.ROOT
+    os.makedirs(WORK, exist_ok=True)
+    items = [i for i in program_items(system)
+             if os.path.lexists(os.path.join(staged, i))]
+    if system == 'macos':
+        launch = [os.path.join(root, NAME + '.app')]
     else:
-        subprocess.Popen(argv, start_new_session=True, close_fds=True,
-                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                         stderr=subprocess.DEVNULL)
+        launch = [os.path.join(root, NAME + ('.exe' if system == 'windows'
+                                             else ''))]
+    plan = {'root': root, 'new': staged, 'work': WORK, 'items': items,
+            'pid': pid or os.getpid(), 'version': version,
+            'result': RESULT, 'log': APPLY_LOG, 'started': STARTED,
+            'wait': WAIT_EXIT, 'launch': launch, 'system': system,
+            'name': NAME}
+    path = os.path.join(WORK, 'apply_helper.json')
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(plan, f)
+    return [exe, HELPER_FLAG, path]
+
+
+def write_scripts(staged, version, pid=None, system=None, frozen=None):
+    """Every installer for this platform, best first.
+
+    BUILD 900: on Windows and Linux the downloaded program installs itself
+    first (no script interpreter, nothing for an execution policy or a
+    script-blocking rule to stop); the scripts remain as the fallback when
+    it does not show itself. macOS keeps the sh installer first: started by
+    this app, it inherits the folder access the user already granted it
+    (~/Downloads, ~/Desktop ...), where the new, differently-signed copy
+    would have to ask again mid-install; the helper is its fallback."""
+    system = system or target()[0]
+    helper = write_helper(staged, version, pid=pid, system=system,
+                          frozen=frozen)
+    script = write_script(staged, version, pid=pid, system=system)
+    if system == 'macos':
+        argvs = [script] + ([helper] if helper else [])
+    else:
+        argvs = ([helper] if helper else []) + [script]
+    if system == 'windows':
+        try:
+            argvs.append(write_cmd_script(staged, version, pid=pid))
+        except UpdateError:
+            pass
+    return argvs
+
+
+def launch_installer(argv, env=None):
+    """Start the installer detached. Returns its Popen."""
+    env = installer_env() if env is None else env
+    cwd = WORK if os.path.isdir(WORK) else None
+    if sys.platform == 'win32':
+        breakaway = 0x01000000                      # CREATE_BREAKAWAY_FROM_JOB
+        group = getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0x200)
+        if argv and os.path.basename(argv[0]).lower().startswith('cmd'):
+            # A hidden console of its own: tasklist, ping and move then
+            # share it instead of each opening a window
+            flags = group | getattr(subprocess, 'CREATE_NO_WINDOW', 0x8000000)
+        else:
+            flags = (getattr(subprocess, 'DETACHED_PROCESS', 0x8) | group
+                     | getattr(subprocess, 'CREATE_NO_WINDOW', 0x8000000))
+        kw = dict(close_fds=True, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
+                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            # out of a job that would kill it when this program exits (some
+            # launchers start programs in one)
+            return subprocess.Popen(argv, creationflags=flags | breakaway,
+                                    **kw)
+        except OSError:
+            return subprocess.Popen(argv, creationflags=flags, **kw)
+    return subprocess.Popen(argv, start_new_session=True, close_fds=True,
+                            cwd=cwd, env=env, stdin=subprocess.DEVNULL,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL)
+
+
+def _pid_alive(pid):
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    if os.name == 'nt':
+        try:
+            import ctypes
+            k = ctypes.windll.kernel32
+            h = k.OpenProcess(0x00100000, False, pid)        # SYNCHRONIZE
+            if not h:
+                return False
+            try:
+                return k.WaitForSingleObject(h, 0) == 0x102  # WAIT_TIMEOUT
+            finally:
+                k.CloseHandle(h)
+        except Exception:                                   # noqa: BLE001
+            return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True                 # exists, owned by someone else
+    return True
+
+
+def _note(text):
+    try:
+        os.makedirs(WORK, exist_ok=True)
+        with open(APPLY_LOG, 'a', encoding='utf-8') as f:
+            f.write('%s [app] %s\n' % (time.strftime('%H:%M:%S'), text))
+    except OSError:
+        pass
+
+
+def start_installer(argvs, version, handshake=HANDSHAKE):
+    """Start the first installer in `argvs` that proves it is running (it
+    creates STARTED), and return its Popen. The caller then quits AT ONCE:
+    the installer is waiting for this process to exit.
+
+    An installer that does not show itself within `handshake` seconds is
+    stopped (so two can never run) and the next is tried. When none
+    starts, UpdateError -- and the program stays open, which is the point:
+    the user is told why instead of watching it close and not come back."""
+    os.makedirs(WORK, exist_ok=True)
+    for p in (RESULT, STARTED, APPLY_LOG):
+        _remove(p)
+    tried = []
+    for argv in argvs:
+        name = os.path.basename(argv[0]) if argv else '?'
+        _note('starting the installer: %s' % ' '.join(argv))
+        try:
+            proc = launch_installer(argv)
+        except OSError as exc:
+            tried.append('%s (%s)' % (name, exc))
+            _note('could not start %s: %s' % (name, exc))
+            continue
+        deadline = time.time() + handshake
+        while time.time() < deadline:
+            if os.path.exists(STARTED):
+                try:
+                    with open(PENDING, 'w', encoding='utf-8') as f:
+                        json.dump({'version': version, 'pid': proc.pid,
+                                   'at': time.time(), 'via': name}, f)
+                except OSError:
+                    pass
+                _note('%s is running (pid %d)' % (name, proc.pid))
+                return proc
+            if proc.poll() is not None:
+                break
+            time.sleep(0.1)
+        code = proc.poll()
+        if code is None:
+            try:
+                proc.kill()
+                proc.wait(10)
+            except Exception:                               # noqa: BLE001
+                pass
+        _remove(STARTED)            # a late marker from the one just stopped
+        why = ('exited at once with status %d' % code if code is not None
+               else 'did not start within %d seconds' % handshake)
+        tried.append('%s %s' % (name, why))
+        _note('%s %s' % (name, why))
+    raise UpdateError('the installer could not be started (%s). Security '
+                      'software may have blocked it. Nothing was changed; '
+                      'you can download the update from the release page '
+                      'instead.' % '; '.join(tried))
 
 
 def discard():
     """Throw away a staged update that was not installed."""
     for p in (os.path.join(WORK, 'new'), os.path.join(WORK, 'old'),
-              os.path.join(WORK, 'new_src')):
+              os.path.join(WORK, 'new_src'), PENDING, STARTED):
         _remove(p)
     try:
         for n in os.listdir(WORK):
@@ -603,9 +987,22 @@ def discard():
         pass
 
 
+def _keep_log():
+    """Copy the installer's log where the next update will not delete it."""
+    try:
+        if os.path.isfile(APPLY_LOG):
+            os.makedirs(STATE_DIR, exist_ok=True)
+            shutil.copyfile(APPLY_LOG, LAST_LOG)
+            return LAST_LOG
+    except OSError:
+        pass
+    return None
+
+
 def last_result(current):
     """At start-up: ('ok' | 'failed', text) for an update the previous run
-    installed, or None. The leftovers of a finished update are removed."""
+    installed or tried to, ('busy', text) while its installer is still at
+    work, or None. The leftovers of a finished update are removed."""
     if not os.path.isdir(WORK):
         return None
     out = None
@@ -614,10 +1011,32 @@ def last_result(current):
             line = f.read().strip()
     except OSError:
         line = ''
+    pending = None
+    try:
+        with open(PENDING, encoding='utf-8') as f:
+            pending = json.load(f)
+    except (OSError, ValueError):
+        pass
     if line.startswith('OK '):
         out = ('ok', line[3:].strip())
     elif line.startswith('FAILED'):
         out = ('failed', line[6:].strip() or 'unknown error')
+    elif pending is not None:
+        # BUILD 898: an installer was started and has written no result.
+        # Still running (this copy was opened by hand while it waits)? Leave
+        # its files alone. Otherwise it was stopped part-way -- before 898
+        # this case was cleaned up in silence.
+        if (_pid_alive(pending.get('pid'))
+                and time.time() - float(pending.get('at') or 0)
+                < WAIT_EXIT + 120):
+            return ('busy', str(pending.get('version') or '?'))
+        out = ('failed', 'the installer stopped before it finished, most '
+               'likely ended by security software, so %s is still '
+               'installed' % current)
+    if out is not None and out[0] == 'failed':
+        log = _keep_log()
+        if log:
+            out = (out[0], out[1] + '\n\nThe installer\'s log: ' + log)
     # an installer may still be cleaning up for a second or two; whatever it
     # leaves is removed by the next launch instead
     if out is None or out[0] == 'ok':
@@ -635,7 +1054,15 @@ def last_result(current):
             pass
     else:
         _remove(RESULT)
-        discard()
+        _remove(APPLY_LOG)
+        if 'could not be put back' in out[1]:
+            # BUILD 900: old/ holds the only copy of what the rollback could
+            # not restore -- keep it, the message names it
+            for p in (os.path.join(WORK, 'new'), os.path.join(WORK, 'new_src'),
+                      PENDING, STARTED):
+                _remove(p)
+        else:
+            discard()
     return out
 
 
@@ -792,6 +1219,16 @@ import json, os, shutil, subprocess, sys, time
 plan = json.load(open(sys.argv[1], encoding='utf-8'))
 root, new, prev, result = plan['root'], plan['new'], plan['prev'], plan['result']
 
+def write(path, text):
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write(text)
+
+try:                                    # BUILD 898: "I am running"
+    write(plan.get('started') or os.path.join(os.path.dirname(result),
+                                              'started'), 'python\n')
+except OSError:
+    pass
+
 def alive(pid):
     if os.name == 'nt':
         import ctypes
@@ -813,11 +1250,11 @@ for _ in range(720):
     if not alive(plan['pid']):
         break
     time.sleep(0.25)
+else:
+    write(result, 'FAILED the old program did not close within 180 seconds, '
+          'so nothing was changed\n')
+    sys.exit(1)
 time.sleep(0.5)
-
-def write(path, text):
-    with open(path, 'w', encoding='utf-8') as f:
-        f.write(text)
 
 backed, added = [], []
 try:
@@ -885,7 +1322,8 @@ def write_source_script(folder, version, pid=None, python=None,
         relaunch = not os.environ.get('SEVENTH_NX_UPDATE_NO_RELAUNCH')
     python = python or sys.executable
     plan = {'root': root, 'new': folder, 'prev': os.path.join(WORK, 'previous'),
-            'result': RESULT, 'version': version, 'pid': pid or os.getpid(),
+            'result': RESULT, 'started': STARTED, 'version': version,
+            'pid': pid or os.getpid(),
             'copy': copy, 'remove': stale, 'python': python,
             'relaunch': relaunch}
     plan_path = os.path.join(WORK, 'apply_source.json')

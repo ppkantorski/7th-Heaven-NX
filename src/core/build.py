@@ -49,6 +49,7 @@ import ff7nx_esui
 import ff7nx_pccode
 import ff7nx_newthreat
 import ff7nx_titlemusic
+import ff7nx_echooverride
 import ff7nx_sqlogo
 import ff7nx_nitpick
 import ff7nx_nitpickbg
@@ -609,6 +610,14 @@ VGMSTREAM_DIR = 'vgmstream'
 # unrelated PC field mod must continue through the conservative section 4/9
 # path below.
 ECHO_S_MOD_ID = '09e81530-3f09-46b9-831b-df431b8f319c'
+
+# BUILD 899. [Tsunamods] Arranged Soundtrack. While it is on (enabled AND its
+# own `Music` folder active), Echo-S's Music option contributes nothing but the
+# title track it always has -- exactly the build before 897 -- so the two
+# soundtracks are never mixed track by track. With it off, Echo-S's music
+# applies in full: its tracks (897) and its FFNx-only cues, battle themes and
+# shuffles (ff7nx_echooverride).
+ARRANGED_SOUNDTRACK_MOD_ID = 'ed5a8c57-56bf-4cf1-acfa-8e5347f27463'
 
 
 # BUILD 577: OPTION TWINS.
@@ -1235,6 +1244,12 @@ class Plan:
         self.skipped_ffnx = 0
         self.skipped_ffnx_audio = {}   # FFNx audio dir -> file count
         self.music_from_vgmstream = 0  # tracks taken from vgmstream/
+        # BUILD 899: Echo-S's music beyond plain tracks, see ff7nx_echooverride
+        self.arranged_soundtrack = False   # Arranged Soundtrack's music is on
+        self.echo_music_withheld = 0       # Echo-S tracks not taken because of it
+        self.echo_music_extra = {}         # lower name.ogg -> (src, mod)
+        self.echo_music_shuffle = {}       # base -> [names], its config.toml
+        self.echo_music_entries = []       # ff7nx_echooverride.Entry, emplaced
         self.unmatched = []
         self.conflicts = []
         self.folder_conflicts = []   # (folder_a, folder_b, count)
@@ -1819,6 +1834,24 @@ def build_plan(mods, settings_by_mod, catalogs, log=lambda *_: None,
         ff7nx_titleart.CURRENT = None
         log('! title screen: %s -- stock kept' % exc)
 
+    # BUILD 899: is Arranged Soundtrack's music on? Decided before any mod is
+    # routed, because it changes what Echo-S contributes.
+    for mod in mods:
+        if (getattr(getattr(mod, 'manifest', None), 'mod_id', '').lower()
+                != ARRANGED_SOUNDTRACK_MOD_ID):
+            continue
+        for rel, _f, _o in mod.files_for(settings_by_mod.get(mod.filename, {}),
+                                         read=runtime_read):
+            dparts = [p.lower() for p in
+                      os.path.dirname(rel).replace('\\', '/').split('/')]
+            if (VGMSTREAM_DIR in dparts
+                    and os.path.splitext(rel)[1].lower() == '.ogg'):
+                plan.arranged_soundtrack = True
+                break
+    if plan.arranged_soundtrack:
+        log('Arranged Soundtrack is on: Echo-S contributes only its title '
+            'track; its own soundtrack, cues and battle themes are not used')
+
     # First pass: gather archive candidates and remember their source folder.
     # candidates: list of dicts across all mods, in application order.
     candidates = []
@@ -1837,31 +1870,50 @@ def build_plan(mods, settings_by_mod, catalogs, log=lambda *_: None,
                 ECHO_S_MOD_ID:
             plan.echo_options = dict(settings)
 
-        # Decide, ONCE PER MOD, whether this mod's `vgmstream/` files are a
+        # Decide, ONCE PER OPTION FOLDER (BUILD 897), whether this mod's `vgmstream/` files are a
         # soundtrack or FFNx aliases -- see the VGMSTREAM_DIR note above.
         #
         # Per file is not enough: Cosmo Memory's `Base/vgmstream/Wind.ogg` IS
         # a real track name, so a name test alone would still let a sound mod
-        # overwrite the `wind` music track. Per mod it separates cleanly: a
+        # overwrite the `wind` music track. Per folder it separates cleanly: a
         # soundtrack replacement's vgmstream names are nearly all real
         # tracks, a sound mod's are nearly all not.
-        vgm, ffnx_sound = [], 0
+        # BUILD 897: PER OPTION FOLDER, NOT PER MOD. One verdict for the
+        # whole mod condemned Echo-S's own soundtrack: its "Music" option
+        # (Echoes of the Planet) ships 121 tracks under
+        # `EchoeS Of The Planet/vgmstream/` and `Arranged/vgmstream/`, while
+        # the REST of the mod is ~19,000 voice/ and sfx/ files -- so the
+        # proportion test below ran 19207 against 121 and every track was
+        # dropped as an "alias". With Arranged Soundtrack off the game was
+        # left on vanilla music. The folder a file came from is the unit a
+        # mod author groups a soundtrack in; Cosmo Memory's lone
+        # `Base/vgmstream/Wind.ogg` still sits beside `Base/sfx/`, so it is
+        # still outvoted in its own folder.
+        def _vgm_group(rel):
+            first = rel.replace('\\', '/').split('/', 1)[0].lower()
+            if (first == VGMSTREAM_DIR or first in FFNX_AUDIO_DIRS
+                    or '/' not in rel.replace('\\', '/')):
+                return ''
+            return first
+
+        vgm_by, sound_by = {}, {}
         for rel, _f, _o in picked:
             if os.path.splitext(rel)[1].lower() != '.ogg':
                 continue
             dparts = [p.lower() for p in
                       os.path.dirname(rel).replace('\\', '/').split('/')]
+            g = _vgm_group(rel)
             if VGMSTREAM_DIR in dparts:
-                vgm.append(os.path.basename(rel).lower())
+                vgm_by.setdefault(g, []).append(os.path.basename(rel).lower())
             elif any(p in FFNX_AUDIO_DIRS for p in dparts):
-                ffnx_sound += 1
+                sound_by[g] = sound_by.get(g, 0) + 1
 
-        # Two signals, and a mod has to pass both:
+        # Two signals, and a folder has to pass both:
         #
-        #   1. It must not also ship FFNx sound. A soundtrack replacement has
-        #      no sfx/, Ambient/ or voice/; Cosmo Memory is almost entirely
-        #      those, and its lone `Base/vgmstream/Wind.ogg` is an ambient
-        #      sound aliased through the music backend.
+        #   1. It must not mostly ship FFNx sound. A soundtrack replacement has
+        #      no sfx/, Ambient/ or voice/ beside it; Cosmo Memory's Base/ is
+        #      almost entirely those, and its lone `Base/vgmstream/Wind.ogg`
+        #      is an ambient sound aliased through the music backend.
         #   2. Its vgmstream names must mostly BE real tracks. This catches a
         #      sound mod that ships nothing but aliases, where signal 1 says
         #      nothing.
@@ -1870,33 +1922,57 @@ def build_plan(mods, settings_by_mod, catalogs, log=lambda *_: None,
         # decides -- never "skip", because a missing dump must not silently
         # turn a soundtrack mod into a no-op. That failure is exactly what
         # this whole block exists to undo.
-        take_vgm = True
-        why = ''
-        if vgm and ffnx_sound > len(vgm):
-            # PROPORTION, not presence. The first version of this test was
-            # `if ffnx_sound:` and it misfired immediately: [Tsunamods]
-            # Arranged Soundtrack ships 91 tracks under vgmstream/ and TWO
-            # files under movies/ (FFNx's audio overlay for a cutscene), and
-            # those two were enough to condemn all 91. A soundtrack mod is
-            # perfectly entitled to carry a little movie audio.
-            #
-            # Cosmo Memory is the case this is for, and it is not close:
-            # ~1380 files under sfx/, Ambient/ and voice/ against a single
-            # `Base/vgmstream/Wind.ogg`. Requiring the sound files to
-            # OUTNUMBER the vgmstream ones separates the two by an order of
-            # magnitude in either direction.
-            take_vgm, why = False, (
-                'it ships %d FFNx sound file(s) against %d under vgmstream/, '
-                'so vgmstream/ here is an alias path'
-                % (ffnx_sound, len(vgm)))
-        elif vgm and music_names is not None:
-            hit = sum(1 for n in vgm if n in music_names)
-            if hit * 2 < len(vgm):
-                take_vgm, why = False, (
-                    'only %d of %d names are real music tracks' % (hit, len(vgm)))
-        if vgm and not take_vgm:
-            log(f'  {mod.display_name}: {len(vgm)} file(s) under vgmstream/ '
-                f'treated as FFNx aliases, not a soundtrack -- {why}')
+        vgm_alias_groups = set()
+        for g, vgm in vgm_by.items():
+            ffnx_sound = sound_by.get(g, 0)
+            why = ''
+            if ffnx_sound > len(vgm):
+                # PROPORTION, not presence. The first version of this test was
+                # `if ffnx_sound:` and it misfired immediately: [Tsunamods]
+                # Arranged Soundtrack ships 91 tracks under vgmstream/ and TWO
+                # files under movies/ (FFNx's audio overlay for a cutscene),
+                # and those two were enough to condemn all 91. A soundtrack
+                # mod is perfectly entitled to carry a little movie audio.
+                why = ('it ships %d FFNx sound file(s) against %d under '
+                       'vgmstream/, so vgmstream/ here is an alias path'
+                       % (ffnx_sound, len(vgm)))
+            elif music_names is not None:
+                hit = sum(1 for n in vgm if n in music_names)
+                if hit * 2 < len(vgm):
+                    why = ('only %d of %d names are real music tracks'
+                           % (hit, len(vgm)))
+            if why:
+                vgm_alias_groups.add(g)
+                log(f'  {mod.display_name}: {len(vgm)} file(s) under '
+                    f'{g + "/" if g else ""}vgmstream/ treated as FFNx '
+                    f'aliases, not a soundtrack -- {why}')
+            else:
+                log(f'  {mod.display_name}: {len(vgm)} file(s) under '
+                    f'{g + "/" if g else ""}vgmstream/ taken as a soundtrack')
+
+        # BUILD 899: Echo-S's FFNx music config (`[bat] shuffle = [...]`).
+        # Its variants are no game track, so they are recognised by this
+        # list rather than by name, and only from a folder taken as music.
+        is_echo_mod = (getattr(getattr(mod, 'manifest', None), 'mod_id', '')
+                       .lower() == ECHO_S_MOD_ID)
+        echo_variants = set()
+        if is_echo_mod and not plan.arranged_soundtrack:
+            for rel, full, _o in picked:
+                dparts = [p.lower() for p in
+                          os.path.dirname(rel).replace('\\', '/').split('/')]
+                if (os.path.basename(rel).lower() == 'config.toml'
+                        and VGMSTREAM_DIR in dparts
+                        and _vgm_group(rel) not in vgm_alias_groups):
+                    try:
+                        with open(full, encoding='utf-8',
+                                  errors='replace') as fh:
+                            plan.echo_music_shuffle.update(
+                                ff7nx_echooverride.parse_shuffle(fh.read()))
+                    except OSError as exc:
+                        log(f'  ! Echo-S music config {rel}: {exc}')
+            echo_variants = {n for base, names in
+                             plan.echo_music_shuffle.items()
+                             for n in names if n != base}
         for rel, full, option in picked:
             base = os.path.basename(rel)
             low = base.lower()
@@ -2156,8 +2232,26 @@ def build_plan(mods, settings_by_mod, catalogs, log=lambda *_: None,
                     # BUILD 629: FFNx's title-screen track (Echo-S, Nitpick)
                     # is no vanilla name and no alias of one -- taken from any
                     # mod that ships it; ff7nx_titlemusic plays it
+                    # BUILD 899: with Arranged Soundtrack on, Echo-S keeps
+                    # only its title track, exactly as before 897.
+                    if (is_echo_mod and plan.arranged_soundtrack
+                            and low != ff7nx_titlemusic.TRACK):
+                        plan.echo_music_withheld += 1
+                        continue
+                    # BUILD 899: a name only FFNx's own lookups would play
+                    # (field_<map>_<n>, bat_<id>, a shuffle variant) is kept
+                    # for ff7nx_echooverride instead of being dropped.
+                    if (is_echo_mod and low != ff7nx_titlemusic.TRACK
+                            and _vgm_group(rel) not in vgm_alias_groups
+                            and (music_names is None
+                                 or low not in music_names)
+                            and ff7nx_echooverride.is_override_name(
+                                low, echo_variants)):
+                        plan.echo_music_extra[low] = (full, mod)
+                        continue
                     if low != ff7nx_titlemusic.TRACK and (
-                            not take_vgm or (music_names is not None
+                            _vgm_group(rel) in vgm_alias_groups
+                            or (music_names is not None
                                              and low not in music_names)):
                         plan.skipped_ffnx_audio[VGMSTREAM_DIR] = \
                             plan.skipped_ffnx_audio.get(VGMSTREAM_DIR, 0) + 1
@@ -13945,6 +14039,7 @@ MAIN_ONLY_MODULES = frozenset((
     'ff7nx_cachegc.py',          # BUILD 754: deletes cache entries, writes no output
     'ff7nx_dockres.py',          # BUILD 761: exefs/main only
     'ff7nx_titlemusic.py',       # BUILD 764: exefs/main + the exe's name bytes
+    'ff7nx_echooverride.py',     # BUILD 899: exefs/main (+ loose music_ogg)
     'nxsettings.py',             # BUILD 756: picks setting values; they reach
                                  # the archives as env vars, fingerprinted there
     'ff7nx_fxdisc.py', 'ff7nx_fxdepth.py', 'ff7nx_fxscale.py', 'ff7nx_fxrim.py', 'ff7nx_fxsnap.py',
@@ -15133,6 +15228,87 @@ def sdout_changes(sdout, changes_dir=None, list_path=None,
             'dir': changes_dir, 'list': list_path}
 
 
+def _echo_field_akao(plan, dump):
+    """field -> [midi id by relative id] for the field this build ships:
+    Echo-S's own copy when it has one, else the dump's."""
+    cache = {}
+    archive = [None]
+
+    def lookup(field):
+        if field in cache:
+            return cache[field]
+        raw = None
+        try:
+            hit = plan.echo_fields.get(field)
+            if hit is not None:
+                with open(hit[0], 'rb') as fh:
+                    raw = lgp.lzs_decompress(fh.read()[4:])
+            elif dump is not None and getattr(dump, 'workingdir', None):
+                if archive[0] is None:
+                    archive[0] = lgp.Archive(os.path.join(
+                        dump.workingdir, 'data', 'field', 'flevel.lgp'))
+                entry = archive[0].index.get(field)
+                if entry is not None:
+                    raw = archive[0].decompressed(entry)
+            cache[field] = (ff7nx_echooverride.akao_ids(
+                lgp.split_sections(raw)[0]) if raw is not None else None)
+        except Exception:                                   # noqa: BLE001
+            cache[field] = None
+        return cache[field]
+    return lookup
+
+
+def _emplace_echo_music(plan, romfs, dump, log, produced):
+    """BUILD 899. Resolve Echo-S's FFNx-only music (scene cues, battle
+    themes, shuffle variants) and copy each under its short alias. The
+    module side is apply_echo_music; without a dump it is all skipped."""
+    plan.echo_music_entries = []
+    if plan.arranged_soundtrack:
+        if plan.echo_music_withheld:
+            log('Echo-S music: %d track(s) not used -- Arranged Soundtrack is '
+                'on' % plan.echo_music_withheld)
+        return
+    if not plan.echo_music_extra and not plan.echo_music_shuffle:
+        return
+    names = None
+    try:
+        exe = getattr(dump, 'exe', None)
+        if exe and os.path.isfile(exe):
+            data = open(exe, 'rb').read()
+            pe = exe_patch.parse_pe(data)
+            names = ff7nx_echooverride.midi_names(
+                data, lambda va: exe_patch.va_to_offset(pe, va))
+    except Exception as exc:                               # noqa: BLE001
+        log('! Echo-S music: the game track list could not be read (%s)'
+            % exc)
+    if names is None:
+        log('! Echo-S music: scene cues, battle themes and shuffles need the '
+            'dump\'s ff7 exe; skipped')
+        return
+    entries = ff7nx_echooverride.plan(
+        {k: v[0] for k, v in plan.echo_music_extra.items()},
+        plan.echo_music_shuffle, _echo_field_akao(plan, dump), names,
+        music_files={k: v[0] for k, v in plan.music.items()}, log=log)
+    for e in entries:
+        dest = os.path.join(romfs, MUSIC_DIR, e.alias + '.ogg')
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        shutil.copyfile(e.src, dest)
+        produced.append(dest)
+        if e.kind == 'field':
+            what = 'in %s, instead of %s' % (e.field, names[e.midi])
+        elif e.kind == 'battle':
+            what = 'for battle %d' % e.battle
+        else:
+            what = 'a random variant of %s' % e.base
+        log('  Echo-S music: %s -> %s.ogg (%s)' % (e.source_name, e.alias,
+                                                  what))
+    unused = sorted(set(plan.echo_music_extra)
+                    - {e.source_name for e in entries})
+    if unused:
+        log('  Echo-S music: not used: %s' % ', '.join(unused))
+    plan.echo_music_entries = entries
+
+
 def apply_plan(plan, archive_paths, sdout, log=lambda *_: None,
                progress=lambda *_: None, dump=None):
     """Write the finished SD tree. Returns a list of produced files.
@@ -15624,6 +15800,7 @@ def apply_plan(plan, archive_paths, sdout, log=lambda *_: None,
         produced.append(dest)
     if plan.music:
         log(f'copied {len(plan.music)} music files')
+    _emplace_echo_music(plan, romfs, dump, log, produced)
 
     # AFTER the music copy, and into the same directory. The two cannot
     # collide -- a track is `<name>.ogg` at the top of music_ogg and a
@@ -19819,6 +19996,44 @@ def apply_titlemusic(sdout, dump, plan, log=lambda *_: None, produced=()):
     if not built:
         out.append(dest)
     return out
+
+
+def apply_echo_music(sdout, dump, plan, log=lambda *_: None, produced=()):
+    """
+    BUILD 899. Echo-S's scene cues, battle themes and shuffles: the alias
+    files are already in music_ogg (_emplace_echo_music); this installs the
+    PLAY_NATIVE cave that asks for them. See ff7nx_echooverride. Not
+    installed at all while Arranged Soundtrack is on, or when there is
+    nothing to override.
+    """
+    entries = getattr(plan, 'echo_music_entries', None) or []
+    if not entries or getattr(plan, 'arranged_soundtrack', False):
+        return []
+    src, built = _audio_bridge_base(sdout, dump, log, produced,
+                                    'Echo-S music')
+    if src is None:
+        return []
+    dest = os.path.join(sdout, 'atmosphere', 'contents', TITLE_ID, 'exefs',
+                        'main')
+    log('')
+    log('Echo-S music (BUILD 899): %d scene cue(s), %d battle theme(s), '
+        '%d shuffle variant(s)'
+        % tuple(sum(1 for e in entries if e.kind == k)
+                for k in ('field', 'battle', 'shuffle')))
+    tmp = dest + '.echooverride-tmp'
+    try:
+        report = ff7nx_echooverride.apply_to_nso(src, tmp, entries)
+    except Exception as exc:                                   # noqa: BLE001
+        log('! Echo-S music: %s -- nothing written; the scenes and battles '
+            'play the generic tracks' % exc)
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        return []
+    os.replace(tmp, dest)
+    log('  %d module words, %d BSS bytes%s'
+        % (report['words'], report['bss_bytes'],
+           ', battle-music hook' if report['battle_hook'] else ''))
+    return [] if built else [dest]
 
 
 def apply_sqlogo(sdout, dump, plan, log=lambda *_: None, produced=()):
