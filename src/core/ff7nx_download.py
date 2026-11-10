@@ -168,10 +168,18 @@ def load_catalogs(refresh=True, log=lambda *_: None):
     return out
 
 
-def load_sources():
-    """The supported mods: [{'id', 'name', 'file'}] in display order."""
+def load_sources(include_builtin=False):
+    """The supported mods: [{'id', 'name', 'file'}] in display order.
+
+    BUILD 905: entries marked "builtin" (a mod the program now does itself,
+    such as Double Input Bugfix) are only there to keep their place in the
+    tested load order; they are left out unless `include_builtin` -- so
+    Install Mods, update checks and adoption never offer them."""
     with open(SOURCES_JSON, encoding='utf-8') as f:
-        return json.load(f)['mods']
+        mods = json.load(f)['mods']
+    if include_builtin:
+        return mods
+    return [m for m in mods if not m.get('builtin')]
 
 
 # ------------------------------------------------------------ versions
@@ -539,9 +547,15 @@ def _extract(archive, dest, log):
             return
         log('  %s failed: %s' % (os.path.basename(tool),
                                  (r.stderr or r.stdout).strip()[-200:]))
-    # macOS's own tar is bsdtar (libarchive), which reads 7z; GNU tar does not
-    tar = _which('bsdtar') or ('/usr/bin/tar' if sys.platform == 'darwin'
-                               else None)
+    # macOS's own tar is bsdtar (libarchive), which reads 7z; GNU tar does
+    # not. BUILD 903: so is Windows 10+'s System32/tar.exe.
+    tar = _which('bsdtar')
+    if not tar and sys.platform == 'darwin':
+        tar = '/usr/bin/tar'
+    if not tar and sys.platform == 'win32':
+        sysroot = os.environ.get('SystemRoot', 'C:\\Windows')
+        cand = os.path.join(sysroot, 'System32', 'tar.exe')
+        tar = cand if os.path.isfile(cand) else None
     if tar:
         r = subprocess.run([tar, '-xf', archive, '-C', dest],
                            capture_output=True, text=True)
@@ -674,3 +688,122 @@ def cleanup(mods_dir):
                 shutil.rmtree(path, ignore_errors=True)
             else:
                 os.remove(path)
+
+
+# ------------------------------------------------------------ BUILD 903
+# A supported mod copied into mods/ BY HAND, under a name that is not the one
+# mod_sources.json gives it -- Nitpick 1.83 unpacks from its .7z as
+# "7ac77aef-..._Nitpick.iro", and settings.json, the load order and the cache
+# all know it as "Nitpick.iro". Under its own name it looks like a NEW mod
+# (off, every option at the author's default), and next to the old copy it is
+# a second Nitpick. Install Mods never has this problem (install() names the
+# file); this makes a manual copy behave the same way.
+
+REPLACED_DIR = '.replaced'
+_ID_RE = re.compile(r'<ID>\s*([^<]+?)\s*</ID>', re.I)
+_VER_RE = re.compile(r'<Version>\s*([^<]+?)\s*</Version>', re.I)
+
+
+def _manifest_text(path):
+    try:
+        if os.path.isdir(path):
+            p = iro.folder_path(path, 'mod.xml')
+            if p is None:
+                return None
+            with open(p, 'rb') as f:
+                data = f.read()
+        else:
+            data = iro.read_one(path, 'mod.xml')
+        return data.decode('utf-8', 'replace') if data else None
+    except Exception:                                          # noqa: BLE001
+        return None
+
+
+def _stem(name):
+    return name[:-4] if name.lower().endswith('.iro') else name
+
+
+def adopt_manual_copies(mods_dir, sources=None, log=lambda *_: None):
+    """Give a hand-copied supported mod the file name Install Mods would.
+
+    For every .iro or mod folder in `mods_dir` whose mod.xml ID is a
+    supported mod's but whose name is not that mod's (`file` in
+    mod_sources.json, either form: name.iro or the folder):
+
+      * the expected name is free: the copy is renamed to it;
+      * the expected name is taken (the old version is still there): the
+        NEWER of the two by <Version> keeps the expected name, the other is
+        moved to mods/.replaced/ -- never deleted. Same version: the copy is
+        the one moved aside.
+
+    Returns [(old name, new name or '.replaced/...')] for what it did."""
+    if not os.path.isdir(mods_dir):
+        return []
+    try:
+        sources = load_sources() if sources is None else sources
+    except Exception:                                          # noqa: BLE001
+        return []
+    by_id = {s['id'].lower(): s for s in sources if s.get('id')}
+    done = []
+    names = sorted(os.listdir(mods_dir))
+    present = {n.lower(): n for n in names}
+    for name in names:
+        full = os.path.join(mods_dir, name)
+        if name.startswith('.') or not (name.lower().endswith('.iro')
+                                        or os.path.isdir(full)):
+            continue
+        text = _manifest_text(full)
+        m = _ID_RE.search(text or '')
+        src = by_id.get(m.group(1).strip().lower()) if m else None
+        if src is None:
+            continue
+        want_stem = _stem(src['file'])
+        if _stem(name).casefold() == want_stem.casefold():
+            continue                    # its own name (or the other form)
+        want = want_stem + ('.iro' if name.lower().endswith('.iro') else '')
+        holder = (present.get((want_stem + '.iro').lower())
+                  or present.get(want_stem.lower()))
+        try:
+            if holder is None:
+                os.rename(full, os.path.join(mods_dir, want))
+                present.pop(name.lower(), None)
+                present[want.lower()] = want
+                done.append((name, want))
+                log('Install Mods: %s is %s -- renamed to %s, so its settings '
+                    'and load order apply' % (name, src['name'], want))
+                continue
+            hv = _VER_RE.search(_manifest_text(
+                os.path.join(mods_dir, holder)) or '')
+            cv = _VER_RE.search(text or '')
+            copy_newer = bool(cv and hv and is_newer(cv.group(1),
+                                                     hv.group(1)))
+            aside_dir = os.path.join(mods_dir, REPLACED_DIR)
+            os.makedirs(aside_dir, exist_ok=True)
+
+            def aside(n):
+                dest = os.path.join(aside_dir, n)
+                k = 1
+                while os.path.lexists(dest):
+                    dest = os.path.join(aside_dir, '%s.%d' % (n, k))
+                    k += 1
+                os.rename(os.path.join(mods_dir, n), dest)
+                return os.path.relpath(dest, mods_dir)
+            if copy_newer:
+                old = aside(holder)
+                os.rename(full, os.path.join(mods_dir, want))
+                present.pop(holder.lower(), None)
+                present.pop(name.lower(), None)
+                present[want.lower()] = want
+                done += [(holder, old), (name, want)]
+                log('Install Mods: %s %s replaces %s %s -- the old copy is in '
+                    'mods/%s' % (name, cv.group(1), holder, hv.group(1), old))
+            else:
+                where = aside(name)
+                present.pop(name.lower(), None)
+                done.append((name, where))
+                log('Install Mods: %s is another copy of %s, not newer than '
+                    'the installed %s -- moved to mods/%s'
+                    % (name, src['name'], holder, where))
+        except OSError as exc:
+            log('! Install Mods: could not adopt %s (%s)' % (name, exc))
+    return done

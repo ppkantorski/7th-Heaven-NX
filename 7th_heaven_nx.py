@@ -948,6 +948,12 @@ VOICE_NORM_CHOICES = [
     ('off', 'Off \u2014 as the mod shipped'),
 ]
 VOICE_NORM_LABELS = dict(VOICE_NORM_CHOICES)
+# BUILD 904. Settings > Voice > Auto-Text Advance delay, in ms
+VOICE_AUTO_DELAY_CHOICES = [(ms, ('%d ms' % ms) + (' (default)' if ms == 500
+                                                    else ''))
+                            for ms in range(0, 1001, 100)]
+VOICE_AUTO_DELAY_LABELS = dict(VOICE_AUTO_DELAY_CHOICES)
+VOICE_AUTO_DELAY_BY_LABEL = {v: k for k, v in VOICE_AUTO_DELAY_CHOICES}
 VOICE_NORM_BY_LABEL = {v: k for k, v in VOICE_NORM_CHOICES}
 
 # BUILD 815: HD lite is the shipped default (data/default_settings.json), so
@@ -1230,6 +1236,9 @@ def _active_order_constraints(mods):
     return out
 
 
+ADOPT_LOG = []      # BUILD 903: what adopt_manual_copies did, for the GUI log
+
+
 def discover_mods(order=None, moved=None):
     """Mods in priority order, highest first: data/mod_sources.json's tested
     order for the mods it lists, 7th Heaven's category auto-sort below them
@@ -1238,6 +1247,18 @@ def discover_mods(order=None, moved=None):
     it. See apply_manual_moves."""
     if not os.path.isdir(MODS_DIR):
         return []
+    # BUILD 903: a supported mod copied in by hand under another name (an
+    # .iro unpacked from a .7z keeps its own) gets the name Install Mods
+    # would give it, so its settings, load order and cache apply.
+    _new = []
+    try:
+        import ff7nx_download
+        ff7nx_download.adopt_manual_copies(MODS_DIR, log=_new.append)
+    except Exception as exc:                                # noqa: BLE001
+        _new.append('! Install Mods: manual-copy check failed (%s)' % exc)
+    for line in _new:
+        print(line)
+    ADOPT_LOG.extend(_new)
     found = []
     for fn in sorted(os.listdir(MODS_DIR)):
         full = os.path.join(MODS_DIR, fn)
@@ -1328,7 +1349,10 @@ def _reference_sources():
     """data/mod_sources.json's mods, in its order: the tested load order."""
     try:
         import ff7nx_download
-        return ff7nx_download.load_sources()
+        # BUILD 905: built-in entries too -- the Double Input Bugfix keeps
+        # its tested place (and stays undraggable) though it is no longer
+        # offered in Install Mods.
+        return ff7nx_download.load_sources(include_builtin=True)
     except Exception:                                          # noqa: BLE001
         return []
 
@@ -3438,6 +3462,10 @@ def launch_ui():
     # BUILD 859: Controls > W-Item bug fix (ff7nx_witem), on by default; off
     # keeps the original game's W-Item duplication
     witem_var = tk.BooleanVar(value=bool(global_saved.get('witem_fix', True)))
+    # BUILD 901: Controls > Double input fix (ff7nx_difix), on by default --
+    # the "Double Input Bugfix" mod left the 7th Heaven catalogue
+    difix_var = tk.BooleanVar(value=bool(global_saved.get('double_input_fix',
+                                                          True)))
     # BUILD 859: Voice > Advanced facial animations (ff7nx_facial's runtime:
     # expressions and the voice lip flap), on by default
     facial_var = tk.BooleanVar(value=bool(global_saved.get('advanced_facial',
@@ -3548,6 +3576,17 @@ def launch_ui():
     def current_voice_normalize():
         return VOICE_NORM_BY_LABEL.get(voice_norm_var.get(),
                                        build.voice_ogg.NORMALIZE_DEFAULT)
+
+    # BUILD 904: Auto-Text Advance delay
+    _ad_saved = global_saved.get('voice_auto_delay',
+                                 build.VOICE_AUTO_DELAY_DEFAULT)
+    if _ad_saved not in VOICE_AUTO_DELAY_LABELS:
+        _ad_saved = build.VOICE_AUTO_DELAY_DEFAULT
+    voice_delay_var = tk.StringVar(value=VOICE_AUTO_DELAY_LABELS[_ad_saved])
+
+    def current_voice_auto_delay():
+        return VOICE_AUTO_DELAY_BY_LABEL.get(voice_delay_var.get(),
+                                             build.VOICE_AUTO_DELAY_DEFAULT)
 
     scaler_saved = global_saved.get('scaler', '')
     if scaler_saved not in SCALER_LABELS:
@@ -3680,6 +3719,12 @@ def launch_ui():
              'Turn off to keep the original game\'s W-Item duplication '
              'glitch.',
              True),
+            ('check', 'Double input fix', difix_var, None,
+             'A button press counts once. Pressing two buttons together, '
+             'like down and A, no longer moves twice, and holding A or X no '
+             'longer keeps confirming or cancelling. The D-pad and L/R still '
+             'repeat when held. Replaces the "Double Input Bugfix" mod, '
+             'which is ignored if you still have it installed.', True),
         ]),
         ('Storage', [
             ('check', 'Compact cache after build', compact_var, None,
@@ -3700,6 +3745,12 @@ def launch_ui():
              _choices(VOICE_NORM_CHOICES, user_hide=('loudness:-15.3', 'peak:-1.1')),
              'Evens out Echo-S voice lines so quiet and loud ones sound '
              'alike. Changing it re-encodes the voice clips once.', False),
+            ('combo', 'Auto-Text Advance delay', voice_delay_var,
+             [label for _v, label in VOICE_AUTO_DELAY_CHOICES],
+             'How long a voiced dialogue box stays up after its line ends '
+             'before Echo-S\'s Auto Text Advance moves on. 0 ms moves on the '
+             'moment the voice stops. You can always press to continue '
+             'sooner.', False),
             ('check', 'Advanced facial animations', facial_var, None,
              'Characters blink, change expression and move their mouths '
              'while a voiced line plays. Off keeps the original game\'s '
@@ -4437,16 +4488,19 @@ def launch_ui():
         sel_vars = {}
 
         def selected_src(src):
-            return install_sel.get(src['id'], True)
+            # BUILD 902: a source may start unticked ("selected": false in
+            # data/mod_sources.json -- Arranged Soundtrack); the user's own
+            # choice, once made, wins either way
+            return install_sel.get(src['id'], bool(src.get('selected', True)))
 
         def on_select(src):
             v = bool(sel_vars[src['id']].get())
             rows[src['id']]['name'].configure(
                 style='TLabel' if v else 'GetModOff.TLabel')
-            if v:
+            if v == bool(src.get('selected', True)):
                 install_sel.pop(src['id'], None)    # the default: not stored
             else:
-                install_sel[src['id']] = False
+                install_sel[src['id']] = v
             save_settings_now()
             refresh()
 
@@ -4503,7 +4557,13 @@ def launch_ui():
             if note is None:
                 # "Up to date" only when the catalog said so: with no
                 # catalog loaded there is nothing to compare against.
+                # BUILD 906: while another mod installs, a row that still
+                # needs one keeps saying so (dimmed: nothing can be queued
+                # mid-run) -- it used to fall through to "Up to date" and
+                # flip back to Update when the run ended.
                 note = ('Queued' if src in state['jobs'] else
+                        ('Install' if what == 'download' else 'Update')
+                        if what else
                         'Not in the catalog' if state['catalog'] and not cat
                         else 'Up to date' if have and cat else
                         'Installed' if have else '')
@@ -5121,6 +5181,7 @@ def launch_ui():
                                  'model_shadows': bool(shadows_var.get()),
                                  'no_cheats': bool(nocheat_var.get()),
                                  'witem_fix': bool(witem_var.get()),
+                                 'double_input_fix': bool(difix_var.get()),
                                  'advanced_facial': bool(facial_var.get()),
                                  'text_autosize': bool(autosize_var.get()),
                                  'compact_cache': bool(compact_var.get()),
@@ -5134,6 +5195,8 @@ def launch_ui():
                                  'video_shader': current_video_shader(),
                                  'voice_normalize':
                                      current_voice_normalize(),
+                                 'voice_auto_delay':
+                                     current_voice_auto_delay(),
                                  'esui_texscale': current_esui_texscale(),
                                  'dock_resolution':
                                      current_dock_resolution(),
@@ -5195,6 +5258,7 @@ def launch_ui():
     shadows_var.trace_add('write', save_settings_now)
     nocheat_var.trace_add('write', save_settings_now)
     witem_var.trace_add('write', save_settings_now)
+    difix_var.trace_add('write', save_settings_now)
     facial_var.trace_add('write', save_settings_now)
     autosize_var.trace_add('write', save_settings_now)
     compact_var.trace_add('write', save_settings_now)
@@ -5211,6 +5275,7 @@ def launch_ui():
     bp_var.trace_add('write', save_settings_now)
     fxaa_var.trace_add('write', save_settings_now)
     vshader_var.trace_add('write', save_settings_now)
+    voice_delay_var.trace_add('write', save_settings_now)   # BUILD 904
 
     # ---------- action bar (bottom, packed FIRST so it is never clipped) ----
     actions = ttk.Frame(outer)
@@ -5931,6 +5996,14 @@ def launch_ui():
                 locked = build.ff7nx_pccode.locked_option(mod, opt.id)
                 if locked:
                     current = build.ff7nx_pccode.locked_value(mod, opt.id)
+                    var.set(_opt_label(opt.label_for(current)))
+                    store[opt.id] = current
+            # BUILD 902. Double Input Bugfix: built in as a Settings patch, so
+            # every option is shown greyed out at its default with a notice.
+            if not locked:
+                locked = build.ff7nx_difix.locked_option(mod, opt.id)
+                if locked:
+                    current = build.ff7nx_difix.locked_value(mod, opt.id)
                     var.set(_opt_label(opt.label_for(current)))
                     store[opt.id] = current
             combo = ttk.Combobox(grid, textvariable=var, values=labels,
@@ -6978,6 +7051,8 @@ def launch_ui():
         os.environ[build.NO_CHEATS_ENV] = (
             '1' if _needs_nso(nocheat_var.get()) else '0')
         os.environ[build.WITEM_FIX_ENV] = '1' if witem_var.get() else '0'
+        os.environ[build.ff7nx_difix.OFF_ENV] = (
+            '0' if difix_var.get() else '1')
         os.environ[build.ADV_FACIAL_ENV] = '1' if facial_var.get() else '0'
         os.environ[build.TEXT_AUTOSIZE_ENV] = (
             '1' if autosize_var.get() else '0')
@@ -7039,6 +7114,7 @@ def launch_ui():
         # ff7nx_gfxpool.POOL_MB_ENV.
         os.environ[_HEADLESS_GFX_ENV] = str(current_gfx_pool())
         os.environ[build.voice_ogg.NORMALIZE_ENV] = current_voice_normalize()
+        os.environ[build.VOICE_AUTO_DELAY_ENV] = str(current_voice_auto_delay())
         os.environ[build.ff7nx_shaders.SCALER_ENV] = current_scaler()
         os.environ[build.ff7nx_shaders.BLACK_POINT_ENV] = str(
             current_black_point())
@@ -7523,6 +7599,10 @@ def launch_ui():
         _last = ff7nx_update.last_result(VERSION)
     except Exception:                                       # noqa: BLE001
         _last = None
+    # BUILD 903: manual mod copies adopted at startup
+    for _line in ADOPT_LOG:
+        log_write(_line)
+    del ADOPT_LOG[:]
     if _last and _last[0] == 'ok':
         log_write('Updated to 7th Heaven NX %s.' % _v(_last[1]))
     elif _last and _last[0] == 'busy':
@@ -7797,6 +7877,9 @@ def main():
             os.environ[build.voice_ogg.NORMALIZE_ENV] = str(
                 saved.get('__global__', {}).get(
                     'voice_normalize', build.voice_ogg.NORMALIZE_DEFAULT))
+        os.environ.setdefault(build.VOICE_AUTO_DELAY_ENV, str(
+                saved.get('__global__', {}).get(
+                    'voice_auto_delay', build.VOICE_AUTO_DELAY_DEFAULT)))
         if build.ff7nx_shaders.SCALER_ENV not in os.environ:
             os.environ[build.ff7nx_shaders.SCALER_ENV] = str(
                 saved.get('__global__', {}).get('scaler', '') or '')
@@ -7843,6 +7926,9 @@ def main():
         os.environ.setdefault(build.WITEM_FIX_ENV, (
                 '1' if saved.get('__global__', {}).get('witem_fix', True)
                 else '0'))
+        os.environ.setdefault(build.ff7nx_difix.OFF_ENV, (
+                '0' if saved.get('__global__', {}).get('double_input_fix',
+                                                       True) else '1'))
         os.environ.setdefault(build.ADV_FACIAL_ENV, (
                 '1' if saved.get('__global__', {}).get('advanced_facial', True)
                 else '0'))

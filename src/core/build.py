@@ -1738,22 +1738,21 @@ def build_plan(mods, settings_by_mod, catalogs, log=lambda *_: None,
     # BUILD 620. Double Input Bugfix: its HEXT files patch x86 CODE, which
     # this port does not run; ff7nx_difix translates them to ARM64 words in
     # exefs/main instead (apply_difix), so they leave the exe list here.
+    # BUILD 901: the mod is no longer on the 7th Heaven catalogue, so the
+    # fix is a Settings > Controls patch (on by default, the mod's own
+    # defaults: fix on, stock repeat rate 50 ms and delay 200 ms). A copy of
+    # the mod that is still installed does NOTHING -- its HEXT files leave
+    # the exe list and its rate/delay options are not read -- so the result
+    # is the same with or without it and the setting alone decides.
     ff7nx_difix.CURRENT = None
     _di = [(f, m) for f, m in plan.hext_files if ff7nx_difix.handles(m)]
-    if _di and not ff7nx_difix.disabled():
-        try:
-            ff7nx_difix.CURRENT = ff7nx_difix.plan_from_hext(
-                [f for f, _m in _di])
-            plan.hext_files = [(f, m) for f, m in plan.hext_files
-                               if not ff7nx_difix.handles(m)]
-            log('%s: %s -- translated to ARM64 (exefs/main), not baked into '
-                'the exe' % (_di[0][1].display_name,
-                             ff7nx_difix.describe(ff7nx_difix.CURRENT)))
-        except Exception as exc:                               # noqa: BLE001
-            ff7nx_difix.CURRENT = None
-            log('! double-input fix: its HEXT files are not the ones this '
-                'build knows (%s); left to the exe path, which skips code '
-                'patches' % exc)
+    if _di:
+        plan.hext_files = [(f, m) for f, m in plan.hext_files
+                           if not ff7nx_difix.handles(m)]
+        log('%s: not used -- the double-input fix is built in now '
+            '(Settings > Controls > Double input fix), so this mod\'s %d '
+            'HEXT file(s) and its options are ignored'
+            % (_di[0][1].display_name, len(_di)))
     # BUILD 878: BUILT IN. The game's own input repeats any held button, so a
     # held A in battle keeps confirming (Attack, then a target) with or
     # without the mod. The held-face-button fix (ff7nx_difix.face_no_repeat)
@@ -13851,6 +13850,8 @@ FPS_MULT_TAG = 'fpsmult='
 # `exefs/main` through nso_patcher -- none of them touch an .lgp, a .tex or a
 # field file. Adding a name here is only safe under that rule.
 MAIN_ONLY_ENV = frozenset((
+    'SEVENTH_NX_VOICE_AUTO_DELAY_MS',  # ff7nx_voice   BUILD 904 GUI setting
+    'SEVENTH_NX_NO_DIFIX',       # ff7nx_difix       BUILD 901 GUI toggle
     'SEVENTH_NX_TEXT_AUTOSIZE',       # BUILD 860: exefs/main only
     'SEVENTH_NX_TEXT_CLOSE',          # BUILD 886: exefs/main only
     'SEVENTH_NX_DEPTH_COPY_FIX',      # BUILD 860h: ff7nx_depthcopy.ENV
@@ -19179,6 +19180,29 @@ def apply_echo_music(sdout, dump, plan, log=lambda *_: None, produced=()):
 # it is a runtime argument rather than a config file.
 ECHO_AUTO_OPTION = 'auto'
 
+# BUILD 904. Settings > Voice > Auto-Text Advance delay: how long a voiced
+# box stays up after its line ends before auto-advance presses OK. 0 is the
+# old behaviour (the press on the next input pass, as FFNx does); the GUI
+# offers 0..1000 ms in 100 ms steps, default 500.
+VOICE_AUTO_DELAY_ENV = 'SEVENTH_NX_VOICE_AUTO_DELAY_MS'
+VOICE_AUTO_DELAY_DEFAULT = 500
+VOICE_AUTO_DELAY_MAX = 1000
+
+
+def voice_auto_delay_ms():
+    raw = os.environ.get(VOICE_AUTO_DELAY_ENV, '').strip()
+    try:
+        ms = int(raw) if raw else VOICE_AUTO_DELAY_DEFAULT
+    except ValueError:
+        ms = VOICE_AUTO_DELAY_DEFAULT
+    return max(0, min(VOICE_AUTO_DELAY_MAX, ms))
+
+
+def voice_auto_delay_frames():
+    """The delay in frames of the loop the voice service runs on (the
+    field and world loops run at the same rate, _field_tick_hz)."""
+    return int(round(voice_auto_delay_ms() * _field_tick_hz() / 1000.0))
+
 # HOW LOUD THE MUSIC IS WHILE SOMEBODY IS TALKING.
 # ================================================
 # This is FFNx's `external_voice_music_fade_volume`, and 25 is FFNx's own
@@ -19417,6 +19441,7 @@ def apply_echo_voice(sdout, dump, plan, log=lambda *_: None, produced=()):
     try:
         report = ff7nx_voice.apply_to_nso(
             src, tmp, auto_advance=auto_advance, level=level,
+            auto_delay_frames=voice_auto_delay_frames(),
             forced_name=forced, message_phase=phase,
             message_stub=stub,
             battle_probability=_echo_battle_percent(plan),
@@ -19512,6 +19537,11 @@ def apply_echo_voice(sdout, dump, plan, log=lambda *_: None, produced=()):
             'MusicManager access from the voice service')
     log('  auto text advance: %s   (Echo-S option "Auto", default on)'
         % ('on' if auto_advance else 'off'))
+    if auto_advance:
+        log('  auto text advance delay: %d ms after the line ends (%d frame(s) '
+            'at %g Hz; Settings > Voice). The player can still press on '
+            'sooner.' % (voice_auto_delay_ms(), voice_auto_delay_frames(),
+                         _field_tick_hz()))
     if report.get('publish_on_dialog_change'):
         log('  a line is requested when the window\'s dialog id changes, not '
             'only on a state transition -- a non-blocking MESSAGE (WINDOW; '

@@ -179,7 +179,9 @@ class ReferenceOrder(unittest.TestCase):
 
     def test_real_sources_file_is_the_default(self):
         import ff7nx_download
-        files = [s['file'] for s in ff7nx_download.load_sources()]
+        # BUILD 905: built-in entries (Double Input) keep their place too
+        files = [s['file'] for s in
+                 ff7nx_download.load_sources(include_builtin=True)]
         mods = [self.M(f) for f in reversed(files)]
         self.assertEqual([m.filename for m in nx.apply_reference_order(mods)],
                          files)

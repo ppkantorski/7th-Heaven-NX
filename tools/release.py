@@ -109,7 +109,11 @@ def _modules():
     """Every package the release has to carry: (import name, pip name,
     required?)."""
     rows = [(i, p, True) for i, p, _ in ff7nx_deps.REQUIRED]
-    rows += [(i, p, False) for i, p, _ in ff7nx_deps.OPTIONAL]
+    # BUILD 903: optional when running from source, but a RELEASE must carry
+    # py7zr -- Nitpick, a supported mod, ships as a .7z, and a release
+    # cannot ask the user to pip install anything
+    release_required = {'py7zr'}
+    rows += [(i, p, i in release_required) for i, p, _ in ff7nx_deps.OPTIONAL]
     i, p, _ = ff7nx_deps.FFMPEG_PACKAGE
     rows.append((i, p, False))
     rows.append(('PyInstaller', 'pyinstaller', True))

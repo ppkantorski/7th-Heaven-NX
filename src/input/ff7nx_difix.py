@@ -84,6 +84,26 @@ def handles(mod):
     return bool(m) and getattr(m, 'mod_id', '') == MOD_ID
 
 
+# BUILD 902. The fix is a Settings patch now and this mod is not used: it
+# stays in the mods list, every option greyed out at its default, with this
+# beside it.
+LOCK_NOTICE = ('Built in now as a patch: Settings > Controls > Double input '
+               'fix. This mod is not used.')
+
+
+def locked_option(mod, option_id):
+    """Why an option of this mod does nothing, or None for other mods."""
+    return LOCK_NOTICE if handles(mod) else None
+
+
+def locked_value(mod, option_id):
+    """The value a locked option is shown at: the mod's own default."""
+    for opt in getattr(getattr(mod, 'manifest', None), 'options', []) or []:
+        if opt.id == option_id:
+            return opt.default
+    return None
+
+
 # ------------------------------------------------------------------ HEXT
 def _patches(text):
     import exe_patch

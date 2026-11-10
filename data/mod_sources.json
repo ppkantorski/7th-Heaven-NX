@@ -1,5 +1,5 @@
 {
-  "_comment": "The mods the Switch build supports, for the Install Mods window (ff7nx_download). id is the 7th Heaven catalog ID; file is the name the mod has in mods/, which settings.json keys it by, so downloads and updates land there. Kept in load order.",
+  "_comment": "The mods the Switch build supports, for the Install Mods window (ff7nx_download). id is the 7th Heaven catalog ID; file is the name the mod has in mods/, which settings.json keys it by, so downloads and updates land there. Kept in load order. \"selected\": false starts a mod UNticked in Install Mods (it is still listed and can be ticked); without it a mod starts ticked. BUILD 902: Double Input Bugfix removed (built in, Settings > Controls); Arranged Soundtrack starts unticked and off -- it replaces Echo-S's own soundtrack, so it is opt-in. BUILD 905: \"builtin\": true marks a mod the program now does itself (Double Input Bugfix: Settings > Controls). It is kept here ONLY for its place in the tested load order, so an installed copy stays where it always was and cannot be dragged; load_sources() leaves it out, so it is not in Install Mods, update checks or the defaults.",
   "mods": [
     {
       "id": "2e4c6623-97b9-4d5c-b2f3-b4f24f06a911",
@@ -34,7 +34,8 @@
     {
       "id": "22ed7aef-254c-49cf-923f-32c146f1597f",
       "name": "Double Input Bugfix (and menu input Qol)",
-      "file": "Double-input-fix"
+      "file": "Double-input-fix",
+      "builtin": true
     },
     {
       "id": "22b8d4ec-603f-46cd-9a70-20f2fcd7aea4",
@@ -79,7 +80,8 @@
     {
       "id": "ed5a8c57-56bf-4cf1-acfa-8e5347f27463",
       "name": "[Tsunamods] Arranged Soundtrack",
-      "file": "[Tsunamods]-Arranged-Soundtrack.iro"
+      "file": "[Tsunamods]-Arranged-Soundtrack.iro",
+      "selected": false
     },
     {
       "id": "50000000-5555-ff75-5775-720000000004",

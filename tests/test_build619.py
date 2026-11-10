@@ -354,17 +354,45 @@ def test_difix_620_plan_from_folder_mod():
     assert D.CURRENT['difix'] and D.CURRENT['rate'] is None \
         and D.CURRENT['delay'] is None
     assert plan.hext_files == []                 # nothing left for the exe
-    st.update(rate=1, delay=1000)
-    build.build_plan([m], {m.filename: st}, {})
-    assert (D.CURRENT['rate'], D.CURRENT['delay']) == (D.INF, 1000)
-    st.update(difix=0, rate=50, delay=200)
-    build.build_plan([m], {m.filename: st}, {})
-    # BUILD 878: the fix is built in -- on with the mod's own toggle off,
-    # and with no mod at all
+    # BUILD 901: the fix is a built-in setting with the mod's defaults; an
+    # installed copy of the mod does nothing, whatever its options say
+    for opts in ({'rate': 1, 'delay': 1000}, {'difix': 0}):
+        st.update(opts)
+        plan = build.build_plan([m], {m.filename: st}, {})
+        assert D.CURRENT == {'difix': True, 'rate': None, 'delay': None,
+                             'files': []}
+        assert plan.hext_files == []
+    build.build_plan([], {}, {})
     assert D.CURRENT == {'difix': True, 'rate': None, 'delay': None,
                          'files': []}
-    build.build_plan([], {}, {})
-    assert D.CURRENT['difix'] and D.CURRENT['rate'] is None
+    # the setting off (Settings > Controls > Double input fix)
+    os.environ[D.OFF_ENV] = '1'
+    try:
+        plan = build.build_plan([m], {m.filename: st}, {})
+        assert D.CURRENT is None and plan.hext_files == []
+    finally:
+        del os.environ[D.OFF_ENV]
+
+
+def test_difix_902_listed_but_locked():
+    """BUILD 902: the mod stays in the mods list so users know it exists,
+    but every option is greyed out at its default with a notice -- the fix
+    is a Settings patch and the mod itself does nothing."""
+    import build
+    import ff7nx_difix as D
+    if not os.path.isdir(_DI):
+        pytest.skip('Double Input Bugfix not installed')
+    m = build.Mod(_DI, '/tmp/unused-cache')
+    m._load_manifest()
+    ids = [o.id for o in m.manifest.options]
+    assert set(ids) >= {'difix', 'rate', 'delay'}
+    for oid in ids:
+        assert 'Settings > Controls > Double input fix' in D.locked_option(m, oid)
+    assert [D.locked_value(m, i) for i in ('difix', 'rate', 'delay')] == \
+        [1, 50, 200]
+    other = build.Mod(os.path.join(os.path.dirname(_DI), 'Nitpick.iro'),
+                      '/tmp/unused-cache')
+    assert D.locked_option(other, 'difix') is None
 
 
 def test_artpatch_620_nvmkin_stairs(tmp_path):

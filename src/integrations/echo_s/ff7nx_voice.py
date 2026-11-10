@@ -2147,7 +2147,7 @@ def _build_disable_name_change_cave(cave, addr, scratch):
     return a.resolve()
 
 
-def _build_auto_ok_input_cave(cave, addr, scratch):
+def _build_auto_ok_input_cave(cave, addr, scratch, delay_frames=0):
     """Inject one FFNx-style raw OK press after the native input refresh.
 
     Voice completion happens later in ``field_loop_sub_63C17F``, after
@@ -2159,7 +2159,13 @@ def _build_auto_ok_input_cave(cave, addr, scratch):
     a = Asm(cave, addr)
     _bss_ptr(a, 8, scratch)
     a.emit(A.ldr(9, 8, VOICE_AUTO_OK_PENDING_OFF))
-    a.cbz64(9, 'resume')
+    if delay_frames:
+        # BUILD 904: the field service counts the pending value down from
+        # delay+1 while the line's window stays open; the press goes in at 1
+        a.emit(A.cmp_imm(9, 1))
+        a.bcond('resume', A.NE)
+    else:
+        a.cbz64(9, 'resume')
     a.emit(A.str_(A.WZR, 8, VOICE_AUTO_OK_PENDING_OFF))
     # This is a B-spliced translated function, so preserve its existing LR
     # while ResolvePaged maps the raw guest status address.
@@ -2560,6 +2566,7 @@ def _build_field_clocked_voice_service(cave, addr, scratch,
                                        auto_advance=False,
                                        world_mode=False,
                                        battle_mode=False,
+                                       auto_delay_frames=0,
                                        resume_target=None,
                                        allow_foreign_replace=False,
                                        defer_foreign_play=True,
@@ -2772,7 +2779,15 @@ def _build_field_clocked_voice_service(cave, addr, scratch,
         a.bcond('out', A.EQ)
         a.emit(A.movz(8, 1))
         a.emit(A.str_(8, 19, VOICE_WAITING_WINDOW_OFF))
-        if world_mode:
+        if auto_delay_frames:
+            # BUILD 904: Auto-Text Advance delay. The press is not made now
+            # but counted down in the waiting state below, one per frame of
+            # this loop; anything that closes or replaces the window first
+            # (the player's own press, the next line) clears it, so a press
+            # can never land on the next box.
+            a.emit(A.movz(8, auto_delay_frames + 1))
+            a.emit(A.str_(8, 19, VOICE_AUTO_OK_PENDING_OFF))
+        elif world_mode:
             _emit_world_auto_ok(a)
         else:
             a.emit(A.str_(8, 19, VOICE_AUTO_OK_PENDING_OFF))
@@ -2830,8 +2845,25 @@ def _build_field_clocked_voice_service(cave, addr, scratch,
         a.bcond('idle_release', A.EQ)
         a.emit(A.ldr(8, 19, VOICE_WAITING_WINDOW_OFF))
         a.emit(A.cmp_imm(8, 1))
-        a.bcond('out', A.EQ)
+        if auto_delay_frames:
+            a.bcond('idle_wait', A.EQ)
+        else:
+            a.bcond('out', A.EQ)
         a.b('idle_release')
+        if auto_delay_frames:
+            a.label('idle_wait')
+            a.emit(A.ldr(8, 19, VOICE_AUTO_OK_PENDING_OFF))
+            a.emit(A.cmp_imm(8, 1))
+            a.bcond('out', 0x9)                       # b.ls: 0 or 1, nothing to count
+            a.emit(A.sub_imm(8, 8, 1))
+            a.emit(A.str_(8, 19, VOICE_AUTO_OK_PENDING_OFF))
+            if world_mode:
+                # the world loop takes its OK bit straight from the service
+                a.emit(A.cmp_imm(8, 1))
+                a.bcond('out', A.NE)
+                a.emit(A.str_(A.WZR, 19, VOICE_AUTO_OK_PENDING_OFF))
+                _emit_world_auto_ok(a)
+            a.b('out')
         a.label('idle_release')
         a.emit(A.str_(A.WZR, 19, VOICE_WAITING_WINDOW_OFF))
         a.emit(A.str_(A.WZR, 19, VOICE_AUTO_OK_PENDING_OFF))
@@ -3277,6 +3309,7 @@ def patch_main_clocked_dialogue(src, dest, forced_name=None,
                                 hook_world=False,
                                 disable_name_change=True,
                                 auto_advance=False,
+                                auto_delay_frames=0,
                                 battle_probability=0,
                                 battle_text=False):
     """Install FFNx-ordered field VO and Echo-S name-menu compatibility.
@@ -3567,6 +3600,7 @@ def patch_main_clocked_dialogue(src, dest, forced_name=None,
                 duck_attack_frames=duck_attack_frames,
                 duck_release_frames=duck_release_frames,
                 auto_advance=auto_advance, resume_target=field_chain,
+                auto_delay_frames=auto_delay_frames if auto_advance else 0,
                 allow_foreign_replace=allow_foreign_field_replace,
                 defer_foreign_play=defer_foreign_play,
                 # FIELD ONLY. The default is off and this is the one caller
@@ -3625,6 +3659,7 @@ def patch_main_clocked_dialogue(src, dest, forced_name=None,
                     duck_attack_frames=duck_attack_frames,
                     duck_release_frames=duck_release_frames,
                     auto_advance=auto_advance, world_mode=True,
+                    auto_delay_frames=auto_delay_frames if auto_advance else 0,
                     resume_target=world_service_chain,
                     allow_foreign_replace=allow_foreign_field_replace,
                     defer_foreign_play=defer_foreign_play,
@@ -3634,7 +3669,7 @@ def patch_main_clocked_dialogue(src, dest, forced_name=None,
     if auto_advance:
         input_entry, input_placed = _emit_laid_out(
             pool, lambda cave, address: _build_auto_ok_input_cave(
-                cave, address, scratch))
+                cave, address, scratch, delay_frames=auto_delay_frames))
     placed = {}
     placed.update(mapjump_placed)
     placed.update(transition_worker_placed)
@@ -3856,6 +3891,7 @@ def _level_flags(level):
 
 
 def apply_to_nso(src, dest, auto_advance=True, voice_gain=VOICE_GAIN_DEFAULT,
+                 auto_delay_frames=0,
                  duck_percent=85,
                  duck_attack_frames=12, duck_release_frames=45,
                  battle_probability=0, battle_text=False, level='full',
@@ -3944,6 +3980,7 @@ def apply_to_nso(src, dest, auto_advance=True, voice_gain=VOICE_GAIN_DEFAULT,
             first_in_burst_wins=first_in_burst_wins,
             replay_guard=replay_guard,
             stream_once=stream_once,
+            auto_delay_frames=auto_delay_frames if flags['auto_advance'] else 0,
             **flags)
     finally:
         _SPILL = None

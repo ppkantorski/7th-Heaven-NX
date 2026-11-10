@@ -339,7 +339,8 @@ def _special(mod):
     if ff7nx_idleanim.handles(mod):
         return ['Field character animations']
     if ff7nx_difix.handles(mod):
-        return ['Controller input']
+        # BUILD 902: built in as a Settings patch; the mod itself is unused
+        return ['Nothing (built in: Settings > Controls)']
     return None
 
 

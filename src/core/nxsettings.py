@@ -35,12 +35,14 @@ USER_KEYS = frozenset((
     'movie_quality',
     'analog_360',
     'witem_fix',                    # BUILD 859: Controls > W-Item bug fix
+    'double_input_fix',             # BUILD 901: Controls > Double input fix
     'advanced_facial',              # BUILD 859: Voice > Advanced facial animations
     'no_autorun',
     'no_cheats',
     'compact_cache',                # BUILD 848: Storage > Compact cache after build
     'changes_folder',               # BUILD 869: Storage > Write a changes folder
     'voice_normalize',
+    'voice_auto_delay',             # BUILD 904: Voice > Auto-Text Advance delay
     'dock_resolution',              # BUILD 762: output resolution
     'title_screen',                 # BUILD 763b: title background
     'gui_theme',                    # window colours (nxthemes); not a build input
