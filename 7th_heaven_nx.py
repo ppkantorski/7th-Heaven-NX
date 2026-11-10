@@ -2302,7 +2302,7 @@ def _run_build_steps(mods, enabled, settings_by_mod, log, progress,
     produced += build.apply_titlemusic(SDOUT_DIR, DUMP, plan, log, produced)
     # BUILD 899. Echo-S's scene cues, battle themes and shuffled variants
     # (off while Arranged Soundtrack is on). See ff7nx_echooverride.
-    produced += build.apply_echo_music(SDOUT_DIR, DUMP, plan, log, produced)
+    produced += build.apply_echo_music_overrides(SDOUT_DIR, DUMP, plan, log, produced)
     # BUILD 640. The startup logo movie (Echo-S: _sqlogo with SYW mods,
     # else _eidoslogo; none without Echo-S). See ff7nx_sqlogo.
     produced += build.apply_sqlogo(SDOUT_DIR, DUMP, plan, log, produced)

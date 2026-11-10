@@ -15261,7 +15261,7 @@ def _echo_field_akao(plan, dump):
 def _emplace_echo_music(plan, romfs, dump, log, produced):
     """BUILD 899. Resolve Echo-S's FFNx-only music (scene cues, battle
     themes, shuffle variants) and copy each under its short alias. The
-    module side is apply_echo_music; without a dump it is all skipped."""
+    module side is apply_echo_music_overrides; without a dump it is all skipped."""
     plan.echo_music_entries = []
     if plan.arranged_soundtrack:
         if plan.echo_music_withheld:
@@ -19998,7 +19998,7 @@ def apply_titlemusic(sdout, dump, plan, log=lambda *_: None, produced=()):
     return out
 
 
-def apply_echo_music(sdout, dump, plan, log=lambda *_: None, produced=()):
+def apply_echo_music_overrides(sdout, dump, plan, log=lambda *_: None, produced=()):
     """
     BUILD 899. Echo-S's scene cues, battle themes and shuffles: the alias
     files are already in music_ogg (_emplace_echo_music); this installs the
