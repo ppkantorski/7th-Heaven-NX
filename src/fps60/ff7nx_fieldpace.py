@@ -537,6 +537,54 @@ MENU_SITE = 0x90AE8
 MENU_ORR4 = 0x321E03E8                      # orr w8, wzr, #4 (vanilla)
 
 
+# BUILD 909: THE 3x ICON SAYS WHAT THE BOOSTER DOES.
+# The port draws `cheat_speedx3` or `cheat_speedx3_off` (render pass
+# +0x10E0A70, only while the multiplier is >= 2) from ONE question,
+# +0x10F3A90 -- the same whitelist that gates its virtual clock (the rdtsc at
+# +0x6720 multiplies only when it says yes). In field mode ([0x12E60A0] == 2)
+# it says no for fship_2/fship_25 (conditional), cargoin, tin_1..tin_4,
+# rootmap, blinele (conditional), fr_e, junbin22, junbin4, subin_1b, subin_3,
+# rcktbas1/itown1a (conditional) and itown2.
+# Stock, icon and speed agreed. The field cave above runs its extra ticks in
+# EVERY field frame (it never asks the whitelist), so on those fields 3x is
+# real while the icon shows "off" (tin_*, hardware 11-11). The icon's call
+# (+0x10E0C8C) now goes to a cave: the stock answer, or -- in field mode with
+# no movie playing, exactly when the field cave runs its extras -- "on".
+# Movies (the field cave stands down) and every other mode keep the stock
+# answer. Installed only together with the field cave.
+ICON_SITE = 0x10E0C8C                       # bl speed_allowed (render pass)
+ICON_FN = 0x10F3A90                         # the port's 3x whitelist
+MODE_GOT = 0x12CE1F8                        # -> int32 port mode ([0x12E60A0])
+FIELD_MODE = 2                              # the mode the field ids gate
+
+
+def build_icon_cave(_entry, addr):
+    """Replaces the icon's `bl 0x10F3A90`. w0 = stock answer, or 1 in field
+    mode with no movie playing (the field cave's own condition)."""
+    a = Asm(_entry, addr)
+    a.emit(A.stp64_pre(29, 30, 31, -0x10))
+    a.emit(A.bl(a.pc(), ICON_FN))                 # stock: allowed?
+    a.cbnz(0, 'out')                              # yes: as stock
+    a.emit(A.adrp(9, a.pc(), MODE_GOT & ~0xFFF))
+    a.emit(A.ldr64(9, 9, MODE_GOT & 0xFFF))
+    a.emit(A.ldr(9, 9, 0))                        # port mode
+    a.emit(A.cmp_imm(9, FIELD_MODE))
+    a.bcond('out', A.NE)                          # not field: stock (off)
+    a.emit(A.adrp(9, a.pc(), MOVIE_GOT & ~0xFFF))
+    a.emit(A.ldr64(9, 9, MOVIE_GOT & 0xFFF))
+    a.cbz64(9, 'on')
+    a.emit(A.ldr64(9, 9, 0))
+    a.cbz64(9, 'on')
+    a.emit(A.ldr(9, 9, MOVIE_IS_PLAYING))
+    a.cbnz(9, 'out')                              # a movie plays: stock
+    a.label('on')
+    a.emit(A.movz(0, 1))
+    a.label('out')
+    a.emit(A.ldp64_post(29, 30, 31, 0x10))
+    a.emit(A.ret())
+    return a.resolve()
+
+
 def boost_enabled():
     # BUILD 847: on by default (843 was off: see above). =off restores the
     # stock 3x; at 1x every cave is the stock call either way.
@@ -1252,6 +1300,16 @@ def apply_boost_to_nso(src, dest, stock=None, budget=None, region=None):
         dead.placed[MENU_SITE] = A.bl(MENU_SITE, cave)
         caves['battle menu'] = cave
         todo.append((MENU_SITE, None, 'battle menu', None))
+    # BUILD 909: the 3x icon follows the field cave (see ICON_SITE)
+    if 'field' in caves:
+        if struct.unpack_from('<I', text, ICON_SITE)[0] == A.bl(ICON_SITE,
+                                                              ICON_FN):
+            cave = dead.put(lambda e, ad: build_icon_cave(e, ad))
+            dead.placed[ICON_SITE] = A.bl(ICON_SITE, cave)
+            caves['3x icon'] = cave
+            todo.append((ICON_SITE, ICON_FN, '3x icon', None))
+        else:
+            skipped.append((ICON_SITE, ICON_FN, '3x icon', None))
     for va, w in dead.placed.items():
         struct.pack_into('<I', text, va, w)
     out = AC.pack(blob, space.commit(), bss_grow)

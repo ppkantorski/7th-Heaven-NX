@@ -57,7 +57,7 @@ HERE = nxpaths.ROOT
 
 # Shown in the header, nearest the title. Single source of truth --
 # anything else that needs it should import this rather than repeat it.
-VERSION = '1.1.3'
+VERSION = '1.1.4'
 sys.path.insert(0, HERE)
 
 import build  # noqa: E402
@@ -68,6 +68,7 @@ import lgp    # noqa: E402
 import ff7nx_field169  # noqa: E402
 import ff7nx_modifies  # noqa: E402
 import nxsettings  # noqa: E402  BUILD 756: user vs developer settings
+import nxdefaults  # noqa: E402  BUILD 910: settings left at a default follow it
 import nxthemes  # noqa: E402
 
 # Resolved once, at import: $SEVENTH_NX_DUMP, then dump/, then the old
@@ -2624,6 +2625,76 @@ def seed_mod_defaults(saved, mods):
     return saved
 
 
+# BUILD 910: settings the user left at their default follow the default
+# when an update changes it (see src/core/nxdefaults.py). The defaults below
+# are exactly what a missing key falls back to: developer values (LOCKED),
+# data/default_settings.json over them, and the few user settings whose
+# default lives only in code.
+_CODE_DEFAULTS = {
+    'voice_auto_delay': build.VOICE_AUTO_DELAY_DEFAULT,   # BUILD 904/907
+    'double_input_fix': True,                             # BUILD 901
+}
+_factory_cache = {}
+
+
+def factory_settings(mods):
+    """The running version's defaults, shaped like settings.json: globals,
+    and per installed mod its on/off and options (the tested values in
+    data/default_mod_settings.json over the mod's own manifest defaults)."""
+    key = tuple((m.filename, _manifest_id(m)) for m in mods)
+    if key in _factory_cache:
+        return _factory_cache[key]
+    g = dict(_CODE_DEFAULTS)
+    g.update(nxsettings.LOCKED)
+    g.update(default_globals())
+    out = {'__global__': g}
+    listed = default_mod_settings()
+    for mod in mods:
+        entry = listed.get(mod.filename)
+        out[mod.filename] = {
+            'enabled': (entry['enabled'] if entry is not None
+                        else NEW_MOD_ENABLED),
+            'options': _mod_options_from_saved(
+                mod, {mod.filename: entry} if entry is not None else {}),
+        }
+    _factory_cache.clear()
+    _factory_cache[key] = out
+    return out
+
+
+def stamp_defaults(data, mods):
+    """`data` (about to be saved) with its record of what is at default."""
+    try:
+        return nxdefaults.stamp(data, factory_settings(mods), VERSION)
+    except Exception as exc:                                    # noqa: BLE001
+        print('settings defaults record skipped: %s' % exc, file=sys.stderr)
+        return data
+
+
+def refresh_defaults(saved, mods, log=print):
+    """Move settings left at an old default to the current one -- in `saved`
+    (what this run uses) and in settings.json -- and make sure the file has
+    a record. A fresh install (no settings.json) is left alone."""
+    try:
+        factory = factory_settings(mods)
+        changes = nxdefaults.refresh(saved, factory)
+        if os.path.exists(SETTINGS):
+            raw = build.load_settings(SETTINGS)
+            if raw:
+                migrate_saved_mod_keys(raw, mods)
+                nxdefaults.refresh(raw, factory)
+                if changes or nxdefaults.KEY not in raw:
+                    build.save_settings(SETTINGS, nxdefaults.stamp(
+                        raw, factory, VERSION))
+        for label, old, new in changes:
+            log('settings: %s was at the old default %r -- now the new '
+                'default %r' % (label, old, new))
+        return changes
+    except Exception as exc:                                    # noqa: BLE001
+        print('settings defaults refresh skipped: %s' % exc, file=sys.stderr)
+        return []
+
+
 def _reveal(path):
     """Open a folder in the OS file browser."""
     import subprocess
@@ -2646,6 +2717,7 @@ def launch_ui():
     mods = discover_mods(*manual_moves(saved))
     migrate_saved_mod_keys(saved, mods)
     seed_mod_defaults(saved, mods)
+    refresh_defaults(saved, mods)               # BUILD 910
     # BUILD 849: mods the user dragged to a new priority (see
     # apply_manual_moves). Highlighted in the list, saved as `mod_moved`.
     moved = set(manual_moves(saved)[1]) & {m.filename for m in mods}
@@ -5219,7 +5291,7 @@ def launch_ui():
         if not _ui_ready[0]:
             return
         try:
-            build.save_settings(SETTINGS, snapshot_settings())
+            build.save_settings(SETTINGS, stamp_defaults(snapshot_settings(), mods))
         except Exception as exc:                      # noqa: BLE001
             print('could not save settings: %s' % exc, file=sys.stderr)
         refresh_dev_note()
@@ -7133,7 +7205,7 @@ def launch_ui():
             os.environ[ff7nx_esui.SCALE_ENV] = str(current_esui_texscale())
         else:
             os.environ.pop(ff7nx_esui.SCALE_ENV, None)
-        build.save_settings(SETTINGS, snapshot_settings())
+        build.save_settings(SETTINGS, stamp_defaults(snapshot_settings(), mods))
         os.environ[build.FIELD_TEX_CAP_ENV] = str(cap_value)
         if cap_value:
             log_write(f'field texture cap: {cap_value}px '
@@ -7739,6 +7811,7 @@ def main():
         mods = discover_mods(*manual_moves(saved))
         migrate_saved_mod_keys(saved, mods)
         seed_mod_defaults(saved, mods)
+        refresh_defaults(saved, mods)           # BUILD 910
         if build.FIELD_TEX_CAP_ENV not in os.environ:
             cap_value = saved.get('__global__', {}).get('field_tex_cap', 0)
             os.environ[build.FIELD_TEX_CAP_ENV] = str(cap_value)

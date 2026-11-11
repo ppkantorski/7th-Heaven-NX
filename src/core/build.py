@@ -145,6 +145,7 @@ import ff7nx_gatewall
 import ff7nx_cargowait
 import ff7nx_winwait
 import ff7nx_lighttile
+import ff7nx_tunnelgate
 import ff7nx_chunkparallax
 import ff7nx_trnad1fx
 import ff7nx_l4offset
@@ -11475,6 +11476,16 @@ def _build_flevel(archive_path, chunks, field_files, romfs, log,
     lt_line = ff7nx_lighttile.summarise(lt_stats)
     if lt_line:
         log(lt_line)
+    # BUILD 908. tunnel_2: Echo-S starts Barret's walk + SPLIT and Tifa's run
+    # back without waiting, so skipping the laser-gate dialogue left Tifa
+    # running in place between two movers (or a dropped REQ polled for
+    # ever). Both now wait. See ff7nx_tunnelgate.
+    tg_stats = ff7nx_tunnelgate.apply_to_flevel(
+        archive, payloads,
+        encode=lambda raw: _encode_field_cached(archive, raw), log=log)
+    tg_line = ff7nx_tunnelgate.summarise(tg_stats)
+    if tg_line:
+        log(tg_line)
 
     # ------------------------------------------ DEPTH-1 RESOLUTION LIFT
     # BUILD 618v: now really dead last among the page passes (see the note

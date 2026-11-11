@@ -473,3 +473,55 @@ def test_world_controller_encodings():
                     (0x9E670121, 'fmov d1, x9')):
         i = next(cs.disasm(struct.pack('<I', w), 0))
         assert '%s %s' % (i.mnemonic, i.op_str) == want
+
+
+# BUILD 909: the 3x icon follows the field cave
+MODE_HOST = 0x63000000
+
+
+def _run_icon(stock, mode, movie, movie_obj=True):
+    mem = E.Mem()
+    mem.write(FP.MODE_GOT, struct.pack('<Q', MODE_HOST))
+    mem.write(MODE_HOST, struct.pack('<i', mode))
+    mem.write(FP.MOVIE_GOT, struct.pack('<Q', 0x61000000))
+    mem.write(0x61000000, struct.pack('<Q', 0x62000000 if movie_obj else 0))
+    mem.write(0x62000000 + FP.MOVIE_IS_PLAYING, struct.pack('<I', movie))
+    seen = []
+
+    def allowed(cpu):
+        seen.append(1)
+        for r in range(0, 19):
+            cpu.x[r] = E.GARBAGE
+        cpu.x[0] = stock
+    cpu = E.Cpu(mem, native={FP.ICON_FN: allowed})
+    cpu.sp = 0x7000000
+    for q in range(31):
+        cpu.x[q] = 0x1000 + q
+    before = list(cpu.x)
+    site = FP.ICON_SITE
+    words = FP.build_icon_cave(CAVE, lambda i: CAVE + 4 * i)
+    code = {site: A.bl(site, CAVE)}
+    code.update({CAVE + 4 * i: w for i, w in enumerate(words)})
+    end = cpu.run(site, code, start_pc=site)
+    assert seen == [1] and end == site + 4 and cpu.sp == 0x7000000
+    assert all(cpu.x[q] == before[q] for q in range(19, 30))
+    return cpu.x[0] & 1
+
+
+def test_icon_on_where_the_field_cave_boosts():
+    # the port's whitelist says yes: on, whatever the mode
+    assert _run_icon(1, FP.FIELD_MODE, 0) == 1
+    assert _run_icon(1, 5, 1) == 1
+    # tin_* (whitelist no) in field mode, no movie: the extras run -> on
+    assert _run_icon(0, FP.FIELD_MODE, 0) == 1
+    assert _run_icon(0, FP.FIELD_MODE, 0, movie_obj=False) == 1
+    # a movie plays (extras stand down) or any other mode: stock off
+    assert _run_icon(0, FP.FIELD_MODE, 1) == 0
+    for mode in (1, 3, 7, 15):
+        assert _run_icon(0, mode, 0) == 0
+
+
+def test_icon_site_and_part_fit():
+    assert FP.ICON_SITE == 0x10E0C8C and FP.ICON_FN == 0x10F3A90
+    words = FP.build_icon_cave(CAVE, lambda i: CAVE + 4 * i)
+    assert len(words) * 4 <= 96
