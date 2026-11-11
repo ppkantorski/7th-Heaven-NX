@@ -57,7 +57,7 @@ HERE = nxpaths.ROOT
 
 # Shown in the header, nearest the title. Single source of truth --
 # anything else that needs it should import this rather than repeat it.
-VERSION = '1.1.2'
+VERSION = '1.1.3'
 sys.path.insert(0, HERE)
 
 import build  # noqa: E402
@@ -949,7 +949,7 @@ VOICE_NORM_CHOICES = [
 ]
 VOICE_NORM_LABELS = dict(VOICE_NORM_CHOICES)
 # BUILD 904. Settings > Voice > Auto-Text Advance delay, in ms
-VOICE_AUTO_DELAY_CHOICES = [(ms, ('%d ms' % ms) + (' (default)' if ms == 500
+VOICE_AUTO_DELAY_CHOICES = [(ms, ('%d ms' % ms) + (' (default)' if ms == build.VOICE_AUTO_DELAY_DEFAULT
                                                     else ''))
                             for ms in range(0, 1001, 100)]
 VOICE_AUTO_DELAY_LABELS = dict(VOICE_AUTO_DELAY_CHOICES)

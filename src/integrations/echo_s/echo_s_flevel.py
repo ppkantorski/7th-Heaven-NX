@@ -1763,13 +1763,75 @@ def _model_loader_is_portable(echo_section3: bytes, stock_section3: bytes):
     return all(name in stock for name in echo if name)
 
 
+# BUILD 905: fields whose Echo-S loader names a model record from ANOTHER
+# field and is taken as Echo-S ships it, because every HRC and animation it
+# names is in char.lgp. See `loader_missing_assets`.
+BORROWED_MODEL_LOADERS = []
+
+
+def loader_assets(section3: bytes):
+    """
+    [(record name, [char.lgp names it loads])] for a model loader: the HRC
+    and one `<stem>.a` per animation, lower-case, in index order.
+    """
+    out = []
+    for name, hrc, (start, end) in model_loader_records(section3):
+        record = section3[start:end]
+        cursor = 0
+        length, = struct.unpack_from('<H', record, cursor)
+        cursor += 2 + length + 2 + 8 + 4
+        animations, = struct.unpack_from('<H', record, cursor)
+        cursor += 2 + 30
+        needs = [hrc.decode('ascii', 'replace').lower()]
+        for _animation in range(animations):
+            length, = struct.unpack_from('<H', record, cursor)
+            stem = bytes(record[cursor + 2:cursor + 2 + length]) \
+                .rstrip(b'\0').decode('ascii', 'replace').split('.')[0]
+            cursor += 2 + length + 2
+            if stem:
+                needs.append(stem.lower() + '.a')
+        out.append((name, needs))
+    return out
+
+
+def loader_missing_assets(section3: bytes, char_assets):
+    """
+    The char.lgp names `section3` loads that `char_assets` does not have.
+    Empty means the loader can be shipped as it is.
+
+    BUILD 905: THE "FOREIGN FIELD" REFUSAL WAS A WRONG PREMISE.
+    ==========================================================
+    `_model_loader_is_portable` refused any loader naming a record from
+    another field (`tunnel_3` wanting `tunnel_1main_ballet.char`) on the
+    belief that this port keys models per field. It does not: the Switch's
+    char.lgp is keyed by HRC and animation stem exactly as the PC's is
+    (12,649 entries, `acgd.hrc`, `adcb.a`, ... and nothing named
+    `<field><model>.char` anywhere in the romfs), the record name is a
+    label, and Echo-S's records are byte-identical to the Switch's for the
+    same model (`tunnel_1`'s Barret record, measured). 40 fields already ship
+    Echo-S's records verbatim, bare animation names included.
+
+    Keeping the Switch loader is what is actually unsafe there: models are
+    handed out in CHAR order, so in `tunnel_3` the added Barret entity (the
+    party leader, `pc 01`) received model 1 -- a Shinra guard -- and the
+    second guard asked for model 3 of 3 and stood frozen; the dead-end
+    scene could never reach its battle. The same off-by-one hit the other
+    seven fields that were on this list.
+    """
+    wanted = set()
+    for _name, needs in loader_assets(section3):
+        wanted.update(needs)
+    return sorted(n for n in wanted if n not in char_assets)
+
+
 # BUILD 708: field -> lines given a speaker tag, field -> why it was not
 SPEAKER_TAGGED = {}
 SPEAKER_UNTAGGED = {}
 
 
 def merge_field_payload(stock_payload: bytes, echo_payload: bytes,
-                        sections=SCRIPT_UNIT_SECTIONS, field_name=None):
+                        sections=SCRIPT_UNIT_SECTIONS, field_name=None,
+                        char_assets=None):
     """Return a Switch field payload with selected Echo-S field sections.
 
     The result is encoded through the archive's verified LZS implementation
@@ -1847,6 +1909,15 @@ def merge_field_payload(stock_payload: bytes, echo_payload: bytes,
                 sections.add(3)
                 if field_name and field_name not in REMAPPED_MODEL_LOADERS:
                     REMAPPED_MODEL_LOADERS.append(field_name)
+            elif (char_assets is not None and not loader_missing_assets(
+                    echo_sections[2], char_assets)):
+                # BUILD 905: every model and animation it names is in
+                # char.lgp, so Echo-S's loader is loadable here as it is --
+                # see `loader_missing_assets`. Taken verbatim, exactly like
+                # the portable case above.
+                sections.add(3)
+                if field_name and field_name not in BORROWED_MODEL_LOADERS:
+                    BORROWED_MODEL_LOADERS.append(field_name)
             elif field_name and field_name not in UNPORTABLE_MODEL_LOADERS:
                 UNPORTABLE_MODEL_LOADERS.append(field_name)
     # BUILD 708: who says each line, worked out once here from the exact

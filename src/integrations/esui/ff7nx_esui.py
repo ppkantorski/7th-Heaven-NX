@@ -1661,6 +1661,52 @@ FIELD_WORDS = {
 }
 
 
+# BUILD 906: "Field Dialog Box Transparency" (fdb). Both choices other than
+# Stock are .text HEXT, so until now every choice drew the stock opaque box
+# (and Transparency Strength, ported in 645e, only acts on the translucent
+# path, which was never taken). x86 0x6E97E0 draws the field dialog's box; its
+# only callers are the field dialog renderer 0x6EBF2C's two calls.
+#   Semi - Default (Field/FieldSDB): 6EB022 `je 0x6EB1EF` -> 6 x NOP. The box
+#     takes its translucent path whatever [0xDC3CD8] (the battle's
+#     transparency flag) says. ARM: the `cbz w8` on that flag.
+#   No Boxes (Field/FieldNDB): 6EC3FF / 6EC454 `call 0x6E97E0` -> 5 x NOP,
+#     text only. ARM: both calls are ONE `bl` (the recompiler merged the
+#     identical tails). The ARM callee pops the emulated return slot itself
+#     (esp += 4 before `ret`, measured), so removing the `bl` alone would leave
+#     esp 4 low; the caller's `add esp, 8` becomes `add esp, 0xC` instead.
+# Applied from the bytes the ACTIVE folders' HEXT write, so the option picks
+# exactly what 7th Heaven applies on PC.
+ARM_NOP = 0xD503201F
+FDB_SEMI_HEXT = ((0x6EB022, 6),)
+FDB_SEMI_WORDS = {
+    0xD91B14: (0x34004A88, ARM_NOP),          # cbz w8, #0xd92464 (je 0x6EB1EF)
+}
+FDB_NONE_HEXT = ((0x6EC3FF, 5), (0x6EC454, 5))
+FDB_NONE_WORDS = {
+    0xD991CC: (0x97FFC349, ARM_NOP),          # bl 0xd89ef0 (call 0x6E97E0)
+    0xD991D4: (0x11002108, 0x11003108),       # add w8, w8, #8 -> #0xc (esp)
+}
+
+
+def _hext_nops(mem, spans):
+    return bool(mem) and all(mem.get(va + k) == 0x90
+                             for va, n in spans for k in range(n))
+
+
+def fdb_words():
+    """{arm va: (old, new)} for the active Field Dialog Box Transparency
+    choice; {} for Stock (or with ESUI off / its HEXT unreadable)."""
+    if CURRENT is None:
+        return {}
+    mem = hext_bytes()
+    out = {}
+    if _hext_nops(mem, FDB_SEMI_HEXT):
+        out.update(FDB_SEMI_WORDS)
+    if _hext_nops(mem, FDB_NONE_HEXT):
+        out.update(FDB_NONE_WORDS)
+    return out
+
+
 def field_words(text):
     """{va: (old, new, label)} for the field tweaks, under ESUI only."""
     if CURRENT is None:
@@ -1671,6 +1717,12 @@ def field_words(text):
         if cur not in (old, new):
             raise ValueError('field +0x%X holds %08X, not the stock %08X' % (va, cur, old))
         out[va] = (old, new, 'ESUI field')
+    for va, (old, new) in fdb_words().items():
+        cur = struct.unpack_from('<I', text, va)[0]
+        if cur not in (old, new):
+            raise ValueError('field dialog box +0x%X holds %08X, not the stock '
+                             '%08X' % (va, cur, old))
+        out[va] = (old, new, 'ESUI field dialog box')
     return out
 
 

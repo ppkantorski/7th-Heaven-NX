@@ -9671,9 +9671,26 @@ def _bake_widescreen_ranges(archive, payloads, widescreen, log):
     return stats
 
 
+def _char_asset_names(char_archive, mod_files, log=lambda *_: None):
+    """
+    (every name the built char.lgp will hold, sorted names mods add), both
+    lower-case; (None, ()) when the vanilla archive cannot be read, which
+    keeps the old refusal for Echo-S loaders that borrow a model. BUILD 905.
+    """
+    if not char_archive or not os.path.exists(char_archive):
+        return None, ()
+    try:
+        base = {str(n).lower() for n in lgp.Archive(char_archive).index}
+    except Exception as exc:                                   # noqa: BLE001
+        log('! char.lgp names not read (%s)' % exc)
+        return None, ()
+    added = sorted({str(n).lower() for n in (mod_files or {})} - base)
+    return base | set(added), tuple(added)
+
+
 def _build_flevel(archive_path, chunks, field_files, romfs, log,
                   dds_sources=(), widescreen=None, echo_fields=None,
-                  pose_stems=()):
+                  pose_stems=(), char_assets=None):
     """
     Patch flevel.lgp. Three replacement shapes, decided per entry by
     comparing the mod file with how the VANILLA entry is stored:
@@ -9842,7 +9859,8 @@ def _build_flevel(archive_path, chunks, field_files, romfs, log,
             # this cannot erase selected Cosmos Limit Break data.
             base_payload = payloads.get(name, entry['payload'])
             raw, imported = echo_s_flevel.merge_field_payload(
-                base_payload, echo_payload, field_name=name)
+                base_payload, echo_payload, field_name=name,
+                char_assets=char_assets)
         except (OSError, ValueError, echo_s_flevel.EchoFlevelError) as exc:
             raise RuntimeError('Echo-S field %s rejected: %s' %
                                (name, exc)) from exc
@@ -9927,6 +9945,19 @@ def _build_flevel(archive_path, chunks, field_files, romfs, log,
                 'every index already means the same asset here, so the Switch '
                 'loader is correct rather than a compromise: %s'
                 % (len(equivalent), ', '.join(sorted(equivalent))))
+        # BUILD 905: loaders naming another field's model record, shipped as
+        # Echo-S has them because char.lgp holds every model and animation
+        # they load (tunnel_3: Barret had been given a guard's model, and the
+        # second guard model 3 of 3 -- the dead-end scene froze).
+        borrowed = echo_s_flevel.BORROWED_MODEL_LOADERS
+        if borrowed:
+            log('  Echo-S: %d field(s) name a model record from another field; '
+                'char.lgp has every model and animation they load, so their '
+                'loader is taken as Echo-S ships it: %s'
+                % (len(borrowed), ', '.join(sorted(borrowed))))
+        elif char_assets is None:
+            log('  ! Echo-S: char.lgp names not available -- loaders that '
+                'borrow another field\'s model stay refused')
         if unportable:
             log('  ! Echo-S edits the model loader in %d field(s) in a way '
                 'this port cannot follow: it names a model belonging to '
@@ -15447,7 +15478,15 @@ def apply_plan(plan, archive_paths, sdout, log=lambda *_: None,
         except Exception as exc:                               # noqa: BLE001
             log('! pose unblock: char.lgp not read (%s); scripts unchanged' % exc)
             pose_stems = []
+        # BUILD 905: the names char.lgp will hold, so an Echo-S loader that
+        # borrows another field's model record can be checked against what
+        # actually loads. Only the names mods ADD go in the key: replacing an
+        # existing model cannot change the answer, adding/removing one can.
+        char_assets, char_added = _char_asset_names(
+            archive_paths.get('char.lgp'),
+            plan.archive_files.get('char.lgp', {}), log)
         flevel_extra = (
+            ('charnames', char_added),
             sorted((k, sorted(v)) for k, v in plan.chunks.items()),
             sorted((name, _stat_sig(src))
                    for name, (src, _mod) in plan.echo_fields.items()),
@@ -15718,7 +15757,8 @@ def apply_plan(plan, archive_paths, sdout, log=lambda *_: None,
                                      flevel_fields, romfs, log,
                                      plan.field_dds_sources,
                                      plan.widescreen, plan.echo_fields,
-                                     pose_stems=pose_stems)
+                                     pose_stems=pose_stems,
+                                     char_assets=char_assets)
                 if dest:
                     _archive_cache_store('flevel.lgp', dest, ffp,
                                          str(FIELD_BG_MAX_RAW), ffp_inputs)
@@ -19183,9 +19223,9 @@ ECHO_AUTO_OPTION = 'auto'
 # BUILD 904. Settings > Voice > Auto-Text Advance delay: how long a voiced
 # box stays up after its line ends before auto-advance presses OK. 0 is the
 # old behaviour (the press on the next input pass, as FFNx does); the GUI
-# offers 0..1000 ms in 100 ms steps, default 500.
+# offers 0..1000 ms in 100 ms steps, default 200 (BUILD 907; was 500).
 VOICE_AUTO_DELAY_ENV = 'SEVENTH_NX_VOICE_AUTO_DELAY_MS'
-VOICE_AUTO_DELAY_DEFAULT = 500
+VOICE_AUTO_DELAY_DEFAULT = 200
 VOICE_AUTO_DELAY_MAX = 1000
 
 
