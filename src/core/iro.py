@@ -397,11 +397,14 @@ def _flatten_activewhen(fragment):
 
 
 class Option:
-    def __init__(self, ident, name, values, default):
+    def __init__(self, ident, name, values, default, previews=None):
         self.id = ident
         self.name = name
         self.values = values          # [(value:int, label:str), ...]
         self.default = default
+        # BUILD 912: value -> its <Option PreviewFile="...">, the picture
+        # 7th Heaven shows for it (a path inside the mod; may be missing)
+        self.previews = dict(previews or {})
 
     def label_for(self, value):
         for v, label in self.values:
@@ -620,7 +623,9 @@ class Manifest:
                 default = 0
             self.options.append(
                 Option(ident, fields.get('Name', ident).strip(),
-                       values, default))
+                       values, default,
+                       previews={v: p.strip() for (v, _l), p
+                                 in zip(values, previews) if p.strip()}))
 
         self.folders = []
         # Folders declared with <Conditional> rather than <ModFolder>.

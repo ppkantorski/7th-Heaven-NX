@@ -57,7 +57,7 @@ HERE = nxpaths.ROOT
 
 # Shown in the header, nearest the title. Single source of truth --
 # anything else that needs it should import this rather than repeat it.
-VERSION = '1.1.4'
+VERSION = '1.1.5'
 sys.path.insert(0, HERE)
 
 import build  # noqa: E402
@@ -69,6 +69,7 @@ import ff7nx_field169  # noqa: E402
 import ff7nx_modifies  # noqa: E402
 import nxsettings  # noqa: E402  BUILD 756: user vs developer settings
 import nxdefaults  # noqa: E402  BUILD 910: settings left at a default follow it
+import nxpreview  # noqa: E402  BUILD 912: option preview beside open dropdowns
 import nxthemes  # noqa: E402
 
 # Resolved once, at import: $SEVENTH_NX_DUMP, then dump/, then the old
@@ -2814,6 +2815,15 @@ def launch_ui():
             catalogs = {}
 
     root = tk.Tk()
+    # BUILD 911: the wheel never changes a dropdown. ttk's Combobox class
+    # binding stepped the value on <MouseWheel>, so scrolling the Settings
+    # window or a mod's options with the pointer passing over a dropdown
+    # silently changed it. The class binding becomes a no-op that does not
+    # 'break', so the event goes on to the window's own scroll binding
+    # (bind_all). The open list itself (ComboboxPopdown) still scrolls.
+    for _seq in ('<MouseWheel>', '<Shift-MouseWheel>', '<Button-4>',
+                 '<Button-5>', '<Shift-Button-4>', '<Shift-Button-5>'):
+        root.bind_class('TCombobox', _seq, lambda _e: None)
     root.title('7th Heaven NX')
     # BUILD 834: the same sizes and faces as macOS, which the whole layout
     # is designed on. Tk sizes fonts in POINTS: macOS draws 1 pt as 1 px,
@@ -3983,7 +3993,10 @@ def launch_ui():
                                 continue
                             choices = ((True, False) if kind == 'check'
                                        else tuple(values))
-                            best, best_score = var.get(), -1
+                            # BUILD 911: a choice must do strictly BETTER
+                            # than what is set now; a row `want` does not
+                            # mention used to land on its first choice
+                            best, best_score = var.get(), score()
                             for c in choices:
                                 var.set(c)
                                 n = score()
@@ -4082,7 +4095,12 @@ def launch_ui():
             """Every setting, developer ones included, back to
             data/default_settings.json -- except the theme and the
             Developer Settings toggle."""
-            want = default_globals()
+            # BUILD 911: the same defaults a missing key falls back to
+            # (factory_settings: code defaults, LOCKED, then the json) --
+            # default_globals() alone has no voice_auto_delay, and its row
+            # was left to the search below, which settled on its first
+            # choice, 0 ms.
+            want = dict(factory_settings(mods)['__global__'])
             for k in ('gui_theme', 'developer_settings'):
                 want.pop(k, None)
             if not want:
@@ -5917,6 +5935,12 @@ def launch_ui():
         word = label.strip()
         return {'on': 'On', 'off': 'Off'}.get(word.lower(), label)
 
+    # BUILD 912: the mod's picture for an option value, in a small window
+    # beside the open dropdown list (see nxpreview). One for the session.
+    option_preview = nxpreview.OptionPreview(root, lambda: {
+        'bg': BG_ROW, 'fg': TEXT_PRIMARY, 'muted': TEXT_MUTED,
+        'border': BORDER})
+
     def show_options(mod):
         for w in options_body.winfo_children():
             w.destroy()
@@ -6082,6 +6106,15 @@ def launch_ui():
                                  state='disabled' if locked else 'readonly',
                                  width=16)
             combo.grid(row=row, column=1, sticky='ew', pady=3, padx=(0, 14))
+            if not locked:
+                # BUILD 912: preview each value while the list is open
+                try:
+                    option_preview.attach(
+                        combo, mod.path,
+                        [getattr(opt, 'previews', {}).get(v) for v in shown],
+                        ['%s: %s' % (opt.name, lab) for lab in labels])
+                except Exception as exc:              # noqa: BLE001
+                    print('option preview: %s' % exc, file=sys.stderr)
             if locked:
                 # BUILD 629: shown, greyed out -- the Switch build has its
                 # own version of what this option changes on PC
@@ -6213,8 +6246,24 @@ def launch_ui():
             _all_checks.add(self)
             self._canvas = None
             self.bind('<Button-1>', self._toggle)
-            variable.trace_add('write', lambda *_: self._draw())
+            # BUILD 911: the trace goes with the widget. Settings redraws
+            # its rows on every Developer Settings change, and each dead
+            # check left a trace that raised TclError on every later write.
+            self._trace = variable.trace_add('write',
+                                             lambda *_: self._draw())
+            self.bind('<Destroy>', self._untrace, add='+')
             self._draw()
+
+        def _untrace(self, evt=None):
+            if evt is not None and evt.widget is not self:
+                return
+            _all_checks.discard(self)
+            if self._trace is not None:
+                try:
+                    self._var.trace_remove('write', self._trace)
+                except (tk.TclError, ValueError):
+                    pass
+                self._trace = None
 
         def _toggle(self, _event=None):
             self._var.set(not self._var.get())

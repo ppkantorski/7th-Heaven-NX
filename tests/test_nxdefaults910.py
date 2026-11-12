@@ -91,3 +91,19 @@ def test_junk_is_harmless():
                       'Echo-s.iro': 3}, NEW) == []
     assert D.stamp({'Echo-s.iro': {'options': None}}, NEW)[D.KEY]['mods'] \
         == {}
+
+
+def test_911_black_point_and_restore_inputs():
+    # data/default_settings.json now agrees with LOCKED (BUILD 822: 11)
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        'nxs', _nx_os.path.join(_nx_root, 'src', 'core', 'nxsettings.py'))
+    nxs = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(nxs)
+    with open(_nx_os.path.join(_nx_root, 'data', 'default_settings.json')) \
+            as fh:
+        g = json.load(fh)['__global__']
+    assert {k: v for k, v in nxs.LOCKED.items() if g.get(k, v) != v} == {}
+    saved = {'__global__': {'hd_black_point': 12}}
+    D.refresh(saved, {'__global__': {'hd_black_point': 11}})
+    assert saved['__global__']['hd_black_point'] == 11

@@ -50,6 +50,8 @@ GLOBAL = '__global__'
 # default_mod_settings.json and the current one.
 LEGACY_GLOBAL = {
     'voice_auto_delay': (500,),            # BUILD 907: 500 -> 200 ms
+    'hd_black_point': (12,),               # BUILD 911: the json still said
+                                           # 12 after BUILD 822 made it 11
 }
 LEGACY_MODS = {
     ('Echo-s.iro', 'Auto'): (0,),          # Auto Text Advance off -> on

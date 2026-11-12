@@ -28,7 +28,7 @@
     "movie_quality": "maximum",
     "movie_fit": "native",
     "movie_colour": "bt709",
-    "hd_black_point": 12,
+    "hd_black_point": 11,
     "movie_30fps": true,
     "analog_360": true,
     "no_autorun": true,
