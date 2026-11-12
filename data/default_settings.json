@@ -52,6 +52,10 @@
     "voice_normalize": "speech:-16.2",
     "esui_texscale": 2,
     "dock_resolution": "always",
-    "title_screen": "sword"
+    "title_screen": "sword",
+    "lang_fields_es": false,
+    "lang_fields_fr": false,
+    "lang_fields_de": false,
+    "force_english": false
   }
 }

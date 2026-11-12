@@ -163,7 +163,12 @@ class OptionPreview:
             self._img.configure(image='', text='No preview', width=0,
                                 height=0)
             return
-        self._photos = [(ImageTk.PhotoImage(f), ms) for f, ms in frames]
+        try:
+            self._photos = [(ImageTk.PhotoImage(f), ms) for f, ms in frames]
+        except Exception:                                   # noqa: BLE001
+            self._photos = []           # no Tk bridge in Pillow: no picture
+            self._img.configure(image='', text='No preview')
+            return
         self._img.configure(image=self._photos[0][0], text='')
         if len(self._photos) > 1:
             def step(i=1):

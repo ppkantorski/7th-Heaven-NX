@@ -3207,7 +3207,10 @@ def launch_ui():
         mid = (asc - cap / 2.0) * ss
         im.paste(art, (int(round((W * ss - art.width) / 2.0)),
                        int(round(mid - art.height / 2.0))))
-        return ImageTk.PhotoImage(im.resize((W, H), Image.LANCZOS))
+        try:                    # BUILD 913: see _check_image
+            return ImageTk.PhotoImage(im.resize((W, H), Image.LANCZOS))
+        except Exception:                                   # noqa: BLE001
+            return None
 
     dump_refresh = ttk.Label(header, padding=0)
     dump_refresh.pack(side='left', padx=(6, 0))
@@ -3560,6 +3563,13 @@ def launch_ui():
     compact_var = tk.BooleanVar(value=bool(global_saved.get('compact_cache', False)))
     # BUILD 869: Storage > Write a changes folder (build.sdout_changes); off by default.
     changes_var = tk.BooleanVar(value=bool(global_saved.get('changes_folder', False)))
+    # BUILD 914: Languages > HD backgrounds in the Spanish / French / German
+    # field archives (ff7nx_langfields); off by default
+    langf_vars = {c: tk.BooleanVar(value=bool(global_saved.get(
+        'lang_fields_' + c, False))) for c in ('es', 'fr', 'de')}
+    # BUILD 915: Languages > Force English (ff7nx_forcelang); off by default
+    force_en_var = tk.BooleanVar(value=bool(global_saved.get('force_english',
+                                                             False)))
     # BUILD 890: GUI > Check for updates automatically (ff7nx_update), on by
     # default; update_skip is the release the user said to skip.
     update_var = tk.BooleanVar(value=bool(global_saved.get('update_check',
@@ -3807,6 +3817,27 @@ def launch_ui():
              'longer keeps confirming or cancelling. The D-pad and L/R still '
              'repeat when held. Replaces the "Double Input Bugfix" mod, '
              'which is ignored if you still have it installed.', True),
+        ]),
+        ('Languages', [
+            ('check', 'Force English', force_en_var, None,
+             'The game normally follows the Switch\'s system language. '
+             'This makes it always run in English, whatever the console is '
+             'set to, so every mod applies in full: Echo-S voices, menus and '
+             'all. With it on, the languages below are not needed and are '
+             'not built.', True),
+            ('check', 'Spanish (Español)', langf_vars['es'], None,
+             'For a Switch set to Spanish: also writes the Spanish field '
+             'archive with the HD backgrounds, in the ~76% of scenes whose '
+             'scenery has no painted text. Dialogue, menus and scenes stay '
+             'Spanish; Echo-S voices are English-only and are not included. '
+             'Adds about 1.5 GB to the SD card.', True),
+            ('check', 'French (Français)', langf_vars['fr'], None,
+             'The same for a Switch set to French (about 76% of scenes). '
+             'Adds about 1.5 GB.', True),
+            ('check', 'German (Deutsch)', langf_vars['de'], None,
+             'The same for a Switch set to German (about 59% of scenes: '
+             'more of its scenery has painted text). Adds about 1.5 GB.',
+             True),
         ]),
         ('Storage', [
             ('check', 'Compact cache after build', compact_var, None,
@@ -5275,6 +5306,11 @@ def launch_ui():
                                  'advanced_facial': bool(facial_var.get()),
                                  'text_autosize': bool(autosize_var.get()),
                                  'compact_cache': bool(compact_var.get()),
+                                 # BUILD 914
+                                 'force_english': bool(force_en_var.get()),
+                                 'lang_fields_es': bool(langf_vars['es'].get()),
+                                 'lang_fields_fr': bool(langf_vars['fr'].get()),
+                                 'lang_fields_de': bool(langf_vars['de'].get()),
                                  'changes_folder': bool(changes_var.get()),
                                  'limiter_fps': current_limiter_fps(),
                                  'widescreen': current_widescreen(),
@@ -5353,6 +5389,9 @@ def launch_ui():
     autosize_var.trace_add('write', save_settings_now)
     compact_var.trace_add('write', save_settings_now)
     changes_var.trace_add('write', save_settings_now)
+    for _lv in langf_vars.values():            # BUILD 914
+        _lv.trace_add('write', save_settings_now)
+    force_en_var.trace_add('write', save_settings_now)   # BUILD 915
     update_var.trace_add('write', save_settings_now)
     lim_var.trace_add('write', save_settings_now)
     # The four added with the field-buffer work. Without these they are
@@ -6228,7 +6267,13 @@ def launch_ui():
             d.rounded_rectangle([0, 0, S - 1, S - 1], radius=r * ss,
                                 fill=bg, outline=TEXT_SECONDARY,
                                 width=max(1, ss))
-        img = ImageTk.PhotoImage(im.resize((n, n), Image.LANCZOS))
+        # BUILD 913: Pillow without its Tk bridge (the 1.1.4 Linux release
+        # lacked PIL._tkinter_finder) fails HERE, not at the import; then the
+        # Canvas fallback draws the box instead of the window failing to open
+        try:
+            img = ImageTk.PhotoImage(im.resize((n, n), Image.LANCZOS))
+        except Exception:                                   # noqa: BLE001
+            img = None
         _chk_cache[key] = img       # also the live reference Tk needs
         return img
 
@@ -7179,6 +7224,11 @@ def launch_ui():
             '1' if autosize_var.get() else '0')
         os.environ['SEVENTH_NX_COMPACT_CACHE'] = (
             '1' if compact_var.get() else '0')
+        # BUILD 914: which other languages get the HD field backgrounds
+        os.environ['SEVENTH_NX_LANG_FIELDS'] = ','.join(
+            c for c, v in langf_vars.items() if v.get())
+        os.environ['SEVENTH_NX_FORCE_ENGLISH'] = (
+            '1' if force_en_var.get() else '0')        # BUILD 915
         os.environ[build.CHANGES_DIR_ENV] = '1' if changes_var.get() else '0'
         os.environ[build.LIMITER_FPS_ENV] = str(
             _needs_nso(current_limiter_fps(), 0))
@@ -8057,6 +8107,12 @@ def main():
         os.environ.setdefault(build.TEXT_AUTOSIZE_ENV, (
                 '1' if saved.get('__global__', {}).get('text_autosize', True)
                 else '0'))
+        os.environ.setdefault('SEVENTH_NX_FORCE_ENGLISH', (
+            '1' if saved.get('__global__', {}).get('force_english')
+            else '0'))
+        os.environ.setdefault('SEVENTH_NX_LANG_FIELDS', ','.join(
+            c for c in ('es', 'fr', 'de')
+            if saved.get('__global__', {}).get('lang_fields_' + c)))
         os.environ.setdefault('SEVENTH_NX_COMPACT_CACHE', (
                 '1' if saved.get('__global__', {}).get('compact_cache')
                 else '0'))

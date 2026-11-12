@@ -51,6 +51,10 @@ USER_KEYS = frozenset((
     'text_autosize',                # BUILD 860: Display > Autosize dialogue boxes
     'update_check',                 # BUILD 890: GUI > Check for updates automatically
     'update_skip',                  # BUILD 890: the release "Skip This Version" chose; not a build input
+    'force_english',                # BUILD 915: Languages > Force English
+    'lang_fields_es',               # BUILD 914: Languages > Spanish field archive
+    'lang_fields_fr',               # BUILD 914: Languages > French
+    'lang_fields_de',               # BUILD 914: Languages > German
 ))
 
 # The shipped configuration: the developer settings' defaults, and what

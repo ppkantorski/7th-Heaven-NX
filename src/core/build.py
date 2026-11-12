@@ -146,6 +146,8 @@ import ff7nx_cargowait
 import ff7nx_winwait
 import ff7nx_lighttile
 import ff7nx_tunnelgate
+import ff7nx_langfields
+import ff7nx_forcelang
 import ff7nx_chunkparallax
 import ff7nx_trnad1fx
 import ff7nx_l4offset
@@ -11687,6 +11689,12 @@ def no_autorun():
         '1', 'true', 'yes', 'on')
 
 
+def force_english():
+    """BUILD 915: is the game's language pinned to English (ff7nx_forcelang)?"""
+    return os.environ.get(ff7nx_forcelang.ENV, '').strip().lower() in (
+        '1', 'true', 'yes', 'on')
+
+
 def no_cheats():
     """Is R3's HP/MP booster off (L3 speed and L3+R3 no-encounters kept)?"""
     return os.environ.get(NO_CHEATS_ENV, '').strip().lower() in (
@@ -13524,6 +13532,49 @@ def _emplace_ambient(plan, romfs, log, produced):
             'option set selects the battle-only folder')
 
 
+def _emplace_lang_fields(romfs, dump, log, produced, stage=None):
+    """BUILD 914, Settings > Languages: write sflevel/fflevel/gflevel with the
+    built flevel's backgrounds (see ff7nx_langfields). Not selected: nothing
+    is written, and prune_stale removes a copy a previous build left."""
+    codes = ff7nx_langfields.selected()
+    if not codes:
+        return
+    if force_english():
+        # BUILD 915: the game never opens them with English forced
+        log('')
+        log('other languages: skipped -- Force English is on, so the game '
+            'always loads the English files')
+        return
+    built = os.path.join(romfs, ARCHIVES['flevel.lgp'])
+    if not os.path.exists(built) or dump is None or not dump.workingdir:
+        log('! other languages: no built flevel.lgp or game dump -- skipped')
+        return
+    if stage:
+        stage('Field backgrounds for other languages')
+    log('')
+    log('other languages ...')
+    global FIELD_BG_MAX_RAW
+    try:
+        res = ff7nx_langfields.build_languages(
+            codes, os.path.join(dump.workingdir, 'data', 'field'), built,
+            romfs, ARCHIVE_FP_CACHE, log,
+            workers=max(1, min(8, nxpaths.cpu_threads())))
+    except Exception as exc:                                   # noqa: BLE001
+        log('! other languages: %s: %s -- not written'
+            % (type(exc).__name__, exc))
+        return
+    for code, dest, st in res:
+        produced.append(dest)
+        log(ff7nx_langfields.summarise(code, st))
+        # exefs/main sizes the field buffer from the largest field the game
+        # can load, in whichever language
+        if st.get('max_raw', 0) > FIELD_BG_MAX_RAW:
+            FIELD_BG_MAX_RAW = st['max_raw']
+            log('  largest field is now %s bytes (%s)'
+                % (format(FIELD_BG_MAX_RAW, ','),
+                   ff7nx_langfields.LANGS[code][0]))
+
+
 def _emplace_field_footstep_trailers(plan, romfs, dump, log, produced):
     """
     Write the resolved per-field terrain map beside the field data itself.
@@ -13893,6 +13944,8 @@ FPS_MULT_TAG = 'fpsmult='
 # field file. Adding a name here is only safe under that rule.
 MAIN_ONLY_ENV = frozenset((
     'SEVENTH_NX_VOICE_AUTO_DELAY_MS',  # ff7nx_voice   BUILD 904 GUI setting
+    'SEVENTH_NX_LANG_FIELDS',    # ff7nx_langfields  BUILD 914: other archives, not flevel
+    'SEVENTH_NX_FORCE_ENGLISH',  # ff7nx_forcelang   BUILD 915: exefs/main only
     'SEVENTH_NX_NO_DIFIX',       # ff7nx_difix       BUILD 901 GUI toggle
     'SEVENTH_NX_TEXT_AUTOSIZE',       # BUILD 860: exefs/main only
     'SEVENTH_NX_TEXT_CLOSE',          # BUILD 886: exefs/main only
@@ -15795,6 +15848,9 @@ def apply_plan(plan, archive_paths, sdout, log=lambda *_: None,
     _emplace_ambient(plan, romfs, log, produced)
     stage('Field footstep sounds')
     _emplace_field_footstep_trailers(plan, romfs, dump, log, produced)
+    # BUILD 914: the HD backgrounds in the other languages' field archives,
+    # from the finished flevel (after the footstep trailers, its last edit).
+    _emplace_lang_fields(romfs, dump, log, produced, stage)
     if plan.battle_bg:
         stage('Building battle backgrounds')
     _emplace_battle_bg(plan, romfs, dump, log, produced)
@@ -16016,7 +16072,8 @@ def apply_fps_patches(sdout, dump, log=lambda *_: None, produced=()):
     # patch, `no-cheats` one word (BUILD 736: R3-alone out of the booster,
     # L3+R3 back) plus two small caves in reclaimed padding, so neither
     # costs the 60 FPS cave budget anything.
-    for on, group in ((no_autorun(), 'no-autorun'), (no_cheats(), 'no-cheats')):
+    for on, group in ((no_autorun(), 'no-autorun'), (no_cheats(), 'no-cheats'),
+                      (force_english(), ff7nx_forcelang.GROUP)):   # BUILD 915
         if on:
             argv = [x + ',' + group if k and argv[k - 1] == '--enable' else x
                     for k, x in enumerate(argv)]

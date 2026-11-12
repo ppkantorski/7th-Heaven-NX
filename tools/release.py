@@ -366,6 +366,14 @@ def _pyinstaller(app, work, dist, system):
         args += ['--paths', d]
     for n in names:
         args += ['--hidden-import', n]
+    # BUILD 913: Pillow's Tk bridge. On Linux, PIL._imagingtk finds libtk
+    # through PIL._tkinter_finder, imported by name at run time, which
+    # PyInstaller's analysis cannot see. Without it every ImageTk.PhotoImage
+    # fails on Linux ("No module named 'PIL._tkinter_finder'"), and Settings
+    # and Install Mods -- built with image checkboxes -- never opened
+    # (1.1.4 linux-x64, Linux Mint 22.3). Windows and macOS do not use it.
+    for n in ('PIL.ImageTk', 'PIL._tkinter_finder'):
+        args += ['--hidden-import', n]
     if _have('certifi'):
         args += ['--collect-data', 'certifi']
     # the program's own files, at the same paths under nxpaths.APP

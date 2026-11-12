@@ -3162,6 +3162,9 @@ def _register_input_tweaks():
     # BUILD 736: `no-cheats` is its caves PLUS this word, which takes R3-alone
     # out of the booster function so L3+R3 (no encounters) can work again.
     NSO_GATED[NOCHEATS_GROUP] = NC.booster_patch()
+    # BUILD 915: Settings > Languages > Force English (ff7nx_forcelang)
+    import ff7nx_forcelang as FL
+    NSO_GATED[FL.GROUP] = FL.patch()
 
 
 ANALOG_GROUP = 'analog-360'
@@ -3688,6 +3691,8 @@ def capability_banner(want, a):
         ('smooth-scripted', 'on (60 FPS set)' if smooth_scripted()
                             else 'OFF (overridden)'),
         ('limiter-fps',     ('%d' % fps) if fps and fps != 60 else False),
+        # BUILD 915: last, so the positional fix-ups below keep their index
+        ('force-english',   'force-english' in want),
     ]
     rate = getattr(a, 'rate', '60')
     if rate != '60':
